@@ -18,10 +18,10 @@
 //!   via `ant_store::graph::diff_trees`.
 
 use ant_core::{Commit, EntryMode, ObjectId, RepoPath, TreeEntry};
-use ant_store::{Backend, PathChange};
+use ant_store::{Backend, CommitNode, ObjectStoreExt, PathChange, StoreError, graph};
 use bytes::Bytes;
 
-use super::OpResult;
+use super::{OpError, OpResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathInfo {
@@ -41,8 +41,52 @@ pub struct LogEntry {
 }
 
 pub async fn resolve_rev(b: &Backend, rev: &str) -> OpResult<ObjectId> {
-    let _ = (b, rev);
-    todo!("server-changeset")
+    let (base, steps) = match rev.rsplit_once('~') {
+        Some((base, n)) => {
+            let n: usize = n
+                .parse()
+                .map_err(|_| OpError::InvalidArgument(format!("bad rev {rev:?}")))?;
+            (base, n)
+        }
+        None => (rev, 0),
+    };
+    let mut id = match base.parse::<ObjectId>() {
+        Ok(id) => {
+            node(b, id).await?;
+            id
+        }
+        Err(_) => b
+            .refs
+            .get_ref(base)
+            .await
+            .map_err(|e| match e {
+                StoreError::InvalidArgument(m) => OpError::InvalidArgument(m),
+                e => e.into(),
+            })?
+            .ok_or_else(|| OpError::NotFound(format!("ref {base}")))?,
+    };
+    for _ in 0..steps {
+        id = *node(b, id)
+            .await?
+            .parents
+            .first()
+            .ok_or_else(|| OpError::NotFound(format!("{rev}: history is shorter")))?;
+    }
+    Ok(id)
+}
+
+async fn node(b: &Backend, id: ObjectId) -> OpResult<CommitNode> {
+    b.meta
+        .get_commits(&[id])
+        .await?
+        .pop()
+        .flatten()
+        .ok_or_else(|| OpError::NotFound(format!("commit {id}")))
+}
+
+async fn rev_tree(b: &Backend, rev: &str) -> OpResult<ObjectId> {
+    let id = resolve_rev(b, rev).await?;
+    Ok(node(b, id).await?.tree)
 }
 
 pub async fn read_path(
@@ -51,8 +95,21 @@ pub async fn read_path(
     path: &RepoPath,
     include_content: bool,
 ) -> OpResult<Option<PathInfo>> {
-    let _ = (b, rev, path, include_content);
-    todo!("server-changeset")
+    let tree = rev_tree(b, rev).await?;
+    let Some((mode, id)) = graph::lookup_path(b.objects.as_ref(), tree, path).await? else {
+        return Ok(None);
+    };
+    let entries = if mode.is_tree() {
+        Some(b.objects.read_tree(&id).await?.entries().to_vec())
+    } else {
+        None
+    };
+    let content = if include_content && mode.is_blob() {
+        Some(b.objects.read_blob(&id).await?)
+    } else {
+        None
+    };
+    Ok(Some(PathInfo { mode, id, entries, content }))
 }
 
 pub async fn log(
@@ -61,13 +118,34 @@ pub async fn log(
     path: Option<&RepoPath>,
     limit: usize,
 ) -> OpResult<Vec<LogEntry>> {
-    let _ = (b, rev, path, limit);
-    todo!("server-changeset")
+    let limit = if limit == 0 { usize::MAX } else { limit };
+    let mut out = Vec::new();
+    let mut next = Some(resolve_rev(b, rev).await?);
+    while let Some(id) = next {
+        if out.len() >= limit {
+            break;
+        }
+        let n = node(b, id).await?;
+        next = n.parents.first().copied();
+        if let Some(path) = path {
+            let changes = b.meta.get_changeset(&id).await?.unwrap_or_default();
+            if !changes.iter().any(|c| c.path.starts_with(path)) {
+                continue;
+            }
+        }
+        let commit = b.objects.read_commit(&id).await?;
+        out.push(LogEntry { id, generation: n.generation, commit });
+    }
+    Ok(out)
 }
 
 pub async fn diff(b: &Backend, from: Option<&str>, to: &str) -> OpResult<Vec<PathChange>> {
-    let _ = (b, from, to);
-    todo!("server-changeset")
+    let old = match from {
+        Some(rev) => Some(rev_tree(b, rev).await?),
+        None => None,
+    };
+    let new = rev_tree(b, to).await?;
+    Ok(graph::diff_trees(b.objects.as_ref(), old, Some(new)).await?)
 }
 
 #[cfg(test)]

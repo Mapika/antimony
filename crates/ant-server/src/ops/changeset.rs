@@ -30,11 +30,18 @@
 //! Performance target: O(changed paths × depth) object reads/writes,
 //! independent of repo size.
 
-use ant_core::{EntryMode, ObjectId, RepoPath, Signature};
-use ant_store::Backend;
+use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
+
+use ant_core::{
+    Commit, EncodedObject, EntryMode, Object, ObjectId, ObjectKind, RepoPath, Signature, Tree,
+    TreeEntry,
+};
+use ant_store::{Backend, ObjectStoreExt, graph};
 use bytes::Bytes;
 
-use super::OpResult;
+use super::{OpError, OpResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteContent {
@@ -66,8 +73,181 @@ pub struct ChangesetRequest {
 }
 
 pub async fn create_changeset(b: &Backend, req: ChangesetRequest) -> OpResult<ObjectId> {
-    let _ = (b, req);
-    todo!("server-changeset")
+    let base_tree = match req.base {
+        Some(id) => {
+            let node = b.meta.get_commits(&[id]).await?.pop().flatten();
+            Some(node.ok_or_else(|| OpError::NotFound(format!("commit {id}")))?.tree)
+        }
+        None => None,
+    };
+
+    // Validate ops and resolve their content into (mode, blob id).
+    let mut seen = HashSet::new();
+    let mut new_objects = Vec::new();
+    let mut referenced = Vec::new();
+    let mut edits: Vec<(Vec<&str>, Edit)> = Vec::with_capacity(req.ops.len());
+    for op in &req.ops {
+        let path = op.path();
+        if path.is_root() {
+            return Err(OpError::InvalidArgument("op on repository root".into()));
+        }
+        if !seen.insert(path.clone()) {
+            return Err(OpError::InvalidArgument(format!("duplicate op for {path}")));
+        }
+        let edit = match op {
+            FileOp::Delete { .. } => Edit::Delete,
+            FileOp::Write { mode, content, .. } => {
+                if !mode.is_blob() {
+                    return Err(OpError::InvalidArgument(format!("{path}: cannot write mode {mode:?}")));
+                }
+                let id = match content {
+                    WriteContent::Inline(data) => {
+                        let obj = EncodedObject::new(ObjectKind::Blob, data);
+                        let id = obj.id();
+                        new_objects.push(obj);
+                        id
+                    }
+                    WriteContent::Blob(id) => {
+                        referenced.push(*id);
+                        *id
+                    }
+                };
+                Edit::Write(*mode, id)
+            }
+        };
+        edits.push((path.components().collect(), edit));
+    }
+    check_blobs(b, &referenced).await?;
+
+    edits.sort_by(|a, b| a.0.cmp(&b.0));
+    let root = apply(b, base_tree, &edits, 0, &mut new_objects).await?;
+    let tree = match root {
+        Some(id) => id,
+        None => {
+            let empty = Object::Tree(Tree::empty()).encode();
+            let id = empty.id();
+            new_objects.push(empty);
+            id
+        }
+    };
+    b.objects.put_many(&new_objects).await?;
+
+    let commit = Commit {
+        tree,
+        parents: req.base.into_iter().collect(),
+        committer: req.committer.unwrap_or_else(|| req.author.clone()),
+        author: req.author,
+        extra_headers: vec![],
+        message: req.message,
+    };
+    Ok(graph::write_commit(b, &commit).await?)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Edit {
+    Write(EntryMode, ObjectId),
+    Delete,
+}
+
+/// Referenced blobs must exist and be blobs.
+async fn check_blobs(b: &Backend, ids: &[ObjectId]) -> OpResult<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let found = b.objects.get_many(ids).await?;
+    for (id, o) in ids.iter().zip(found) {
+        match o {
+            None => return Err(OpError::not_found_object(*id)),
+            Some(o) if o.kind() != ObjectKind::Blob => {
+                return Err(OpError::InvalidArgument(format!("{id} is a {:?}, not a blob", o.kind())));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Apply `edits` (sorted by components, all sharing the first `depth`
+/// components) to the tree `base`. Returns the new tree id, or `None` if the
+/// directory ends up empty. New trees are appended to `out`.
+fn apply<'a>(
+    b: &'a Backend,
+    base: Option<ObjectId>,
+    edits: &'a [(Vec<&'a str>, Edit)],
+    depth: usize,
+    out: &'a mut Vec<EncodedObject>,
+) -> Pin<Box<dyn Future<Output = OpResult<Option<ObjectId>>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut tree = match base {
+            Some(id) => b.objects.read_tree(&id).await?,
+            None => Tree::empty(),
+        };
+        let mut i = 0;
+        while i < edits.len() {
+            let name = edits[i].0[depth];
+            let end = i + edits[i..].iter().take_while(|(c, _)| c[depth] == name).count();
+            let group = &edits[i..end];
+            i = end;
+
+            // Sorting puts the edit for `name` itself before edits beneath it.
+            let (own, nested) = match group.first() {
+                Some((c, e)) if c.len() == depth + 1 => (Some(*e), &group[1..]),
+                _ => (None, group),
+            };
+            let existing = tree.get(name).cloned();
+            let display = || group[0].0[..=depth].join("/");
+
+            if nested.is_empty() {
+                match (own, existing) {
+                    (Some(Edit::Write(..)), Some(e)) if e.mode.is_tree() => {
+                        return Err(OpError::InvalidArgument(format!("{} is a directory", display())));
+                    }
+                    (Some(Edit::Write(mode, id)), _) => {
+                        tree.upsert(TreeEntry { mode, name: name.to_string(), id })?;
+                    }
+                    (Some(Edit::Delete), Some(e)) if !e.mode.is_tree() => {
+                        tree.remove(name);
+                    }
+                    (Some(Edit::Delete), _) => {
+                        return Err(OpError::NotFound(format!("file {}", display())));
+                    }
+                    (None, _) => unreachable!("group has at least one edit"),
+                }
+                continue;
+            }
+
+            let sub_base = match (own, existing) {
+                (Some(Edit::Write(..)), _) => {
+                    return Err(OpError::InvalidArgument(format!(
+                        "{} is written as a file and used as a directory",
+                        display()
+                    )));
+                }
+                (Some(Edit::Delete), Some(e)) if !e.mode.is_tree() => None,
+                (Some(Edit::Delete), _) => {
+                    return Err(OpError::NotFound(format!("file {}", display())));
+                }
+                (None, Some(e)) if e.mode.is_tree() => Some(e.id),
+                (None, Some(_)) => {
+                    return Err(OpError::InvalidArgument(format!("{} is not a directory", display())));
+                }
+                (None, None) => None,
+            };
+            match apply(b, sub_base, nested, depth + 1, out).await? {
+                Some(id) => tree.upsert(TreeEntry { mode: EntryMode::Tree, name: name.to_string(), id })?,
+                None => {
+                    tree.remove(name);
+                }
+            }
+        }
+        if tree.is_empty() {
+            return Ok(None);
+        }
+        let obj = Object::Tree(tree).encode();
+        let id = obj.id();
+        out.push(obj);
+        Ok(Some(id))
+    })
 }
 
 #[cfg(test)]
