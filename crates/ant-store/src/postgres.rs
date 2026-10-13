@@ -222,7 +222,7 @@ impl PgStore {
 
         let search_path = format!("SET search_path TO {qs}");
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(16)
+            .max_connections(64)
             .after_connect(move |conn, _meta| {
                 let stmt = search_path.clone();
                 Box::pin(async move {

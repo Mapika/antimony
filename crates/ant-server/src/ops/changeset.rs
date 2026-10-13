@@ -213,9 +213,6 @@ pub async fn create_changeset_as(
     let encoded = EncodedObject::new(ObjectKind::Commit, &commit.encode());
     let id = encoded.id();
     new_objects.push(encoded);
-    // One write for every new object (blobs, trees, the commit), then record
-    // the commit with the changeset computed above: no tree is read back.
-    b.objects.put_many(&new_objects).await?;
     let node = CommitNode {
         id,
         tree,
@@ -225,7 +222,15 @@ pub async fn create_changeset_as(
     };
     let changes_weight = cache::changeset_weight(&changes);
     let recorded = Arc::new(changes.clone());
-    b.meta.put_commit(node.clone(), changes).await?;
+    // One write for every new object (blobs, trees, the commit) and, at the
+    // same time, the commit record with the changeset computed above: no
+    // tree is read back. The id is returned only once both are durable; a
+    // record whose objects failed to write is unreachable, and a retry of
+    // the same request completes it.
+    futures::try_join!(
+        async { b.objects.put_many(&new_objects).await },
+        async { b.meta.put_commit(node.clone(), changes).await },
+    )?;
 
     let objects = cache::objects(&b.objects);
     objects.trees.insert_many(trees.into_iter().map(|(_, id, tree)| {

@@ -64,6 +64,8 @@ use ant_auth::Policy;
 use ant_store::graph;
 
 type Entry = (EntryMode, ObjectId);
+/// A new blob or tree and the path it is written at (for zone tagging).
+type TagWrite = (RepoPath, ObjectId);
 pub(super) type Directories = BTreeMap<RepoPath, Tree>;
 
 // Load only directories on changed paths, one batch per depth.
@@ -648,7 +650,7 @@ impl BatchState {
         Ok(Ok(id))
     }
 
-    /// Write queued objects, then record queued commits (parents first), and
+    /// Write queued objects and record queued commits (parents first), then
     /// publish both to the store-scoped caches.
     async fn flush(&mut self, b: &Backend) -> OpResult<()> {
         let writes = std::mem::take(&mut self.writes);
@@ -657,7 +659,7 @@ impl BatchState {
         }
         // Tags must be recorded before the objects are stored, one call per
         // distinct policy (normally all requests share one).
-        let mut by_policy: Vec<(Arc<Policy>, Vec<(RepoPath, ObjectId)>)> = Vec::new();
+        let mut by_policy: Vec<(Arc<Policy>, Vec<TagWrite>)> = Vec::new();
         for (policy, path, id) in writes.tags {
             match by_policy.iter_mut().find(|(p, _)| Arc::ptr_eq(p, &policy)) {
                 Some((_, group)) => group.push((path, id)),
@@ -667,13 +669,6 @@ impl BatchState {
         for (policy, group) in &by_policy {
             acl::tag_written(b, policy, group).await?;
         }
-        b.objects.put_many(&writes.objects).await?;
-        cache::objects(&b.objects).trees.insert_many(
-            writes.trees.into_iter().map(|(id, tree)| {
-                let weight = cache::tree_weight(&tree);
-                (id, tree, weight)
-            }),
-        );
         let entries: Vec<_> = writes
             .commits
             .iter()
@@ -681,7 +676,21 @@ impl BatchState {
                 (node.clone(), Arc::new(changes.clone()), cache::changeset_weight(changes))
             })
             .collect();
-        b.meta.put_commits(writes.commits).await?;
+        // Objects and commit records go out concurrently: both finish before
+        // the caller's CAS makes anything reachable, and a recorded commit
+        // whose objects failed to write is unreachable (its id was never
+        // returned) and is completed by any retry, which rebuilds it
+        // identically.
+        futures::try_join!(
+            async { b.objects.put_many(&writes.objects).await },
+            async { b.meta.put_commits(writes.commits).await },
+        )?;
+        cache::objects(&b.objects).trees.insert_many(
+            writes.trees.into_iter().map(|(id, tree)| {
+                let weight = cache::tree_weight(&tree);
+                (id, tree, weight)
+            }),
+        );
         let meta = cache::meta(&b.meta);
         meta.nodes
             .insert_many(entries.iter().map(|(n, _, _)| (n.id, n.clone(), cache::NODE_WEIGHT)));
@@ -900,9 +909,14 @@ async fn land_batch(
     ref_name: &str,
     batch: &[Request],
 ) -> OpResult<Vec<OpResult<LandOutcome>>> {
-    let mut start = b.refs.get_ref(ref_name).await?;
     let mut state = BatchState::default();
     let ids: Vec<_> = batch.iter().map(|r| r.commit).collect();
+    let keys: Vec<_> = ids.iter().map(|id| id.as_bytes().as_slice()).collect();
+    // Independent reads, one round trip.
+    let (mut start, mut mapped) = futures::try_join!(
+        async { b.refs.get_ref(ref_name).await },
+        async { b.meta.get_derived_many(LANDED_AS, &keys).await },
+    )?;
     // Batch-wide prefetch: nodes, then the changesets and messages a rebase
     // needs (unrecorded ids are reported per request by `apply`).
     state.prefetch(b, &ids).await?;
@@ -911,9 +925,11 @@ async fn land_batch(
         cache::get_changesets(b, &recorded).await?;
         cache::read_commits(b, &recorded).await?;
     }
-    let keys: Vec<_> = ids.iter().map(|id| id.as_bytes().as_slice()).collect();
-    for _ in 0..MAX_LAND_ATTEMPTS {
-        for (id, mapped) in ids.iter().zip(b.meta.get_derived_many(LANDED_AS, &keys).await?) {
+    for attempt in 0..MAX_LAND_ATTEMPTS {
+        if attempt > 0 {
+            mapped = b.meta.get_derived_many(LANDED_AS, &keys).await?;
+        }
+        for (id, mapped) in ids.iter().zip(std::mem::take(&mut mapped)) {
             state.mappings.insert(*id, mapped);
         }
         let mut tip = start;
@@ -1708,5 +1724,150 @@ mod group_tests {
         // Reapplying identical changes records an empty changeset.
         let again = rebase(&b, original, rebased).await.unwrap().unwrap();
         assert!(b.meta.get_changeset(&again).await.unwrap().unwrap().is_empty());
+    }
+}
+
+/// The batched in-memory replay must be indistinguishable from landing the
+/// same requests one at a time: same outcomes (hence same rebased commit
+/// ids, i.e. same trees and metadata), same conflict sets, same recorded
+/// changesets, and changesets equal to the tree diff.
+#[cfg(test)]
+mod batch_equivalence {
+    use super::*;
+    use crate::ops::changeset::FileOp;
+    use crate::ops::changeset::tests::{commit, delete, write};
+    use ant_store::graph::diff_trees;
+    use proptest::prelude::*;
+
+    const PATHS: [&str; 6] = ["a", "b", "d/x", "d/y", "e/f/g", "hot"];
+    const HOT: &str = "l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\n";
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Write(usize, u8),
+        Delete(usize),
+        HotLine(usize, u8),
+    }
+
+    #[derive(Debug, Clone)]
+    struct Change {
+        /// `None`: based on the seed; `Some(i)`: stacked on an earlier change.
+        parent: Option<usize>,
+        ops: Vec<Op>,
+    }
+
+    fn change() -> impl Strategy<Value = Change> {
+        let op = prop_oneof![
+            (0..PATHS.len() - 1, 0u8..3).prop_map(|(p, v)| Op::Write(p, v)),
+            (0..PATHS.len() - 1).prop_map(Op::Delete),
+            (0usize..8, 0u8..3).prop_map(|(l, v)| Op::HotLine(l, v)),
+        ];
+        (prop::option::weighted(0.25, 0usize..64), prop::collection::vec(op, 1..4))
+            .prop_map(|(parent, ops)| Change { parent, ops })
+    }
+
+    fn file_ops(ops: &[Op]) -> Vec<FileOp> {
+        let mut seen = BTreeSet::new();
+        let mut hot: Vec<String> = HOT.lines().map(str::to_owned).collect();
+        let mut hot_touched = false;
+        let mut out = Vec::new();
+        for op in ops {
+            match *op {
+                Op::Write(p, v) if seen.insert(p) => out.push(write(PATHS[p], &format!("v{v}"))),
+                Op::Delete(p) if seen.insert(p) => out.push(delete(PATHS[p])),
+                Op::HotLine(l, v) => {
+                    hot[l] = format!("L{l}v{v}");
+                    hot_touched = true;
+                }
+                _ => {}
+            }
+        }
+        if hot_touched {
+            out.push(write("hot", &(hot.join("\n") + "\n")));
+        }
+        out
+    }
+
+    /// Create the same commits in `b` (deterministic ids); `None` where
+    /// creation fails (e.g. deleting a path the parent already deleted).
+    async fn create(b: &Backend, changes: &[Change]) -> (ObjectId, Vec<Option<ObjectId>>) {
+        let seed = commit(
+            b,
+            None,
+            PATHS.iter().map(|p| write(p, if *p == "hot" { HOT } else { "seed" })).collect(),
+        )
+        .await
+        .unwrap();
+        let mut ids: Vec<Option<ObjectId>> = Vec::new();
+        for change in changes {
+            let parent = change
+                .parent
+                .filter(|_| !ids.is_empty())
+                .and_then(|i| ids[i % ids.len()])
+                .unwrap_or(seed);
+            ids.push(commit(b, Some(parent), file_ops(&change.ops)).await.ok());
+        }
+        (seed, ids)
+    }
+
+    fn summary(outcomes: Vec<OpResult<LandOutcome>>) -> Vec<Result<LandOutcome, String>> {
+        outcomes.into_iter().map(|o| o.map_err(|e| e.to_string())).collect()
+    }
+
+    async fn check(changes: Vec<Change>) -> Result<(), TestCaseError> {
+        let batched = Backend::in_memory();
+        let sequential = Backend::in_memory();
+        let (seed, ids) = create(&batched, &changes).await;
+        let (seed2, ids2) = create(&sequential, &changes).await;
+        prop_assert_eq!(seed, seed2);
+        prop_assert_eq!(&ids, &ids2);
+        let ids: Vec<ObjectId> = ids.into_iter().flatten().collect();
+        land(&batched, "main", seed).await.unwrap();
+        land(&sequential, "main", seed).await.unwrap();
+
+        // One batch: enqueue synchronously, then await.
+        let replies: Vec<_> = ids.iter().map(|id| enqueue(&batched, "main", *id)).collect();
+        let mut one_batch = Vec::new();
+        for reply in replies {
+            one_batch.push(reply.await.unwrap());
+        }
+        let mut one_by_one = Vec::new();
+        for id in &ids {
+            one_by_one.push(land(&sequential, "main", *id).await);
+        }
+        prop_assert_eq!(summary(one_batch), summary(one_by_one));
+        let tip = batched.refs.get_ref("main").await.unwrap();
+        prop_assert_eq!(tip, sequential.refs.get_ref("main").await.unwrap());
+
+        // Same recorded history and changesets, each equal to its tree diff.
+        let chain = batched.meta.first_parent_chain(tip.unwrap(), Some(seed), 1000).await.unwrap();
+        for node in chain {
+            let parent = batched.meta.get_commits(&node.parents).await.unwrap()[0].clone().unwrap();
+            let recorded = batched.meta.get_changeset(&node.id).await.unwrap().unwrap();
+            prop_assert_eq!(
+                &recorded,
+                &sequential.meta.get_changeset(&node.id).await.unwrap().unwrap()
+            );
+            let diff = diff_trees(batched.objects.as_ref(), Some(parent.tree), Some(node.tree))
+                .await
+                .unwrap();
+            prop_assert_eq!(recorded, diff);
+            prop_assert_eq!(
+                batched.objects.get_many(&[node.id]).await.unwrap(),
+                sequential.objects.get_many(&[node.id]).await.unwrap()
+            );
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn batch_replay_matches_sequential_landing(
+            changes in prop::collection::vec(change(), 1..24)
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(check(changes))?;
+        }
     }
 }
