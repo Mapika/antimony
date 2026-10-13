@@ -20,11 +20,8 @@ use crate::{ObjectStore, Result};
 pub const DEFAULT_INLINE_THRESHOLD: usize = 4096;
 
 pub struct TieredObjectStore {
-    #[allow(dead_code)]
     small: Arc<dyn ObjectStore>,
-    #[allow(dead_code)]
     large: Arc<dyn ObjectStore>,
-    #[allow(dead_code)]
     threshold: usize,
 }
 
@@ -37,16 +34,50 @@ impl TieredObjectStore {
 #[async_trait]
 impl ObjectStore for TieredObjectStore {
     async fn get_many(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
-        let _ = ids;
-        todo!("store-s3")
+        let mut out = self.small.get_many(ids).await?;
+        let misses: Vec<usize> =
+            out.iter().enumerate().filter(|(_, o)| o.is_none()).map(|(i, _)| i).collect();
+        if !misses.is_empty() {
+            let miss_ids: Vec<ObjectId> = misses.iter().map(|&i| ids[i]).collect();
+            let found = self.large.get_many(&miss_ids).await?;
+            for (i, o) in misses.into_iter().zip(found) {
+                out[i] = o;
+            }
+        }
+        Ok(out)
     }
+
     async fn put_many(&self, objects: &[EncodedObject]) -> Result<()> {
-        let _ = objects;
-        todo!("store-s3")
+        let mut small = Vec::new();
+        let mut large = Vec::new();
+        for o in objects {
+            if o.as_bytes().len() <= self.threshold {
+                small.push(o.clone());
+            } else {
+                large.push(o.clone());
+            }
+        }
+        if !small.is_empty() {
+            self.small.put_many(&small).await?;
+        }
+        if !large.is_empty() {
+            self.large.put_many(&large).await?;
+        }
+        Ok(())
     }
+
     async fn has_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {
-        let _ = ids;
-        todo!("store-s3")
+        let mut out = self.small.has_many(ids).await?;
+        let misses: Vec<usize> =
+            out.iter().enumerate().filter(|(_, present)| !**present).map(|(i, _)| i).collect();
+        if !misses.is_empty() {
+            let miss_ids: Vec<ObjectId> = misses.iter().map(|&i| ids[i]).collect();
+            let found = self.large.has_many(&miss_ids).await?;
+            for (i, present) in misses.into_iter().zip(found) {
+                out[i] = present;
+            }
+        }
+        Ok(out)
     }
 }
 

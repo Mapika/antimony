@@ -17,10 +17,20 @@
 //! - `ensure_bucket` creates the bucket if it does not exist (treat
 //!   "already owned by you" as success).
 
+use std::collections::HashSet;
+
 use ant_core::{EncodedObject, ObjectId};
 use async_trait::async_trait;
+use aws_sdk_s3::primitives::ByteStream;
+use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt, stream};
 
-use crate::{ObjectStore, Result};
+use crate::{ObjectStore, Result, StoreError};
+
+/// Maximum number of concurrent S3 requests per batch call.
+const FANOUT: usize = 64;
+/// zstd level for stored object bodies.
+const ZSTD_LEVEL: i32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct S3Config {
@@ -49,44 +59,145 @@ impl S3Config {
 
 #[derive(Clone)]
 pub struct S3ObjectStore {
-    #[allow(dead_code)]
     client: aws_sdk_s3::Client,
-    #[allow(dead_code)]
     bucket: String,
-    #[allow(dead_code)]
     prefix: String,
+}
+
+fn corrupt(msg: impl Into<String>) -> StoreError {
+    StoreError::Backend(msg.into().into())
 }
 
 impl S3ObjectStore {
     pub async fn connect(cfg: &S3Config) -> Result<Self> {
-        let _ = cfg;
-        todo!("store-s3")
+        let credentials = aws_sdk_s3::config::Credentials::new(
+            &cfg.access_key,
+            &cfg.secret_key,
+            None,
+            None,
+            "ant-static",
+        );
+        let conf = aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new(cfg.region.clone()))
+            .endpoint_url(&cfg.endpoint)
+            .credentials_provider(credentials)
+            .force_path_style(true)
+            .build();
+        Ok(Self {
+            client: aws_sdk_s3::Client::from_conf(conf),
+            bucket: cfg.bucket.clone(),
+            prefix: cfg.prefix.clone(),
+        })
     }
 
     pub async fn ensure_bucket(&self) -> Result<()> {
-        todo!("store-s3")
+        match self.client.create_bucket().bucket(&self.bucket).send().await {
+            Ok(_) => Ok(()),
+            // SeaweedFS (no identities configured) reports an existing bucket as
+            // `BucketAlreadyExists` rather than `BucketAlreadyOwnedByYou`; both mean
+            // the bucket is usable, so creation is idempotent.
+            Err(e) => match e.as_service_error() {
+                Some(s) if s.is_bucket_already_owned_by_you() || s.is_bucket_already_exists() => {
+                    Ok(())
+                }
+                _ => Err(StoreError::backend(e)),
+            },
+        }
     }
 
     /// Object key for `id`.
     pub fn key(&self, id: &ObjectId) -> String {
-        let _ = id;
-        todo!("store-s3")
+        let hex = id.to_hex();
+        if self.prefix.is_empty() {
+            format!("{}/{}", &hex[..2], hex)
+        } else {
+            format!("{}/{}/{}", self.prefix.trim_end_matches('/'), &hex[..2], hex)
+        }
+    }
+
+    async fn get_one(&self, id: ObjectId) -> Result<Option<EncodedObject>> {
+        let resp = match self.client.get_object().bucket(&self.bucket).key(self.key(&id)).send().await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                if e.as_service_error().is_some_and(|s| s.is_no_such_key()) {
+                    return Ok(None);
+                }
+                return Err(StoreError::backend(e));
+            }
+        };
+        let compressed: Bytes = resp.body.collect().await.map_err(StoreError::backend)?.into_bytes();
+        let raw = zstd::stream::decode_all(&compressed[..]).map_err(StoreError::backend)?;
+        let obj = EncodedObject::from_bytes(Bytes::from(raw))
+            .map_err(|e| corrupt(format!("object {id}: {e}")))?;
+        obj.verify(&id).map_err(|e| corrupt(format!("object {id}: {e}")))?;
+        Ok(Some(obj))
+    }
+
+    async fn put_one(&self, id: ObjectId, obj: &EncodedObject) -> Result<()> {
+        let compressed =
+            zstd::stream::encode_all(&obj.as_bytes()[..], ZSTD_LEVEL).map_err(StoreError::backend)?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.key(&id))
+            .body(ByteStream::from(compressed))
+            .send()
+            .await
+            .map_err(StoreError::backend)?;
+        Ok(())
+    }
+
+    async fn has_one(&self, id: ObjectId) -> Result<bool> {
+        match self.client.head_object().bucket(&self.bucket).key(self.key(&id)).send().await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if e.as_service_error().is_some_and(|s| s.is_not_found()) {
+                    Ok(false)
+                } else {
+                    Err(StoreError::backend(e))
+                }
+            }
+        }
     }
 }
 
 #[async_trait]
 impl ObjectStore for S3ObjectStore {
     async fn get_many(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
-        let _ = ids;
-        todo!("store-s3")
+        stream::iter(ids.iter().copied())
+            .map(|id| self.get_one(id))
+            .buffered(FANOUT)
+            .try_collect()
+            .await
     }
+
     async fn put_many(&self, objects: &[EncodedObject]) -> Result<()> {
-        let _ = objects;
-        todo!("store-s3")
+        let mut seen = HashSet::with_capacity(objects.len());
+        // `EncodedObject` clones are cheap (shared `Bytes`); owning the pairs
+        // keeps the buffered stream's closure free of higher-ranked borrows.
+        let unique: Vec<(ObjectId, EncodedObject)> = objects
+            .iter()
+            .filter_map(|o| {
+                let id = o.id();
+                seen.insert(id).then(|| (id, o.clone()))
+            })
+            .collect();
+        stream::iter(unique)
+            .map(|(id, o)| async move { self.put_one(id, &o).await })
+            .buffered(FANOUT)
+            .try_collect::<Vec<()>>()
+            .await?;
+        Ok(())
     }
+
     async fn has_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {
-        let _ = ids;
-        todo!("store-s3")
+        stream::iter(ids.iter().copied())
+            .map(|id| self.has_one(id))
+            .buffered(FANOUT)
+            .try_collect()
+            .await
     }
 }
 
