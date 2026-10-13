@@ -8,8 +8,8 @@
 //! - `commit` must be recorded and have exactly one parent `P`; merge
 //!   commits → `InvalidArgument`.
 //! - Take `commit`'s recorded changeset (vs `P`). For each change at path:
-//!     base = entry at path in P's tree, ours = entry in `onto`'s tree,
-//!     theirs = change.new.
+//!   base = entry at path in P's tree, ours = entry in `onto`'s tree,
+//!   theirs = change.new.
 //!   * ours == base            → apply theirs (write or delete)
 //!   * ours == theirs          → already applied, skip
 //!   * base, ours, theirs all regular files (File/Executable) with
@@ -40,10 +40,115 @@
 //! - Must be safe under heavy concurrency: N concurrent lands of
 //!   non-conflicting commits must all land, each exactly once.
 
-use ant_core::{ObjectId, RepoPath};
-use ant_store::Backend;
+use std::collections::{BTreeMap, BTreeSet};
 
-use super::OpResult;
+use ant_core::{EncodedObject, EntryMode, Object, ObjectId, ObjectKind, RepoPath, Tree, TreeEntry};
+use ant_store::graph::{is_ancestor, write_commit};
+use ant_store::{Backend, CasOutcome, ObjectStoreExt, StoreError};
+
+use super::{OpError, OpResult};
+
+type Entry = (EntryMode, ObjectId);
+type Directories = BTreeMap<RepoPath, Tree>;
+
+// Load only directories on changed paths, one batch per depth.
+async fn load_directories(
+    b: &Backend,
+    root: ObjectId,
+    paths: &[ant_store::PathChange],
+) -> OpResult<Directories> {
+    let mut needed = BTreeSet::from([RepoPath::root()]);
+    for change in paths {
+        let mut path = change.path.clone();
+        needed.insert(path.clone());
+        while let Some((parent, _)) = path.split_last() {
+            needed.insert(parent.clone());
+            path = parent;
+        }
+    }
+    let mut pending = vec![(RepoPath::root(), root)];
+    let mut dirs = BTreeMap::new();
+    while !pending.is_empty() {
+        let ids: Vec<_> = pending.iter().map(|(_, id)| *id).collect();
+        let objects = b.objects.get_many(&ids).await?;
+        let mut next = Vec::new();
+        for ((path, id), object) in pending.into_iter().zip(objects) {
+            let object = object.ok_or(StoreError::NotFound(id))?;
+            if object.kind() != ObjectKind::Tree {
+                return Err(StoreError::WrongKind {
+                    id,
+                    expected: ObjectKind::Tree,
+                    actual: object.kind(),
+                }
+                .into());
+            }
+            let tree = Tree::decode(object.body())?;
+            for entry in tree.entries().iter().filter(|e| e.mode.is_tree()) {
+                let child = path.join(&entry.name)?;
+                if needed.contains(&child) {
+                    next.push((child, entry.id));
+                }
+            }
+            dirs.insert(path, tree);
+        }
+        pending = next;
+    }
+    Ok(dirs)
+}
+
+fn entry(dirs: &Directories, path: &RepoPath) -> Option<Entry> {
+    let (parent, name) = path.split_last()?;
+    dirs.get(&parent)?.get(name).map(|e| (e.mode, e.id))
+}
+
+fn deepest_first(dirs: &Directories) -> Vec<RepoPath> {
+    let mut paths: Vec<_> = dirs.keys().cloned().collect();
+    paths.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    paths
+}
+
+fn prune_empty(dirs: &mut Directories) {
+    for path in deepest_first(dirs) {
+        if let Some((parent, name)) = path.split_last()
+            && dirs.get(&path).is_some_and(Tree::is_empty)
+        {
+            dirs.remove(&path);
+            if let Some(tree) = dirs.get_mut(&parent) {
+                tree.remove(name);
+            }
+        }
+    }
+}
+
+fn apply_write(dirs: &mut Directories, path: &RepoPath, value: Entry) -> OpResult<bool> {
+    let Some((parent, name)) = path.split_last() else {
+        return Ok(false);
+    };
+    let mut dir = RepoPath::root();
+    for component in parent.components() {
+        let child = dir.join(component)?;
+        let tree = dirs.entry(dir).or_default();
+        if let Some(existing) = tree.get(component) {
+            if !existing.mode.is_tree() {
+                return Ok(false);
+            }
+        } else {
+            tree.upsert(TreeEntry {
+                name: component.into(),
+                mode: EntryMode::Tree,
+                id: ObjectId::empty_tree(),
+            })?;
+        }
+        dirs.entry(child.clone()).or_default();
+        dir = child;
+    }
+    let tree = dirs.entry(parent).or_default();
+    if tree.get(name).is_some_and(|e| e.mode.is_tree()) {
+        return Ok(false);
+    }
+    tree.upsert(TreeEntry { name: name.into(), mode: value.0, id: value.1 })?;
+    Ok(true)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LandOutcome {
@@ -58,13 +163,164 @@ pub async fn rebase(
     commit: ObjectId,
     onto: ObjectId,
 ) -> OpResult<Result<ObjectId, Vec<RepoPath>>> {
-    let _ = (b, commit, onto);
-    todo!("server-land")
+    let nodes = b.meta.get_commits(&[commit, onto]).await?;
+    let original = nodes[0].as_ref().ok_or_else(|| OpError::not_found_object(commit))?;
+    if original.parents.len() != 1 {
+        return Err(OpError::InvalidArgument("rebase requires exactly one parent".into()));
+    }
+    let target = nodes[1].as_ref().ok_or_else(|| OpError::not_found_object(onto))?;
+    let parent = original.parents[0];
+    let parent_node = b
+        .meta
+        .get_commits(&[parent])
+        .await?
+        .pop()
+        .flatten()
+        .ok_or_else(|| OpError::not_found_object(parent))?;
+    let changes =
+        b.meta.get_changeset(&commit).await?.ok_or_else(|| OpError::not_found_object(commit))?;
+    let base_dirs = load_directories(b, parent_node.tree, &changes).await?;
+    let mut dirs = load_directories(b, target.tree, &changes).await?;
+    let mut conflicts = BTreeSet::new();
+    let mut edits = BTreeMap::new();
+    let mut merges = Vec::new();
+    let mut blob_ids = BTreeSet::new();
+    for change in &changes {
+        let base = entry(&base_dirs, &change.path);
+        let ours = entry(&dirs, &change.path);
+        let theirs = change.new;
+        if ours == theirs {
+            continue;
+        }
+        if ours == base {
+            edits.insert(change.path.clone(), theirs);
+            continue;
+        }
+        if let (Some(base), Some(ours), Some(theirs)) = (base, ours, theirs)
+            && [base.0, ours.0, theirs.0]
+                .into_iter()
+                .all(|m| matches!(m, EntryMode::File | EntryMode::Executable))
+            && (ours.0 == base.0 || theirs.0 == base.0)
+        {
+            blob_ids.extend([base.1, ours.1, theirs.1]);
+            merges.push((change.path.clone(), base, ours, theirs));
+        } else {
+            conflicts.insert(change.path.clone());
+        }
+    }
+    let blob_ids: Vec<_> = blob_ids.into_iter().collect();
+    let mut blobs = BTreeMap::new();
+    if !blob_ids.is_empty() {
+        for (id, object) in blob_ids.iter().copied().zip(b.objects.get_many(&blob_ids).await?) {
+            let object = object.ok_or(StoreError::NotFound(id))?;
+            if object.kind() != ObjectKind::Blob {
+                return Err(StoreError::WrongKind {
+                    id,
+                    expected: ObjectKind::Blob,
+                    actual: object.kind(),
+                }
+                .into());
+            }
+            blobs.insert(id, object);
+        }
+    }
+    let mut objects = Vec::new();
+    for (path, base, ours, theirs) in merges {
+        let texts = [base.1, ours.1, theirs.1]
+            .map(|id| blobs.get(&id).and_then(|blob| std::str::from_utf8(blob.body()).ok()));
+        if let [Some(base_text), Some(ours_text), Some(theirs_text)] = texts
+            && let Ok(merged) = diffy::merge(base_text, ours_text, theirs_text)
+        {
+            let object = EncodedObject::new(ObjectKind::Blob, merged.as_bytes());
+            let mode = if ours.0 == base.0 { theirs.0 } else { ours.0 };
+            edits.insert(path, Some((mode, object.id())));
+            objects.push(object);
+        } else {
+            conflicts.insert(path);
+        }
+    }
+    // Deleting first permits file/directory replacements within one changeset.
+    for (path, value) in &edits {
+        if value.is_none()
+            && let Some((parent, name)) = path.split_last()
+            && let Some(tree) = dirs.get_mut(&parent)
+        {
+            tree.remove(name);
+        }
+    }
+    prune_empty(&mut dirs);
+    for (path, value) in &edits {
+        if let Some(value) = value
+            && !apply_write(&mut dirs, path, *value)?
+        {
+            conflicts.insert(path.clone());
+        }
+    }
+    if !conflicts.is_empty() {
+        return Ok(Err(conflicts.into_iter().collect()));
+    }
+    let mut root = target.tree;
+    for path in deepest_first(&dirs) {
+        let tree = dirs
+            .remove(&path)
+            .ok_or_else(|| OpError::InvalidArgument(format!("missing directory {path}")))?;
+        let object = Object::Tree(tree).encode();
+        let id = object.id();
+        if let Some((parent, name)) = path.split_last() {
+            let parent_tree = dirs
+                .get_mut(&parent)
+                .ok_or_else(|| OpError::InvalidArgument(format!("missing directory {parent}")))?;
+            if parent_tree.get(name).is_some_and(|e| e.id == id) {
+                continue;
+            }
+            parent_tree.upsert(TreeEntry { name: name.into(), mode: EntryMode::Tree, id })?;
+        } else {
+            root = id;
+            if root == target.tree {
+                continue;
+            }
+        }
+        objects.push(object);
+    }
+    if !objects.is_empty() {
+        b.objects.put_many(&objects).await?;
+    }
+    let mut rebased = b.objects.read_commit(&commit).await?;
+    rebased.tree = root;
+    rebased.parents = vec![onto];
+    Ok(Ok(write_commit(b, &rebased).await?))
 }
 
 pub async fn land(b: &Backend, ref_name: &str, commit: ObjectId) -> OpResult<LandOutcome> {
-    let _ = (b, ref_name, commit);
-    todo!("server-land")
+    if b.meta.get_commits(&[commit]).await?.pop().flatten().is_none() {
+        return Err(OpError::not_found_object(commit));
+    }
+    let mut tip = b.refs.get_ref(ref_name).await?;
+    for _ in 0..MAX_LAND_ATTEMPTS {
+        let (new_tip, rebased) = match tip {
+            None => (commit, false),
+            Some(tip) => {
+                if is_ancestor(b, commit, tip).await? {
+                    return Ok(LandOutcome::Landed { new_tip: tip, rebased: false });
+                }
+                if is_ancestor(b, tip, commit).await? {
+                    (commit, false)
+                } else {
+                    match rebase(b, commit, tip).await? {
+                        Ok(id) => (id, true),
+                        Err(paths) => return Ok(LandOutcome::Conflict { tip, paths }),
+                    }
+                }
+            }
+        };
+        match b.refs.cas_ref(ref_name, tip, Some(new_tip)).await? {
+            CasOutcome::Updated => return Ok(LandOutcome::Landed { new_tip, rebased }),
+            CasOutcome::Mismatch { actual } => tip = actual,
+        }
+    }
+    Err(OpError::Aborted(format!(
+        "ref {ref_name} changed during {MAX_LAND_ATTEMPTS} land attempts"
+    )))
 }
 
 #[cfg(test)]
@@ -210,5 +466,240 @@ mod tests {
         // Linear first-parent history of N+1 commits.
         let node = b.meta.get_commits(&[t]).await.unwrap().pop().unwrap().unwrap();
         assert_eq!(node.generation as usize, N + 1);
+    }
+}
+
+#[cfg(test)]
+mod independent_tests {
+    use super::*;
+    use crate::ops::changeset::tests::sig;
+    use ant_core::Commit;
+    use ant_store::graph::{build_tree, lookup_path};
+
+    async fn snapshot(b: &Backend, parent: Option<ObjectId>, files: &[(&str, &[u8])]) -> ObjectId {
+        let tree = build_tree(b.objects.as_ref(), files).await.unwrap();
+        write_commit(
+            b,
+            &Commit {
+                tree,
+                parents: parent.into_iter().collect(),
+                author: sig(),
+                committer: sig(),
+                extra_headers: vec![],
+                message: "snapshot\n".into(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn contents(b: &Backend, commit: ObjectId, path: &str) -> Option<Vec<u8>> {
+        let tree = b.objects.read_commit(&commit).await.unwrap().tree;
+        let (_, id) =
+            lookup_path(b.objects.as_ref(), tree, &RepoPath::new(path).unwrap()).await.unwrap()?;
+        Some(b.objects.read_blob(&id).await.unwrap().to_vec())
+    }
+
+    #[tokio::test]
+    async fn fast_forward_and_validation() {
+        let b = Backend::in_memory();
+        let missing = ObjectId([19; 32]);
+        assert!(matches!(land(&b, "main", missing).await, Err(OpError::NotFound(_))));
+        assert!(matches!(rebase(&b, missing, missing).await, Err(OpError::NotFound(_))));
+        let root = snapshot(&b, None, &[("f", b"one")]).await;
+        assert!(matches!(rebase(&b, root, root).await, Err(OpError::InvalidArgument(_))));
+        assert_eq!(
+            land(&b, "main", root).await.unwrap(),
+            LandOutcome::Landed { new_tip: root, rebased: false }
+        );
+        let next = snapshot(&b, Some(root), &[("f", b"two")]).await;
+        assert_eq!(
+            land(&b, "main", next).await.unwrap(),
+            LandOutcome::Landed { new_tip: next, rebased: false }
+        );
+        assert_eq!(
+            land(&b, "main", root).await.unwrap(),
+            LandOutcome::Landed { new_tip: next, rebased: false }
+        );
+        assert!(matches!(rebase(&b, next, missing).await, Err(OpError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn text_merge_preserves_metadata_and_mode() {
+        let b = Backend::in_memory();
+        let base = snapshot(&b, None, &[("f", b"a\nb\nc\nd\ne\n")]).await;
+        let ours = snapshot(&b, Some(base), &[("f", b"A\nb\nc\nd\ne\n")]).await;
+        let theirs = snapshot(&b, Some(base), &[("f", b"a\nb\nc\nd\nE\n")]).await;
+        let mut original = b.objects.read_commit(&theirs).await.unwrap();
+        let mut tree = b.objects.read_tree(&original.tree).await.unwrap();
+        let mut file = tree.get("f").unwrap().clone();
+        file.mode = EntryMode::Executable;
+        tree.upsert(file).unwrap();
+        original.tree = b.objects.put(Object::Tree(tree).encode()).await.unwrap();
+        original.committer.time += 42;
+        original.message = "verbatim\n\nmessage".into();
+        let theirs = write_commit(&b, &original).await.unwrap();
+        let merged = rebase(&b, theirs, ours).await.unwrap().unwrap();
+        assert_eq!(contents(&b, merged, "f").await.unwrap(), b"A\nb\nc\nd\nE\n");
+        let actual = b.objects.read_commit(&merged).await.unwrap();
+        assert_eq!(actual.author, original.author);
+        assert_eq!(actual.committer, original.committer);
+        assert_eq!(actual.message, original.message);
+        assert_eq!(actual.parents, [ours]);
+        assert_eq!(
+            b.objects.read_tree(&actual.tree).await.unwrap().get("f").unwrap().mode,
+            EntryMode::Executable
+        );
+    }
+
+    #[tokio::test]
+    async fn sorted_conflicts_leave_ref_and_log_unchanged() {
+        let b = Backend::in_memory();
+        let base = snapshot(&b, None, &[("z", b"old"), ("bin", b"\xff"), ("p/q", b"q")]).await;
+        let ours =
+            snapshot(&b, Some(base), &[("z", b"ours"), ("bin", b"\xfe"), ("p", b"file")]).await;
+        let theirs = snapshot(
+            &b,
+            Some(base),
+            &[("z", b"theirs"), ("bin", b"\xfd"), ("p/q", b"q"), ("p/new", b"new")],
+        )
+        .await;
+        land(&b, "main", ours).await.unwrap();
+        let log = b.meta.tail(0, 100).await.unwrap();
+        assert_eq!(
+            land(&b, "main", theirs).await.unwrap(),
+            LandOutcome::Conflict {
+                tip: ours,
+                paths: ["bin", "p/new", "z"].map(|p| RepoPath::new(p).unwrap()).to_vec(),
+            }
+        );
+        assert_eq!(b.refs.get_ref("main").await.unwrap(), Some(ours));
+        assert_eq!(b.meta.tail(0, 100).await.unwrap(), log);
+    }
+
+    #[tokio::test]
+    async fn replacements_deletions_and_identical_changes() {
+        let b = Backend::in_memory();
+        let base = snapshot(&b, None, &[("p", b"file"), ("d/q", b"q"), ("same", b"old")]).await;
+        let ours = snapshot(
+            &b,
+            Some(base),
+            &[("p", b"file"), ("d/q", b"q"), ("same", b"new"), ("other", b"ours")],
+        )
+        .await;
+        let theirs =
+            snapshot(&b, Some(base), &[("p/q", b"nested"), ("d", b"file"), ("same", b"new")]).await;
+        let merged = rebase(&b, theirs, ours).await.unwrap().unwrap();
+        for (path, expected) in
+            [("p/q", "nested"), ("d", "file"), ("same", "new"), ("other", "ours")]
+        {
+            assert_eq!(contents(&b, merged, path).await.unwrap(), expected.as_bytes());
+        }
+        let tree = b.objects.read_commit(&merged).await.unwrap().tree;
+        assert!(
+            lookup_path(b.objects.as_ref(), tree, &RepoPath::new("d/q").unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_disjoint_lands() {
+        let b = Backend::in_memory();
+        let root = snapshot(&b, None, &[("seed", b"s")]).await;
+        land(&b, "main", root).await.unwrap();
+        let mut commits = Vec::new();
+        for i in 0..24 {
+            commits.push(
+                snapshot(&b, Some(root), &[("seed", b"s"), (&format!("agent{i}/out"), b"done")])
+                    .await,
+            );
+        }
+        let mut tasks = Vec::new();
+        for id in commits {
+            let b = b.clone();
+            tasks.push(tokio::spawn(async move { land(&b, "main", id).await }));
+        }
+        for task in tasks {
+            assert!(matches!(task.await.unwrap().unwrap(), LandOutcome::Landed { .. }));
+        }
+        let tip = b.refs.get_ref("main").await.unwrap().unwrap();
+        for i in 0..24 {
+            assert_eq!(contents(&b, tip, &format!("agent{i}/out")).await.unwrap(), b"done");
+        }
+        assert_eq!(b.meta.get_commits(&[tip]).await.unwrap()[0].as_ref().unwrap().generation, 25);
+    }
+
+    #[tokio::test]
+    async fn symlink_and_simultaneous_mode_changes_conflict() {
+        for mode in [EntryMode::Symlink, EntryMode::Executable] {
+            let b = Backend::in_memory();
+            let base = snapshot(&b, None, &[("f", b"a\nb\nc\nd\ne\n")]).await;
+            let mut sides = Vec::new();
+            for text in [b"A\nb\nc\nd\ne\n", b"a\nb\nc\nd\nE\n"] {
+                let blob = EncodedObject::new(ObjectKind::Blob, text);
+                let id = blob.id();
+                b.objects.put(blob).await.unwrap();
+                let tree = ant_store::graph::write_tree(
+                    b.objects.as_ref(),
+                    vec![TreeEntry { name: "f".into(), mode, id }],
+                )
+                .await
+                .unwrap();
+                sides.push(
+                    write_commit(
+                        &b,
+                        &Commit {
+                            tree,
+                            parents: vec![base],
+                            author: sig(),
+                            committer: sig(),
+                            extra_headers: vec![],
+                            message: "side".into(),
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                );
+            }
+            assert_eq!(
+                rebase(&b, sides[0], sides[1]).await.unwrap(),
+                Err(vec![RepoPath::new("f").unwrap()])
+            );
+        }
+    }
+
+    struct ContendedRefs {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ant_store::RefStore for ContendedRefs {
+        async fn get_ref(&self, _: &str) -> ant_store::Result<Option<ObjectId>> {
+            Ok(None)
+        }
+        async fn cas_ref(
+            &self,
+            _: &str,
+            _: Option<ObjectId>,
+            _: Option<ObjectId>,
+        ) -> ant_store::Result<CasOutcome> {
+            self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(CasOutcome::Mismatch { actual: None })
+        }
+        async fn list_refs(&self, _: &str) -> ant_store::Result<Vec<(String, ObjectId)>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn aborts_after_exact_retry_limit() {
+        let mut b = Backend::in_memory();
+        let refs = std::sync::Arc::new(ContendedRefs { attempts: 0.into() });
+        b.refs = refs.clone();
+        let root = snapshot(&b, None, &[]).await;
+        assert!(matches!(land(&b, "main", root).await, Err(OpError::Aborted(_))));
+        assert_eq!(refs.attempts.load(std::sync::atomic::Ordering::SeqCst), MAX_LAND_ATTEMPTS);
     }
 }
