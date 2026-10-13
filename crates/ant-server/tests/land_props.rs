@@ -489,7 +489,6 @@ proptest! {
     /// Same scenario, strict reading of "landing an already-landed commit is
     /// a no-op": the ref must not move at all.
     #[test]
-    #[ignore = "BUG: re-landing the original of an already rebase-landed commit appends a duplicate empty commit (land.rs land(): is_ancestor(commit, tip) is false for the pre-rebase id)"]
     fn relanding_rebased_original_is_noop(
         base in base_model(), mx in mutations('x'), my in mutations('y')
     ) {
@@ -518,7 +517,6 @@ proptest! {
 
     /// A retry of an already-landed commit must not be reported as a conflict.
     #[test]
-    #[ignore = "BUG: re-landing the original of a rebase-landed file->directory replacement reports Conflict (land.rs entry(): a Tree entry at the path is treated as `ours` differing from base and theirs)"]
     fn relanding_original_never_conflicts(
         base in base_model(), mx in mutations('x'), my in mutations('y')
     ) {
@@ -543,7 +541,6 @@ proptest! {
 }
 
 #[tokio::test]
-#[ignore = "BUG: re-landing the original of a rebase-landed file->directory replacement reports Conflict (land.rs entry())"]
 async fn regression_reland_file_to_dir_conflicts() {
     let b = Backend::in_memory();
     let base: Model = [("a".to_string(), (EntryMode::File, vec![]))].into();
@@ -559,7 +556,6 @@ async fn regression_reland_file_to_dir_conflicts() {
 }
 
 #[tokio::test]
-#[ignore = "BUG: re-landing the original of an already rebase-landed commit appends a duplicate empty commit (land.rs land())"]
 async fn regression_reland_original_moves_ref() {
     let b = Backend::in_memory();
     let base: Model = [("a".to_string(), (EntryMode::File, b"1\n".to_vec()))].into();
@@ -581,7 +577,6 @@ async fn regression_reland_original_moves_ref() {
 /// Landing the top of an unlanded two-commit stack onto a moved tip rebases
 /// only the top commit, silently dropping the lower commit's changes.
 #[tokio::test]
-#[ignore = "BUG: landing a stacked commit whose parent is not on the ref rebases only its own changeset and drops the parent's changes (land.rs rebase(): uses the commit's changeset vs its single parent)"]
 async fn regression_stack_landing_drops_parent_changes() {
     let b = Backend::in_memory();
     let base: Model = [("a".to_string(), (EntryMode::File, b"1\n".to_vec()))].into();

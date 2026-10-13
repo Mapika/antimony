@@ -353,7 +353,6 @@ proptest! {
 
     /// Same as above with the contract applied literally.
     #[test]
-    #[ignore = "BUG: Delete of `f/x` where `f` is a file returns InvalidArgument, contract says NotFound (changeset.rs apply: `(None, Some(_))` arm)"]
     fn changeset_matches_model_strict(
         base in model(),
         use_base in prop::bool::weighted(0.9),
@@ -420,7 +419,6 @@ fn delete_last_file_prunes_to_empty_root() {
 }
 
 #[test]
-#[ignore = "BUG: Delete of `f/x` where `f` is a file returns InvalidArgument, contract says NotFound (changeset.rs apply: `(None, Some(_))` arm)"]
 fn regression_delete_below_a_file_is_not_found() {
     run_with(m(&[("a", "x")]), true, vec![spec("a/b", Kind::Delete)], true).unwrap();
 }

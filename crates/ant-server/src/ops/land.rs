@@ -291,30 +291,95 @@ pub async fn rebase(
     Ok(Ok(write_commit(b, &rebased).await?))
 }
 
+/// Derived-data kind mapping a commit id to the id it was landed as after a
+/// server-side rebase. Makes retries of a land idempotent.
+const LANDED_AS: &str = "land/landed-as/v1";
+
+/// Longest unlanded stack `land` will replay.
+pub const MAX_STACK: usize = 256;
+
+async fn landed_as(b: &Backend, id: ObjectId) -> OpResult<Option<ObjectId>> {
+    Ok(match b.meta.get_derived(LANDED_AS, id.as_bytes()).await? {
+        Some(v) => Some(ObjectId::from_bytes(&v)?),
+        None => None,
+    })
+}
+
+/// True if `id`, or what it was rebased into, is already in `tip`'s history.
+async fn already_landed(b: &Backend, id: ObjectId, tip: ObjectId) -> OpResult<bool> {
+    if is_ancestor(b, id, tip).await? {
+        return Ok(true);
+    }
+    match landed_as(b, id).await? {
+        Some(landed) => Ok(is_ancestor(b, landed, tip).await?),
+        None => Ok(false),
+    }
+}
+
+/// The unlanded first-parent stack ending at `commit`, bottom first.
+async fn unlanded_stack(b: &Backend, commit: ObjectId, tip: ObjectId) -> OpResult<Vec<ObjectId>> {
+    let mut stack = vec![commit];
+    let mut cur = commit;
+    loop {
+        let node = b.meta.get_commits(&[cur]).await?.pop().flatten().ok_or_else(|| OpError::not_found_object(cur))?;
+        // Root or merge commits are left for `rebase` to reject.
+        let [parent] = node.parents[..] else { break };
+        if already_landed(b, parent, tip).await? {
+            break;
+        }
+        if stack.len() >= MAX_STACK {
+            return Err(OpError::InvalidArgument(format!(
+                "{commit} sits on more than {MAX_STACK} unlanded commits"
+            )));
+        }
+        stack.push(parent);
+        cur = parent;
+    }
+    stack.reverse();
+    Ok(stack)
+}
+
 pub async fn land(b: &Backend, ref_name: &str, commit: ObjectId) -> OpResult<LandOutcome> {
     if b.meta.get_commits(&[commit]).await?.pop().flatten().is_none() {
         return Err(OpError::not_found_object(commit));
     }
     let mut tip = b.refs.get_ref(ref_name).await?;
     for _ in 0..MAX_LAND_ATTEMPTS {
+        let mut rebased_pairs = Vec::new();
         let (new_tip, rebased) = match tip {
             None => (commit, false),
             Some(tip) => {
-                if is_ancestor(b, commit, tip).await? {
+                if already_landed(b, commit, tip).await? {
                     return Ok(LandOutcome::Landed { new_tip: tip, rebased: false });
                 }
                 if is_ancestor(b, tip, commit).await? {
                     (commit, false)
                 } else {
-                    match rebase(b, commit, tip).await? {
-                        Ok(id) => (id, true),
-                        Err(paths) => return Ok(LandOutcome::Conflict { tip, paths }),
+                    // Replay every unlanded commit under `commit` too, or a
+                    // stack would silently lose its lower commits' changes.
+                    let mut onto = tip;
+                    for c in unlanded_stack(b, commit, tip).await? {
+                        match rebase(b, c, onto).await? {
+                            Ok(id) => {
+                                rebased_pairs.push((c, id));
+                                onto = id;
+                            }
+                            Err(paths) => return Ok(LandOutcome::Conflict { tip, paths }),
+                        }
                     }
+                    (onto, true)
                 }
             }
         };
         match b.refs.cas_ref(ref_name, tip, Some(new_tip)).await? {
-            CasOutcome::Updated => return Ok(LandOutcome::Landed { new_tip, rebased }),
+            CasOutcome::Updated => {
+                for (original, landed) in rebased_pairs {
+                    b.meta
+                        .put_derived(LANDED_AS, original.as_bytes(), landed.as_bytes().to_vec().into())
+                        .await?;
+                }
+                return Ok(LandOutcome::Landed { new_tip, rebased });
+            }
             CasOutcome::Mismatch { actual } => tip = actual,
         }
     }

@@ -228,6 +228,11 @@ fn apply<'a>(
                     return Err(OpError::NotFound(format!("file {}", display())));
                 }
                 (None, Some(e)) if e.mode.is_tree() => Some(e.id),
+                // Below a file: writing there is a path conflict, while
+                // deleting there targets a file that does not exist.
+                (None, Some(_)) if nested.iter().all(|(_, e)| matches!(e, Edit::Delete)) => {
+                    return Err(OpError::NotFound(format!("{} is not a directory", display())));
+                }
                 (None, Some(_)) => {
                     return Err(OpError::InvalidArgument(format!("{} is not a directory", display())));
                 }
