@@ -28,10 +28,10 @@ fn kind(mode: EntryMode) -> FileType {
 }
 
 #[derive(Clone, Copy)]
-struct Node {
-    parent: INodeNo,
-    mode: EntryMode,
-    id: ObjectId,
+pub(super) struct Node {
+    pub(super) parent: INodeNo,
+    pub(super) mode: EntryMode,
+    pub(super) id: ObjectId,
 }
 
 #[derive(Default)]
@@ -75,10 +75,10 @@ impl BlobCache {
     }
 }
 
-struct State {
-    nodes: Vec<Node>,
-    paths: HashMap<(INodeNo, String), INodeNo>,
-    trees: HashMap<ObjectId, Arc<Tree>>,
+pub(super) struct State {
+    pub(super) nodes: Vec<Node>,
+    pub(super) paths: HashMap<(INodeNo, String), INodeNo>,
+    pub(super) trees: HashMap<ObjectId, Arc<Tree>>,
     prefetched: HashSet<ObjectId>,
     sizes: HashMap<ObjectId, u64>,
     blobs: BlobCache,
@@ -92,7 +92,7 @@ pub(crate) struct View {
     gid: u32,
     // Callbacks run on fuser's OS threads, never Tokio workers. Serializing
     // cache misses also coalesces concurrent requests for the same object.
-    state: Mutex<State>,
+    pub(super) state: Mutex<State>,
 }
 
 impl View {
@@ -133,7 +133,7 @@ impl View {
         s.nodes.get(index).copied().ok_or(Errno::ENOENT)
     }
 
-    fn inode(s: &mut State, parent: INodeNo, entry: &TreeEntry) -> INodeNo {
+    pub(super) fn inode(s: &mut State, parent: INodeNo, entry: &TreeEntry) -> INodeNo {
         *s.paths
             .entry((parent, entry.name.clone()))
             .or_insert_with(|| {
@@ -154,16 +154,35 @@ impl View {
         if node.mode != EntryMode::Tree {
             return Err(Errno::ENOTDIR);
         }
-        if let Some(tree) = s.trees.get(&node.id) {
+        self.cached_tree(s, node.id)
+    }
+
+    pub(super) fn cached_tree(&self, s: &mut State, id: ObjectId) -> Result<Arc<Tree>> {
+        if let Some(tree) = s.trees.get(&id) {
             return Ok(tree.clone());
         }
-        let tree = Arc::new(
-            self.rt
-                .block_on(self.objects.read_tree(&node.id))
-                .map_err(io_error)?,
-        );
-        s.trees.insert(node.id, tree.clone());
+        let tree = Arc::new(self.rt.block_on(self.objects.read_tree(&id)).map_err(io_error)?);
+        s.trees.insert(id, tree.clone());
         Ok(tree)
+    }
+
+    pub(super) fn batch_objects(&self, ids: &[ObjectId]) -> Result<Vec<ant_core::EncodedObject>> {
+        let objects = self.rt.block_on(self.objects.get_many(ids)).map_err(io_error)?;
+        if objects.len() != ids.len() { return Err(io_error("misaligned object batch")); }
+        ids.iter().zip(objects).map(|(id, o)| o.ok_or_else(|| io_error(StoreError::NotFound(*id)))).collect()
+    }
+
+    pub(super) fn cache_trees(&self, s: &mut State, ids: &[ObjectId]) -> Result<()> {
+        let mut ids: Vec<_> = ids.iter().filter(|id| !s.trees.contains_key(id)).copied().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        for batch in ids.chunks(512) {
+            for (id, object) in batch.iter().zip(self.batch_objects(batch)?) {
+                if object.kind() != ObjectKind::Tree { return Err(io_error("expected tree")); }
+                s.trees.insert(*id, Arc::new(Tree::decode(object.body()).map_err(io_error)?));
+            }
+        }
+        Ok(())
     }
 
     fn prefetch(&self, s: &mut State, ino: INodeNo, tree: &Tree) -> Result<()> {
@@ -204,7 +223,7 @@ impl View {
         Ok(())
     }
 
-    fn blob(&self, s: &mut State, id: ObjectId) -> Result<Bytes> {
+    pub(super) fn blob(&self, s: &mut State, id: ObjectId) -> Result<Bytes> {
         if let Some(data) = s.blobs.get(&id) {
             return Ok(data);
         }

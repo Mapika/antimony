@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+antd.workspace = true
 ant-core.workspace = true
 ant-store.workspace = true
 bytes.workspace = true

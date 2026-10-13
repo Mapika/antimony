@@ -26,7 +26,11 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
             RefCmd::List { prefix } => refs::list(&ctx, &prefix).await,
             RefCmd::Set { name, rev, expect, create } => refs::set(&ctx, &name, &rev, expect, create).await,
         },
-        Command::Ws { cmd: WsCmd::New { dir, at, sparse } } => ws::new(&ctx, &dir, &at, sparse).await,
+        Command::Ws { cmd: WsCmd::New { dir, at, sparse, lazy } } => {
+            if lazy { ws::new_lazy(&ctx, &dir, &at).await } else { ws::new(&ctx, &dir, &at, sparse).await }
+        },
+        Command::Ws { cmd: WsCmd::Unmount { dir } } => ws::unmount(&dir).await,
+        Command::Ws { cmd: WsCmd::Serve { dir, state } } => ws::serve(&ctx, &dir, &state).await,
         Command::Status => ws::status(&ctx).await,
         Command::Submit { message } => ws::submit(&ctx, &message).await,
         Command::Land { ref_name, commit } => ws::land(&ctx, &ref_name, commit).await,

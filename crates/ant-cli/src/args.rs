@@ -157,6 +157,10 @@ pub enum RefCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum WsCmd {
+    /// Unmount a lazy workspace, keeping its edits.
+    Unmount { dir: PathBuf },
+    #[command(hide = true)]
+    Serve { dir: PathBuf, state: PathBuf },
     /// Create a (sparse) workspace.
     New {
         dir: PathBuf,
@@ -165,5 +169,23 @@ pub enum WsCmd {
         /// Sparse pattern (repeatable). No patterns = everything.
         #[arg(long)]
         sparse: Vec<String>,
+        /// Mount a writable lazy workspace in a detached process.
+        #[arg(long, conflicts_with = "sparse")]
+        lazy: bool,
     },
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lazy_workspace_commands() {
+        let cli = Cli::try_parse_from(["ant", "ws", "new", "--lazy", "/tmp/ws"]).unwrap();
+        assert!(matches!(cli.command, Command::Ws { cmd: WsCmd::New { lazy: true, .. } }));
+        assert!(Cli::try_parse_from(["ant", "ws", "new", "--lazy", "--sparse", "src", "/tmp/ws"]).is_err());
+        let cli = Cli::try_parse_from(["ant", "ws", "unmount", "/tmp/ws"]).unwrap();
+        assert!(matches!(cli.command, Command::Ws { cmd: WsCmd::Unmount { .. } }));
+    }
 }
