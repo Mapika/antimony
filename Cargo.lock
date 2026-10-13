@@ -110,6 +110,7 @@ dependencies = [
 name = "ant-cli"
 version = "0.1.0"
 dependencies = [
+ "ant-auth",
  "ant-core",
  "ant-fuse",
  "ant-gitbridge",
@@ -119,6 +120,7 @@ dependencies = [
  "antd",
  "anyhow",
  "clap",
+ "sqlx",
  "tempfile",
  "tokio",
  "tonic",
@@ -199,6 +201,7 @@ dependencies = [
 name = "ant-server"
 version = "0.1.0"
 dependencies = [
+ "ant-auth",
  "ant-core",
  "ant-gitserve",
  "ant-proto",
@@ -213,6 +216,7 @@ dependencies = [
  "proptest",
  "reqwest",
  "sqlx",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",

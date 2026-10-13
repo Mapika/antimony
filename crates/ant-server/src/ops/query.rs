@@ -22,6 +22,7 @@ use ant_store::{Backend, CommitNode, ObjectStoreExt, PathChange, StoreError, gra
 use bytes::Bytes;
 
 use super::{OpError, OpResult, history};
+use crate::acl::Access;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathInfo {
@@ -112,14 +113,53 @@ pub async fn read_path(
     Ok(Some(PathInfo { mode, id, entries, content }))
 }
 
+/// [`read_path`] on behalf of `access`: a path the caller cannot read is
+/// reported exactly like a missing one. Tree listings still show restricted
+/// entry names and ids (v1: content, not structure, is protected).
+pub async fn read_path_as(
+    b: &Backend,
+    access: Option<&Access>,
+    rev: &str,
+    path: &RepoPath,
+    include_content: bool,
+) -> OpResult<Option<PathInfo>> {
+    if let Some(access) = access
+        && !access.can_read(path)
+    {
+        // Resolve anyway so a bad rev still errors the same way.
+        rev_tree(b, rev).await?;
+        return Ok(None);
+    }
+    read_path(b, rev, path, include_content).await
+}
+
 pub async fn log(
     b: &Backend,
     rev: &str,
     path: Option<&RepoPath>,
     limit: usize,
 ) -> OpResult<Vec<LogEntry>> {
+    log_as(b, None, rev, path, limit).await
+}
+
+/// [`log`] on behalf of `access`: with `path`, only changes at paths the
+/// caller can read select a commit (so `--path secrets` reveals nothing).
+pub async fn log_as(
+    b: &Backend,
+    access: Option<&Access>,
+    rev: &str,
+    path: Option<&RepoPath>,
+    limit: usize,
+) -> OpResult<Vec<LogEntry>> {
     let tip = resolve_rev(b, rev).await?;
+    // The index cannot filter by readability; use it only when everything
+    // under `path` is readable.
+    let restricted = match (access, path) {
+        (Some(a), Some(p)) => !a.can_read_all_under(p),
+        _ => false,
+    };
     if let Some(path) = path
+        && !restricted
         && let Some(indexed) = indexed_path_log(b, rev, tip, path, limit).await
     {
         return Ok(indexed);
@@ -135,7 +175,9 @@ pub async fn log(
         next = n.parents.first().copied();
         if let Some(path) = path {
             let changes = b.meta.get_changeset(&id).await?.unwrap_or_default();
-            if !changes.iter().any(|c| c.path.starts_with(path)) {
+            if !changes.iter().any(|c| {
+                c.path.starts_with(path) && (!restricted || access.is_none_or(|a| a.can_read(&c.path)))
+            }) {
                 continue;
             }
         }
@@ -160,6 +202,26 @@ async fn indexed_path_log(
 }
 
 pub async fn diff(b: &Backend, from: Option<&str>, to: &str) -> OpResult<Vec<PathChange>> {
+    diff_as(b, None, from, to).await
+}
+
+/// [`diff`] on behalf of `access`: changes at unreadable paths are dropped.
+pub async fn diff_as(
+    b: &Backend,
+    access: Option<&Access>,
+    from: Option<&str>,
+    to: &str,
+) -> OpResult<Vec<PathChange>> {
+    let mut changes = diff_unfiltered(b, from, to).await?;
+    if let Some(access) = access
+        && !access.can_read_everything()
+    {
+        changes.retain(|c| access.can_read(&c.path));
+    }
+    Ok(changes)
+}
+
+async fn diff_unfiltered(b: &Backend, from: Option<&str>, to: &str) -> OpResult<Vec<PathChange>> {
     let old = match from {
         Some(rev) => Some(rev_tree(b, rev).await?),
         None => None,

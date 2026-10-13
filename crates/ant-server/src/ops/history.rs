@@ -45,6 +45,7 @@ use bytes::Bytes;
 
 use super::query::{self, LogEntry};
 use super::{OpError, OpResult};
+use crate::acl::Access;
 
 /// Commits per index batch (changeset fetch + row write + watermark CAS).
 const INDEX_BATCH: usize = 1000;
@@ -405,6 +406,23 @@ fn attribute(owners: Vec<ObjectId>, lines: Vec<&str>) -> Vec<BlameLine> {
         .zip(lines)
         .map(|(commit, l)| BlameLine { commit, line: l.to_string() })
         .collect()
+}
+
+/// [`blame`] on behalf of `access`: an unreadable path is reported exactly
+/// like a missing one (`NotFound`).
+pub async fn blame_as(
+    b: &Backend,
+    access: Option<&Access>,
+    rev: &str,
+    path: &RepoPath,
+) -> OpResult<Vec<BlameLine>> {
+    if let Some(access) = access
+        && !access.can_read(path)
+    {
+        query::resolve_rev(b, rev).await?;
+        return Err(OpError::NotFound(format!("{path} at {rev}")));
+    }
+    blame(b, rev, path).await
 }
 
 pub async fn blame(b: &Backend, rev: &str, path: &RepoPath) -> OpResult<Vec<BlameLine>> {
