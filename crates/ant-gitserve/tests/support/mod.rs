@@ -21,10 +21,8 @@ pub async fn history(revisions: usize, width: usize) -> (Backend, u64) {
     let mut parent = None;
     let mut undeltified = 44_u64; // pack header and SHA-256 trailer
     for revision in 0..revisions {
-        let blob = EncodedObject::new(
-            ObjectKind::Blob,
-            format!("revision {revision}\n").as_bytes(),
-        );
+        let blob =
+            EncodedObject::new(ObjectKind::Blob, format!("revision {revision}\n").as_bytes());
         let index = revision % entries.len();
         entries[index].id = b.objects.put(blob).await.unwrap();
         let tree = ant_core::Tree::new(entries.clone()).unwrap();
@@ -69,15 +67,10 @@ pub async fn revisions(
     range: std::ops::Range<usize>,
 ) -> ant_core::ObjectId {
     use ant_store::graph::{build_tree, write_tree};
-    let fixed: Vec<_> = (0..64)
-        .map(|n| (format!("fixed{n:03}"), format!("file {n}")))
-        .collect();
+    let fixed: Vec<_> = (0..64).map(|n| (format!("fixed{n:03}"), format!("file {n}"))).collect();
     let root = build_tree(
         b.objects.as_ref(),
-        &fixed
-            .iter()
-            .map(|(name, body)| (name.as_str(), body.as_bytes()))
-            .collect::<Vec<_>>(),
+        &fixed.iter().map(|(name, body)| (name.as_str(), body.as_bytes())).collect::<Vec<_>>(),
     )
     .await
     .unwrap();
@@ -95,21 +88,13 @@ pub async fn revisions(
     for n in range {
         let mut content = content.clone();
         content[1000..1008].copy_from_slice(&(n as u64).to_le_bytes());
-        let blob = b
-            .objects
-            .put(EncodedObject::new(ObjectKind::Blob, &content))
-            .await
-            .unwrap();
+        let blob = b.objects.put(EncodedObject::new(ObjectKind::Blob, &content)).await.unwrap();
         let (mode, id) = if n % 40 < 2 {
             (
                 EntryMode::Tree,
                 write_tree(
                     b.objects.as_ref(),
-                    vec![TreeEntry {
-                        name: "child".into(),
-                        mode: EntryMode::File,
-                        id: blob,
-                    }],
+                    vec![TreeEntry { name: "child".into(), mode: EntryMode::File, id: blob }],
                 )
                 .await
                 .unwrap(),
@@ -118,11 +103,7 @@ pub async fn revisions(
             (EntryMode::File, blob)
         };
         let mut entries = fixed.entries().to_vec();
-        entries.push(TreeEntry {
-            name: "changing".into(),
-            mode,
-            id,
-        });
+        entries.push(TreeEntry { name: "changing".into(), mode, id });
         let tree = write_tree(b.objects.as_ref(), entries).await.unwrap();
         let sig = Signature {
             name: "test".into(),

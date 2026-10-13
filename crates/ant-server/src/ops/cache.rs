@@ -127,11 +127,14 @@ pub(crate) fn commit_weight(commit: &Commit) -> usize {
 
 type Registry<S, C> = Mutex<Vec<(Weak<S>, Arc<C>)>>;
 
-static OBJECTS: LazyLock<Registry<dyn ObjectStore, ObjectCaches>> =
-    LazyLock::new(Default::default);
+static OBJECTS: LazyLock<Registry<dyn ObjectStore, ObjectCaches>> = LazyLock::new(Default::default);
 static META: LazyLock<Registry<dyn MetaStore, MetaCaches>> = LazyLock::new(Default::default);
 
-fn scoped<S: ?Sized, C>(registry: &Registry<S, C>, store: &Arc<S>, make: impl FnOnce() -> C) -> Arc<C> {
+fn scoped<S: ?Sized, C>(
+    registry: &Registry<S, C>,
+    store: &Arc<S>,
+    make: impl FnOnce() -> C,
+) -> Arc<C> {
     let mut entries = registry.lock().unwrap_or_else(|e| e.into_inner());
     entries.retain(|(weak, _)| weak.strong_count() > 0);
     let weak = Arc::downgrade(store);
@@ -214,7 +217,10 @@ pub(crate) async fn get_changesets(
 
 /// Index-aligned commit-object reads through the commit cache. Missing
 /// objects are `NotFound`; non-commits are `WrongKind`.
-pub(crate) async fn read_commits(b: &Backend, ids: &[ObjectId]) -> ant_store::Result<Vec<Arc<Commit>>> {
+pub(crate) async fn read_commits(
+    b: &Backend,
+    ids: &[ObjectId],
+) -> ant_store::Result<Vec<Arc<Commit>>> {
     let caches = objects(&b.objects);
     let cached = caches.commits.get_many(ids);
     let missing: Vec<ObjectId> =

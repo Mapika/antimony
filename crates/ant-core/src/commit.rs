@@ -21,7 +21,9 @@ impl Signature {
         out.extend_from_slice(&self.name);
         out.extend_from_slice(b" <");
         out.extend_from_slice(&self.email);
-        out.extend_from_slice(format!("> {} {}{:02}{:02}", self.time, sign, abs / 60, abs % 60).as_bytes());
+        out.extend_from_slice(
+            format!("> {} {}{:02}{:02}", self.time, sign, abs / 60, abs % 60).as_bytes(),
+        );
     }
 
     fn decode(s: &[u8]) -> Result<Self> {
@@ -123,7 +125,9 @@ impl Commit {
 
         let mut it = fields.into_iter().peekable();
         let id_of = |v: &[u8]| -> Result<ObjectId> {
-            std::str::from_utf8(v).map_err(|_| Error::Malformed("commit: bad object id".into()))?.parse()
+            std::str::from_utf8(v)
+                .map_err(|_| Error::Malformed("commit: bad object id".into()))?
+                .parse()
         };
         let tree = match it.next() {
             Some((b"tree", v)) => id_of(&v)?,
@@ -159,7 +163,12 @@ mod tests {
     use super::*;
 
     fn sig() -> Signature {
-        Signature { name: b"Ada L".to_vec(), email: b"ada@x.org".to_vec(), time: 1700000000, tz_offset_minutes: -330 }
+        Signature {
+            name: b"Ada L".to_vec(),
+            email: b"ada@x.org".to_vec(),
+            time: 1700000000,
+            tz_offset_minutes: -330,
+        }
     }
 
     #[test]
@@ -204,7 +213,10 @@ mod tests {
             parents: vec![],
             author: s.clone(),
             committer: s,
-            extra_headers: vec![("encoding".into(), b"ISO-8859-1".to_vec()), ("x".into(), vec![0xff, b'\n', 0xfe])],
+            extra_headers: vec![
+                ("encoding".into(), b"ISO-8859-1".to_vec()),
+                ("x".into(), vec![0xff, b'\n', 0xfe]),
+            ],
             message: vec![b'm', 0xe4, 0xc0, b'\n'],
         };
         let enc = c.encode();

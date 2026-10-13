@@ -1,14 +1,12 @@
 //! `ObjectStore` (and thin helpers for the other RPCs) over the server's
 //! gRPC API, with optional plain-HTTP object reads through a cache/CDN.
 //!
-//! TASK (transport): implement everything marked `todo!()`.
-//!
 //! - `connect(grpc_url, http_base)`: tonic channel with
 //!   `ant_proto::MAX_MESSAGE_BYTES` limits on the generated client.
 //! - `get_many`: if `http_base` is set, GET `{http_base}/o/{hex}` for each id
 //!   with bounded concurrency (64) via reqwest; else (or on HTTP transport
-//!   error) use the `GetObjects` stream, chunking requests to ≤ 4096 ids.
-//!   Results in input order. Verify hashes.
+//!   error) the `GetObjects` stream, in requests of ≤ 4096 ids. Results come
+//!   in input order, hashes verified.
 //! - `put_many`: `PutObjects` in chunks of ≤ 64 MiB total payload.
 //! - `has_many`: `HasObjects`.
 //! - `client()` exposes the raw generated client for other RPCs (refs,
@@ -41,7 +39,10 @@ const PUT_BATCH_BYTES: usize = 64 * 1024 * 1024;
 pub struct BearerAuth(Option<MetadataValue<Ascii>>);
 
 impl Interceptor for BearerAuth {
-    fn call(&mut self, mut req: tonic::Request<()>) -> std::result::Result<tonic::Request<()>, tonic::Status> {
+    fn call(
+        &mut self,
+        mut req: tonic::Request<()>,
+    ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
         if let Some(v) = &self.0 {
             req.metadata_mut().insert("authorization", v.clone());
         }
@@ -97,7 +98,11 @@ impl RemoteObjectStore {
 
     /// Fetch every id over HTTP. Any failure (transport, unexpected status,
     /// hash mismatch) is an error so the caller can fall back to gRPC.
-    async fn get_many_http(&self, base: &str, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
+    async fn get_many_http(
+        &self,
+        base: &str,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<EncodedObject>>> {
         let http = self.http.clone();
         let base = base.to_owned();
         let auth = self.authorization.clone();
@@ -128,7 +133,8 @@ impl RemoteObjectStore {
                 .into_inner();
             let mut received = 0usize;
             while let Some(item) = stream.message().await.map_err(StoreError::backend)? {
-                let expected = chunk.get(received).ok_or_else(|| protocol_error("extra object in stream"))?;
+                let expected =
+                    chunk.get(received).ok_or_else(|| protocol_error("extra object in stream"))?;
                 if item.id != expected.0 {
                     return Err(protocol_error("object stream out of order"));
                 }
@@ -187,7 +193,9 @@ impl ObjectStore for RemoteObjectStore {
         if let Some(base) = &self.http_base {
             match self.get_many_http(base, ids).await {
                 Ok(objects) => return Ok(objects),
-                Err(e) => tracing::debug!(error = %e, "HTTP object read failed; falling back to gRPC"),
+                Err(e) => {
+                    tracing::debug!(error = %e, "HTTP object read failed; falling back to gRPC")
+                }
             }
         }
         self.get_many_grpc(ids).await

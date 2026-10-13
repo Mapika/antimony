@@ -15,9 +15,7 @@ fn size(out: &mut Vec<u8>, mut n: usize) {
 }
 
 fn hash(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0_u64, |h, &b| {
-        h.wrapping_mul(257).wrapping_add(u64::from(b))
-    })
+    bytes.iter().fold(0_u64, |h, &b| h.wrapping_mul(257).wrapping_add(u64::from(b)))
 }
 
 fn insert(out: &mut Vec<u8>, bytes: &[u8]) {

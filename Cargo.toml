@@ -23,7 +23,6 @@ ant-gitserve = { path = "crates/ant-gitserve" }
 
 anyhow = "1"
 async-trait = "0.1"
-aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
 axum = "0.8"
 bytes = "1"
@@ -55,7 +54,6 @@ tokio-stream = "0.1"
 tonic = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
-tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
@@ -64,7 +62,10 @@ zstd = "0.13"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-debug = "line-tables-only"
+# No debuginfo in the shipped binary (123 MB with line tables, 30 MB without);
+# the symbol table stays, so backtraces still name functions (no line numbers).
+debug = false
+strip = "debuginfo"
 
 [profile.dev]
 # Keep the shared agent build cache small; full debuginfo is rarely needed.

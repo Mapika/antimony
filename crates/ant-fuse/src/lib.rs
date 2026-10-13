@@ -2,37 +2,27 @@
 //! looked up or read, so an agent can "check out" a huge monorepo instantly
 //! and only pay for what it touches.
 //!
-//! TASK (fuse): implement `mount` with `fuser` (0.18, no libfuse; mounting
-//! goes through `fusermount3`, which is installed).
+//! [`mount`] uses `fuser` without libfuse (mounting goes through
+//! `fusermount3`); [`mount_rw`] adds a copy-on-write layer (see [`rw`]).
 //!
-//! Requirements:
-//! - Inodes: root = 1. Assign inode numbers on first lookup and keep them
-//!   stable for the life of the mount (map (parent ino, name) → ino and ino →
-//!   (mode, object id)). Identical objects at different paths get different
-//!   inodes (hard-link semantics are NOT wanted).
-//! - `lookup`/`getattr`/`readdir`(+`.` and `..`)/`open`/`read`/`readlink`
-//!   implemented. Directories 0o555, files 0o444, executables 0o555,
-//!   symlinks 0o777, gitlinks appear as empty directories. `nlink` = 1 for
-//!   files, 2 for dirs. uid/gid = the mounting process's. mtime = UNIX_EPOCH
-//!   (or a fixed timestamp passed in options).
-//! - File size must be correct in `getattr` *without* necessarily
-//!   downloading the content; it's fine (v1) to fetch the blob to learn its
-//!   size, but cache it.
-//! - All mutating ops (`write`, `create`, `mkdir`, `unlink`, `rename`,
-//!   `setattr`, …) → `EROFS`. Opening for write → `EROFS`.
-//! - Object fetches are async: FUSE callbacks run on fuser's thread; use the
-//!   provided `tokio::runtime::Handle` with `block_on`, or better spawn and
-//!   reply from the task (fuser replies are `Send`). Do not deadlock when
-//!   the runtime is a current-thread runtime used by the caller — tests use a
-//!   multi-thread runtime, and document that requirement.
-//! - In-memory caches: decoded trees (unbounded is fine v1) and blob
-//!   contents (bounded by `MountOptions::blob_cache_bytes`, LRU).
-//! - `readdir` on a large directory must work with offsets (fuser calls it
-//!   repeatedly).
-//! - When a directory is listed, prefetch its subtrees' objects in ONE
-//!   `get_many` (cheap win for `find`/`ls -R`).
-//! - Errors from the store → `EIO` (log with tracing).
-//! - Unmount when the returned `BackgroundSession` is dropped.
+//! - Inodes: root = 1; numbers are assigned on first lookup and stay stable
+//!   for the life of the mount. Identical objects at different paths get
+//!   different inodes (no hard-link semantics).
+//! - Directories 0o555, files 0o444, executables 0o555, symlinks 0o777,
+//!   gitlinks appear as empty directories. `nlink` is 1 for files and 2 for
+//!   directories; uid/gid are the mounting process's; mtime is UNIX_EPOCH or
+//!   the timestamp in [`MountOptions`].
+//! - `getattr` reports exact sizes; a blob is fetched (and its size cached)
+//!   to learn its size.
+//! - Read-only mounts answer every mutation, and opening for write, with
+//!   `EROFS`.
+//! - FUSE callbacks run on fuser's threads and block on the given Tokio
+//!   runtime handle, which must belong to a multi-thread runtime.
+//! - Caches: decoded trees (unbounded) and blob contents (LRU bounded by
+//!   `MountOptions::blob_cache_bytes`). Listing a directory prefetches its
+//!   subtrees with one `get_many`; `readdir` supports offsets.
+//! - Store errors become `EIO` (logged with tracing).
+//! - Dropping the returned `BackgroundSession` unmounts.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -111,14 +101,17 @@ mod tests {
 
     use super::*;
     use ant_core::{EncodedObject, EntryMode, Object, ObjectKind, Tree, TreeEntry};
+    use ant_store::ObjectStoreExt;
     use ant_store::graph::build_tree;
     use ant_store::memory::MemoryObjectStore;
-    use ant_store::ObjectStoreExt;
 
     async fn fixture() -> (Arc<MemoryObjectStore>, ObjectId) {
         let s = Arc::new(MemoryObjectStore::default());
-        let sub = build_tree(s.as_ref(), &[("lib.rs", b"pub fn x() {}\n"), ("deep/er/f", b"deep")]).await.unwrap();
-        let exe = s.put(EncodedObject::new(ObjectKind::Blob, b"#!/bin/sh\necho hi\n")).await.unwrap();
+        let sub = build_tree(s.as_ref(), &[("lib.rs", b"pub fn x() {}\n"), ("deep/er/f", b"deep")])
+            .await
+            .unwrap();
+        let exe =
+            s.put(EncodedObject::new(ObjectKind::Blob, b"#!/bin/sh\necho hi\n")).await.unwrap();
         let link = s.put(EncodedObject::new(ObjectKind::Blob, b"src/lib.rs")).await.unwrap();
         let big: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
         let big_id = s.put(EncodedObject::new(ObjectKind::Blob, &big)).await.unwrap();
@@ -132,8 +125,12 @@ mod tests {
         // Wide directory to exercise readdir offsets.
         let wide = build_tree(
             s.as_ref(),
-            &(0..1500).map(|i| (format!("f{i:04}"), b"w".as_slice())).collect::<Vec<_>>()
-                .iter().map(|(n, c)| (n.as_str(), *c)).collect::<Vec<_>>(),
+            &(0..1500)
+                .map(|i| (format!("f{i:04}"), b"w".as_slice()))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|(n, c)| (n.as_str(), *c))
+                .collect::<Vec<_>>(),
         )
         .await
         .unwrap();
@@ -144,7 +141,8 @@ mod tests {
 
     fn mount_fixture(
         rt: &tokio::runtime::Runtime,
-    ) -> (parking_lot::MutexGuard<'static, ()>, tempfile::TempDir, PathBuf, fuser::BackgroundSession) {
+    ) -> (parking_lot::MutexGuard<'static, ()>, tempfile::TempDir, PathBuf, fuser::BackgroundSession)
+    {
         let gate = crate::KERNEL_GATE.lock();
         let (s, root) = rt.block_on(fixture());
         let tmp = tempfile::tempdir().unwrap();
@@ -169,7 +167,10 @@ mod tests {
         assert!(mnt.join("vendor").is_dir());
         assert_eq!(std::fs::read_dir(mnt.join("vendor")).unwrap().count(), 0);
 
-        let mut names: Vec<_> = std::fs::read_dir(&mnt).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        let mut names: Vec<_> = std::fs::read_dir(&mnt)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
         names.sort();
         assert_eq!(names, ["big.bin", "link", "run.sh", "src", "vendor", "wide"]);
 

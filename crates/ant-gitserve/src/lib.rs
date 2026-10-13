@@ -30,10 +30,7 @@ pub fn router(backend: Backend) -> Router {
     Router::new()
         .route("/repo.git/info/refs", get(advertise))
         .route("/repo.git/git-upload-pack", post(upload))
-        .route(
-            "/repo.git/git-receive-pack",
-            axum::routing::any(|| async { StatusCode::FORBIDDEN }),
-        )
+        .route("/repo.git/git-receive-pack", axum::routing::any(|| async { StatusCode::FORBIDDEN }))
         .with_state(backend)
 }
 
@@ -43,13 +40,7 @@ fn response(body: impl Into<Body>, advertisement: bool) -> Response {
     } else {
         "application/x-git-upload-pack-result"
     };
-    (
-        [
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        body.into(),
-    )
+    ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "no-cache")], body.into())
         .into_response()
 }
 
@@ -118,20 +109,13 @@ fn decode_body(headers: &HeaderMap, body: Bytes) -> std::io::Result<Bytes> {
 
 async fn refs(b: &Backend, args: &[&str]) -> Result<Vec<u8>> {
     let refs = b.refs.list_refs("").await?;
-    let prefixes: Vec<_> = args
-        .iter()
-        .filter_map(|arg| arg.strip_prefix("ref-prefix "))
-        .collect();
+    let prefixes: Vec<_> = args.iter().filter_map(|arg| arg.strip_prefix("ref-prefix ")).collect();
     let include =
         |name: &str| prefixes.is_empty() || prefixes.iter().any(|prefix| name.starts_with(prefix));
     let symrefs = args.contains(&"symrefs");
     let mut body = Vec::new();
     if include("HEAD") {
-        let target = if symrefs {
-            " symref-target:refs/heads/main"
-        } else {
-            ""
-        };
+        let target = if symrefs { " symref-target:refs/heads/main" } else { "" };
         if let Some((_, id)) = refs.iter().find(|(name, _)| name == "main") {
             body.extend(packet(format!("{id} HEAD{target}\n").as_bytes()));
         } else if args.contains(&"unborn") {
@@ -182,14 +166,8 @@ async fn fetch_response(b: Backend, fetch: Fetch) -> Result<Response> {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tx.send(Ok(prefix.into())).await?;
     tokio::spawn(async move {
-        if let Err(error) = pack::send_planned(
-            b,
-            selection.ids,
-            selection.paths,
-            fetch.ofs_delta,
-            tx.clone(),
-        )
-        .await
+        if let Err(error) =
+            pack::send_planned(b, selection.ids, selection.paths, fetch.ofs_delta, tx.clone()).await
         {
             let _ = tx.send(Err(std::io::Error::other(error.to_string()))).await;
         }

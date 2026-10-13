@@ -29,18 +29,19 @@ pub async fn object_store(s: Arc<dyn ObjectStore>) {
     // Idempotent re-put.
     s.put_many(&[a.clone(), a.clone()]).await.unwrap();
 
-    let got = s
-        .get_many(&[a.id(), missing, b.id(), a.id(), big.id(), empty.id()])
-        .await
-        .unwrap();
+    let got = s.get_many(&[a.id(), missing, b.id(), a.id(), big.id(), empty.id()]).await.unwrap();
     assert_eq!(
         got,
-        vec![Some(a.clone()), None, Some(b.clone()), Some(a.clone()), Some(big.clone()), Some(empty.clone())]
+        vec![
+            Some(a.clone()),
+            None,
+            Some(b.clone()),
+            Some(a.clone()),
+            Some(big.clone()),
+            Some(empty.clone())
+        ]
     );
-    assert_eq!(
-        s.has_many(&[missing, a.id(), big.id()]).await.unwrap(),
-        vec![false, true, true]
-    );
+    assert_eq!(s.has_many(&[missing, a.id(), big.id()]).await.unwrap(), vec![false, true, true]);
     assert_eq!(s.get_many(&[]).await.unwrap(), vec![]);
 
     // Ext helpers + kind checking.
@@ -121,7 +122,8 @@ pub async fn ref_store(s: Arc<dyn RefStore>) {
             loop {
                 let cur = s.get_ref("counter").await.unwrap().unwrap();
                 let next = ObjectId([cur.0[0] + 1; 32]);
-                if s.cas_ref("counter", Some(cur), Some(next)).await.unwrap() == CasOutcome::Updated {
+                if s.cas_ref("counter", Some(cur), Some(next)).await.unwrap() == CasOutcome::Updated
+                {
                     break;
                 }
             }
@@ -136,8 +138,20 @@ pub async fn ref_store(s: Arc<dyn RefStore>) {
 pub async fn meta_store(s: Arc<dyn MetaStore>) {
     let c1 = ObjectId([1; 32]);
     let c2 = ObjectId([2; 32]);
-    let n1 = CommitNode { id: c1, tree: ObjectId::empty_tree(), parents: vec![], generation: 1, committer_time: 100 };
-    let n2 = CommitNode { id: c2, tree: ObjectId([9; 32]), parents: vec![c1], generation: 2, committer_time: 200 };
+    let n1 = CommitNode {
+        id: c1,
+        tree: ObjectId::empty_tree(),
+        parents: vec![],
+        generation: 1,
+        committer_time: 100,
+    };
+    let n2 = CommitNode {
+        id: c2,
+        tree: ObjectId([9; 32]),
+        parents: vec![c1],
+        generation: 2,
+        committer_time: 200,
+    };
     let ch2 = vec![
         PathChange {
             path: RepoPath::new("a/x.rs").unwrap(),
@@ -196,7 +210,13 @@ pub async fn meta_store(s: Arc<dyn MetaStore>) {
         let s = s.clone();
         tasks.push(tokio::spawn(async move {
             let id = ObjectId([100 + i; 32]);
-            let n = CommitNode { id, tree: ObjectId::empty_tree(), parents: vec![c2], generation: 3, committer_time: 0 };
+            let n = CommitNode {
+                id,
+                tree: ObjectId::empty_tree(),
+                parents: vec![c2],
+                generation: 3,
+                committer_time: 0,
+            };
             s.put_commit(n, vec![]).await.unwrap()
         }));
     }
@@ -291,13 +311,23 @@ pub async fn meta_store_batch(s: Arc<dyn MetaStore>) {
 /// History-index suite (part of the meta-store contract).
 pub async fn history_index(s: Arc<dyn MetaStore>) {
     let c = |n: u8| ObjectId([n; 32]);
-    let row = |p: &str, g: u64, n: u8| HistoryRow { path: RepoPath::new(p).unwrap(), generation: g, commit: c(n) };
+    let row = |p: &str, g: u64, n: u8| HistoryRow {
+        path: RepoPath::new(p).unwrap(),
+        generation: g,
+        commit: c(n),
+    };
     let p = |x: &str| RepoPath::new(x).unwrap();
 
     assert_eq!(s.query_history("main", &RepoPath::root(), u64::MAX, 10).await.unwrap(), vec![]);
     s.index_history(
         "main",
-        &[row("src/a.rs", 1, 1), row("README", 1, 1), row("src/b/c.rs", 2, 2), row("docs/x", 3, 3), row("src/a.rs", 4, 4)],
+        &[
+            row("src/a.rs", 1, 1),
+            row("README", 1, 1),
+            row("src/b/c.rs", 2, 2),
+            row("docs/x", 3, 3),
+            row("src/a.rs", 4, 4),
+        ],
     )
     .await
     .unwrap();
@@ -329,5 +359,8 @@ pub async fn history_index(s: Arc<dyn MetaStore>) {
     s.clear_history("main").await.unwrap();
     assert_eq!(s.history_watermark("main").await.unwrap(), None);
     assert_eq!(q("", u64::MAX, 10).await, vec![]);
-    assert_eq!(s.query_history("other", &RepoPath::root(), u64::MAX, 10).await.unwrap(), vec![(9, c(9))]);
+    assert_eq!(
+        s.query_history("other", &RepoPath::root(), u64::MAX, 10).await.unwrap(),
+        vec![(9, c(9))]
+    );
 }

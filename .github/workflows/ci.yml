@@ -9,11 +9,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # NOTE: the tree is not yet rustfmt-clean under the default config; this job
-  # reports but does not block until a one-off `cargo fmt` pass lands.
   fmt:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95

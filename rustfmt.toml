@@ -1,0 +1,2 @@
+# Matches the dominant hand-written style: fill lines up to max_width (100).
+use_small_heuristics = "Max"

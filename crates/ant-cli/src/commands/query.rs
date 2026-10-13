@@ -14,7 +14,11 @@ pub async fn ls(ctx: &Ctx, target: &str) -> Result<Outcome> {
     let path = path.unwrap_or("");
     let mut client = ctx.remote().await?.client();
     let r = client
-        .read_path(pb::ReadPathRequest { rev: rev.into(), path: path.into(), include_content: false })
+        .read_path(pb::ReadPathRequest {
+            rev: rev.into(),
+            path: path.into(),
+            include_content: false,
+        })
         .await
         .rpc()?
         .into_inner();
@@ -25,7 +29,14 @@ pub async fn ls(ctx: &Ctx, target: &str) -> Result<Outcome> {
     if mode_from_pb(r.mode)? == EntryMode::Tree {
         for e in r.entries {
             let mode = mode_from_pb(e.mode)?;
-            writeln!(out, "{} {} {}\t{}", mode.as_octal(), kind_name(mode), id_from(&e.id)?, e.name)?;
+            writeln!(
+                out,
+                "{} {} {}\t{}",
+                mode.as_octal(),
+                kind_name(mode),
+                id_from(&e.id)?,
+                e.name
+            )?;
         }
     } else {
         let mode = mode_from_pb(r.mode)?;
@@ -40,7 +51,11 @@ pub async fn cat(ctx: &Ctx, target: &str) -> Result<Outcome> {
     let path = path.filter(|p| !p.is_empty()).ok_or_else(|| anyhow!("cat needs <rev>:<path>"))?;
     let mut client = ctx.remote().await?.client();
     let r = client
-        .read_path(pb::ReadPathRequest { rev: rev.into(), path: path.into(), include_content: true })
+        .read_path(pb::ReadPathRequest {
+            rev: rev.into(),
+            path: path.into(),
+            include_content: true,
+        })
         .await
         .rpc()?
         .into_inner();
@@ -53,7 +68,12 @@ pub async fn cat(ctx: &Ctx, target: &str) -> Result<Outcome> {
     Ok(Outcome::ok(r.content))
 }
 
-pub async fn log(ctx: &Ctx, rev: &str, limit: Option<u32>, path: Option<String>) -> Result<Outcome> {
+pub async fn log(
+    ctx: &Ctx,
+    rev: &str,
+    limit: Option<u32>,
+    path: Option<String>,
+) -> Result<Outcome> {
     let mut client = ctx.remote().await?.client();
     let path = path.map(|p| p.trim_matches('/').to_string());
     let r = client

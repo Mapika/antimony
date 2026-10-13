@@ -14,7 +14,8 @@ pub async fn get(ctx: &Ctx, name: &str) -> Result<Outcome> {
 
 pub async fn list(ctx: &Ctx, prefix: &str) -> Result<Outcome> {
     let mut client = ctx.remote().await?.client();
-    let r = client.list_refs(pb::ListRefsRequest { prefix: prefix.into() }).await.rpc()?.into_inner();
+    let r =
+        client.list_refs(pb::ListRefsRequest { prefix: prefix.into() }).await.rpc()?.into_inner();
     let mut out = String::new();
     for e in r.refs {
         writeln!(out, "{} {}", id_from(&e.target)?, e.name)?;
@@ -22,9 +23,20 @@ pub async fn list(ctx: &Ctx, prefix: &str) -> Result<Outcome> {
     Ok(Outcome::ok(out))
 }
 
-pub async fn set(ctx: &Ctx, name: &str, rev: &str, expect: Option<String>, create: bool) -> Result<Outcome> {
+pub async fn set(
+    ctx: &Ctx,
+    name: &str,
+    rev: &str,
+    expect: Option<String>,
+    create: bool,
+) -> Result<Outcome> {
     let mut client = ctx.remote().await?.client();
-    let new = client.resolve_rev(pb::ResolveRevRequest { rev: rev.into() }).await.rpc()?.into_inner().commit;
+    let new = client
+        .resolve_rev(pb::ResolveRevRequest { rev: rev.into() })
+        .await
+        .rpc()?
+        .into_inner()
+        .commit;
     // Without --expect/--create, compare-and-swap against the current value.
     let expected = if create {
         None
@@ -34,7 +46,11 @@ pub async fn set(ctx: &Ctx, name: &str, rev: &str, expect: Option<String>, creat
         client.get_ref(pb::GetRefRequest { name: name.into() }).await.rpc()?.into_inner().target
     };
     let r = client
-        .update_ref(pb::UpdateRefRequest { name: name.into(), expected, new_target: Some(new.clone()) })
+        .update_ref(pb::UpdateRefRequest {
+            name: name.into(),
+            expected,
+            new_target: Some(new.clone()),
+        })
         .await
         .rpc()?
         .into_inner();

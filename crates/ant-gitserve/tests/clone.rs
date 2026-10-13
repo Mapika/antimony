@@ -26,42 +26,20 @@ async fn git_result(dir: &Path, args: &[&str]) -> std::process::Output {
 
 async fn git(dir: &Path, args: &[&str]) -> String {
     let result = git_result(dir, args).await;
-    assert!(
-        result.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&result.stderr)
-    );
+    assert!(result.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&result.stderr));
     String::from_utf8(result.stdout).unwrap().trim().to_string()
 }
 
 async fn commit(b: &Backend, parents: Vec<ObjectId>, version: u8) -> ObjectId {
-    let nested = build_tree(b.objects.as_ref(), &[("deep/file", b"nested\n")])
-        .await
-        .unwrap();
-    let mut entries = vec![TreeEntry {
-        mode: EntryMode::Tree,
-        name: "dir".into(),
-        id: nested,
-    }];
+    let nested = build_tree(b.objects.as_ref(), &[("deep/file", b"nested\n")]).await.unwrap();
+    let mut entries = vec![TreeEntry { mode: EntryMode::Tree, name: "dir".into(), id: nested }];
     for (name, mode, content) in [
         ("readme", EntryMode::File, vec![version; 10]),
-        (
-            "run",
-            EntryMode::Executable,
-            b"#!/bin/sh\necho hello\n".to_vec(),
-        ),
+        ("run", EntryMode::Executable, b"#!/bin/sh\necho hello\n".to_vec()),
         ("link", EntryMode::Symlink, b"dir/deep/file".to_vec()),
     ] {
-        let id = b
-            .objects
-            .put(EncodedObject::new(ObjectKind::Blob, &content))
-            .await
-            .unwrap();
-        entries.push(TreeEntry {
-            mode,
-            name: name.into(),
-            id,
-        });
+        let id = b.objects.put(EncodedObject::new(ObjectKind::Blob, &content)).await.unwrap();
+        entries.push(TreeEntry { mode, name: name.into(), id });
     }
     let tree = write_tree(b.objects.as_ref(), entries).await.unwrap();
     let sig = Signature {
@@ -114,13 +92,7 @@ impl Fixture {
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        Self {
-            b,
-            ids,
-            url,
-            task,
-            temp: tempfile::tempdir().unwrap(),
-        }
+        Self { b, ids, url, task, temp: tempfile::tempdir().unwrap() }
     }
 
     async fn clone_into(&self, name: &str, options: &[&str]) -> std::path::PathBuf {
@@ -135,26 +107,10 @@ impl Fixture {
 fn assert_files(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(std::fs::read(dir.join("readme")).unwrap(), vec![3; 10]);
-    assert_eq!(
-        std::fs::read(dir.join("dir/deep/file")).unwrap(),
-        b"nested\n"
-    );
-    assert_eq!(
-        std::fs::read(dir.join("run")).unwrap(),
-        b"#!/bin/sh\necho hello\n"
-    );
-    assert_ne!(
-        std::fs::metadata(dir.join("run"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o111,
-        0
-    );
-    assert_eq!(
-        std::fs::read_link(dir.join("link")).unwrap(),
-        Path::new("dir/deep/file")
-    );
+    assert_eq!(std::fs::read(dir.join("dir/deep/file")).unwrap(), b"nested\n");
+    assert_eq!(std::fs::read(dir.join("run")).unwrap(), b"#!/bin/sh\necho hello\n");
+    assert_ne!(std::fs::metadata(dir.join("run")).unwrap().permissions().mode() & 0o111, 0);
+    assert_eq!(std::fs::read_link(dir.join("link")).unwrap(), Path::new("dir/deep/file"));
 }
 
 #[tokio::test]
@@ -164,17 +120,9 @@ async fn full_clone_and_push_rejected() {
     assert_files(&dir);
     assert_eq!(
         git(&dir, &["log", "--format=%H"]).await,
-        f.ids
-            .iter()
-            .rev()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n")
+        f.ids.iter().rev().map(ToString::to_string).collect::<Vec<_>>().join("\n")
     );
-    assert_eq!(
-        git(&dir, &["rev-parse", "origin/topic"]).await,
-        f.ids[1].to_string()
-    );
+    assert_eq!(git(&dir, &["rev-parse", "origin/topic"]).await, f.ids[1].to_string());
     assert_eq!(
         git(&dir, &["symbolic-ref", "refs/remotes/origin/HEAD"]).await,
         "refs/remotes/origin/main"
@@ -184,46 +132,25 @@ async fn full_clone_and_push_rejected() {
     assert!(!push.status.success());
     assert!(String::from_utf8_lossy(&push.stderr).contains("403"));
     assert_eq!(f.b.refs.list_refs("").await.unwrap().len(), 2);
-    let result = reqwest::Client::new()
-        .post(format!("{}/git-receive-pack", f.url))
-        .send()
-        .await
-        .unwrap();
+    let result =
+        reqwest::Client::new().post(format!("{}/git-receive-pack", f.url)).send().await.unwrap();
     assert_eq!(result.status(), 403);
 }
 
 #[tokio::test]
 async fn partial_clone_fetches_blobs_on_checkout() {
     let f = Fixture::new().await;
-    let dir = f
-        .clone_into("partial", &["--filter=blob:none", "--no-checkout"])
-        .await;
-    let objects = git(
-        &dir,
-        &[
-            "cat-file",
-            "--batch-all-objects",
-            "--batch-check=%(objecttype)",
-        ],
-    )
-    .await;
+    let dir = f.clone_into("partial", &["--filter=blob:none", "--no-checkout"]).await;
+    let objects =
+        git(&dir, &["cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"]).await;
     assert!(!objects.lines().any(|line| line == "blob"));
     assert!(objects.lines().any(|line| line == "commit"));
     git(&dir, &["checkout", "main"]).await;
     assert_files(&dir);
-    let objects = git(
-        &dir,
-        &[
-            "cat-file",
-            "--batch-all-objects",
-            "--batch-check=%(objecttype)",
-        ],
-    )
-    .await;
+    let objects =
+        git(&dir, &["cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"]).await;
     assert_eq!(objects.lines().filter(|line| *line == "blob").count(), 4);
-    let checked_out = f
-        .clone_into("partial-checkout", &["--filter=blob:none"])
-        .await;
+    let checked_out = f.clone_into("partial-checkout", &["--filter=blob:none"]).await;
     assert_files(&checked_out);
 }
 
@@ -233,25 +160,15 @@ async fn shallow_clone() {
     let dir = f.clone_into("shallow", &["--depth", "1"]).await;
     assert_files(&dir);
     assert_eq!(git(&dir, &["rev-list", "--count", "HEAD"]).await, "1");
-    assert_eq!(
-        git(&dir, &["rev-parse", "--is-shallow-repository"]).await,
-        "true"
-    );
+    assert_eq!(git(&dir, &["rev-parse", "--is-shallow-repository"]).await, "true");
 }
 
 async fn objects(dir: &Path) -> HashSet<String> {
-    git(
-        dir,
-        &[
-            "cat-file",
-            "--batch-all-objects",
-            "--batch-check=%(objectname)",
-        ],
-    )
-    .await
-    .lines()
-    .map(str::to_owned)
-    .collect()
+    git(dir, &["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"])
+        .await
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 #[tokio::test]
@@ -260,15 +177,9 @@ async fn incremental_fetch_sends_exactly_new_objects() {
     let dir = f.clone_into("incremental", &[]).await;
     let old = objects(&dir).await;
     let next = commit(&f.b, vec![f.ids[2]], 4).await;
-    f.b.refs
-        .cas_ref("main", Some(f.ids[2]), Some(next))
-        .await
-        .unwrap();
+    f.b.refs.cas_ref("main", Some(f.ids[2]), Some(next)).await.unwrap();
     git(&dir, &["fetch", "origin"]).await;
-    assert_eq!(
-        git(&dir, &["rev-parse", "origin/main"]).await,
-        next.to_string()
-    );
+    assert_eq!(git(&dir, &["rev-parse", "origin/main"]).await, next.to_string());
     let new = objects(&dir).await;
     assert_eq!(new.difference(&old).count(), 3); // commit, root tree, changed blob
     // Inspect every pack, including duplicates: counting the object database
@@ -294,20 +205,10 @@ async fn incremental_fetch_sends_exactly_new_objects() {
 async fn partial_clone_lazy_fetch_of_many_blobs() {
     let b = Backend::in_memory();
     let files: Vec<(String, Vec<u8>)> = (0..300)
-        .map(|i| {
-            (
-                format!("d{}/f{i:03}.txt", i % 7),
-                format!("content {i}\n").into_bytes(),
-            )
-        })
+        .map(|i| (format!("d{}/f{i:03}.txt", i % 7), format!("content {i}\n").into_bytes()))
         .collect();
-    let refs: Vec<(&str, &[u8])> = files
-        .iter()
-        .map(|(p, c)| (p.as_str(), c.as_slice()))
-        .collect();
-    let tree = ant_store::graph::build_tree(b.objects.as_ref(), &refs)
-        .await
-        .unwrap();
+    let refs: Vec<(&str, &[u8])> = files.iter().map(|(p, c)| (p.as_str(), c.as_slice())).collect();
+    let tree = ant_store::graph::build_tree(b.objects.as_ref(), &refs).await.unwrap();
     let sig = ant_core::Signature {
         name: "t".into(),
         email: "t@t".into(),
@@ -333,11 +234,7 @@ async fn partial_clone_lazy_fetch_of_many_blobs() {
     let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, ant_gitserve::router(b)).await });
     let tmp = tempfile::tempdir().unwrap();
-    git(
-        tmp.path(),
-        &["clone", "-q", "--filter=blob:none", &url, "p"],
-    )
-    .await;
+    git(tmp.path(), &["clone", "-q", "--filter=blob:none", &url, "p"]).await;
     let dir = tmp.path().join("p");
     for (path, content) in &files {
         assert_eq!(&std::fs::read(dir.join(path)).unwrap(), content, "{path}");
@@ -357,13 +254,7 @@ fn rss_kib() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .unwrap_or_default()
         .lines()
-        .find_map(|line| {
-            line.strip_prefix("VmRSS:")?
-                .split_whitespace()
-                .next()?
-                .parse()
-                .ok()
-        })
+        .find_map(|line| line.strip_prefix("VmRSS:")?.split_whitespace().next()?.parse().ok())
         .unwrap_or(0)
 }
 
@@ -383,9 +274,7 @@ async fn large_blobless_history_is_delta_compressed() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
     let task = tokio::spawn(async move {
-        axum::serve(listener, ant_gitserve::router(b))
-            .await
-            .unwrap();
+        axum::serve(listener, ant_gitserve::router(b)).await.unwrap();
     });
     let temp = tempfile::tempdir().unwrap();
     let before = rss_kib();
@@ -398,17 +287,7 @@ async fn large_blobless_history_is_delta_compressed() {
         }
     });
     let start = Instant::now();
-    git(
-        temp.path(),
-        &[
-            "clone",
-            "--filter=blob:none",
-            "--no-checkout",
-            &url,
-            "large",
-        ],
-    )
-    .await;
+    git(temp.path(), &["clone", "--filter=blob:none", "--no-checkout", &url, "large"]).await;
     let elapsed = start.elapsed();
     monitor.abort();
     let dir = temp.path().join("large");
@@ -418,25 +297,16 @@ async fn large_blobless_history_is_delta_compressed() {
         peak.load(Ordering::Relaxed)
     );
     git(&dir, &["fsck", "--full"]).await;
-    assert_eq!(
-        git(&dir, &["rev-list", "--count", "HEAD"]).await,
-        REVISIONS.to_string()
-    );
+    assert_eq!(git(&dir, &["rev-list", "--count", "HEAD"]).await, REVISIONS.to_string());
     task.abort();
-    assert!(
-        packed * 100 <= undeltified * 30,
-        "pack {packed} exceeds 30% of {undeltified}"
-    );
+    assert!(packed * 100 <= undeltified * 30, "pack {packed} exceeds 30% of {undeltified}");
 }
 
 #[tokio::test]
 async fn delta_chains_path_type_changes_and_incremental_fetch() {
     let f = Fixture::new().await;
     let tip = support::revisions(&f.b, Some(f.ids[2]), 0..125).await;
-    f.b.refs
-        .cas_ref("main", Some(f.ids[2]), Some(tip))
-        .await
-        .unwrap();
+    f.b.refs.cas_ref("main", Some(f.ids[2]), Some(tip)).await.unwrap();
     let dir = f.clone_into("chains", &["--no-checkout"]).await;
     git(&dir, &["fsck", "--full"]).await;
     let old = objects(&dir).await;
@@ -446,10 +316,7 @@ async fn delta_chains_path_type_changes_and_incremental_fetch() {
     for entry in std::fs::read_dir(dir.join(".git/objects/pack")).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|e| e == "idx") {
-            for line in git(&dir, &["verify-pack", "-v", path.to_str().unwrap()])
-                .await
-                .lines()
-            {
+            for line in git(&dir, &["verify-pack", "-v", path.to_str().unwrap()]).await.lines() {
                 let fields: Vec<_> = line.split_whitespace().collect();
                 if fields.len() == 7 && fields[0].len() == 64 {
                     max_depth = max_depth.max(fields[5].parse::<usize>().unwrap());
@@ -462,10 +329,7 @@ async fn delta_chains_path_type_changes_and_incremental_fetch() {
     assert!(tree_deltas > 50 && blob_deltas > 50);
     assert!((2..=50).contains(&max_depth));
     let next = support::revisions(&f.b, Some(tip), 125..135).await;
-    f.b.refs
-        .cas_ref("main", Some(tip), Some(next))
-        .await
-        .unwrap();
+    f.b.refs.cas_ref("main", Some(tip), Some(next)).await.unwrap();
     git(&dir, &["fetch", "origin"]).await;
     git(&dir, &["fsck", "--full"]).await;
     let new = objects(&dir).await;
@@ -477,17 +341,9 @@ async fn delta_chains_path_type_changes_and_incremental_fetch() {
             packed_count += git(&dir, &["verify-pack", "-v", path.to_str().unwrap()])
                 .await
                 .lines()
-                .filter(|line| {
-                    line.split_whitespace()
-                        .next()
-                        .is_some_and(|id| id.len() == 64)
-                })
+                .filter(|line| line.split_whitespace().next().is_some_and(|id| id.len() == 64))
                 .count();
         }
     }
-    assert_eq!(
-        packed_count,
-        new.len(),
-        "incremental pack repeated known objects"
-    );
+    assert_eq!(packed_count, new.len(), "incremental pack repeated known objects");
 }

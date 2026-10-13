@@ -7,6 +7,10 @@ pub mod changeset;
 pub mod history;
 pub mod land;
 pub mod query;
+mod tree_edit;
+
+#[cfg(test)]
+mod test_support;
 
 use ant_core::ObjectId;
 use ant_store::StoreError;

@@ -168,7 +168,8 @@ impl MetaStore for MemoryMetaStore {
             .into_iter()
             .flatten()
             .filter(|(p, g, _)| {
-                *g <= max_generation && RepoPath::new(p.clone()).is_ok_and(|p| p.starts_with(prefix))
+                *g <= max_generation
+                    && RepoPath::new(p.clone()).is_ok_and(|p| p.starts_with(prefix))
             })
             .map(|(_, g, c)| (*g, *c))
             .collect();

@@ -47,7 +47,10 @@ mod tests {
         let env = lookup(&[("ANT_AUTHOR_NAME", "E"), ("ANT_AUTHOR_EMAIL", "e@x"), ("USER", "u")]);
         let git = lookup(&[("user.name", "G"), ("user.email", "g@x")]);
         let s = resolve_author(&env, &git, 5);
-        assert_eq!((&s.name[..], &s.email[..], s.time, s.tz_offset_minutes), (&b"E"[..], &b"e@x"[..], 5, 0));
+        assert_eq!(
+            (&s.name[..], &s.email[..], s.time, s.tz_offset_minutes),
+            (&b"E"[..], &b"e@x"[..], 5, 0)
+        );
     }
 
     #[test]

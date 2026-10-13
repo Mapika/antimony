@@ -1,18 +1,15 @@
 //! On-disk content-addressed object cache.
 //!
-//! TASK (antd-cache): implement everything marked `todo!()`.
-//!
 //! - Layout: `{root}/objects/{hex[0..2]}/{hex}`; file content is the
 //!   zstd-compressed (level 1) encoded object. Temp files go in `{root}/tmp`
-//!   (same filesystem) and are `rename`d into place — never write the final
-//!   path directly. If the final path already exists, skip the write.
+//!   (same filesystem) and are `rename`d into place, never written at the
+//!   final path. If the final path already exists, the write is skipped.
 //! - `get_many`: missing file → `None`. A corrupt file (bad zstd / framing)
-//!   is deleted and reported as `None` (it's a cache). On hit, bump the
-//!   file's mtime to "now" (`libc::utimensat` or `std::fs::File::set_modified`)
-//!   so eviction is LRU-ish; failures to bump are ignored.
-//! - Use `tokio::task::spawn_blocking` for filesystem work; process a batch
-//!   in one blocking task (or a few), not one task per object.
-//! - `gc()`: if the total size of `objects/` exceeds `max_bytes`, delete
+//!   is deleted and reported as `None` (it's a cache). A hit bumps the
+//!   file's mtime to "now" (`File::set_modified`) so eviction is LRU-ish;
+//!   failures to bump are ignored.
+//! - Filesystem work runs in `spawn_blocking`, one blocking task per batch.
+//! - `gc()`: if the total size of `objects/` exceeds `max_bytes`, deletes
 //!   oldest-mtime files until it is under 90% of `max_bytes`. Returns bytes
 //!   freed. Concurrent readers may race with deletion; that just produces a
 //!   miss.
@@ -253,7 +250,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Incompressible-ish payloads so sizes are predictable.
         let mk = |seed: u8| {
-            let body: Vec<u8> = (0..20_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8 ^ seed).collect();
+            let body: Vec<u8> =
+                (0..20_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8 ^ seed).collect();
             EncodedObject::new(ObjectKind::Blob, &body)
         };
         let objs: Vec<_> = (0..10).map(mk).collect();
@@ -280,7 +278,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = Arc::new(DiskObjectStore::open(dir.path(), u64::MAX).unwrap());
         let b = Arc::new(DiskObjectStore::open(dir.path(), u64::MAX).unwrap());
-        let objs: Vec<_> = (0..200).map(|i| EncodedObject::new(ObjectKind::Blob, format!("{i}").as_bytes())).collect();
+        let objs: Vec<_> = (0..200)
+            .map(|i| EncodedObject::new(ObjectKind::Blob, format!("{i}").as_bytes()))
+            .collect();
         let (oa, ob) = (objs.clone(), objs.clone());
         let ta = tokio::spawn(async move { a.put_many(&oa).await });
         let tb = tokio::spawn(async move { b.put_many(&ob).await });

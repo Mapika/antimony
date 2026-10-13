@@ -15,6 +15,6 @@ mod tree;
 pub use commit::{Commit, Signature};
 pub use error::{Error, Result};
 pub use id::ObjectId;
-pub use object::{EncodedObject, ObjectKind, Object, hash_object};
+pub use object::{EncodedObject, Object, ObjectKind, hash_object};
 pub use path::RepoPath;
 pub use tree::{EntryMode, Tree, TreeEntry};

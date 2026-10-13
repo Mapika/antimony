@@ -120,12 +120,7 @@ fn object(
     let mut encoder = ZlibEncoder::new(writer, Compression::fast());
     encoder.write_all(body)?;
     encoder.finish()?;
-    *base = eligible.then_some(Base {
-        path,
-        object,
-        offset,
-        depth,
-    });
+    *base = eligible.then_some(Base { path, object, offset, depth });
     Ok(())
 }
 
@@ -182,10 +177,7 @@ pub async fn send_planned(
                 .zip(objects)
                 .map(|(path, item)| Ok((*path, item.ok_or_else(|| anyhow!("object disappeared"))?)))
                 .collect();
-            read_tx
-                .send(objects?)
-                .await
-                .map_err(|_| anyhow!("pack consumer disconnected"))?;
+            read_tx.send(objects?).await.map_err(|_| anyhow!("pack consumer disconnected"))?;
         }
         Ok(())
     };
@@ -233,16 +225,10 @@ mod tests {
         git(dir.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]).await;
         if promisor {
             git(dir.path(), &["config", "remote.origin.promisor", "true"]).await;
-            git(
-                dir.path(),
-                &["config", "remote.origin.url", "/nonexistent-promisor"],
-            )
-            .await;
+            git(dir.path(), &["config", "remote.origin.url", "/nonexistent-promisor"]).await;
         }
         let mut command = tokio::process::Command::new("git");
-        command
-            .current_dir(dir.path())
-            .args(["index-pack", "--stdin", "--fix-thin"]);
+        command.current_dir(dir.path()).args(["index-pack", "--stdin", "--fix-thin"]);
         if promisor {
             command.arg("--promisor");
         }
@@ -266,11 +252,7 @@ mod tests {
         drop(input);
         sender.await.unwrap().unwrap();
         let result = child.wait_with_output().await.unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
         (dir, size)
     }
 
@@ -278,13 +260,7 @@ mod tests {
         std::fs::read_to_string("/proc/self/status")
             .unwrap_or_default()
             .lines()
-            .find_map(|line| {
-                line.strip_prefix("VmRSS:")?
-                    .split_whitespace()
-                    .next()?
-                    .parse()
-                    .ok()
-            })
+            .find_map(|line| line.strip_prefix("VmRSS:")?.split_whitespace().next()?.parse().ok())
             .unwrap_or(0)
     }
 
@@ -332,11 +308,7 @@ mod tests {
                 start.elapsed(),
                 peak.load(Ordering::Relaxed)
             );
-            git(
-                dir.path(),
-                &["update-ref", "refs/heads/main", &tip.to_string()],
-            )
-            .await;
+            git(dir.path(), &["update-ref", "refs/heads/main", &tip.to_string()]).await;
             git(dir.path(), &["fsck", "--full"]).await;
             sizes.push(size);
         }
@@ -350,21 +322,13 @@ mod tests {
         let tip = support::revisions(&b, None, 0..125).await;
         let selection = crate::select::select(
             &b,
-            &crate::select::Fetch {
-                wants: vec![tip],
-                done: true,
-                ..Default::default()
-            },
+            &crate::select::Fetch { wants: vec![tip], done: true, ..Default::default() },
         )
         .await
         .unwrap();
         let old: std::collections::HashSet<_> = selection.ids.iter().copied().collect();
         let (dir, _) = receive(b.clone(), selection, true, false).await;
-        git(
-            dir.path(),
-            &["update-ref", "refs/heads/main", &tip.to_string()],
-        )
-        .await;
+        git(dir.path(), &["update-ref", "refs/heads/main", &tip.to_string()]).await;
         git(dir.path(), &["fsck", "--full"]).await;
         let mut trees = 0;
         let mut blobs = 0;
@@ -372,9 +336,8 @@ mod tests {
         for entry in std::fs::read_dir(dir.path().join("objects/pack")).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|e| e == "idx") {
-                for line in git(dir.path(), &["verify-pack", "-v", path.to_str().unwrap()])
-                    .await
-                    .lines()
+                for line in
+                    git(dir.path(), &["verify-pack", "-v", path.to_str().unwrap()]).await.lines()
                 {
                     let fields: Vec<_> = line.split_whitespace().collect();
                     if fields.len() == 7 && fields[0].len() == 64 {
@@ -406,18 +369,11 @@ mod tests {
             let path = entry.unwrap().path();
             std::fs::copy(
                 &path,
-                incremental
-                    .path()
-                    .join("objects/pack")
-                    .join(path.file_name().unwrap()),
+                incremental.path().join("objects/pack").join(path.file_name().unwrap()),
             )
             .unwrap();
         }
-        git(
-            incremental.path(),
-            &["update-ref", "refs/heads/main", &next.to_string()],
-        )
-        .await;
+        git(incremental.path(), &["update-ref", "refs/heads/main", &next.to_string()]).await;
         git(incremental.path(), &["fsck", "--full"]).await;
     }
 
@@ -426,16 +382,10 @@ mod tests {
         let b = Backend::in_memory();
         let (tx, mut rx) = mpsc::channel(8);
         assert!(
-            send_planned(b.clone(), vec![ObjectId::empty_tree()], vec![0], true, tx)
-                .await
-                .is_err()
+            send_planned(b.clone(), vec![ObjectId::empty_tree()], vec![0], true, tx).await.is_err()
         );
         while let Some(chunk) = rx.recv().await {
-            assert_ne!(
-                chunk.unwrap(),
-                b"0000"[..],
-                "failed pack must not finish successfully"
-            );
+            assert_ne!(chunk.unwrap(), b"0000"[..], "failed pack must not finish successfully");
         }
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
@@ -450,9 +400,8 @@ mod tests {
     #[tokio::test]
     async fn real_git_accepts_streamed_pack_across_batches_and_sidebands() {
         let b = Backend::in_memory();
-        let mut objects: Vec<_> = (0_u32..520)
-            .map(|n| EncodedObject::new(ObjectKind::Blob, &n.to_be_bytes()))
-            .collect();
+        let mut objects: Vec<_> =
+            (0_u32..520).map(|n| EncodedObject::new(ObjectKind::Blob, &n.to_be_bytes())).collect();
         // Incompressible payload crosses several maximum-size sidebands.
         let mut state = 123456789_u32;
         let data: Vec<_> = (0..200_000)
@@ -505,10 +454,6 @@ mod tests {
         task.await.unwrap().unwrap();
         assert!(flushed && total > 200_000);
         let output = child.wait_with_output().await.unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     }
 }

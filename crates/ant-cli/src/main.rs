@@ -1,5 +1,5 @@
-//! TASK (cli): the `ant` command. This doc comment is the contract shared by
-//! the implementation and `tests/e2e.rs`.
+//! The `ant` command: client for an antimony server, plus `ant serve`. This
+//! doc comment is the output contract; `tests/e2e.rs` checks it.
 //!
 //! Global flags (each also an env var):
 //!   --server <url>     ANT_SERVER   gRPC url, default http://127.0.0.1:7420

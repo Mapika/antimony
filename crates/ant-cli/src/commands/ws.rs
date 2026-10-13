@@ -10,7 +10,7 @@ use antd::workspace::{LocalChange, LocalChangeKind, Sparse, Workspace};
 use anyhow::{Context as _, Result, anyhow, bail};
 
 use crate::author::current_author;
-use crate::ctx::{Ctx, Outcome, RpcResult, id_from, mode_to_pb};
+use crate::ctx::{Ctx, Outcome, RpcResult, id_from};
 use crate::discover::require_workspace;
 
 const LAST_SUBMIT: &str = ".ant/last_submit";
@@ -18,7 +18,13 @@ const LAST_SUBMIT: &str = ".ant/last_submit";
 pub async fn new(ctx: &Ctx, dir: &Path, at: &str, patterns: Vec<String>) -> Result<Outcome> {
     let sparse = if patterns.is_empty() { Sparse::all() } else { Sparse::new(patterns)? };
     let (rt, remote) = ctx.read_through().await?;
-    let commit = remote.client().resolve_rev(pb::ResolveRevRequest { rev: at.into() }).await.rpc()?.into_inner().commit;
+    let commit = remote
+        .client()
+        .resolve_rev(pb::ResolveRevRequest { rev: at.into() })
+        .await
+        .rpc()?
+        .into_inner()
+        .commit;
     let commit = id_from(&commit)?;
     let tree = rt.read_commit(&commit).await?.tree;
     Workspace::materialize(rt.as_ref(), dir, commit, tree, sparse).await?;
@@ -78,7 +84,7 @@ pub async fn submit(ctx: &Ctx, message: &str) -> Result<Outcome> {
             path: c.path.to_string(),
             op: Some(match c.new {
                 Some((mode, id)) => pb::file_op::Op::Write(pb::WriteOp {
-                    mode: mode_to_pb(mode) as i32,
+                    mode: pb::EntryMode::from(mode) as i32,
                     content: Some(pb::write_op::Content::BlobId(id.as_bytes().to_vec())),
                 }),
                 None => pb::file_op::Op::Delete(pb::DeleteOp {}),
@@ -86,7 +92,7 @@ pub async fn submit(ctx: &Ctx, message: &str) -> Result<Outcome> {
         })
         .collect();
     let a = tokio::task::spawn_blocking(current_author).await?;
-    let author = pb::Signature { name: a.name, email: a.email, time: a.time, tz_offset_minutes: a.tz_offset_minutes };
+    let author = pb::Signature::from(&a);
     let r = remote
         .client()
         .create_changeset(pb::CreateChangesetRequest {
@@ -118,14 +124,21 @@ pub async fn land(ctx: &Ctx, ref_name: &str, commit: Option<String>) -> Result<O
             let p = root.join(LAST_SUBMIT);
             tokio::fs::read_to_string(&p)
                 .await
-                .map_err(|_| anyhow!("no commit given and {} not found; run `ant submit` first", p.display()))?
+                .map_err(|_| {
+                    anyhow!("no commit given and {} not found; run `ant submit` first", p.display())
+                })?
                 .trim()
                 .to_string()
         }
     };
     let (rt, remote) = ctx.read_through().await?;
     let mut client = remote.client();
-    let commit = client.resolve_rev(pb::ResolveRevRequest { rev: commit_hex }).await.rpc()?.into_inner().commit;
+    let commit = client
+        .resolve_rev(pb::ResolveRevRequest { rev: commit_hex })
+        .await
+        .rpc()?
+        .into_inner()
+        .commit;
     let r = client
         .land(pb::LandRequest { ref_name: ref_name.into(), commit })
         .await
@@ -140,9 +153,13 @@ pub async fn land(ctx: &Ctx, ref_name: &str, commit: Option<String>) -> Result<O
                 // The new tip's trees and blobs are not cached locally yet, so
                 // the reset must read through to the server.
                 if let Some(state) = lazy_state(&root).await? {
-                    ant_fuse::rw::reset(rt.clone(), &state, tip, tree).await.context("resetting lazy workspace")?;
+                    ant_fuse::rw::reset(rt.clone(), &state, tip, tree)
+                        .await
+                        .context("resetting lazy workspace")?;
                 } else {
-                    ws.reset_to(rt.as_ref(), tip, tree).await.context("resetting workspace to new tip")?;
+                    ws.reset_to(rt.as_ref(), tip, tree)
+                        .await
+                        .context("resetting workspace to new tip")?;
                 }
             }
             Ok(Outcome::ok(format!("landed {tip}{}\n", if l.rebased { " rebased" } else { "" })))
@@ -171,11 +188,22 @@ pub async fn new_lazy(ctx: &Ctx, dir: &Path, at: &str) -> Result<Outcome> {
     if let Some(state) = lazy_state(&dir).await? {
         spawn_lazy(ctx, &dir, &state).await?;
         let config = tokio::fs::read_to_string(state.join("base")).await?;
-        let commit = config.lines().find_map(|l| l.strip_prefix("base_commit=")).ok_or_else(|| anyhow!("invalid lazy base"))?;
+        let commit = config
+            .lines()
+            .find_map(|l| l.strip_prefix("base_commit="))
+            .ok_or_else(|| anyhow!("invalid lazy base"))?;
         return Ok(Outcome::ok(format!("{commit}\n")));
     }
     let (objects, remote) = ctx.read_through().await?;
-    let commit = id_from(&remote.client().resolve_rev(pb::ResolveRevRequest { rev: at.into() }).await.rpc()?.into_inner().commit)?;
+    let commit = id_from(
+        &remote
+            .client()
+            .resolve_rev(pb::ResolveRevRequest { rev: at.into() })
+            .await
+            .rpc()?
+            .into_inner()
+            .commit,
+    )?;
     let tree = objects.read_commit(&commit).await?.tree;
     let cache = std::path::absolute(&ctx.cache)?;
     let d = dir.clone();
@@ -183,11 +211,17 @@ pub async fn new_lazy(ctx: &Ctx, dir: &Path, at: &str) -> Result<Outcome> {
         use std::os::unix::{ffi::OsStrExt, fs::symlink};
         std::fs::create_dir_all(&d)?;
         let d = std::fs::canonicalize(d)?;
-        if std::fs::read_dir(&d)?.next().is_some() { bail!("workspace directory is not empty"); }
+        if std::fs::read_dir(&d)?.next().is_some() {
+            bail!("workspace directory is not empty");
+        }
         let id = ant_core::hash_object(ant_core::ObjectKind::Blob, d.as_os_str().as_bytes());
         let state = cache.join("ws").join(id.to_hex());
-        if state.starts_with(&d) { bail!("lazy workspace state must be outside the mountpoint; choose another --cache"); }
-        if state.exists() { bail!("lazy workspace state already exists at {}", state.display()); }
+        if state.starts_with(&d) {
+            bail!("lazy workspace state must be outside the mountpoint; choose another --cache");
+        }
+        if state.exists() {
+            bail!("lazy workspace state already exists at {}", state.display());
+        }
         std::fs::create_dir_all(state.join("upper"))?;
         std::fs::create_dir(state.join("meta"))?;
         std::fs::write(state.join("base"), format!("base_commit={commit}\nbase_tree={tree}\n"))?;
@@ -197,7 +231,8 @@ pub async fn new_lazy(ctx: &Ctx, dir: &Path, at: &str) -> Result<Outcome> {
         symlink(state.join("meta"), state.join("upper/.ant"))?;
         symlink(state.join("meta"), d.join(".ant"))?;
         Ok(state)
-    }).await??;
+    })
+    .await??;
     spawn_lazy(ctx, &dir, &state).await?;
     Ok(Outcome::ok(format!("{commit}\n")))
 }
@@ -206,18 +241,34 @@ async fn spawn_lazy(ctx: &Ctx, dir: &Path, state: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let mut cmd = Command::new(std::env::current_exe()?);
-    cmd.arg("--server").arg(&ctx.server).arg("--cache").arg(std::path::absolute(&ctx.cache)?)
-        .arg("--cache-bytes").arg(ctx.cache_bytes.to_string());
-    if let Some(http) = &ctx.http { cmd.arg("--http").arg(http); }
-    cmd.arg("ws").arg("serve").arg(dir).arg(state)
-        .current_dir("/").process_group(0).stdin(Stdio::null()).stdout(Stdio::null());
+    cmd.arg("--server")
+        .arg(&ctx.server)
+        .arg("--cache")
+        .arg(std::path::absolute(&ctx.cache)?)
+        .arg("--cache-bytes")
+        .arg(ctx.cache_bytes.to_string());
+    if let Some(http) = &ctx.http {
+        cmd.arg("--http").arg(http);
+    }
+    cmd.arg("ws")
+        .arg("serve")
+        .arg(dir)
+        .arg(state)
+        .current_dir("/")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
     let log = tokio::fs::File::create(state.join("daemon.log")).await?.into_std().await;
     cmd.stderr(log);
-    let mut child = tokio::task::spawn_blocking(move || cmd.spawn()).await?.context("starting lazy workspace daemon")?;
+    let mut child = tokio::task::spawn_blocking(move || cmd.spawn())
+        .await?
+        .context("starting lazy workspace daemon")?;
     let ready = state.join("ready");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        if tokio::fs::read_to_string(&ready).await.is_ok_and(|pid| pid == child.id().to_string()) { return Ok(()); }
+        if tokio::fs::read_to_string(&ready).await.is_ok_and(|pid| pid == child.id().to_string()) {
+            return Ok(());
+        }
         if let Some(status) = child.try_wait()? {
             let log = tokio::fs::read_to_string(state.join("daemon.log")).await?;
             bail!("lazy workspace daemon exited ({status}): {log}");
@@ -239,24 +290,34 @@ pub async fn serve(ctx: &Ctx, dir: &Path, state: &Path) -> Result<Outcome> {
     let session = tokio::task::spawn_blocking(move || {
         let (commit, tree) = ant_fuse::rw::base(&s)?;
         ant_fuse::mount_rw(objects, commit, tree, &d, &s, handle, ant_fuse::MountOptions::default())
-    }).await??;
+    })
+    .await??;
     tokio::fs::write(state.join("ready"), std::process::id().to_string()).await?;
     tokio::task::spawn_blocking(move || session.join()).await??;
-    if tokio::fs::read_to_string(state.join("ready")).await.is_ok_and(|pid| pid == std::process::id().to_string()) {
+    if tokio::fs::read_to_string(state.join("ready"))
+        .await
+        .is_ok_and(|pid| pid == std::process::id().to_string())
+    {
         tokio::fs::remove_file(state.join("ready")).await?;
     }
     Ok(Outcome::empty())
 }
 
 pub async fn unmount(dir: &Path) -> Result<Outcome> {
-    let state = lazy_state(dir).await?.ok_or_else(|| anyhow!("not a lazy workspace: {}", dir.display()))?;
+    let state =
+        lazy_state(dir).await?.ok_or_else(|| anyhow!("not a lazy workspace: {}", dir.display()))?;
     let dir = std::path::absolute(dir)?;
     let output = tokio::task::spawn_blocking(move || {
         std::process::Command::new("fusermount3").arg("-u").arg(&dir).output()
-    }).await??;
-    if !output.status.success() { bail!("unmount failed: {}", String::from_utf8_lossy(&output.stderr)); }
+    })
+    .await??;
+    if !output.status.success() {
+        bail!("unmount failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while tokio::fs::try_exists(state.join("ready")).await? && tokio::time::Instant::now() < deadline {
+    while tokio::fs::try_exists(state.join("ready")).await?
+        && tokio::time::Instant::now() < deadline
+    {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     Ok(Outcome::empty())
@@ -268,18 +329,34 @@ struct LazyObjects {
     read: std::sync::Arc<antd::readthrough::ReadThrough>,
     local: std::sync::Arc<antd::disk::DiskObjectStore>,
 }
-type StoreFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = ant_store::Result<T>> + Send + 'a>>;
+type StoreFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ant_store::Result<T>> + Send + 'a>>;
 impl ObjectStore for LazyObjects {
-    fn get_many<'a, 'b, 'f>(&'a self, ids: &'b [ObjectId]) -> StoreFuture<'f, Vec<Option<EncodedObject>>>
-    where 'a: 'f, 'b: 'f, Self: 'f {
+    fn get_many<'a, 'b, 'f>(
+        &'a self,
+        ids: &'b [ObjectId],
+    ) -> StoreFuture<'f, Vec<Option<EncodedObject>>>
+    where
+        'a: 'f,
+        'b: 'f,
+        Self: 'f,
+    {
         Box::pin(async move { self.read.get_many(ids).await })
     }
     fn put_many<'a, 'b, 'f>(&'a self, objects: &'b [EncodedObject]) -> StoreFuture<'f, ()>
-    where 'a: 'f, 'b: 'f, Self: 'f {
+    where
+        'a: 'f,
+        'b: 'f,
+        Self: 'f,
+    {
         Box::pin(async move { self.local.put_many(objects).await })
     }
     fn has_many<'a, 'b, 'f>(&'a self, ids: &'b [ObjectId]) -> StoreFuture<'f, Vec<bool>>
-    where 'a: 'f, 'b: 'f, Self: 'f {
+    where
+        'a: 'f,
+        'b: 'f,
+        Self: 'f,
+    {
         Box::pin(async move { self.read.has_many(ids).await })
     }
 }

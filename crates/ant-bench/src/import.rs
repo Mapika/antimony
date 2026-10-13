@@ -15,18 +15,27 @@ use ant_server::config::StoreArgs;
 use anyhow::Context as _;
 
 use crate::json::J;
-use crate::util::{Metrics, cpu_seconds, instrument, mib, peak_rss_bytes};
-use crate::{StoreInfo, write_json};
+use crate::util::{Metrics, cpu_seconds, instrument, mib, peak_rss_bytes, write_json};
 
+#[derive(clap::Args, Debug)]
 pub struct Args {
+    /// Path to the git directory (bare repo or work tree).
     pub git_dir: PathBuf,
+    #[arg(long, default_value = "refs/heads/master")]
     pub git_ref: String,
+    /// Antimony ref to point at the imported tip.
+    #[arg(long, default_value = "main")]
     pub ant_ref: String,
+    /// Objects per store batch (ImportOptions::batch_objects).
+    #[arg(long, default_value_t = 1024)]
     pub batch_objects: usize,
+    /// Stop (and report partial numbers) after this many seconds; 0 = no limit.
+    #[arg(long, default_value_t = 0)]
     pub max_seconds: u64,
+    #[arg(long)]
     pub json: Option<PathBuf>,
+    #[command(flatten)]
     pub store: StoreArgs,
-    pub info: StoreInfo,
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
@@ -45,7 +54,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let mut opts = ImportOptions::single(&args.git_ref, &args.ant_ref);
     opts.batch_objects = args.batch_objects;
 
-    println!("importing {} ({} -> {}) batch_objects={}", args.git_dir.display(), args.git_ref, args.ant_ref, args.batch_objects);
+    println!(
+        "importing {} ({} -> {}) batch_objects={}",
+        args.git_dir.display(),
+        args.git_ref,
+        args.ant_ref,
+        args.batch_objects
+    );
     let start = Instant::now();
     let cpu0 = cpu_seconds().unwrap_or((0.0, 0.0));
 
@@ -70,9 +85,15 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             );
             let mut parts = Vec::new();
             for (name, calls, secs, _) in pm.totals() {
-                let (pcalls, psecs) = last_ops.insert(name.clone(), (calls, secs)).unwrap_or((0, 0.0));
+                let (pcalls, psecs) =
+                    last_ops.insert(name.clone(), (calls, secs)).unwrap_or((0, 0.0));
                 if calls > pcalls {
-                    parts.push(format!("{}={}x/{:.2}s", name.trim_start_matches("store."), calls - pcalls, secs - psecs));
+                    parts.push(format!(
+                        "{}={}x/{:.2}s",
+                        name.trim_start_matches("store."),
+                        calls - pcalls,
+                        secs - psecs
+                    ));
                 }
             }
             println!("           ops in interval: {}", parts.join(" "));
@@ -100,16 +121,20 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         // Partial: derive from what the writer persisted.
         None => ImportStats { commits: recorded(), trees: 0, blobs: put_objects.items() },
     };
-    let objects = if timed_out { put_objects.items() } else { stats.commits + stats.trees + stats.blobs };
+    let objects =
+        if timed_out { put_objects.items() } else { stats.commits + stats.trees + stats.blobs };
 
-    let pg = match (&args.info.pg_url, &args.info.pg_schema) {
-        (Some(url), Some(schema)) => Some(pg_size(url, schema).await?),
-        _ => None,
+    let pg = match args.store.pg_url() {
+        Some(url) => Some(pg_size(url, args.store.pg_schema()).await?),
+        None => None,
     };
 
     let rss = peak_rss_bytes();
     println!();
-    println!("== import summary{} ==", if timed_out { " (STOPPED at --max-seconds; partial)" } else { "" });
+    println!(
+        "== import summary{} ==",
+        if timed_out { " (STOPPED at --max-seconds; partial)" } else { "" }
+    );
     println!("wall            {wall:.2}s");
     println!(
         "cpu             user {:.1}s sys {:.1}s  (of {wall:.1}s wall x cores)",
@@ -123,9 +148,16 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         println!("trees           {}", stats.trees);
         println!("blobs           {}", stats.blobs);
     }
-    println!("commits/s       {:.1}", if timed_out { recorded() } else { stats.commits } as f64 / wall);
+    println!(
+        "commits/s       {:.1}",
+        if timed_out { recorded() } else { stats.commits } as f64 / wall
+    );
     println!("objects/s       {:.1}", objects as f64 / wall);
-    println!("object bytes    {:.1} MiB written ({:.2} MiB/s)", mib(put_objects.bytes()), mib(put_objects.bytes()) / wall);
+    println!(
+        "object bytes    {:.1} MiB written ({:.2} MiB/s)",
+        mib(put_objects.bytes()),
+        mib(put_objects.bytes()) / wall
+    );
     if let Some(r) = rss {
         println!("peak RSS        {:.1} MiB", mib(r));
     }
@@ -136,10 +168,21 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
     }
     metrics.print("store-call timing (sum over all callers; writer is sequential)");
-    let writer_secs: f64 = ["has_many", "put_many", "get_many", "put_commit", "put_commits", "get_commits", "put_derived", "put_derived_many", "cas_ref", "get_ref"]
-        .iter()
-        .map(|n| metrics.counter(&format!("store.{n}")).secs())
-        .sum();
+    let writer_secs: f64 = [
+        "has_many",
+        "put_many",
+        "get_many",
+        "put_commit",
+        "put_commits",
+        "get_commits",
+        "put_derived",
+        "put_derived_many",
+        "cas_ref",
+        "get_ref",
+    ]
+    .iter()
+    .map(|n| metrics.counter(&format!("store.{n}")).secs())
+    .sum();
     println!(
         "  writer-side store time ~{writer_secs:.1}s = {:.0}% of wall (rest = writer waiting on the producer)",
         100.0 * writer_secs / wall
@@ -169,7 +212,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             pg.map(|(_, t)| {
                 J::Arr(
                     t.into_iter()
-                        .map(|(n, b, r)| J::obj().with("table", n).with("bytes", b as u64).with("rows_est", r as u64))
+                        .map(|(n, b, r)| {
+                            J::obj()
+                                .with("table", n)
+                                .with("bytes", b as u64)
+                                .with("rows_est", r as u64)
+                        })
                         .collect(),
                 )
             }),

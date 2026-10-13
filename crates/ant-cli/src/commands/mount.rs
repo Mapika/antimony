@@ -10,7 +10,13 @@ use crate::ctx::{Ctx, Outcome, RpcResult, id_from};
 
 pub async fn run(ctx: &Ctx, rev: &str, mountpoint: &Path) -> Result<Outcome> {
     let (rt, remote) = ctx.read_through().await?;
-    let commit = remote.client().resolve_rev(pb::ResolveRevRequest { rev: rev.into() }).await.rpc()?.into_inner().commit;
+    let commit = remote
+        .client()
+        .resolve_rev(pb::ResolveRevRequest { rev: rev.into() })
+        .await
+        .rpc()?
+        .into_inner()
+        .commit;
     let commit: ObjectId = id_from(&commit)?;
     let tree = rt.read_commit(&commit).await?.tree;
 

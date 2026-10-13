@@ -1,36 +1,32 @@
 //! Server-side commit creation from file-level operations.
 //!
-//! TASK (server-changeset): implement `create_changeset`.
-//!
-//! Semantics:
-//! - Start from `base`'s tree (or the empty tree when `base` is `None`).
+//! [`create_changeset`] semantics:
+//! - Starts from `base`'s tree (or the empty tree when `base` is `None`).
 //!   `base`, if given, must be a *recorded* commit (`MetaStore`), else
 //!   `NotFound`.
-//! - Apply every op. Ops may come in any order but at most one op per path
+//! - Applies every op. Ops may come in any order but at most one op per path
 //!   (duplicates → `InvalidArgument`).
 //! - `Write` creates intermediate directories as needed. Writing where an
 //!   ancestor path component is a non-tree (file/symlink/gitlink), or where
 //!   the path itself is currently a tree → `InvalidArgument` (in a single
-//!   request, deleting `p` and writing `p/q` IS allowed and must work).
+//!   request, deleting `p` and writing `p/q` is allowed).
 //! - `Write` mode must be `File`, `Executable` or `Symlink`, else
 //!   `InvalidArgument`. `WriteContent::Blob(id)` must exist in the object
 //!   store and be a blob, else `NotFound`/`InvalidArgument`.
 //! - `Delete` of a path that is not a non-tree entry in the base →
 //!   `NotFound`. Directories left empty by deletes are removed (git cannot
 //!   represent empty trees except the root).
-//! - Only rewrite trees along modified paths; untouched subtrees keep their
-//!   ids. Store all new blobs/trees with as few `put_many` calls as
-//!   practical (one per batch, not one per object).
-//! - Build the `Commit` (parents = `[base]` or `[]`, committer defaults to
-//!   author, message verbatim), then persist it with generation and
-//!   changeset exactly as `ant_store::graph::write_commit` would. (The
-//!   implementation stores the commit object in the same `put_many` as the
-//!   trees and computes the changeset from the ops instead of re-reading
-//!   the trees it just built.) Return the commit id.
+//! - Only trees along modified paths are rewritten; untouched subtrees keep
+//!   their ids. Directories are loaded per depth (`tree_edit`), and every
+//!   new blob, tree and the commit go out in one `put_many`.
+//! - The `Commit` (parents = `[base]` or `[]`, committer defaults to author,
+//!   message verbatim) is recorded with the generation and changeset
+//!   `ant_store::graph::write_commit` would compute; the changeset comes
+//!   from the ops instead of re-reading the trees just built.
 //! - An empty ops list is allowed (produces a commit with the same tree).
 //!
-//! Performance target: O(changed paths × depth) object reads/writes,
-//! independent of repo size.
+//! Cost: O(changed paths × depth) object reads/writes, independent of repo
+//! size.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -155,7 +151,7 @@ pub async fn create_changeset_as(
     let mut directories = match base_tree {
         Some(root) => {
             let paths: Vec<_> = req.ops.iter().map(|op| op.path().clone()).collect();
-            let [dirs] = super::land::load_directories(b, [root], &paths).await?;
+            let [dirs] = super::tree_edit::load_directories(b, [root], &paths).await?;
             dirs
         }
         None => Default::default(),
@@ -169,7 +165,8 @@ pub async fn create_changeset_as(
         .zip(&edits)
         .filter_map(|(op, (_, edit))| {
             let path = op.path();
-            let old = super::land::entry(&directories, path).filter(|(mode, _)| !mode.is_tree());
+            let old =
+                super::tree_edit::entry(&directories, path).filter(|(mode, _)| !mode.is_tree());
             let new = match *edit {
                 Edit::Write(mode, id) => Some((mode, id)),
                 Edit::Delete => None,
@@ -229,10 +226,9 @@ pub async fn create_changeset_as(
     // tree is read back. The id is returned only once both are durable; a
     // record whose objects failed to write is unreachable, and a retry of
     // the same request completes it.
-    futures::try_join!(
-        async { b.objects.put_many(&new_objects).await },
-        async { b.meta.put_commit(node.clone(), changes).await },
-    )?;
+    futures::try_join!(async { b.objects.put_many(&new_objects).await }, async {
+        b.meta.put_commit(node.clone(), changes).await
+    },)?;
 
     let objects = cache::objects(&b.objects);
     objects.trees.insert_many(trees.into_iter().map(|(_, id, tree)| {
@@ -278,7 +274,7 @@ async fn check_blobs(b: &Backend, ids: &[ObjectId]) -> OpResult<()> {
 /// components) to the tree `base`. Returns the new tree id, or `None` if the
 /// directory ends up empty. New trees are appended to `out`.
 fn apply(
-    directories: &mut super::land::Directories,
+    directories: &mut super::tree_edit::Directories,
     base: Option<ObjectId>,
     edits: &[(Vec<&str>, Edit)],
     depth: usize,
@@ -370,44 +366,13 @@ fn apply(
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use crate::ops::OpError;
+    use crate::ops::test_support::{commit, delete, read, sig, write};
     use ant_core::{EncodedObject, ObjectKind};
     use ant_store::graph::{diff_trees, lookup_path};
     use ant_store::{ChangeKind, ObjectStoreExt};
-
-    pub fn sig() -> Signature {
-        Signature { name: "agent".into(), email: "a@x".into(), time: 1_700_000_000, tz_offset_minutes: 0 }
-    }
-
-    pub fn write(path: &str, content: &str) -> FileOp {
-        FileOp::Write {
-            path: RepoPath::new(path).unwrap(),
-            mode: EntryMode::File,
-            content: WriteContent::Inline(Bytes::copy_from_slice(content.as_bytes())),
-        }
-    }
-
-    pub fn delete(path: &str) -> FileOp {
-        FileOp::Delete { path: RepoPath::new(path).unwrap() }
-    }
-
-    pub async fn commit(b: &Backend, base: Option<ObjectId>, ops: Vec<FileOp>) -> OpResult<ObjectId> {
-        create_changeset(
-            b,
-            ChangesetRequest { base, ops, author: sig(), committer: None, message: "msg\n".into() },
-        )
-        .await
-    }
-
-    pub async fn read(b: &Backend, commit_id: ObjectId, path: &str) -> Option<String> {
-        let c = b.objects.read_commit(&commit_id).await.unwrap();
-        let (mode, id) =
-            lookup_path(b.objects.as_ref(), c.tree, &RepoPath::new(path).unwrap()).await.unwrap()?;
-        assert!(mode.is_blob(), "{path} is not a blob");
-        Some(String::from_utf8(b.objects.read_blob(&id).await.unwrap().to_vec()).unwrap())
-    }
 
     #[tokio::test]
     async fn root_commit_and_nested_writes() {
@@ -436,7 +401,12 @@ pub(crate) mod tests {
         assert_eq!(read(&b, c2, "d/y").await.as_deref(), Some("2"));
         let tree = b.objects.read_commit(&c2).await.unwrap().tree;
         // "e" became empty and must be gone entirely.
-        assert!(lookup_path(b.objects.as_ref(), tree, &RepoPath::new("e").unwrap()).await.unwrap().is_none());
+        assert!(
+            lookup_path(b.objects.as_ref(), tree, &RepoPath::new("e").unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let cs = b.meta.get_changeset(&c2).await.unwrap().unwrap();
         let kinds: Vec<_> = cs.iter().map(|c| (c.path.as_str(), c.kind)).collect();
@@ -559,7 +529,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn many_files_wide_directory() {
         let b = Backend::in_memory();
-        let ops: Vec<_> = (0..2000).map(|i| write(&format!("w/{:04}/f.rs", i % 100 * 100 + i / 100), "x")).collect();
+        let ops: Vec<_> = (0..2000)
+            .map(|i| write(&format!("w/{:04}/f.rs", i % 100 * 100 + i / 100), "x"))
+            .collect();
         let c = commit(&b, None, ops).await.unwrap();
         assert_eq!(b.meta.get_changeset(&c).await.unwrap().unwrap().len(), 2000);
     }
