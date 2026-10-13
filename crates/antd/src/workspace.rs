@@ -48,7 +48,7 @@
 //! (writes, deletes, removes now-empty dirs), then rewrites the index and
 //! config.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -58,7 +58,7 @@ use std::path::{Path, PathBuf};
 
 use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, RepoPath, Tree, hash_object};
 use ant_store::ObjectStore;
-use ant_store::graph::{diff_trees, lookup_path};
+use ant_store::graph::diff_trees;
 use anyhow::{Context, anyhow, bail};
 use bytes::Bytes;
 use globset::GlobBuilder;
@@ -653,15 +653,20 @@ impl Workspace {
         new_commit: ObjectId,
         new_tree: ObjectId,
     ) -> anyhow::Result<()> {
+        // One diff serves both the landed check and the apply step. Map each
+        // changed path to its new entry (`None` = removed in the new tree).
+        let changes = diff_trees(objects, Some(self.base_tree), Some(new_tree)).await?;
+        let at_new: HashMap<String, Option<(EntryMode, ObjectId)>> =
+            changes.iter().map(|ch| (ch.path.as_str().to_string(), ch.new)).collect();
+
         // Every local change must already be present, identically, in the new tree.
         let local = self.status(objects).await?;
         let mut dirty = Vec::new();
         for c in &local {
-            let at_new = lookup_path(objects, new_tree, &c.path).await?;
             let landed = match (c.kind, c.new) {
-                // Deleted locally: fine if the new tree has no file there.
-                (LocalChangeKind::Deleted, _) => !matches!(at_new, Some((m, _)) if !m.is_tree()),
-                (_, Some(new)) => at_new == Some(new),
+                // Deleted locally: landed only if the new tree removed the file.
+                (LocalChangeKind::Deleted, _) => at_new.get(c.path.as_str()) == Some(&None),
+                (_, Some(new)) => at_new.get(c.path.as_str()) == Some(&Some(new)),
                 (_, None) => false,
             };
             if !landed {
@@ -675,7 +680,7 @@ impl Workspace {
         let matcher = self.sparse.compile()?;
         let mut removals = Vec::new();
         let mut writes = Vec::new();
-        for ch in diff_trees(objects, Some(self.base_tree), Some(new_tree)).await? {
+        for ch in changes {
             if !matcher.matches(&ch.path) {
                 continue;
             }
@@ -685,18 +690,40 @@ impl Workspace {
             }
         }
 
+        // Landed local changes outside the sparse scope are not touched on disk,
+        // so fold them into the index: a landed deletion drops its entry, and a
+        // landed add/modify is indexed from its current stat. Otherwise status()
+        // would keep reporting them and submit would resend them.
+        let mut out_removed = Vec::new();
+        let mut out_added = Vec::new();
+        for c in &local {
+            if matcher.matches(&c.path) {
+                continue;
+            }
+            match (c.kind, c.new) {
+                (LocalChangeKind::Deleted, _) => out_removed.push(c.path.as_str().to_string()),
+                (_, Some((mode, id))) => out_added.push((c.path.as_str().to_string(), mode, id)),
+                (_, None) => {}
+            }
+        }
+
         let removed_keys: Vec<String> = removals.iter().map(|p| p.as_str().to_string()).collect();
         let d = self.dir.clone();
         let mut index = tokio::task::spawn_blocking(move || -> anyhow::Result<Index> {
             for p in &removals {
                 remove_leaf(&d, p)?;
             }
-            read_index(&d)
+            let mut index = read_index(&d)?;
+            for key in removed_keys.iter().chain(out_removed.iter()) {
+                index.remove(key);
+            }
+            for (key, mode, id) in out_added {
+                let meta = fs::symlink_metadata(d.join(&key)).with_context(|| format!("statting {key}"))?;
+                index.insert(key, Entry { mode, id, stat: stat_of(&meta) });
+            }
+            Ok(index)
         })
         .await??;
-        for key in &removed_keys {
-            index.remove(key);
-        }
 
         for (key, entry) in write_leaves(objects, &self.dir, &writes).await? {
             match entry {
@@ -896,5 +923,22 @@ mod tests {
         // Dirty change not in the new tree → refuse.
         std::fs::write(dir.join("d"), b"local edit").unwrap();
         assert!(ws.reset_to(objs.as_ref(), C, t1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn reset_to_indexes_landed_out_of_scope_add() {
+        let objs = Arc::new(MemoryObjectStore::default());
+        let t1 = build_tree(objs.as_ref(), &[("a", b"1"), ("b/c", b"2")]).await.unwrap();
+        let t2 = build_tree(objs.as_ref(), &[("a", b"1"), ("b/c", b"2"), ("x", b"landed")]).await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ws");
+        let sparse = Sparse::new(vec!["a".into()]).unwrap();
+        let mut ws = Workspace::materialize(objs.as_ref(), &dir, C, t1, sparse).await.unwrap();
+        // Added outside the sparse scope, identical to the landed tree.
+        std::fs::write(dir.join("x"), b"landed").unwrap();
+        ws.reset_to(objs.as_ref(), C2, t2).await.unwrap();
+        // It must now be indexed, so the workspace is clean and not resent.
+        assert!(ws.status(objs.as_ref()).await.unwrap().is_empty());
+        assert!(!dir.join("b").exists());
     }
 }
