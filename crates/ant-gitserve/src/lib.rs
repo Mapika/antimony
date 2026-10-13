@@ -2,6 +2,7 @@
 //!
 //! TASK (gitserve): SHA-256 upload-pack, shallow and blobless fetches, and
 //! bounded incremental pack streaming. Commits must be recorded in MetaStore.
+mod delta;
 mod pack;
 mod protocol;
 mod select;
@@ -181,7 +182,15 @@ async fn fetch_response(b: Backend, fetch: Fetch) -> Result<Response> {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tx.send(Ok(prefix.into())).await?;
     tokio::spawn(async move {
-        if let Err(error) = pack::send(b, selection.ids, tx.clone()).await {
+        if let Err(error) = pack::send_planned(
+            b,
+            selection.ids,
+            selection.paths,
+            fetch.ofs_delta,
+            tx.clone(),
+        )
+        .await
+        {
             let _ = tx.send(Err(std::io::Error::other(error.to_string()))).await;
         }
     });
