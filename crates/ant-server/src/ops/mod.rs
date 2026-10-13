@@ -19,6 +19,9 @@ pub enum OpError {
     /// Retryable contention (e.g. CAS kept losing).
     #[error("aborted: {0}")]
     Aborted(String),
+    /// The authenticated caller lacks a required permission (`acl`).
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]

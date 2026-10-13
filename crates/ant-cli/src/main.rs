@@ -41,6 +41,14 @@
 //!       resets the workspace to the new tip. Conflict: stdout `conflict`
 //!       followed by one path per line, exit code 2.
 //!   ant mount <rev> <mountpoint>   read-only FUSE view, foreground until SIGINT/SIGTERM
+//!   ant admin reindex-acl <rev> --policy <file> [--full] [--history] <store flags>
+//!       Zone-tag objects for access control straight in the stores (after
+//!       imports / policy path-rule changes). stdout:
+//!       `<commit-id> <trees walked> <trees skipped> <tags written>`.
+//!
+//! `--token` / ANT_TOKEN: bearer token sent on every gRPC and HTTP request
+//! (servers running with `--policy`). `ant import --policy <file>` (or
+//! ANT_POLICY) zone-tags the imported history.
 //!
 //! Workspace commands (status/submit/land) find the workspace by walking up
 //! from the current directory to the first dir containing `.ant/workspace`;

@@ -13,6 +13,8 @@
 //! - `has_many`: `HasObjects`.
 //! - `client()` exposes the raw generated client for other RPCs (refs,
 //!   changesets, land, queries) — the CLI uses it directly.
+//! - `connect_with_token` sends `authorization: Bearer <token>` on every
+//!   RPC and HTTP object request (servers running with an access policy).
 
 use ant_core::{EncodedObject, ObjectId};
 use ant_proto::MAX_MESSAGE_BYTES;
@@ -22,6 +24,9 @@ use ant_store::{ObjectStore, Result, StoreError};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use tonic::metadata::{Ascii, MetadataValue};
+use tonic::service::Interceptor;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
 /// Concurrent HTTP object fetches.
@@ -31,29 +36,62 @@ const RPC_IDS_PER_REQUEST: usize = 4096;
 /// Max total payload bytes per `PutObjects` request.
 const PUT_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
+/// Adds `authorization: Bearer <token>` to every request when set.
+#[derive(Clone, Default)]
+pub struct BearerAuth(Option<MetadataValue<Ascii>>);
+
+impl Interceptor for BearerAuth {
+    fn call(&mut self, mut req: tonic::Request<()>) -> std::result::Result<tonic::Request<()>, tonic::Status> {
+        if let Some(v) = &self.0 {
+            req.metadata_mut().insert("authorization", v.clone());
+        }
+        Ok(req)
+    }
+}
+
+/// The generated client with [`BearerAuth`].
+pub type AntRpcClient = AntClient<InterceptedService<Channel, BearerAuth>>;
+
 #[derive(Clone)]
 pub struct RemoteObjectStore {
-    #[allow(dead_code)]
-    client: AntClient<Channel>,
-    #[allow(dead_code)]
+    client: AntRpcClient,
     http_base: Option<String>,
     http: reqwest::Client,
+    /// `Bearer <token>` for HTTP object reads.
+    authorization: Option<String>,
 }
 
 impl RemoteObjectStore {
     pub async fn connect(grpc_url: &str, http_base: Option<&str>) -> anyhow::Result<Self> {
+        Self::connect_with_token(grpc_url, http_base, None).await
+    }
+
+    /// [`Self::connect`], authenticating every request with `token`.
+    pub async fn connect_with_token(
+        grpc_url: &str,
+        http_base: Option<&str>,
+        token: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let authorization = token.map(|t| format!("Bearer {t}"));
+        let auth = match &authorization {
+            Some(a) => BearerAuth(Some(
+                a.parse().map_err(|_| anyhow::anyhow!("token is not a valid header value"))?,
+            )),
+            None => BearerAuth(None),
+        };
         let channel = Channel::from_shared(grpc_url.to_owned())?.connect().await?;
-        let client = AntClient::new(channel)
+        let client = AntClient::with_interceptor(channel, auth)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
         Ok(Self {
             client,
             http_base: http_base.map(|b| b.trim_end_matches('/').to_owned()),
             http: reqwest::Client::new(),
+            authorization,
         })
     }
 
-    pub fn client(&self) -> AntClient<Channel> {
+    pub fn client(&self) -> AntRpcClient {
         self.client.clone()
     }
 
@@ -62,11 +100,13 @@ impl RemoteObjectStore {
     async fn get_many_http(&self, base: &str, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
         let http = self.http.clone();
         let base = base.to_owned();
+        let auth = self.authorization.clone();
         stream::iter(ids.iter().copied())
             .map(move |id| {
                 let http = http.clone();
                 let url = format!("{base}/o/{}", id.to_hex());
-                async move { fetch_http_object(&http, &url, id).await }
+                let auth = auth.clone();
+                async move { fetch_http_object(&http, &url, auth.as_deref(), id).await }
             })
             .buffered(HTTP_CONCURRENCY)
             .try_collect()
@@ -117,8 +157,17 @@ fn decode_verified(data: Bytes, id: &ObjectId) -> Result<EncodedObject> {
     Ok(obj)
 }
 
-async fn fetch_http_object(http: &reqwest::Client, url: &str, id: ObjectId) -> Result<Option<EncodedObject>> {
-    let resp = http.get(url).send().await.map_err(StoreError::backend)?;
+async fn fetch_http_object(
+    http: &reqwest::Client,
+    url: &str,
+    authorization: Option<&str>,
+    id: ObjectId,
+) -> Result<Option<EncodedObject>> {
+    let mut req = http.get(url);
+    if let Some(a) = authorization {
+        req = req.header(reqwest::header::AUTHORIZATION, a);
+    }
+    let resp = req.send().await.map_err(StoreError::backend)?;
     match resp.status() {
         s if s == reqwest::StatusCode::NOT_FOUND => Ok(None),
         s if s.is_success() => {
