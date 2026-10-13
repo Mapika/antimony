@@ -204,6 +204,7 @@ dependencies = [
  "tonic",
  "tracing",
  "walkdir",
+ "zstd",
 ]
 
 [[package]]

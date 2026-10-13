@@ -14,39 +14,143 @@
 //!   `parking_lot::Mutex<HashMap<ObjectId, Shared future / watch channel>>`
 //!   or similar. (Tested below with a counting upstream.)
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use ant_core::{EncodedObject, ObjectId};
-use ant_store::{ObjectStore, Result};
+use ant_store::{ObjectStore, Result, StoreError};
 use async_trait::async_trait;
+use futures::future::{BoxFuture, FutureExt, Shared};
+use parking_lot::Mutex;
+
+type Fetched = std::result::Result<Arc<HashMap<ObjectId, EncodedObject>>, Arc<String>>;
+type InFlight = Shared<BoxFuture<'static, Fetched>>;
 
 pub struct ReadThrough {
-    #[allow(dead_code)]
     local: Arc<dyn ObjectStore>,
-    #[allow(dead_code)]
     upstream: Arc<dyn ObjectStore>,
+    inflight: Arc<Mutex<HashMap<ObjectId, InFlight>>>,
 }
 
 impl ReadThrough {
     pub fn new(local: Arc<dyn ObjectStore>, upstream: Arc<dyn ObjectStore>) -> Self {
-        let _ = (&local, &upstream);
-        todo!("antd-cache")
+        Self { local, upstream, inflight: Default::default() }
+    }
+
+    /// Fetch `ids` from upstream, verify, and fill the local store. Re-checks
+    /// local first: a previous fetch may have landed after our local miss.
+    async fn fetch(
+        local: Arc<dyn ObjectStore>,
+        upstream: Arc<dyn ObjectStore>,
+        ids: Vec<ObjectId>,
+    ) -> Result<HashMap<ObjectId, EncodedObject>> {
+        let mut out = HashMap::with_capacity(ids.len());
+        let mut missing = Vec::new();
+        for (id, o) in ids.iter().zip(local.get_many(&ids).await?) {
+            match o {
+                Some(o) => {
+                    out.insert(*id, o);
+                }
+                None => missing.push(*id),
+            }
+        }
+        if missing.is_empty() {
+            return Ok(out);
+        }
+        let mut fetched = Vec::new();
+        for (id, o) in missing.iter().zip(upstream.get_many(&missing).await?) {
+            if let Some(o) = o {
+                o.verify(id).map_err(StoreError::backend)?;
+                fetched.push(o.clone());
+                out.insert(*id, o);
+            }
+        }
+        local.put_many(&fetched).await?;
+        Ok(out)
     }
 }
 
 #[async_trait]
 impl ObjectStore for ReadThrough {
     async fn get_many(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
-        let _ = ids;
-        todo!("antd-cache")
+        let mut out = self.local.get_many(ids).await?;
+        let mut misses: Vec<ObjectId> =
+            ids.iter().zip(&out).filter(|(_, o)| o.is_none()).map(|(id, _)| *id).collect();
+        if misses.is_empty() {
+            return Ok(out);
+        }
+        misses.sort_unstable();
+        misses.dedup();
+
+        // Join fetches already in flight; start one batch for the rest.
+        let mut waits: Vec<InFlight> = Vec::new();
+        let mut led = Vec::new();
+        {
+            let mut map = self.inflight.lock();
+            let mut mine = Vec::new();
+            for id in &misses {
+                match map.get(id) {
+                    Some(f) => {
+                        if !waits.iter().any(|w| w.ptr_eq(f)) {
+                            waits.push(f.clone());
+                        }
+                    }
+                    None => mine.push(*id),
+                }
+            }
+            if !mine.is_empty() {
+                let (local, upstream, batch) = (self.local.clone(), self.upstream.clone(), mine.clone());
+                let fut: InFlight = async move {
+                    Self::fetch(local, upstream, batch)
+                        .await
+                        .map(Arc::new)
+                        .map_err(|e| Arc::new(e.to_string()))
+                }
+                .boxed()
+                .shared();
+                for id in &mine {
+                    map.insert(*id, fut.clone());
+                }
+                waits.push(fut);
+                led = mine;
+            }
+        }
+
+        let results = futures::future::join_all(waits).await;
+        if !led.is_empty() {
+            let mut map = self.inflight.lock();
+            for id in &led {
+                map.remove(id);
+            }
+        }
+        let mut found: HashMap<ObjectId, EncodedObject> = HashMap::new();
+        for r in results {
+            let r = r.map_err(|e| StoreError::backend(std::io::Error::other(e.to_string())))?;
+            found.extend(r.iter().map(|(k, v)| (*k, v.clone())));
+        }
+        for (slot, id) in out.iter_mut().zip(ids) {
+            if slot.is_none() {
+                *slot = found.get(id).cloned();
+            }
+        }
+        Ok(out)
     }
+
     async fn put_many(&self, objects: &[EncodedObject]) -> Result<()> {
-        let _ = objects;
-        todo!("antd-cache")
+        self.upstream.put_many(objects).await?;
+        self.local.put_many(objects).await
     }
+
     async fn has_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {
-        let _ = ids;
-        todo!("antd-cache")
+        let mut out = self.local.has_many(ids).await?;
+        let misses: Vec<usize> = (0..ids.len()).filter(|&i| !out[i]).collect();
+        if !misses.is_empty() {
+            let miss_ids: Vec<ObjectId> = misses.iter().map(|&i| ids[i]).collect();
+            for (i, present) in misses.into_iter().zip(self.upstream.has_many(&miss_ids).await?) {
+                out[i] = present;
+            }
+        }
+        Ok(out)
     }
 }
 

@@ -19,55 +19,189 @@
 //! - `ObjectStore::put_many` writes every object (no size check);
 //!   `gc` is the only place that evicts.
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use ant_core::{EncodedObject, ObjectId};
-use ant_store::{ObjectStore, Result};
+use ant_store::{ObjectStore, Result, StoreError};
 use async_trait::async_trait;
+use bytes::Bytes;
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct DiskObjectStore {
-    #[allow(dead_code)]
     root: PathBuf,
-    #[allow(dead_code)]
     max_bytes: u64,
 }
 
 impl DiskObjectStore {
     /// Open (creating directories as needed).
     pub fn open(root: impl AsRef<Path>, max_bytes: u64) -> std::io::Result<Self> {
-        let _ = (root.as_ref(), max_bytes);
-        todo!("antd-cache")
+        let root = root.as_ref().to_path_buf();
+        std::fs::create_dir_all(root.join("objects"))?;
+        std::fs::create_dir_all(root.join("tmp"))?;
+        Ok(Self { root, max_bytes })
     }
 
     pub fn path_for(&self, id: &ObjectId) -> PathBuf {
-        let _ = id;
-        todo!("antd-cache")
+        object_path(&self.root, id)
     }
 
     /// Total bytes on disk under `objects/`.
     pub async fn disk_usage(&self) -> std::io::Result<u64> {
-        todo!("antd-cache")
+        let root = self.root.clone();
+        blocking(move || Ok(scan(&root)?.iter().map(|(_, size, _)| size).sum())).await
     }
 
     /// Evict least-recently-used objects if over budget. Returns bytes freed.
     pub async fn gc(&self) -> std::io::Result<u64> {
-        todo!("antd-cache")
+        let root = self.root.clone();
+        let max = self.max_bytes;
+        blocking(move || {
+            let mut files = scan(&root)?;
+            let mut total: u64 = files.iter().map(|(_, size, _)| size).sum();
+            if total <= max {
+                return Ok(0);
+            }
+            let target = max / 10 * 9 + (max % 10) * 9 / 10;
+            files.sort_by_key(|(_, _, mtime)| *mtime);
+            let mut freed = 0;
+            for (path, size, _) in files {
+                if total <= target {
+                    break;
+                }
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        total -= size;
+                        freed += size;
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotFound => total -= size,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(freed)
+        })
+        .await
     }
+}
+
+fn object_path(root: &Path, id: &ObjectId) -> PathBuf {
+    let hex = id.to_hex();
+    root.join("objects").join(&hex[..2]).join(hex)
+}
+
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T> {
+    tokio::task::spawn_blocking(f).await.map_err(std::io::Error::other)?
+}
+
+/// (path, size, mtime) of every cached object.
+fn scan(root: &Path) -> std::io::Result<Vec<(PathBuf, u64, SystemTime)>> {
+    let mut out = Vec::new();
+    for shard in std::fs::read_dir(root.join("objects"))? {
+        let shard = shard?;
+        if !shard.file_type()?.is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(shard.path())? {
+            let f = f?;
+            // Racing deletions just shrink the result.
+            let Ok(meta) = f.metadata() else { continue };
+            if meta.is_file() {
+                out.push((f.path(), meta.len(), meta.modified()?));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn read_one(path: &Path) -> Option<EncodedObject> {
+    let compressed = match std::fs::read(path) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let decoded = zstd::decode_all(&compressed[..])
+        .ok()
+        .and_then(|raw| EncodedObject::from_bytes(Bytes::from(raw)).ok());
+    match decoded {
+        Some(o) => {
+            if let Ok(f) = std::fs::File::open(path) {
+                let _ = f.set_modified(SystemTime::now());
+            }
+            Some(o)
+        }
+        None => {
+            // Corrupt cache entry: drop it and report a miss.
+            let _ = std::fs::remove_file(path);
+            None
+        }
+    }
+}
+
+fn write_one(root: &Path, id: &ObjectId, obj: &EncodedObject) -> std::io::Result<()> {
+    let dest = object_path(root, id);
+    if dest.exists() {
+        return Ok(());
+    }
+    let compressed = zstd::encode_all(&obj.as_bytes()[..], 1)?;
+    let tmp = root.join("tmp").join(format!(
+        "{}.{}.{}",
+        id.to_hex(),
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, compressed)?;
+    let renamed = match std::fs::rename(&tmp, &dest) {
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            std::fs::create_dir_all(dest.parent().unwrap_or(root))?;
+            std::fs::rename(&tmp, &dest)
+        }
+        r => r,
+    };
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    renamed
 }
 
 #[async_trait]
 impl ObjectStore for DiskObjectStore {
     async fn get_many(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
-        let _ = ids;
-        todo!("antd-cache")
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let root = self.root.clone();
+        let ids = ids.to_vec();
+        blocking(move || Ok(ids.iter().map(|id| read_one(&object_path(&root, id))).collect()))
+            .await
+            .map_err(StoreError::backend)
     }
+
     async fn put_many(&self, objects: &[EncodedObject]) -> Result<()> {
-        let _ = objects;
-        todo!("antd-cache")
+        if objects.is_empty() {
+            return Ok(());
+        }
+        let root = self.root.clone();
+        let objects = objects.to_vec();
+        blocking(move || {
+            for o in &objects {
+                write_one(&root, &o.id(), o)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(StoreError::backend)
     }
+
     async fn has_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {
-        let _ = ids;
-        todo!("antd-cache")
+        let root = self.root.clone();
+        let ids = ids.to_vec();
+        blocking(move || Ok(ids.iter().map(|id| object_path(&root, id).exists()).collect()))
+            .await
+            .map_err(StoreError::backend)
     }
 }
 
