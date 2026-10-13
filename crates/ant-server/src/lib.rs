@@ -6,3 +6,4 @@ pub mod config;
 pub mod http;
 pub mod ops;
 pub mod rpc;
+pub mod serve;

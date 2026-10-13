@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # NOTE: the tree is not yet rustfmt-clean under the default config; this job
+  # reports but does not block until a one-off `cargo fmt` pass lands.
+  fmt:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Fast tier: no external services. The FUSE mount tests in ant-fuse need
+  # /dev/fuse and fusermount3 (present on GitHub-hosted runners after
+  # installing fuse3).
+  test-fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: sudo apt-get update && sudo apt-get install -y fuse3
+      - name: Choose FUSE filter
+        run: |
+          if [ -c /dev/fuse ]; then
+            echo "NEXTEST_FILTER=all()" >> "$GITHUB_ENV"
+          else
+            echo "::warning::/dev/fuse unavailable: skipping FUSE tests"
+            echo "NEXTEST_FILTER=not package(ant-fuse)" >> "$GITHUB_ENV"
+          fi
+      - run: cargo nextest run --workspace -E "$NEXTEST_FILTER"
+
+  # Full tier: Postgres + SeaweedFS from docker-compose.yml (SeaweedFS needs
+  # command-line arguments, which GitHub service containers cannot pass; the
+  # tests expect Postgres on :54329 and S3 on :9009, exactly what compose maps).
+  test-full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: sudo apt-get update && sudo apt-get install -y fuse3 git
+      - name: Start Postgres and SeaweedFS
+        run: |
+          docker compose up -d --wait postgres s3
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null http://localhost:9009 && break
+            sleep 1
+          done
+      - name: Choose FUSE filter
+        run: |
+          # /dev/fuse (and the ability to mount) is required by ant-fuse and
+          # `cli_lazy_end_to_end`; skip them when the runner lacks it.
+          if [ -c /dev/fuse ]; then
+            echo "NEXTEST_FILTER=not test(history_bench_postgres)" >> "$GITHUB_ENV"
+          else
+            echo "::warning::/dev/fuse unavailable: skipping FUSE tests"
+            echo "NEXTEST_FILTER=not test(history_bench_postgres) and not package(ant-fuse) and not test(cli_lazy_end_to_end)" >> "$GITHUB_ENV"
+          fi
+      - run: cargo nextest run --workspace --run-ignored all -E "$NEXTEST_FILTER"

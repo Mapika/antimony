@@ -228,19 +228,6 @@ fn strs(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
-fn cargo_build_server() -> PathBuf {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let st = Command::new(cargo)
-        .args(["build", "-p", "ant-server"])
-        .status()
-        .expect("running cargo build");
-    assert!(st.success(), "cargo build -p ant-server failed");
-    let ant = PathBuf::from(env!("CARGO_BIN_EXE_ant"));
-    let server = ant.parent().expect("bin dir").join("ant-server");
-    assert!(server.exists(), "ant-server not found at {server:?}");
-    server
-}
-
 #[test]
 #[ignore = "needs docker compose up -d"]
 fn cli_end_to_end() {
@@ -259,7 +246,6 @@ fn run_end_to_end(lazy: bool) {
     let schema = format!("e2e_{uniq}");
     let prefix = format!("e2e/{uniq}/");
 
-    let server_bin = cargo_build_server();
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
 
@@ -309,7 +295,8 @@ fn run_end_to_end(lazy: bool) {
     let tip = tip.to_string();
 
     // ---- server ----
-    let mut cmd = Command::new(&server_bin);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ant"));
+    cmd.arg("serve");
     cmd.args([
         "--grpc-listen",
         &format!("127.0.0.1:{grpc_port}"),

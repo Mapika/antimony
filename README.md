@@ -44,13 +44,13 @@ clients are always online, history lives on the server, and nobody pushes.
 
 ```sh
 docker compose up -d                      # Postgres + S3-compatible store (SeaweedFS)
-cargo build --release
+cargo build --release                     # one binary: target/release/ant (server + client)
 
 STORE="--pg-url postgres://ant:ant@localhost:54329/ant \
   --s3-endpoint http://localhost:9009 --s3-bucket ant --s3-access-key x --s3-secret-key x"
 
-./target/release/ant import /path/to/git/repo --git-ref refs/heads/main --ref main $STORE
-./target/release/ant-server $STORE &      # gRPC :7420, HTTP :7421
+ant import /path/to/git/repo --git-ref refs/heads/main --ref main $STORE
+ant serve $STORE &                        # gRPC :7420, HTTP :7421 (--memory for a throwaway server)
 
 ant ls main:src
 ant log main -n 5
@@ -60,6 +60,23 @@ ant status && ant submit -m "fix" && ant land   # exit code 2 on conflict
 
 git clone http://127.0.0.1:7421/repo.git      # humans and IDEs
 ```
+
+One binary, `ant`, is both the server and the client; the standalone
+`ant-server` binary is a thin wrapper around `ant serve`. Clients find the
+server via `ANT_SERVER` (default `http://127.0.0.1:7420`).
+`ant completions <bash|zsh|fish|...>` prints a shell completion script.
+
+### Docker
+
+```sh
+docker build -t antimony .                       # one image, entrypoint `ant`
+docker compose --profile server up -d --build    # postgres + s3 + `ant serve` on :7420/:7421
+ANT_SERVER=http://127.0.0.1:7420 ant ref list
+```
+
+The image is `debian:bookworm-slim` + `fuse3`. Containers that use FUSE mounts
+need `--device /dev/fuse --cap-add SYS_ADMIN`. Any `ant` command works as the
+container command, e.g. `docker run antimony import ...`.
 
 ## Status
 
@@ -73,7 +90,7 @@ indexed path history and blame, writable lazy
 
 ## Access control and threat model
 
-`ant-server --policy policy.toml` (or `ANT_POLICY`) turns on access control;
+`ant serve --policy policy.toml` (or `ANT_POLICY`) turns on access control;
 without it the server runs in open mode and logs a warning. The policy
 format (principals with SHA-256-hashed bearer tokens, longest-prefix path
 rules, ref rules, admins) is documented in `crates/ant-auth`. Clients send

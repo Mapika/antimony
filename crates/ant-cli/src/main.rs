@@ -70,6 +70,18 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+/// A one-line hint for failures with an obvious remedy.
+fn hint_for(e: &anyhow::Error) -> Option<&'static str> {
+    let first = e.to_string();
+    if first.starts_with("connecting to ") {
+        Some("is `ant serve` running? set ANT_SERVER (or --server) to its gRPC url")
+    } else if first.contains("HOME is not set") {
+        Some("pass --cache <dir> or set ANT_CACHE")
+    } else {
+        None
+    }
+}
+
 fn main() -> ExitCode {
     let cli = args::Cli::parse();
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
@@ -92,6 +104,9 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("error: {e:#}");
+            if let Some(hint) = hint_for(&e) {
+                eprintln!("hint: {hint}");
+            }
             1
         }
     };
