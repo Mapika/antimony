@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use ant_store::packed::PackedS3Store;
 use ant_store::postgres::PgStore;
 use ant_store::s3::{S3Config, S3ObjectStore};
 use ant_store::tiered::{DEFAULT_INLINE_THRESHOLD, TieredObjectStore};
@@ -106,9 +107,11 @@ impl StoreArgs {
                     Some(cfg) => {
                         let s3 = S3ObjectStore::connect(&cfg).await.context("configuring S3")?;
                         s3.ensure_bucket().await.context("ensuring S3 bucket")?;
+                        // Large objects are bundled into S3 packs indexed in Postgres.
+                        let packed = PackedS3Store::new(pg.as_ref().clone(), s3);
                         Arc::new(TieredObjectStore::new(
                             pg.clone(),
-                            Arc::new(s3),
+                            Arc::new(packed),
                             self.inline_threshold,
                         ))
                     }

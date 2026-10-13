@@ -27,6 +27,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use sqlx::Row;
 
+use crate::changeset_codec;
+
 use crate::{
     CasOutcome, ChangeKind, CommitNode, MetaStore, ObjectStore, PathChange, RefStore, Result,
     StoreError, validate_ref_name,
@@ -35,9 +37,26 @@ use crate::{
 /// Compression level for stored object bodies (matches the S3 store).
 const ZSTD_LEVEL: i32 = 3;
 
+/// Environment switch for bulk loads: object inserts commit without waiting for
+/// the WAL flush (see [`PgStore::with_async_object_commit`]).
+pub const BULK_ENV: &str = "ANT_PG_BULK";
+
+/// Location of a packed object: `len` bytes at `off` of pack `pack`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IndexEntry {
+    pub id: ObjectId,
+    pub pack: [u8; 16],
+    pub off: u64,
+    pub len: u32,
+}
+
+/// Uncompressed bytes of objects hashed and compressed per blocking task.
+const COMPRESS_CHUNK_BYTES: usize = 512 * 1024;
+
 #[derive(Clone)]
 pub struct PgStore {
     pool: sqlx::PgPool,
+    async_object_commit: bool,
 }
 
 /// Quote a SQL identifier, doubling any embedded double quotes.
@@ -47,14 +66,6 @@ fn quote_ident(name: &str) -> String {
 
 fn be(e: impl std::error::Error + Send + Sync + 'static) -> StoreError {
     StoreError::backend(e)
-}
-
-fn change_kind_code(k: ChangeKind) -> i16 {
-    match k {
-        ChangeKind::Added => 0,
-        ChangeKind::Modified => 1,
-        ChangeKind::Deleted => 2,
-    }
 }
 
 fn change_kind_from_code(c: i16) -> Result<ChangeKind> {
@@ -94,44 +105,121 @@ fn ids_to_vecs(ids: &[ObjectId]) -> Vec<Vec<u8>> {
     ids.iter().map(|id| id.as_bytes().to_vec()).collect()
 }
 
-/// Changeset rows for a batch of commits, as parallel arrays for `unnest`.
-#[derive(Default)]
-struct ChangeRows<'a> {
-    commit_ids: Vec<&'a [u8]>,
-    idx: Vec<i32>,
-    paths: Vec<&'a str>,
-    kinds: Vec<i16>,
-    old_modes: Vec<Option<&'static str>>,
-    old_ids: Vec<Option<&'a [u8]>>,
-    new_modes: Vec<Option<&'static str>>,
-    new_ids: Vec<Option<&'a [u8]>>,
-}
-
-impl<'a> ChangeRows<'a> {
-    fn new(commits: impl Iterator<Item = (&'a ObjectId, &'a [PathChange])>) -> Self {
-        let mut rows = Self::default();
-        for (id, changes) in commits {
-            for (i, c) in changes.iter().enumerate() {
-                rows.commit_ids.push(id.as_bytes().as_slice());
-                rows.idx.push(i as i32);
-                rows.paths.push(c.path.as_str());
-                rows.kinds.push(change_kind_code(c.kind));
-                rows.old_modes.push(c.old.as_ref().map(|(m, _)| m.as_octal()));
-                rows.old_ids.push(c.old.as_ref().map(|(_, id)| id.as_bytes().as_slice()));
-                rows.new_modes.push(c.new.as_ref().map(|(m, _)| m.as_octal()));
-                rows.new_ids.push(c.new.as_ref().map(|(_, id)| id.as_bytes().as_slice()));
-            }
-        }
-        rows
-    }
-}
-
 impl PgStore {
+    /// Commit object inserts with `synchronous_commit = off` (also enabled by the
+    /// `ANT_PG_BULK` environment variable at connect time).
+    ///
+    /// Objects are immutable and content-addressed, so a crash can at worst
+    /// lose objects whose insert returned a moment ago; Postgres flushes WAL in
+    /// order, so any later synchronous commit (the commit records and ref
+    /// updates that reference those objects) makes them durable first. A
+    /// writer that records commits only after storing their objects (as the
+    /// importer and the server do) therefore keeps its guarantees while bulk
+    /// loads skip one fsync per batch.
+    pub fn with_async_object_commit(mut self, on: bool) -> Self {
+        self.async_object_commit = on;
+        self
+    }
+
+    /// Record where objects live inside packs; first writer wins (identical content).
+    pub(crate) async fn index_objects(&self, entries: &[IndexEntry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut sorted: Vec<&IndexEntry> = entries.iter().collect();
+        sorted.sort_unstable_by_key(|e| e.id);
+        sorted.dedup_by_key(|e| e.id);
+        let ids: Vec<&[u8]> = sorted.iter().map(|e| e.id.as_bytes().as_slice()).collect();
+        let packs: Vec<&[u8]> = sorted.iter().map(|e| e.pack.as_slice()).collect();
+        let offs: Vec<i64> = sorted.iter().map(|e| e.off as i64).collect();
+        let lens: Vec<i32> = sorted.iter().map(|e| e.len as i32).collect();
+        let insert = sqlx::query(
+            "INSERT INTO object_index (id, pack, off, len) \
+             SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::bigint[], $4::integer[]) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&ids)
+        .bind(&packs)
+        .bind(&offs)
+        .bind(&lens);
+        if self.async_object_commit {
+            let mut tx = self.pool.begin().await.map_err(be)?;
+            sqlx::query("SET LOCAL synchronous_commit = off")
+                .execute(&mut *tx)
+                .await
+                .map_err(be)?;
+            insert.execute(&mut *tx).await.map_err(be)?;
+            tx.commit().await.map_err(be)?;
+        } else {
+            insert.execute(&self.pool).await.map_err(be)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn lookup_index(
+        &self,
+        ids: &[ObjectId],
+    ) -> Result<HashMap<ObjectId, IndexEntry>> {
+        let rows = sqlx::query("SELECT id, pack, off, len FROM object_index WHERE id = ANY($1)")
+            .bind(ids_to_vecs(ids))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(be)?;
+        let mut out = HashMap::with_capacity(rows.len());
+        for r in &rows {
+            let id = object_id_col(r, "id")?;
+            let pack: Vec<u8> = r.try_get("pack").map_err(be)?;
+            let pack: [u8; 16] = pack
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::InvalidArgument("corrupt pack id".into()))?;
+            let off: i64 = r.try_get("off").map_err(be)?;
+            let len: i32 = r.try_get("len").map_err(be)?;
+            out.insert(id, IndexEntry { id, pack, off: off as u64, len: len as u32 });
+        }
+        Ok(out)
+    }
+
+    /// Changesets stored as one row per path (databases written by earlier versions).
+    async fn legacy_changesets(
+        &self,
+        ids: &[ObjectId],
+    ) -> Result<HashMap<ObjectId, Vec<PathChange>>> {
+        let rows = sqlx::query(
+            "SELECT commit_id, path, kind, old_mode, old_id, new_mode, new_id FROM changes \
+             WHERE commit_id = ANY($1) ORDER BY commit_id, idx",
+        )
+        .bind(ids_to_vecs(ids))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(be)?;
+        let mut map: HashMap<ObjectId, Vec<PathChange>> =
+            ids.iter().map(|id| (*id, Vec::new())).collect();
+        for r in &rows {
+            let id = object_id_col(r, "commit_id")?;
+            let path: String = r.try_get("path").map_err(be)?;
+            map.entry(id).or_default().push(PathChange {
+                path: RepoPath::new(path)?,
+                kind: change_kind_from_code(r.try_get("kind").map_err(be)?)?,
+                old: change_side(
+                    r.try_get("old_mode").map_err(be)?,
+                    r.try_get("old_id").map_err(be)?,
+                )?,
+                new: change_side(
+                    r.try_get("new_mode").map_err(be)?,
+                    r.try_get("new_id").map_err(be)?,
+                )?,
+            });
+        }
+        Ok(map)
+    }
+
     /// Connect and ensure `schema` and all tables exist.
     pub async fn connect(url: &str, schema: &str) -> Result<Self> {
         use sqlx::Connection;
 
         let qs = quote_ident(schema);
+        let ql = qs.replace('\'', "''");
 
         // Create the schema and tables under a transaction-scoped advisory lock
         // so concurrent connects to a fresh schema do not race on the catalog.
@@ -148,6 +236,14 @@ impl PgStore {
                 "CREATE TABLE IF NOT EXISTS {qs}.objects (\
                     id bytea PRIMARY KEY, \
                     data bytea NOT NULL)"
+            ),
+            // Where large objects live inside S3 packs (see `crate::packed`).
+            format!(
+                "CREATE TABLE IF NOT EXISTS {qs}.object_index (\
+                    id bytea PRIMARY KEY, \
+                    pack bytea NOT NULL, \
+                    off bigint NOT NULL, \
+                    len integer NOT NULL)"
             ),
             format!(
                 "CREATE TABLE IF NOT EXISTS {qs}.refs (\
@@ -178,6 +274,43 @@ impl PgStore {
                     new_mode text, \
                     new_id bytea, \
                     PRIMARY KEY (commit_id, idx))"
+            ),
+            format!(
+                "CREATE TABLE IF NOT EXISTS {qs}.changesets (\
+                    commit_id bytea PRIMARY KEY, \
+                    data bytea NOT NULL)"
+            ),
+            // Object bodies and changesets are already compressed: store them
+            // out of line without Postgres trying (and failing) to compress them.
+            // Guarded: these ALTERs take heavy locks, so run them only once.
+            format!(
+                "DO $$ BEGIN \
+                 IF (SELECT attstorage FROM pg_attribute \
+                     WHERE attrelid = '{ql}.objects'::regclass AND attname = 'data') <> 'e' THEN \
+                   ALTER TABLE {qs}.objects ALTER COLUMN data SET STORAGE EXTERNAL; \
+                 END IF; \
+                 IF (SELECT attstorage FROM pg_attribute \
+                     WHERE attrelid = '{ql}.changesets'::regclass AND attname = 'data') <> 'e' THEN \
+                   ALTER TABLE {qs}.changesets ALTER COLUMN data SET STORAGE EXTERNAL; \
+                 END IF; \
+                 END $$"
+            ),
+            // Insert-only tables: vacuum when they have doubled, not every 20%.
+            format!(
+                "DO $$ BEGIN \
+                 IF (SELECT reloptions IS NULL FROM pg_class \
+                     WHERE oid = '{ql}.objects'::regclass) THEN \
+                   ALTER TABLE {qs}.objects SET (autovacuum_vacuum_insert_scale_factor = 1.0, \
+                     autovacuum_vacuum_insert_threshold = 200000, \
+                     toast.autovacuum_vacuum_insert_scale_factor = 1.0, \
+                     toast.autovacuum_vacuum_insert_threshold = 200000); \
+                 END IF; \
+                 IF (SELECT reloptions IS NULL FROM pg_class \
+                     WHERE oid = '{ql}.changesets'::regclass) THEN \
+                   ALTER TABLE {qs}.changesets SET (autovacuum_vacuum_insert_scale_factor = 1.0, \
+                     autovacuum_vacuum_insert_threshold = 200000); \
+                 END IF; \
+                 END $$"
             ),
             format!(
                 "CREATE TABLE IF NOT EXISTS {qs}.derived (\
@@ -229,7 +362,8 @@ impl PgStore {
             .await
             .map_err(be)?;
 
-        Ok(Self { pool })
+        let async_object_commit = std::env::var(BULK_ENV).is_ok_and(|v| !v.is_empty() && v != "0");
+        Ok(Self { pool, async_object_commit })
     }
 }
 
@@ -268,31 +402,61 @@ impl ObjectStore for PgStore {
         if objects.is_empty() {
             return Ok(());
         }
-        let mut owned: Vec<(Vec<u8>, Bytes)> =
-            objects.iter().map(|o| (o.id().as_bytes().to_vec(), o.as_bytes().clone())).collect();
+        // Hash and compress on the blocking pool, in parallel chunks.
+        let mut chunks: Vec<Vec<EncodedObject>> = Vec::new();
+        let (mut current, mut bytes) = (Vec::new(), 0usize);
+        for o in objects {
+            bytes += o.as_bytes().len();
+            current.push(o.clone());
+            if bytes >= COMPRESS_CHUNK_BYTES {
+                chunks.push(std::mem::take(&mut current));
+                bytes = 0;
+            }
+        }
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+        let tasks = chunks.into_iter().map(|chunk| {
+            tokio::task::spawn_blocking(move || -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+                chunk
+                    .into_iter()
+                    .map(|raw| {
+                        let id = raw.id();
+                        Ok((
+                            id.as_bytes().to_vec(),
+                            zstd::encode_all(&raw.as_bytes()[..], ZSTD_LEVEL).map_err(be)?,
+                        ))
+                    })
+                    .collect()
+            })
+        });
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(objects.len());
+        for part in futures::future::try_join_all(tasks).await.map_err(be)? {
+            rows.extend(part?);
+        }
         // Insert in key order so concurrent batches sharing objects take row
         // locks in the same order; arrival order deadlocks (found importing
         // the Linux kernel with concurrent writers).
-        owned.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        owned.dedup_by(|a, b| a.0 == b.0);
-        let (ids, data): (Vec<Vec<u8>>, Vec<Vec<u8>>) = tokio::task::spawn_blocking(move || {
-            owned
-                .into_iter()
-                .map(|(id, bytes)| Ok((id, zstd::encode_all(&bytes[..], ZSTD_LEVEL).map_err(be)?)))
-                .collect::<Result<Vec<_>>>()
-                .map(|v| v.into_iter().unzip())
-        })
-        .await
-        .map_err(be)??;
-        sqlx::query(
+        rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        rows.dedup_by(|a, b| a.0 == b.0);
+        let (ids, data): (Vec<Vec<u8>>, Vec<Vec<u8>>) = rows.into_iter().unzip();
+        let insert = sqlx::query(
             "INSERT INTO objects (id, data) SELECT * FROM unnest($1::bytea[], $2::bytea[]) \
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(&ids)
-        .bind(&data)
-        .execute(&self.pool)
-        .await
-        .map_err(be)?;
+        .bind(&data);
+        if self.async_object_commit {
+            let mut tx = self.pool.begin().await.map_err(be)?;
+            sqlx::query("SET LOCAL synchronous_commit = off")
+                .execute(&mut *tx)
+                .await
+                .map_err(be)?;
+            insert.execute(&mut *tx).await.map_err(be)?;
+            tx.commit().await.map_err(be)?;
+        } else {
+            insert.execute(&self.pool).await.map_err(be)?;
+        }
         Ok(())
     }
 
@@ -603,32 +767,29 @@ impl MetaStore for PgStore {
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            "SELECT c.id AS id, ch.path AS path, ch.kind AS kind, ch.old_mode AS old_mode, \
-                    ch.old_id AS old_id, ch.new_mode AS new_mode, ch.new_id AS new_id \
-             FROM commits c LEFT JOIN changes ch ON ch.commit_id = c.id \
-             WHERE c.id = ANY($1) ORDER BY c.id, ch.idx",
+            "SELECT c.id AS id, cs.data AS data \
+             FROM commits c LEFT JOIN changesets cs ON cs.commit_id = c.id \
+             WHERE c.id = ANY($1)",
         )
         .bind(ids_to_vecs(ids))
         .fetch_all(&self.pool)
         .await
         .map_err(be)?;
-        let mut map: HashMap<ObjectId, Vec<PathChange>> = HashMap::new();
+        let mut map: HashMap<ObjectId, Vec<PathChange>> = HashMap::with_capacity(rows.len());
+        // Commits recorded before changesets were stored as one blob keep
+        // their per-path rows in `changes`.
+        let mut legacy: Vec<ObjectId> = Vec::new();
         for r in &rows {
-            let entry = map.entry(object_id_col(r, "id")?).or_default();
-            let path: Option<String> = r.try_get("path").map_err(be)?;
-            let Some(path) = path else { continue };
-            entry.push(PathChange {
-                path: RepoPath::new(path)?,
-                kind: change_kind_from_code(r.try_get("kind").map_err(be)?)?,
-                old: change_side(
-                    r.try_get("old_mode").map_err(be)?,
-                    r.try_get("old_id").map_err(be)?,
-                )?,
-                new: change_side(
-                    r.try_get("new_mode").map_err(be)?,
-                    r.try_get("new_id").map_err(be)?,
-                )?,
-            });
+            let id = object_id_col(r, "id")?;
+            match r.try_get::<Option<Vec<u8>>, _>("data").map_err(be)? {
+                Some(data) => {
+                    map.insert(id, changeset_codec::decode(&data)?);
+                }
+                None => legacy.push(id),
+            }
+        }
+        if !legacy.is_empty() {
+            map.extend(self.legacy_changesets(&legacy).await?);
         }
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
@@ -653,7 +814,8 @@ impl MetaStore for PgStore {
             .collect();
         let gens: Vec<i64> = unique.iter().map(|(n, _)| n.generation as i64).collect();
         let times: Vec<i64> = unique.iter().map(|(n, _)| n.committer_time).collect();
-        let rows = ChangeRows::new(unique.iter().map(|(n, c)| (&n.id, c.as_slice())));
+        let changesets: Vec<Vec<u8>> =
+            unique.iter().map(|(_, c)| changeset_codec::encode(c)).collect::<Result<_>>()?;
 
         // One atomic statement (no explicit transaction round trips): insert
         // the new nodes, append them to the log in input order (parents
@@ -673,13 +835,12 @@ impl MetaStore for PgStore {
                  SELECT input.id FROM input JOIN ins ON ins.id = input.id ORDER BY input.ord \
                  RETURNING commit_id, seq), \
              ch AS ( \
-                 INSERT INTO changes \
-                     (commit_id, idx, path, kind, old_mode, old_id, new_mode, new_id) \
-                 SELECT c.* FROM unnest($6::bytea[], $7::integer[], $8::text[], \
-                                        $9::smallint[], $10::text[], $11::bytea[], \
-                                        $12::text[], $13::bytea[]) \
-                     AS c(commit_id, idx, path, kind, old_mode, old_id, new_mode, new_id) \
-                 WHERE c.commit_id IN (SELECT id FROM ins)) \
+                 INSERT INTO changesets (commit_id, data) \
+                 SELECT input.id, cs.data \
+                 FROM input JOIN ins ON ins.id = input.id \
+                      JOIN unnest($6::bytea[]) WITH ORDINALITY AS cs(data, ord) \
+                        ON cs.ord = input.ord \
+                 ORDER BY input.ord) \
              SELECT commit_id, seq FROM lg \
              UNION ALL \
              SELECT commit_id, seq FROM log \
@@ -690,14 +851,7 @@ impl MetaStore for PgStore {
         .bind(&parents)
         .bind(&gens)
         .bind(&times)
-        .bind(&rows.commit_ids)
-        .bind(&rows.idx)
-        .bind(&rows.paths)
-        .bind(&rows.kinds)
-        .bind(&rows.old_modes)
-        .bind(&rows.old_ids)
-        .bind(&rows.new_modes)
-        .bind(&rows.new_ids)
+        .bind(&changesets)
         .fetch_all(&self.pool)
         .await
         .map_err(be)?;
@@ -770,34 +924,7 @@ impl MetaStore for PgStore {
     }
 
     async fn get_changeset(&self, id: &ObjectId) -> Result<Option<Vec<PathChange>>> {
-        let exists = sqlx::query("SELECT 1 FROM commits WHERE id = $1")
-            .bind(id.as_bytes().as_slice())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(be)?;
-        if exists.is_none() {
-            return Ok(None);
-        }
-        let rows = sqlx::query(
-            "SELECT path, kind, old_mode, old_id, new_mode, new_id FROM changes \
-             WHERE commit_id = $1 ORDER BY idx",
-        )
-        .bind(id.as_bytes().as_slice())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(be)?;
-        let side = change_side;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in &rows {
-            let path: String = r.try_get("path").map_err(be)?;
-            out.push(PathChange {
-                path: RepoPath::new(path)?,
-                kind: change_kind_from_code(r.try_get("kind").map_err(be)?)?,
-                old: side(r.try_get("old_mode").map_err(be)?, r.try_get("old_id").map_err(be)?)?,
-                new: side(r.try_get("new_mode").map_err(be)?, r.try_get("new_id").map_err(be)?)?,
-            });
-        }
-        Ok(Some(out))
+        Ok(self.get_changesets(std::slice::from_ref(id)).await?.pop().flatten())
     }
 
     async fn tail(&self, after: u64, limit: usize) -> Result<Vec<(u64, ObjectId)>> {
@@ -963,6 +1090,85 @@ mod tests {
         a.cas_ref("main", None, Some(ObjectId([1; 32]))).await.unwrap();
         let b = PgStore::connect(&url, &schema).await.unwrap();
         assert_eq!(b.get_ref("main").await.unwrap(), Some(ObjectId([1; 32])));
+    }
+
+    /// Commits recorded before changesets became one blob per commit still
+    /// read back from their per-path `changes` rows.
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_reads_legacy_per_path_changesets() {
+        let s = fresh().await;
+        let legacy = ObjectId([7; 32]);
+        sqlx::query(
+            "INSERT INTO commits (id, tree, parents, generation, committer_time) \
+             VALUES ($1, $2, ''::bytea, 1, 5)",
+        )
+        .bind(legacy.as_bytes().as_slice())
+        .bind(ObjectId::empty_tree().as_bytes().as_slice())
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO log (commit_id) VALUES ($1)")
+            .bind(legacy.as_bytes().as_slice())
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        let blob = ObjectId([8; 32]);
+        for (i, path) in ["a.txt", "b/c.txt"].into_iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO changes (commit_id, idx, path, kind, old_mode, old_id, new_mode, new_id) \
+                 VALUES ($1, $2, $3, 0, NULL, NULL, '100644', $4)",
+            )
+            .bind(legacy.as_bytes().as_slice())
+            .bind(i as i32)
+            .bind(path)
+            .bind(blob.as_bytes().as_slice())
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        // A commit with no changes at all, also legacy.
+        let bare = ObjectId([9; 32]);
+        sqlx::query(
+            "INSERT INTO commits (id, tree, parents, generation, committer_time) \
+             VALUES ($1, $2, $3, 2, 6)",
+        )
+        .bind(bare.as_bytes().as_slice())
+        .bind(ObjectId::empty_tree().as_bytes().as_slice())
+        .bind(legacy.as_bytes().as_slice())
+        .execute(&s.pool)
+        .await
+        .unwrap();
+
+        let want = vec![
+            PathChange {
+                path: RepoPath::new("a.txt").unwrap(),
+                kind: ChangeKind::Added,
+                old: None,
+                new: Some((EntryMode::File, blob)),
+            },
+            PathChange {
+                path: RepoPath::new("b/c.txt").unwrap(),
+                kind: ChangeKind::Added,
+                old: None,
+                new: Some((EntryMode::File, blob)),
+            },
+        ];
+        assert_eq!(s.get_changeset(&legacy).await.unwrap(), Some(want.clone()));
+        assert_eq!(s.get_changeset(&bare).await.unwrap(), Some(vec![]));
+        assert_eq!(s.get_changeset(&ObjectId([1; 32])).await.unwrap(), None);
+        // Mixed with a new-style commit in one call.
+        let fresh_id = ObjectId([3; 32]);
+        let node = CommitNode {
+            id: fresh_id,
+            tree: ObjectId::empty_tree(),
+            parents: vec![],
+            generation: 1,
+            committer_time: 1,
+        };
+        s.put_commit(node, want.clone()).await.unwrap();
+        let got = s.get_changesets(&[fresh_id, legacy, ObjectId([1; 32]), bare]).await.unwrap();
+        assert_eq!(got, vec![Some(want.clone()), Some(want), None, Some(vec![])]);
     }
 
     #[tokio::test]

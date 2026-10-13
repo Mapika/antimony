@@ -8,9 +8,11 @@
 //!
 //! Every implementation must pass the suites in [`conformance`].
 
+mod changeset_codec;
 pub mod conformance;
 pub mod graph;
 pub mod memory;
+pub mod packed;
 pub mod postgres;
 pub mod s3;
 pub mod tiered;

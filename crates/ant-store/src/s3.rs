@@ -65,6 +65,10 @@ pub struct S3ObjectStore {
     prefix: String,
 }
 
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn corrupt(msg: impl Into<String>) -> StoreError {
     StoreError::Backend(msg.into().into())
 }
@@ -115,6 +119,58 @@ impl S3ObjectStore {
         } else {
             format!("{}/{}/{}", self.prefix.trim_end_matches('/'), &hex[..2], hex)
         }
+    }
+
+    /// Key of pack `pack` (see [`crate::packed`]).
+    pub(crate) fn pack_key(&self, pack: &[u8; 16]) -> String {
+        let hex = hex_string(pack);
+        if self.prefix.is_empty() {
+            format!("packs/{hex}")
+        } else {
+            format!("{}/packs/{hex}", self.prefix.trim_end_matches('/'))
+        }
+    }
+
+    pub(crate) async fn put_raw(&self, key: String, body: Vec<u8>) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(body))
+            .send()
+            .await
+            .map_err(StoreError::backend)?;
+        Ok(())
+    }
+
+    /// `len` bytes at `offset` of object `key`.
+    pub(crate) async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes> {
+        let resp = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(format!("bytes={}-{}", offset, offset + len.max(1) - 1))
+            .send()
+            .await
+            .map_err(StoreError::backend)?;
+        let body = resp.body.collect().await.map_err(StoreError::backend)?.into_bytes();
+        if body.len() as u64 != len {
+            return Err(corrupt(format!(
+                "{key}: short range read ({} of {len} bytes)",
+                body.len()
+            )));
+        }
+        Ok(body)
+    }
+
+    /// Decompress and verify one stored body.
+    pub(crate) fn decode_object(id: ObjectId, compressed: &[u8]) -> Result<EncodedObject> {
+        let raw = zstd::stream::decode_all(compressed).map_err(StoreError::backend)?;
+        let obj = EncodedObject::from_bytes(Bytes::from(raw))
+            .map_err(|e| corrupt(format!("object {id}: {e}")))?;
+        obj.verify(&id).map_err(|e| corrupt(format!("object {id}: {e}")))?;
+        Ok(obj)
     }
 
     async fn get_one(&self, id: ObjectId) -> Result<Option<EncodedObject>> {
@@ -197,16 +253,26 @@ impl ObjectStore for S3ObjectStore {
     }
 
     async fn put_many(&self, objects: &[EncodedObject]) -> Result<()> {
-        let mut seen = HashSet::with_capacity(objects.len());
         // `EncodedObject` clones are cheap (shared `Bytes`); owning the pairs
         // keeps the buffered stream's closure free of higher-ranked borrows.
-        let unique: Vec<(ObjectId, EncodedObject)> = objects
-            .iter()
-            .filter_map(|o| {
-                let id = o.id();
-                seen.insert(id).then(|| (id, o.clone()))
-            })
-            .collect();
+        let owned: Vec<EncodedObject> = objects.to_vec();
+        let hash_all = move || {
+            let mut seen = HashSet::with_capacity(owned.len());
+            owned
+                .into_iter()
+                .filter_map(|o| {
+                    let id = o.id();
+                    seen.insert(id).then_some((id, o))
+                })
+                .collect::<Vec<(ObjectId, EncodedObject)>>()
+        };
+        // Hashing a big batch is CPU-heavy: keep it off the async worker threads.
+        let unique =
+            if objects.iter().map(|o| o.as_bytes().len()).sum::<usize>() > BLOCKING_THRESHOLD {
+                tokio::task::spawn_blocking(hash_all).await.map_err(StoreError::backend)?
+            } else {
+                hash_all()
+            };
         stream::iter(unique)
             .map(|(id, o)| async move { self.put_one(id, &o).await })
             .buffered(FANOUT)
