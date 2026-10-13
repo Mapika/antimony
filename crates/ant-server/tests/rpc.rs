@@ -584,3 +584,16 @@ async fn changeset_rejects_bad_requests() {
         .unwrap_err();
     assert_eq!(err.code(), Code::NotFound);
 }
+
+#[tokio::test]
+async fn blame_rpc() {
+    let mut s = spawn_server().await;
+    let c1 = commit(&mut s, None, vec![write_file("f", "a\nb\n")], "first").await;
+    let c2 = commit(&mut s, Some(c1.clone()), vec![write_file("f", "a\nB\nc\n")], "second").await;
+    s.grpc.land(pb::LandRequest { ref_name: "main".into(), commit: c2.clone() }).await.unwrap();
+    let r = s.grpc.blame(pb::BlameRequest { rev: "main".into(), path: "f".into() }).await.unwrap().into_inner();
+    let got: Vec<_> = r.lines.iter().map(|l| (l.commit.clone(), l.line.as_str())).collect();
+    assert_eq!(got, vec![(c1.clone(), "a"), (c2.clone(), "B"), (c2.clone(), "c")]);
+    let e = s.grpc.blame(pb::BlameRequest { rev: "main".into(), path: "nope".into() }).await.unwrap_err();
+    assert_eq!(e.code(), Code::NotFound);
+}

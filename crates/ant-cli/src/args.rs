@@ -51,6 +51,8 @@ pub enum Command {
         #[arg(long)]
         path: Option<String>,
     },
+    /// Per-line attribution of a file: <rev>:<path>.
+    Blame { target: String },
     /// Changed paths between two revs.
     Diff { from: String, to: String },
     /// Read and update refs.

@@ -30,6 +30,7 @@ use futures::stream::{BoxStream, StreamExt};
 use tonic::{Request, Response, Status};
 
 use crate::ops::changeset::{self, ChangesetRequest, FileOp, WriteContent};
+use crate::ops::history;
 use crate::ops::land::{self, LandOutcome};
 use crate::ops::query;
 use crate::ops::OpError;
@@ -322,7 +323,12 @@ impl Ant for AntService {
             .await
             .map_err(store_status)?;
         Ok(Response::new(match outcome {
-            CasOutcome::Updated => pb::UpdateRefResponse { updated: true, actual: None },
+            CasOutcome::Updated => {
+                if new.is_some() {
+                    history::schedule_catch_up(&self.backend, &req.name);
+                }
+                pb::UpdateRefResponse { updated: true, actual: None }
+            }
             CasOutcome::Mismatch { actual } => pb::UpdateRefResponse {
                 updated: false,
                 actual: actual.map(|a| a.0.to_vec()),
@@ -360,6 +366,11 @@ impl Ant for AntService {
         ant_store::validate_ref_name(&req.ref_name).map_err(store_status)?;
         let commit = parse_id(&req.commit)?;
         let outcome = land::land(&self.backend, &req.ref_name, commit).await.map_err(op_status)?;
+        if matches!(outcome, LandOutcome::Landed { .. }) {
+            // Coalesced per ref, so a burst of lands in one leader batch (or
+            // across batches) costs one background catch-up, not one each.
+            history::schedule_catch_up(&self.backend, &req.ref_name);
+        }
         let outcome = match outcome {
             LandOutcome::Landed { new_tip, rebased } => {
                 pb::land_response::Outcome::Landed(pb::Landed {
@@ -424,6 +435,18 @@ impl Ant for AntService {
             .map_err(op_status)?;
         Ok(Response::new(pb::LogResponse {
             commits: entries.into_iter().map(commit_info_to_pb).collect(),
+        }))
+    }
+
+    async fn blame(&self, request: Request<pb::BlameRequest>) -> Result<Response<pb::BlameResponse>, Status> {
+        let req = request.into_inner();
+        let path = parse_rev_path(&req.path)?;
+        let lines = history::blame(&self.backend, &req.rev, &path).await.map_err(op_status)?;
+        Ok(Response::new(pb::BlameResponse {
+            lines: lines
+                .into_iter()
+                .map(|l| pb::BlameLine { commit: l.commit.0.to_vec(), line: l.line })
+                .collect(),
         }))
     }
 

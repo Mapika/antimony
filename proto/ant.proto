@@ -33,6 +33,7 @@ service Ant {
   rpc ReadPath(ReadPathRequest) returns (ReadPathResponse);
   rpc Log(LogRequest) returns (LogResponse);
   rpc Diff(DiffRequest) returns (DiffResponse);
+  rpc Blame(BlameRequest) returns (BlameResponse);
 }
 
 message GetObjectsRequest { repeated bytes ids = 1; }
@@ -166,6 +167,16 @@ message CommitInfo {
   string message = 7;
 }
 message LogResponse { repeated CommitInfo commits = 1; }
+
+message BlameRequest {
+  string rev = 1;
+  string path = 2;
+}
+message BlameLine {
+  bytes commit = 1;
+  string line = 2;
+}
+message BlameResponse { repeated BlameLine lines = 1; }
 
 enum ChangeKind {
   CHANGE_KIND_UNSPECIFIED = 0;

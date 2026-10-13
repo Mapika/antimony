@@ -69,6 +69,22 @@ pub async fn log(ctx: &Ctx, rev: &str, limit: Option<u32>, path: Option<String>)
     Ok(Outcome::ok(out))
 }
 
+pub async fn blame(ctx: &Ctx, target: &str) -> Result<Outcome> {
+    let (rev, path) = parse_rev_path(target)?;
+    let path = path.filter(|p| !p.is_empty()).ok_or_else(|| anyhow!("blame needs <rev>:<path>"))?;
+    let mut client = ctx.remote().await?.client();
+    let r = client
+        .blame(pb::BlameRequest { rev: rev.into(), path: path.into() })
+        .await
+        .rpc()?
+        .into_inner();
+    let mut out = String::new();
+    for (i, l) in r.lines.iter().enumerate() {
+        writeln!(out, "{} {}\t{}", id_from(&l.commit)?, i + 1, l.line)?;
+    }
+    Ok(Outcome::ok(out))
+}
+
 pub async fn diff(ctx: &Ctx, from: &str, to: &str) -> Result<Outcome> {
     let mut client = ctx.remote().await?.client();
     let r = client

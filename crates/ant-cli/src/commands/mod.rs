@@ -17,6 +17,7 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
         Command::Import(a) => import::run(a).await,
         Command::Ls { target } => query::ls(&ctx, &target).await,
         Command::Cat { target } => query::cat(&ctx, &target).await,
+        Command::Blame { target } => query::blame(&ctx, &target).await,
         Command::Log { rev, limit, path } => query::log(&ctx, &rev, limit, path).await,
         Command::Diff { from, to } => query::diff(&ctx, &from, &to).await,
         Command::Ref { cmd } => match cmd {

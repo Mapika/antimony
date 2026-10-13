@@ -23,6 +23,7 @@
 //!       is `blob|tree|commit`. If the path is a blob: that single entry.
 //!       Missing path: exit 1.
 //!   ant cat <rev>:<path>        raw blob bytes. Missing/not a blob: exit 1.
+//!   ant blame <rev>:<path>                    `<commit-id> <line-no>\t<line>` per line
 //!   ant log [<rev>] [-n N] [--path <path>]   `<id> <subject>` newest first; rev default `main`
 //!   ant diff <from-rev> <to-rev>   `A|M|D\t<path>`
 //!   ant ref get <name>             `<id>` (missing: exit 1)
