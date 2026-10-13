@@ -61,10 +61,9 @@ pub async fn serve_on(backend: Backend, listener: tokio::net::TcpListener) -> an
     let svc = AntServer::new(AntService::new(backend))
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    tonic::transport::Server::builder()
-        .add_service(svc)
-        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-        .await?;
+    // Without TCP_NODELAY, Nagle + delayed ACKs add ~40 ms to small RPCs.
+    let incoming = tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
+    tonic::transport::Server::builder().add_service(svc).serve_with_incoming(incoming).await?;
     Ok(())
 }
 

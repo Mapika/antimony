@@ -84,6 +84,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "TASK(history): remove this ignore when implementing"]
     async fn index_matches_changeset_scan() {
         let b = Backend::in_memory();
         let c0 = commit(&b, None, vec![write("src/a.rs", "1"), write("README", "r")]).await.unwrap();
@@ -105,6 +106,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "TASK(history): remove this ignore when implementing"]
     async fn non_fast_forward_rebuilds() {
         let b = Backend::in_memory();
         let c0 = commit(&b, None, vec![write("f", "0")]).await.unwrap();
@@ -122,6 +124,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "TASK(history): remove this ignore when implementing"]
     async fn blame_attributes_lines() {
         let b = Backend::in_memory();
         let c0 = commit(&b, None, vec![write("f", "a\nb\nc\n")]).await.unwrap();

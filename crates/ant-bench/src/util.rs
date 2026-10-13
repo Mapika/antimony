@@ -304,6 +304,37 @@ impl MetaStore for TimedMeta {
     async fn put_derived(&self, kind: &str, key: &[u8], value: Bytes) -> Result<()> {
         timed(&self.put_derived, 1, self.inner.put_derived(kind, key, value)).await
     }
+
+    async fn get_derived_many(&self, kind: &str, keys: &[&[u8]]) -> Result<Vec<Option<Bytes>>> {
+        timed(&self.get_derived, keys.len() as u64, self.inner.get_derived_many(kind, keys)).await
+    }
+
+    // History-index calls are passed through untimed.
+    async fn index_history(&self, ref_name: &str, rows: &[ant_store::HistoryRow]) -> Result<()> {
+        self.inner.index_history(ref_name, rows).await
+    }
+
+    async fn query_history(
+        &self,
+        ref_name: &str,
+        prefix: &ant_core::RepoPath,
+        max_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, ObjectId)>> {
+        self.inner.query_history(ref_name, prefix, max_generation, limit).await
+    }
+
+    async fn history_watermark(&self, ref_name: &str) -> Result<Option<ObjectId>> {
+        self.inner.history_watermark(ref_name).await
+    }
+
+    async fn set_history_watermark(&self, ref_name: &str, expected: Option<ObjectId>, new: ObjectId) -> Result<bool> {
+        self.inner.set_history_watermark(ref_name, expected, new).await
+    }
+
+    async fn clear_history(&self, ref_name: &str) -> Result<()> {
+        self.inner.clear_history(ref_name).await
+    }
 }
 
 /// Wrap every store of `backend` so each call is timed under `prefix.*`.

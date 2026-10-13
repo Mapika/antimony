@@ -15,7 +15,6 @@ use ant_core::ObjectId;
 use ant_proto::MAX_MESSAGE_BYTES;
 use ant_proto::v1 as pb;
 use ant_proto::v1::ant_client::AntClient;
-use ant_proto::v1::ant_server::AntServer;
 use ant_server::config::StoreArgs;
 use ant_server::{http, rpc};
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -279,15 +278,9 @@ pub async fn run(args: Args) -> Result<i32> {
             let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let http_l = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let addr = grpc.local_addr()?;
-            if args.nodelay {
-                let incoming = tonic::transport::server::TcpIncoming::from(grpc).with_nodelay(Some(true));
-                let svc = AntServer::new(rpc::AntService::new(backend.clone()))
-                    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-                    .max_encoding_message_size(MAX_MESSAGE_BYTES);
-                tokio::spawn(tonic::transport::Server::builder().add_service(svc).serve_with_incoming(incoming));
-            } else {
-                tokio::spawn(rpc::serve_on(backend.clone(), grpc));
-            }
+            // `serve_on` enables TCP_NODELAY; `--nodelay` is kept as a no-op.
+            let _ = args.nodelay;
+            tokio::spawn(rpc::serve_on(backend.clone(), grpc));
             tokio::spawn(http::serve_on(backend, http_l));
             (format!("http://{addr}"), "embedded")
         }

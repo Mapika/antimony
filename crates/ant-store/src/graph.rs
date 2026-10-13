@@ -150,22 +150,28 @@ pub async fn is_ancestor(b: &Backend, ancestor: ObjectId, descendant: ObjectId) 
         return Ok(true);
     }
     let target_gen = node(b, ancestor).await?.generation;
-    let mut seen = HashSet::new();
-    let mut stack = vec![descendant];
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        let n = node(b, id).await?;
-        if n.generation <= target_gen {
-            continue;
-        }
-        for p in n.parents {
-            if p == ancestor {
-                return Ok(true);
+    // Breadth-first by frontier: one batched `get_commits` per step instead of
+    // one round trip per commit.
+    let mut seen = HashSet::from([descendant]);
+    let mut frontier = vec![descendant];
+    while !frontier.is_empty() {
+        let nodes = b.meta.get_commits(&frontier).await?;
+        let mut next = Vec::new();
+        for (id, n) in frontier.iter().zip(nodes) {
+            let n = n.ok_or_else(|| StoreError::InvalidArgument(format!("commit {id} is not recorded")))?;
+            if n.generation <= target_gen {
+                continue;
             }
-            stack.push(p);
+            for p in n.parents {
+                if p == ancestor {
+                    return Ok(true);
+                }
+                if seen.insert(p) {
+                    next.push(p);
+                }
+            }
         }
+        frontier = next;
     }
     Ok(false)
 }

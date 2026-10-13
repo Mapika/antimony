@@ -57,6 +57,7 @@
 //!   history past path checks) → permission_denied.
 //! - git export (`ant-gitserve`): requires `can_read_everything` (it cannot
 //!   filter trees without changing ids) else 403.
+//!
 //! Tests must also cover: fetching a restricted blob by id is denied while
 //! the same bytes written to a public path become readable; open mode keeps
 //! the existing behavior (all existing tests must still pass untouched).

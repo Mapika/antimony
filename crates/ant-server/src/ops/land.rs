@@ -339,10 +339,26 @@ async fn unlanded_stack(b: &Backend, commit: ObjectId, tip: ObjectId) -> OpResul
     Ok(stack)
 }
 
+/// Per-ref land serialization within this process. Concurrent lands on one
+/// ref would otherwise each rebase onto a tip that moves before their CAS,
+/// wasting the work and starving (measured: 10 CAS attempts per land at 16
+/// agents on Postgres). CAS remains the correctness guarantee across
+/// processes; this only removes self-inflicted contention.
+fn ref_lock(ref_name: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+    static LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        LazyLock::new(Default::default);
+    let mut locks = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    locks.entry(ref_name.to_string()).or_default().clone()
+}
+
 pub async fn land(b: &Backend, ref_name: &str, commit: ObjectId) -> OpResult<LandOutcome> {
     if b.meta.get_commits(&[commit]).await?.pop().flatten().is_none() {
         return Err(OpError::not_found_object(commit));
     }
+    let lock = ref_lock(ref_name);
+    let _guard = lock.lock().await;
     let mut tip = b.refs.get_ref(ref_name).await?;
     for _ in 0..MAX_LAND_ATTEMPTS {
         let mut rebased_pairs = Vec::new();
