@@ -510,10 +510,16 @@ impl MetaStore for PgStore {
     }
 
     async fn tail(&self, after: u64, limit: usize) -> Result<Vec<(u64, ObjectId)>> {
+        // `seq` is a BIGINT: a cursor past i64::MAX cannot match any row, and
+        // an out-of-range limit means "no limit" (clamp to i64::MAX).
+        let Ok(after) = i64::try_from(after) else {
+            return Ok(vec![]);
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows =
             sqlx::query("SELECT seq, commit_id FROM log WHERE seq > $1 ORDER BY seq LIMIT $2")
-                .bind(after as i64)
-                .bind(limit as i64)
+                .bind(after)
+                .bind(limit)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(be)?;
@@ -602,5 +608,26 @@ mod tests {
             .unwrap();
         let b = PgStore::connect(&url, &schema).await.unwrap();
         assert_eq!(b.get_ref("main").await.unwrap(), Some(ObjectId([1; 32])));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_tail_handles_extreme_bounds() {
+        let s = fresh().await;
+        let c1 = ObjectId([1; 32]);
+        let n1 = CommitNode {
+            id: c1,
+            tree: ObjectId::empty_tree(),
+            parents: vec![],
+            generation: 1,
+            committer_time: 100,
+        };
+        let s1 = s.put_commit(n1, vec![]).await.unwrap();
+        // A cursor past i64::MAX cannot match any row (and must not wrap negative).
+        assert_eq!(s.tail(u64::MAX, 10).await.unwrap(), vec![]);
+        assert_eq!(s.tail(i64::MAX as u64 + 1, 10).await.unwrap(), vec![]);
+        // "No limit" must not be sent to Postgres as a negative LIMIT.
+        assert_eq!(s.tail(0, usize::MAX).await.unwrap(), vec![(s1, c1)]);
+        assert_eq!(s.tail(s1, usize::MAX).await.unwrap(), vec![]);
     }
 }
