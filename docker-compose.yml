@@ -1,0 +1,22 @@
+# Local dev/test dependencies. `docker compose up -d`
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ant
+      POSTGRES_PASSWORD: ant
+      POSTGRES_DB: ant
+    ports: ["54329:5432"]
+    command: ["postgres", "-c", "max_connections=500"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "ant"]
+      interval: 2s
+      retries: 30
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9010"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9009:9000", "9010:9010"]

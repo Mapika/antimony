@@ -1,0 +1,175 @@
+//! Lazy, read-only FUSE view of a tree. Nothing is downloaded until it is
+//! looked up or read, so an agent can "check out" a huge monorepo instantly
+//! and only pay for what it touches.
+//!
+//! TASK (fuse): implement `mount` with `fuser` (0.18, no libfuse; mounting
+//! goes through `fusermount3`, which is installed).
+//!
+//! Requirements:
+//! - Inodes: root = 1. Assign inode numbers on first lookup and keep them
+//!   stable for the life of the mount (map (parent ino, name) → ino and ino →
+//!   (mode, object id)). Identical objects at different paths get different
+//!   inodes (hard-link semantics are NOT wanted).
+//! - `lookup`/`getattr`/`readdir`(+`.` and `..`)/`open`/`read`/`readlink`
+//!   implemented. Directories 0o555, files 0o444, executables 0o555,
+//!   symlinks 0o777, gitlinks appear as empty directories. `nlink` = 1 for
+//!   files, 2 for dirs. uid/gid = the mounting process's. mtime = UNIX_EPOCH
+//!   (or a fixed timestamp passed in options).
+//! - File size must be correct in `getattr` *without* necessarily
+//!   downloading the content; it's fine (v1) to fetch the blob to learn its
+//!   size, but cache it.
+//! - All mutating ops (`write`, `create`, `mkdir`, `unlink`, `rename`,
+//!   `setattr`, …) → `EROFS`. Opening for write → `EROFS`.
+//! - Object fetches are async: FUSE callbacks run on fuser's thread; use the
+//!   provided `tokio::runtime::Handle` with `block_on`, or better spawn and
+//!   reply from the task (fuser replies are `Send`). Do not deadlock when
+//!   the runtime is a current-thread runtime used by the caller — tests use a
+//!   multi-thread runtime, and document that requirement.
+//! - In-memory caches: decoded trees (unbounded is fine v1) and blob
+//!   contents (bounded by `MountOptions::blob_cache_bytes`, LRU).
+//! - `readdir` on a large directory must work with offsets (fuser calls it
+//!   repeatedly).
+//! - When a directory is listed, prefetch its subtrees' objects in ONE
+//!   `get_many` (cheap win for `find`/`ls -R`).
+//! - Errors from the store → `EIO` (log with tracing).
+//! - Unmount when the returned `BackgroundSession` is dropped.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use ant_core::ObjectId;
+use ant_store::ObjectStore;
+
+#[derive(Debug, Clone)]
+pub struct MountOptions {
+    pub attr_ttl: Duration,
+    pub blob_cache_bytes: usize,
+    pub mtime: SystemTime,
+    pub fs_name: String,
+}
+
+impl Default for MountOptions {
+    fn default() -> Self {
+        Self {
+            attr_ttl: Duration::from_secs(3600),
+            blob_cache_bytes: 256 * 1024 * 1024,
+            mtime: SystemTime::UNIX_EPOCH,
+            fs_name: "antimony".into(),
+        }
+    }
+}
+
+/// Mount `root_tree` read-only at `mountpoint`. Requires `rt` to be a
+/// multi-threaded runtime.
+pub fn mount(
+    objects: Arc<dyn ObjectStore>,
+    root_tree: ObjectId,
+    mountpoint: &Path,
+    rt: tokio::runtime::Handle,
+    opts: MountOptions,
+) -> std::io::Result<fuser::BackgroundSession> {
+    let _ = (objects, root_tree, mountpoint, rt, opts);
+    todo!("fuse")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::PathBuf;
+
+    use super::*;
+    use ant_core::{EncodedObject, EntryMode, Object, ObjectKind, Tree, TreeEntry};
+    use ant_store::graph::build_tree;
+    use ant_store::memory::MemoryObjectStore;
+    use ant_store::ObjectStoreExt;
+
+    async fn fixture() -> (Arc<MemoryObjectStore>, ObjectId) {
+        let s = Arc::new(MemoryObjectStore::default());
+        let sub = build_tree(s.as_ref(), &[("lib.rs", b"pub fn x() {}\n"), ("deep/er/f", b"deep")]).await.unwrap();
+        let exe = s.put(EncodedObject::new(ObjectKind::Blob, b"#!/bin/sh\necho hi\n")).await.unwrap();
+        let link = s.put(EncodedObject::new(ObjectKind::Blob, b"src/lib.rs")).await.unwrap();
+        let big: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        let big_id = s.put(EncodedObject::new(ObjectKind::Blob, &big)).await.unwrap();
+        let mut entries = vec![
+            TreeEntry { mode: EntryMode::Tree, name: "src".into(), id: sub },
+            TreeEntry { mode: EntryMode::Executable, name: "run.sh".into(), id: exe },
+            TreeEntry { mode: EntryMode::Symlink, name: "link".into(), id: link },
+            TreeEntry { mode: EntryMode::Gitlink, name: "vendor".into(), id: ObjectId([1; 32]) },
+            TreeEntry { mode: EntryMode::File, name: "big.bin".into(), id: big_id },
+        ];
+        // Wide directory to exercise readdir offsets.
+        let wide = build_tree(
+            s.as_ref(),
+            &(0..1500).map(|i| (format!("f{i:04}"), b"w".as_slice())).collect::<Vec<_>>()
+                .iter().map(|(n, c)| (n.as_str(), *c)).collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+        entries.push(TreeEntry { mode: EntryMode::Tree, name: "wide".into(), id: wide });
+        let root = s.put(Object::Tree(Tree::new(entries).unwrap()).encode()).await.unwrap();
+        (s, root)
+    }
+
+    fn mount_fixture(rt: &tokio::runtime::Runtime) -> (tempfile::TempDir, PathBuf, fuser::BackgroundSession) {
+        let (s, root) = rt.block_on(fixture());
+        let tmp = tempfile::tempdir().unwrap();
+        let mnt = tmp.path().join("mnt");
+        std::fs::create_dir(&mnt).unwrap();
+        let sess = mount(s, root, &mnt, rt.handle().clone(), MountOptions::default()).unwrap();
+        (tmp, mnt, sess)
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap()
+    }
+
+    #[test]
+    fn reads_files_dirs_links() {
+        let rt = rt();
+        let (_tmp, mnt, _sess) = mount_fixture(&rt);
+        assert_eq!(std::fs::read_to_string(mnt.join("src/lib.rs")).unwrap(), "pub fn x() {}\n");
+        assert_eq!(std::fs::read_to_string(mnt.join("src/deep/er/f")).unwrap(), "deep");
+        assert_eq!(std::fs::read_link(mnt.join("link")).unwrap(), PathBuf::from("src/lib.rs"));
+        assert_eq!(std::fs::read_to_string(mnt.join("link")).unwrap(), "pub fn x() {}\n");
+        assert!(mnt.join("vendor").is_dir());
+        assert_eq!(std::fs::read_dir(mnt.join("vendor")).unwrap().count(), 0);
+
+        let mut names: Vec<_> = std::fs::read_dir(&mnt).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["big.bin", "link", "run.sh", "src", "vendor", "wide"]);
+
+        let m = std::fs::metadata(mnt.join("run.sh")).unwrap();
+        assert_eq!(m.permissions().mode() & 0o777, 0o555);
+        assert_eq!(m.len(), 18);
+        let m = std::fs::metadata(mnt.join("src/lib.rs")).unwrap();
+        assert_eq!(m.permissions().mode() & 0o777, 0o444);
+        // Stable inodes.
+        let i1 = std::fs::metadata(mnt.join("src/lib.rs")).unwrap().ino();
+        let i2 = std::fs::metadata(mnt.join("src/lib.rs")).unwrap().ino();
+        assert_eq!(i1, i2);
+    }
+
+    #[test]
+    fn large_file_and_wide_dir() {
+        let rt = rt();
+        let (_tmp, mnt, _sess) = mount_fixture(&rt);
+        let big = std::fs::read(mnt.join("big.bin")).unwrap();
+        assert_eq!(big.len(), 3_000_000);
+        assert!(big.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8));
+        assert_eq!(std::fs::read_dir(mnt.join("wide")).unwrap().count(), 1500);
+    }
+
+    #[test]
+    fn read_only() {
+        let rt = rt();
+        let (_tmp, mnt, _sess) = mount_fixture(&rt);
+        let e = std::fs::write(mnt.join("new"), b"x").unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EROFS));
+        let e = std::fs::OpenOptions::new().write(true).open(mnt.join("src/lib.rs")).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EROFS));
+        assert!(std::fs::remove_file(mnt.join("run.sh")).is_err());
+        assert!(std::fs::create_dir(mnt.join("d")).is_err());
+        assert!(std::fs::metadata(mnt.join("missing")).is_err());
+    }
+}

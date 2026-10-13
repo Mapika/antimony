@@ -1,0 +1,19 @@
+[package]
+name = "ant-fuse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ant-core.workspace = true
+ant-store.workspace = true
+bytes.workspace = true
+fuser.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "ant-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ant"
+path = "src/main.rs"
+
+[dependencies]
+ant-core.workspace = true
+ant-proto.workspace = true
+ant-store.workspace = true
+ant-gitbridge.workspace = true
+ant-fuse.workspace = true
+ant-server.workspace = true
+antd.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

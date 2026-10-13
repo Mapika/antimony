@@ -1,0 +1,17 @@
+[package]
+name = "ant-gitbridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ant-core.workspace = true
+ant-store.workspace = true
+anyhow.workspace = true
+gix.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,188 @@
+syntax = "proto3";
+
+package ant.v1;
+
+// All ids are raw 32-byte SHA-256 object ids. All `data` fields carry the
+// full encoded object ("<kind> <len>\0<body>"), never compressed.
+//
+// Immutable object reads are ALSO served over plain HTTP at
+// `GET /o/{hex-id}` (Cache-Control: immutable) so any HTTP cache/CDN can
+// front them. gRPC is for batches, mutations, and queries.
+service Ant {
+  // ---- objects ----
+  // Streams one ObjectResult per requested id, in request order.
+  rpc GetObjects(GetObjectsRequest) returns (stream ObjectResult);
+  rpc HasObjects(HasObjectsRequest) returns (HasObjectsResponse);
+  // Upload blobs before referencing them from CreateChangeset. Server
+  // verifies each object's framing and stores it under its own hash.
+  rpc PutObjects(PutObjectsRequest) returns (PutObjectsResponse);
+
+  // ---- refs ----
+  rpc GetRef(GetRefRequest) returns (GetRefResponse);
+  rpc ListRefs(ListRefsRequest) returns (ListRefsResponse);
+  rpc UpdateRef(UpdateRefRequest) returns (UpdateRefResponse);
+
+  // ---- writes ----
+  // Server builds trees + commit from file-level ops on top of `base`.
+  rpc CreateChangeset(CreateChangesetRequest) returns (CreateChangesetResponse);
+  // Rebase `commit` onto `ref` if needed and advance `ref` by CAS.
+  rpc Land(LandRequest) returns (LandResponse);
+
+  // ---- queries (no checkout needed) ----
+  rpc ResolveRev(ResolveRevRequest) returns (ResolveRevResponse);
+  rpc ReadPath(ReadPathRequest) returns (ReadPathResponse);
+  rpc Log(LogRequest) returns (LogResponse);
+  rpc Diff(DiffRequest) returns (DiffResponse);
+}
+
+message GetObjectsRequest { repeated bytes ids = 1; }
+message ObjectResult {
+  bytes id = 1;
+  bool found = 2;
+  bytes data = 3;
+}
+
+message HasObjectsRequest { repeated bytes ids = 1; }
+message HasObjectsResponse { repeated bool present = 1; }
+
+message PutObjectsRequest { repeated bytes data = 1; }
+message PutObjectsResponse { repeated bytes ids = 1; }
+
+message GetRefRequest { string name = 1; }
+message GetRefResponse { optional bytes target = 1; }
+
+message ListRefsRequest { string prefix = 1; }
+message RefEntry {
+  string name = 1;
+  bytes target = 2;
+}
+message ListRefsResponse { repeated RefEntry refs = 1; }
+
+message UpdateRefRequest {
+  string name = 1;
+  optional bytes expected = 2;  // absent = must not exist
+  optional bytes new_target = 3; // absent = delete
+}
+message UpdateRefResponse {
+  bool updated = 1;
+  optional bytes actual = 2; // set when !updated
+}
+
+enum EntryMode {
+  ENTRY_MODE_UNSPECIFIED = 0;
+  ENTRY_MODE_FILE = 1;
+  ENTRY_MODE_EXECUTABLE = 2;
+  ENTRY_MODE_SYMLINK = 3;
+  ENTRY_MODE_TREE = 4;
+  ENTRY_MODE_GITLINK = 5;
+}
+
+message Signature {
+  string name = 1;
+  string email = 2;
+  int64 time = 3;
+  int32 tz_offset_minutes = 4;
+}
+
+message FileOp {
+  string path = 1;
+  oneof op {
+    WriteOp write = 2;
+    DeleteOp delete = 3;
+  }
+}
+message WriteOp {
+  EntryMode mode = 1; // FILE, EXECUTABLE or SYMLINK
+  oneof content {
+    bytes inline = 2;  // raw file content (symlink: target path)
+    bytes blob_id = 3; // previously uploaded blob
+  }
+}
+message DeleteOp {}
+
+message CreateChangesetRequest {
+  optional bytes base = 1; // parent commit; absent = root commit
+  repeated FileOp ops = 2;
+  Signature author = 3;
+  optional Signature committer = 4; // defaults to author
+  string message = 5;
+}
+message CreateChangesetResponse { bytes commit = 1; }
+
+message LandRequest {
+  string ref_name = 1;
+  bytes commit = 2;
+}
+message LandResponse {
+  oneof outcome {
+    Landed landed = 1;
+    Conflict conflict = 2;
+  }
+}
+message Landed {
+  bytes new_tip = 1;  // == commit if fast-forwarded, else the rebased commit
+  bool rebased = 2;
+}
+message Conflict {
+  bytes tip = 1;           // ref tip the rebase was attempted against
+  repeated string paths = 2;
+}
+
+// rev syntax: a ref name, or 64-hex commit id, optionally followed by `~N`
+// (N-th first-parent ancestor).
+message ResolveRevRequest { string rev = 1; }
+message ResolveRevResponse { bytes commit = 1; }
+
+message ReadPathRequest {
+  string rev = 1;
+  string path = 2;          // "" = root
+  bool include_content = 3; // for blobs: inline the content
+}
+message TreeEntry {
+  EntryMode mode = 1;
+  string name = 2;
+  bytes id = 3;
+}
+message ReadPathResponse {
+  bool found = 1;
+  EntryMode mode = 2;
+  bytes id = 3;
+  repeated TreeEntry entries = 4; // set when the path is a tree
+  bytes content = 5;              // set when blob && include_content
+}
+
+message LogRequest {
+  string rev = 1;
+  optional string path = 2; // only commits whose changeset touches path (prefix)
+  uint32 limit = 3;
+}
+message CommitInfo {
+  bytes id = 1;
+  bytes tree = 2;
+  repeated bytes parents = 3;
+  uint64 generation = 4;
+  Signature author = 5;
+  Signature committer = 6;
+  string message = 7;
+}
+message LogResponse { repeated CommitInfo commits = 1; }
+
+enum ChangeKind {
+  CHANGE_KIND_UNSPECIFIED = 0;
+  CHANGE_KIND_ADDED = 1;
+  CHANGE_KIND_MODIFIED = 2;
+  CHANGE_KIND_DELETED = 3;
+}
+message PathChange {
+  string path = 1;
+  ChangeKind kind = 2;
+  EntryMode old_mode = 3;
+  bytes old_id = 4;
+  EntryMode new_mode = 5;
+  bytes new_id = 6;
+}
+message DiffRequest {
+  string from_rev = 1; // "" = empty tree
+  string to_rev = 2;
+}
+message DiffResponse { repeated PathChange changes = 1; }
