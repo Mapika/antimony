@@ -1,0 +1,26 @@
+[package]
+name = "ant-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ant-bench"
+path = "src/main.rs"
+
+[dependencies]
+ant-core.workspace = true
+ant-proto.workspace = true
+ant-store.workspace = true
+ant-gitbridge.workspace = true
+ant-server.workspace = true
+antd.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+clap.workspace = true
+rand.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing-subscriber.workspace = true

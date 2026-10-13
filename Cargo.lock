@@ -86,6 +86,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ant-bench"
+version = "0.1.0"
+dependencies = [
+ "ant-core",
+ "ant-gitbridge",
+ "ant-proto",
+ "ant-server",
+ "ant-store",
+ "antd",
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "clap",
+ "rand 0.9.5",
+ "sqlx",
+ "tokio",
+ "tonic",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ant-cli"
 version = "0.1.0"
 dependencies = [
