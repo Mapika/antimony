@@ -2,9 +2,10 @@
 
 use anyhow::Result;
 
-use crate::args::{Cli, Command, RefCmd, WsCmd};
+use crate::args::{AdminCmd, Cli, Command, RefCmd, WsCmd};
 use crate::ctx::{Ctx, Outcome};
 
+mod admin;
 mod import;
 mod mount;
 mod query;
@@ -30,5 +31,6 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
         Command::Submit { message } => ws::submit(&ctx, &message).await,
         Command::Land { ref_name, commit } => ws::land(&ctx, &ref_name, commit).await,
         Command::Mount { rev, mountpoint } => mount::run(&ctx, &rev, &mountpoint).await,
+        Command::Admin { cmd: AdminCmd::ReindexAcl(a) } => admin::reindex_acl(a).await,
     }
 }

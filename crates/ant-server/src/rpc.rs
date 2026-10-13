@@ -17,10 +17,15 @@
 //!   onto `ops::query`, `ops::land`, `ops::changeset`.
 //! - Set max decoding/encoding message size to `ant_proto::MAX_MESSAGE_BYTES`
 //!   on the generated server.
+//!
+//! Access control (`crate::acl`): with a policy, every RPC authenticates the
+//! `authorization: Bearer <token>` metadata (missing/unknown →
+//! `unauthenticated`) and delegates to the `ops::*_as` variants; object
+//! RPCs report unreadable objects exactly like missing ones.
 
 use std::net::SocketAddr;
 
-use ant_core::{EncodedObject, EntryMode, ObjectId, RepoPath, Signature};
+use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, RepoPath, Signature};
 use ant_proto::MAX_MESSAGE_BYTES;
 use ant_proto::v1 as pb;
 use ant_proto::v1::ant_server::{Ant, AntServer};
@@ -29,6 +34,7 @@ use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
 use tonic::{Request, Response, Status};
 
+use crate::acl::{self, Access, Acl};
 use crate::ops::changeset::{self, ChangesetRequest, FileOp, WriteContent};
 use crate::ops::history;
 use crate::ops::land::{self, LandOutcome};
@@ -43,11 +49,26 @@ const MAX_IDS: usize = 100_000;
 #[derive(Clone)]
 pub struct AntService {
     pub backend: Backend,
+    acl: Acl,
 }
 
 impl AntService {
+    /// Open mode (no access control).
     pub fn new(backend: Backend) -> Self {
-        Self { backend }
+        Self::with_acl(backend, Acl::open())
+    }
+
+    pub fn with_acl(backend: Backend, acl: Acl) -> Self {
+        Self { backend, acl }
+    }
+
+    /// The caller of `request`: `None` in open mode.
+    fn access<T>(&self, request: &Request<T>) -> Result<Option<Access>, Status> {
+        if self.acl.is_open() {
+            return Ok(None);
+        }
+        let header = request.metadata().get("authorization").and_then(|v| v.to_str().ok());
+        self.acl.authenticate_header(header).map_err(|e| Status::unauthenticated(e.to_string()))
     }
 }
 
@@ -59,7 +80,16 @@ pub async fn serve(backend: Backend, addr: SocketAddr) -> anyhow::Result<()> {
 
 /// Serve gRPC on an already-bound listener (tests bind port 0).
 pub async fn serve_on(backend: Backend, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
-    let svc = AntServer::new(AntService::new(backend))
+    serve_with_acl(backend, Acl::open(), listener).await
+}
+
+/// [`serve_on`] enforcing `acl`.
+pub async fn serve_with_acl(
+    backend: Backend,
+    acl: Acl,
+    listener: tokio::net::TcpListener,
+) -> anyhow::Result<()> {
+    let svc = AntServer::new(AntService::with_acl(backend, acl))
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
     // Without TCP_NODELAY, Nagle + delayed ACKs add ~40 ms to small RPCs.
@@ -90,6 +120,7 @@ fn op_status(e: OpError) -> Status {
         OpError::NotFound(m) => Status::not_found(m),
         OpError::InvalidArgument(m) => Status::invalid_argument(m),
         OpError::Aborted(m) => Status::aborted(m),
+        OpError::PermissionDenied(m) => Status::permission_denied(m),
         OpError::Store(e) => store_status(e),
         OpError::Core(e) => Status::invalid_argument(e.to_string()),
     }
@@ -205,6 +236,18 @@ fn to_ids(ids: impl IntoIterator<Item = ObjectId>) -> Vec<Vec<u8>> {
     ids.into_iter().map(|i| i.0.to_vec()).collect()
 }
 
+/// Index-aligned read access to objects by id (all true in open mode).
+async fn readable_ids(
+    b: &Backend,
+    access: Option<&Access>,
+    ids: &[ObjectId],
+) -> Result<Vec<bool>, StoreError> {
+    match access {
+        None => Ok(vec![true; ids.len()]),
+        Some(a) => acl::readable(b, &a.policy, &a.principal, ids).await,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // service
 // ---------------------------------------------------------------------------
@@ -217,20 +260,28 @@ impl Ant for AntService {
         &self,
         request: Request<pb::GetObjectsRequest>,
     ) -> Result<Response<Self::GetObjectsStream>, Status> {
+        let access = self.access(&request)?;
         let ids = parse_ids(&request.into_inner().ids)?;
-        let objects = self.backend.objects.clone();
+        let backend = self.backend.clone();
         let chunks: Vec<Vec<ObjectId>> = ids.chunks(OBJECT_CHUNK).map(<[ObjectId]>::to_vec).collect();
         let stream = futures::stream::iter(chunks)
             .then(move |chunk| {
-                let objects = objects.clone();
+                let backend = backend.clone();
+                let access = access.clone();
                 async move {
+                    let allowed = match readable_ids(&backend, access.as_ref(), &chunk).await {
+                        Ok(a) => a,
+                        Err(e) => return futures::stream::iter(vec![Err(store_status(e))]),
+                    };
                     let results: Vec<Result<pb::ObjectResult, Status>> =
-                        match objects.get_many(&chunk).await {
+                        match backend.objects.get_many(&chunk).await {
                             Ok(found) => chunk
                                 .iter()
                                 .zip(found)
-                                .map(|(id, obj)| {
-                                    Ok(match obj {
+                                .zip(allowed)
+                                .map(|((id, obj), allowed)| {
+                                    // Unreadable is indistinguishable from missing.
+                                    Ok(match obj.filter(|_| allowed) {
                                         Some(o) => pb::ObjectResult {
                                             id: id.0.to_vec(),
                                             found: true,
@@ -258,8 +309,14 @@ impl Ant for AntService {
         &self,
         request: Request<pb::HasObjectsRequest>,
     ) -> Result<Response<pb::HasObjectsResponse>, Status> {
+        let access = self.access(&request)?;
         let ids = parse_ids(&request.into_inner().ids)?;
-        let present = self.backend.objects.has_many(&ids).await.map_err(store_status)?;
+        let mut present = self.backend.objects.has_many(&ids).await.map_err(store_status)?;
+        let allowed =
+            readable_ids(&self.backend, access.as_ref(), &ids).await.map_err(store_status)?;
+        for (p, a) in present.iter_mut().zip(allowed) {
+            *p &= a;
+        }
         Ok(Response::new(pb::HasObjectsResponse { present }))
     }
 
@@ -267,12 +324,21 @@ impl Ant for AntService {
         &self,
         request: Request<pb::PutObjectsRequest>,
     ) -> Result<Response<pb::PutObjectsResponse>, Status> {
+        let access = self.access(&request)?;
         let data = request.into_inner().data;
         let mut objects = Vec::with_capacity(data.len());
         for d in data {
             let obj = EncodedObject::from_bytes(Bytes::from(d))
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
             objects.push(obj);
+        }
+        if let Some(access) = &access {
+            // Trees/commits could smuggle history past the path checks.
+            if !access.is_admin() && objects.iter().any(|o| o.kind() != ObjectKind::Blob) {
+                return Err(Status::permission_denied("only blobs may be uploaded"));
+            }
+            let kinds: Vec<_> = objects.iter().map(|o| (o.id(), o.kind())).collect();
+            acl::record_uploads(&self.backend, access, &kinds).await.map_err(store_status)?;
         }
         let ids = to_ids(objects.iter().map(EncodedObject::id));
         self.backend.objects.put_many(&objects).await.map_err(store_status)?;
@@ -283,6 +349,7 @@ impl Ant for AntService {
         &self,
         request: Request<pb::GetRefRequest>,
     ) -> Result<Response<pb::GetRefResponse>, Status> {
+        self.access(&request)?;
         let name = request.into_inner().name;
         ant_store::validate_ref_name(&name).map_err(store_status)?;
         let target = self.backend.refs.get_ref(&name).await.map_err(store_status)?;
@@ -295,6 +362,7 @@ impl Ant for AntService {
         &self,
         request: Request<pb::ListRefsRequest>,
     ) -> Result<Response<pb::ListRefsResponse>, Status> {
+        self.access(&request)?;
         let prefix = request.into_inner().prefix;
         let refs = self
             .backend
@@ -312,10 +380,16 @@ impl Ant for AntService {
         &self,
         request: Request<pb::UpdateRefRequest>,
     ) -> Result<Response<pb::UpdateRefResponse>, Status> {
+        let access = self.access(&request)?;
         let req = request.into_inner();
         ant_store::validate_ref_name(&req.name).map_err(store_status)?;
         let expected = parse_opt_id(req.expected.as_ref())?;
         let new = parse_opt_id(req.new_target.as_ref())?;
+        if let Some(access) = &access {
+            acl::check_update_ref(&self.backend, access, &req.name, expected, new)
+                .await
+                .map_err(op_status)?;
+        }
         let outcome = self
             .backend
             .refs
@@ -340,6 +414,7 @@ impl Ant for AntService {
         &self,
         request: Request<pb::CreateChangesetRequest>,
     ) -> Result<Response<pb::CreateChangesetResponse>, Status> {
+        let access = self.access(&request)?;
         let req = request.into_inner();
         let base = parse_opt_id(req.base.as_ref())?;
         let ops = req
@@ -352,8 +427,9 @@ impl Ant for AntService {
             .map(sig_from_pb)
             .ok_or_else(|| Status::invalid_argument("author is required"))?;
         let committer = req.committer.map(sig_from_pb);
-        let commit = changeset::create_changeset(
+        let commit = changeset::create_changeset_as(
             &self.backend,
+            access.as_ref(),
             ChangesetRequest { base, ops, author, committer, message: req.message },
         )
         .await
@@ -362,10 +438,13 @@ impl Ant for AntService {
     }
 
     async fn land(&self, request: Request<pb::LandRequest>) -> Result<Response<pb::LandResponse>, Status> {
+        let access = self.access(&request)?;
         let req = request.into_inner();
         ant_store::validate_ref_name(&req.ref_name).map_err(store_status)?;
         let commit = parse_id(&req.commit)?;
-        let outcome = land::land(&self.backend, &req.ref_name, commit).await.map_err(op_status)?;
+        let outcome = land::land_as(&self.backend, access.as_ref(), &req.ref_name, commit)
+            .await
+            .map_err(op_status)?;
         if matches!(outcome, LandOutcome::Landed { .. }) {
             // Coalesced per ref, so a burst of lands in one leader batch (or
             // across batches) costs one background catch-up, not one each.
@@ -392,6 +471,7 @@ impl Ant for AntService {
         &self,
         request: Request<pb::ResolveRevRequest>,
     ) -> Result<Response<pb::ResolveRevResponse>, Status> {
+        self.access(&request)?;
         let rev = request.into_inner().rev;
         let commit = query::resolve_rev(&self.backend, &rev).await.map_err(op_status)?;
         Ok(Response::new(pb::ResolveRevResponse { commit: commit.0.to_vec() }))
@@ -401,11 +481,13 @@ impl Ant for AntService {
         &self,
         request: Request<pb::ReadPathRequest>,
     ) -> Result<Response<pb::ReadPathResponse>, Status> {
+        let access = self.access(&request)?;
         let req = request.into_inner();
         let path = parse_rev_path(&req.path)?;
-        let info = query::read_path(&self.backend, &req.rev, &path, req.include_content)
-            .await
-            .map_err(op_status)?;
+        let info =
+            query::read_path_as(&self.backend, access.as_ref(), &req.rev, &path, req.include_content)
+                .await
+                .map_err(op_status)?;
         Ok(Response::new(match info {
             None => pb::ReadPathResponse::default(),
             Some(info) => pb::ReadPathResponse {
@@ -428,20 +510,25 @@ impl Ant for AntService {
     }
 
     async fn log(&self, request: Request<pb::LogRequest>) -> Result<Response<pb::LogResponse>, Status> {
+        let access = self.access(&request)?;
         let req = request.into_inner();
         let path = req.path.as_deref().map(parse_rev_path).transpose()?;
-        let entries = query::log(&self.backend, &req.rev, path.as_ref(), req.limit as usize)
-            .await
-            .map_err(op_status)?;
+        let entries =
+            query::log_as(&self.backend, access.as_ref(), &req.rev, path.as_ref(), req.limit as usize)
+                .await
+                .map_err(op_status)?;
         Ok(Response::new(pb::LogResponse {
             commits: entries.into_iter().map(commit_info_to_pb).collect(),
         }))
     }
 
     async fn blame(&self, request: Request<pb::BlameRequest>) -> Result<Response<pb::BlameResponse>, Status> {
+        let access = self.access(&request)?;
         let req = request.into_inner();
         let path = parse_rev_path(&req.path)?;
-        let lines = history::blame(&self.backend, &req.rev, &path).await.map_err(op_status)?;
+        let lines = history::blame_as(&self.backend, access.as_ref(), &req.rev, &path)
+            .await
+            .map_err(op_status)?;
         Ok(Response::new(pb::BlameResponse {
             lines: lines
                 .into_iter()
@@ -451,9 +538,12 @@ impl Ant for AntService {
     }
 
     async fn diff(&self, request: Request<pb::DiffRequest>) -> Result<Response<pb::DiffResponse>, Status> {
+        let access = self.access(&request)?;
         let req = request.into_inner();
         let from = if req.from_rev.is_empty() { None } else { Some(req.from_rev.as_str()) };
-        let changes = query::diff(&self.backend, from, &req.to_rev).await.map_err(op_status)?;
+        let changes = query::diff_as(&self.backend, access.as_ref(), from, &req.to_rev)
+            .await
+            .map_err(op_status)?;
         let changes = changes
             .into_iter()
             .map(|c| {

@@ -34,6 +34,7 @@ pub struct Ctx {
     pub cache: PathBuf,
     pub cache_bytes: u64,
     pub directory: Option<PathBuf>,
+    pub token: Option<String>,
 }
 
 impl Ctx {
@@ -51,11 +52,12 @@ impl Ctx {
             cache,
             cache_bytes: cli.cache_bytes,
             directory: cli.directory.clone(),
+            token: cli.token.clone().filter(|t| !t.is_empty()),
         })
     }
 
     pub async fn remote(&self) -> Result<RemoteObjectStore> {
-        RemoteObjectStore::connect(&self.server, self.http.as_deref())
+        RemoteObjectStore::connect_with_token(&self.server, self.http.as_deref(), self.token.as_deref())
             .await
             .with_context(|| format!("connecting to {}", self.server))
     }

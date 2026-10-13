@@ -41,6 +41,7 @@ use ant_store::{Backend, ChangeKind, CommitNode, PathChange};
 use bytes::Bytes;
 
 use super::{OpError, OpResult, cache};
+use crate::acl::{self, Access};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteContent {
@@ -72,6 +73,23 @@ pub struct ChangesetRequest {
 }
 
 pub async fn create_changeset(b: &Backend, req: ChangesetRequest) -> OpResult<ObjectId> {
+    create_changeset_as(b, None, req).await
+}
+
+/// [`create_changeset`] on behalf of `access` (`None` = open mode, no
+/// checks). Every op path must be writable (`PermissionDenied`), and blobs
+/// referenced by id must be readable by, or uploaded by, the caller —
+/// otherwise they are reported exactly like missing blobs (`NotFound`).
+/// Under a policy, written blobs and rewritten trees are zone-tagged
+/// (`acl::tag_written`) before they are stored.
+pub async fn create_changeset_as(
+    b: &Backend,
+    access: Option<&Access>,
+    req: ChangesetRequest,
+) -> OpResult<ObjectId> {
+    if let Some(access) = access {
+        access.check_writable(req.ops.iter().map(FileOp::path))?;
+    }
     let base = match req.base {
         Some(id) => {
             let node = cache::get_nodes(b, &[id]).await?.pop().flatten();
@@ -85,6 +103,7 @@ pub async fn create_changeset(b: &Backend, req: ChangesetRequest) -> OpResult<Ob
     let mut seen = HashSet::new();
     let mut new_objects = Vec::new();
     let mut referenced = Vec::new();
+    let mut blob_writes = Vec::new();
     let mut edits: Vec<(Vec<&str>, Edit)> = Vec::with_capacity(req.ops.len());
     for op in &req.ops {
         let path = op.path();
@@ -114,10 +133,20 @@ pub async fn create_changeset(b: &Backend, req: ChangesetRequest) -> OpResult<Ob
                         *id
                     }
                 };
+                blob_writes.push((path.clone(), id));
                 Edit::Write(*mode, id)
             }
         };
         edits.push((path.components().collect(), edit));
+    }
+    if let Some(access) = access
+        && !access.is_admin()
+        && !referenced.is_empty()
+    {
+        let allowed = acl::can_reference(b, access, &referenced).await?;
+        if let Some((id, _)) = referenced.iter().zip(allowed).find(|(_, ok)| !ok) {
+            return Err(OpError::not_found_object(*id));
+        }
     }
     check_blobs(b, &referenced).await?;
 
@@ -155,17 +184,23 @@ pub async fn create_changeset(b: &Backend, req: ChangesetRequest) -> OpResult<Ob
     changes.sort_by(|a, b| a.path.cmp(&b.path));
     edits.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut new_trees = Vec::new();
-    let root = apply(&mut directories, base_tree, &edits, 0, &mut new_objects, &mut new_trees)?;
+    let mut trees = Vec::new();
+    let root = apply(&mut directories, base_tree, &edits, 0, &mut new_objects, &mut trees)?;
     let tree = match root {
         Some(id) => id,
         None => {
             let empty = Object::Tree(Tree::empty()).encode();
             let id = empty.id();
             new_objects.push(empty);
+            trees.push((RepoPath::root(), id, Arc::new(Tree::empty())));
             id
         }
     };
+    if let Some(access) = access {
+        let mut writes: Vec<_> = trees.iter().map(|(path, id, _)| (path.clone(), *id)).collect();
+        writes.extend(blob_writes);
+        acl::tag_written(b, &access.policy, &writes).await?;
+    }
 
     let commit = Commit {
         tree,
@@ -193,7 +228,7 @@ pub async fn create_changeset(b: &Backend, req: ChangesetRequest) -> OpResult<Ob
     b.meta.put_commit(node.clone(), changes).await?;
 
     let objects = cache::objects(&b.objects);
-    objects.trees.insert_many(new_trees.into_iter().map(|(id, tree)| {
+    objects.trees.insert_many(trees.into_iter().map(|(_, id, tree)| {
         let weight = cache::tree_weight(&tree);
         (id, tree, weight)
     }));
@@ -241,17 +276,15 @@ fn apply(
     edits: &[(Vec<&str>, Edit)],
     depth: usize,
     out: &mut Vec<EncodedObject>,
-    trees: &mut Vec<(ObjectId, Arc<Tree>)>,
+    trees: &mut Vec<(RepoPath, ObjectId, Arc<Tree>)>,
 ) -> OpResult<Option<ObjectId>> {
+    let dir = RepoPath::new(
+        edits.first().map(|(parts, _)| parts[..depth].join("/")).unwrap_or_default(),
+    )?;
     let mut tree = match base {
-        Some(_) => {
-            let path = RepoPath::new(
-                edits.first().map(|(parts, _)| parts[..depth].join("/")).unwrap_or_default(),
-            )?;
-            directories
-                .remove(&path)
-                .ok_or_else(|| OpError::InvalidArgument(format!("missing directory {path}")))?
-        }
+        Some(_) => directories
+            .remove(&dir)
+            .ok_or_else(|| OpError::InvalidArgument(format!("missing directory {dir}")))?,
         None => Tree::empty(),
     };
     let mut i = 0;
@@ -325,7 +358,7 @@ fn apply(
     let obj = EncodedObject::new(ObjectKind::Tree, &tree.encode());
     let id = obj.id();
     out.push(obj);
-    trees.push((id, Arc::new(tree)));
+    trees.push((dir, id, Arc::new(tree)));
     Ok(Some(id))
 }
 

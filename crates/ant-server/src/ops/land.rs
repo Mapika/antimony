@@ -59,6 +59,9 @@ use ant_store::{ObjectStoreExt, graph::write_commit};
 use ant_store::{Backend, CasOutcome, ChangeKind, CommitNode, PathChange, StoreError};
 
 use super::{OpError, OpResult, cache};
+use crate::acl::{self, Access};
+use ant_auth::Policy;
+use ant_store::graph;
 
 type Entry = (EntryMode, ObjectId);
 pub(super) type Directories = BTreeMap<RepoPath, Tree>;
@@ -224,7 +227,7 @@ pub async fn rebase(
     onto: ObjectId,
 ) -> OpResult<Result<ObjectId, Vec<RepoPath>>> {
     let mut state = BatchState::default();
-    let result = state.rebase(b, commit, onto).await?;
+    let result = state.rebase(b, None, commit, onto).await?;
     if result.is_ok() {
         state.flush(b).await?;
     }
@@ -249,17 +252,20 @@ struct Writes {
     objects: Vec<EncodedObject>,
     commits: Vec<(CommitNode, Vec<PathChange>)>,
     trees: Vec<(ObjectId, Arc<Tree>)>,
+    /// Zone tags owed (under a policy) for new blobs/trees: (path, id).
+    tags: Vec<(Arc<Policy>, RepoPath, ObjectId)>,
 }
 
 impl Writes {
-    fn mark(&self) -> (usize, usize, usize) {
-        (self.objects.len(), self.commits.len(), self.trees.len())
+    fn mark(&self) -> [usize; 4] {
+        [self.objects.len(), self.commits.len(), self.trees.len(), self.tags.len()]
     }
 
-    fn truncate(&mut self, (objects, commits, trees): (usize, usize, usize)) {
+    fn truncate(&mut self, [objects, commits, trees, tags]: [usize; 4]) {
         self.objects.truncate(objects);
         self.commits.truncate(commits);
         self.trees.truncate(trees);
+        self.tags.truncate(tags);
     }
 }
 
@@ -399,31 +405,39 @@ impl BatchState {
         Ok(stack)
     }
 
+    /// Decide one request against the tentative `tip`. `verified` is the
+    /// request's own permission pre-check; anything it does not cover fails
+    /// this request only, before it has any effect on the batch.
     async fn apply(
         &mut self,
         b: &Backend,
         commit: ObjectId,
         tip: Option<ObjectId>,
+        verified: &Verified,
+        policy: Option<&Arc<Policy>>,
     ) -> OpResult<LandOutcome> {
         self.nodes(b, &[commit]).await?;
         let Some(tip) = tip else {
+            // Creating a ref: no previous content to protect.
             return Ok(LandOutcome::Landed { new_tip: commit, rebased: false });
         };
         if self.already_landed(b, commit, tip).await? {
             return Ok(LandOutcome::Landed { new_tip: tip, rebased: false });
         }
         if self.ancestor(b, tip, commit).await? {
+            verified.allows_fast_forward(tip)?;
             return Ok(LandOutcome::Landed { new_tip: commit, rebased: false });
         }
+        let stack = self.stack(b, commit, tip).await?;
+        verified.allows_replay(&stack)?;
         let mut onto = tip;
         let mut pairs = Vec::new();
         let mark = self.writes.mark();
-        let stack = self.stack(b, commit, tip).await?;
         // One round trip each for the whole stack's changesets and messages.
         cache::get_changesets(b, &stack).await?;
         cache::read_commits(b, &stack).await?;
         for original in stack {
-            match self.rebase(b, original, onto).await {
+            match self.rebase(b, policy, original, onto).await {
                 Ok(Ok(id)) => {
                     pairs.push((original, id));
                     onto = id;
@@ -450,6 +464,7 @@ impl BatchState {
     async fn rebase(
         &mut self,
         b: &Backend,
+        policy: Option<&Arc<Policy>>,
         commit: ObjectId,
         onto: ObjectId,
     ) -> OpResult<Result<ObjectId, Vec<RepoPath>>> {
@@ -523,6 +538,8 @@ impl BatchState {
             }
         }
         let mut objects = Vec::new();
+        // (path, id) of every new blob/tree, for zone tagging.
+        let mut written = Vec::new();
         for (path, base, ours, theirs) in merges {
             let texts = [base.1, ours.1, theirs.1]
                 .map(|id| blobs.get(&id).and_then(|blob| std::str::from_utf8(blob.body()).ok()));
@@ -531,6 +548,7 @@ impl BatchState {
             {
                 let object = EncodedObject::new(ObjectKind::Blob, merged.as_bytes());
                 let mode = if ours.0 == base.0 { theirs.0 } else { ours.0 };
+                written.push((path.clone(), object.id()));
                 edits.insert(path, Some((mode, object.id())));
                 objects.push(object);
             } else {
@@ -597,6 +615,7 @@ impl BatchState {
                 }
             }
             objects.push(object);
+            written.push((path, id));
             new_trees.push((id, Arc::new(tree)));
         }
         let original = cache::read_commits(b, &[commit]).await?;
@@ -620,6 +639,11 @@ impl BatchState {
         self.nodes.insert(id, node.clone());
         self.writes.objects.extend(objects);
         self.writes.trees.extend(new_trees);
+        if let Some(policy) = policy {
+            self.writes
+                .tags
+                .extend(written.into_iter().map(|(path, id)| (policy.clone(), path, id)));
+        }
         self.writes.commits.push((node, recorded_changes));
         Ok(Ok(id))
     }
@@ -630,6 +654,18 @@ impl BatchState {
         let writes = std::mem::take(&mut self.writes);
         if writes.commits.is_empty() && writes.objects.is_empty() {
             return Ok(());
+        }
+        // Tags must be recorded before the objects are stored, one call per
+        // distinct policy (normally all requests share one).
+        let mut by_policy: Vec<(Arc<Policy>, Vec<(RepoPath, ObjectId)>)> = Vec::new();
+        for (policy, path, id) in writes.tags {
+            match by_policy.iter_mut().find(|(p, _)| Arc::ptr_eq(p, &policy)) {
+                Some((_, group)) => group.push((path, id)),
+                None => by_policy.push((policy, vec![(path, id)])),
+            }
+        }
+        for (policy, group) in &by_policy {
+            acl::tag_written(b, policy, group).await?;
         }
         b.objects.put_many(&writes.objects).await?;
         cache::objects(&b.objects).trees.insert_many(
@@ -658,7 +694,119 @@ const MAX_BATCH: usize = 64;
 type Reply = oneshot::Sender<OpResult<LandOutcome>>;
 struct Request {
     commit: ObjectId,
+    verified: Verified,
+    policy: Option<Arc<Policy>>,
     reply: Reply,
+}
+
+/// What a land request's permission pre-check (run against the ref tip seen
+/// before joining a batch) proved the caller may do.
+#[derive(Debug, Clone)]
+enum Verified {
+    /// Open mode or admin.
+    All,
+    /// The ref did not exist: only creating it was checked.
+    Creation,
+    /// Every changeset on `commit`'s first-parent chain down to (excluding)
+    /// `stop`, the first commit already landed (in the ref's history or mapped
+    /// to a landed rebase), is writable by the caller. Covers replaying any
+    /// of them, and fast-forwarding from any tip on that chain.
+    Chain { set: HashSet<ObjectId>, stop: Option<ObjectId> },
+    /// The tree diff from `from` to `commit` is writable (fast-forward only;
+    /// e.g. merges whose first-parent changesets carry other people's work).
+    Exact { from: ObjectId },
+}
+
+const RETRY: &str = "ref moved while checking permissions; retry";
+
+impl Verified {
+    fn allows_fast_forward(&self, tip: ObjectId) -> OpResult<()> {
+        match self {
+            Verified::All => Ok(()),
+            Verified::Chain { set, stop } if *stop == Some(tip) || set.contains(&tip) => Ok(()),
+            Verified::Exact { from } if *from == tip => Ok(()),
+            _ => Err(OpError::Aborted(RETRY.into())),
+        }
+    }
+
+    fn allows_replay(&self, stack: &[ObjectId]) -> OpResult<()> {
+        match self {
+            Verified::All => Ok(()),
+            Verified::Chain { set, .. } if stack.iter().all(|c| set.contains(c)) => Ok(()),
+            // Includes `Exact` (only a fast-forward was verified): a retry
+            // re-verifies against the new tip.
+            _ => Err(OpError::Aborted(RETRY.into())),
+        }
+    }
+}
+
+/// Per-request permission pre-check for `land_as`, run before the request
+/// joins a batch (so a denied request never touches anyone else's).
+async fn verify_land(
+    b: &Backend,
+    access: &Access,
+    ref_name: &str,
+    commit: ObjectId,
+) -> OpResult<Verified> {
+    if !access.policy.can_land(&access.principal, ref_name) {
+        return Err(OpError::PermissionDenied(format!("cannot land onto {ref_name}")));
+    }
+    if access.is_admin() {
+        return Ok(Verified::All);
+    }
+    let mut state = BatchState::default();
+    state.nodes(b, &[commit]).await?;
+    let Some(tip) = b.refs.get_ref(ref_name).await? else {
+        return Ok(Verified::Creation);
+    };
+    let mut chain = Vec::new();
+    let mut stop = None;
+    let mut complete = true;
+    let mut cur = Some(commit);
+    while let Some(c) = cur {
+        if state.already_landed(b, c, tip).await? {
+            stop = Some(c);
+            break;
+        }
+        if chain.len() >= MAX_STACK {
+            complete = false;
+            break;
+        }
+        state.nodes(b, &[c]).await?;
+        cur = state.nodes[&c].parents.first().copied();
+        chain.push(c);
+    }
+    let mut verdict =
+        Err(OpError::PermissionDenied(format!("more than {MAX_STACK} commits to verify")));
+    if complete {
+        verdict = Ok(());
+        let sets = b.meta.get_changesets(&chain).await?;
+        for (id, set) in chain.iter().zip(sets) {
+            let set = set.ok_or_else(|| OpError::not_found_object(*id))?;
+            verdict = access.check_writable(set.iter().map(|c| &c.path));
+            if verdict.is_err() {
+                break;
+            }
+        }
+    }
+    if !state.ancestor(b, tip, commit).await? {
+        // Will be replayed: every replayed changeset was checked above.
+        verdict?;
+        return Ok(Verified::Chain { set: chain.into_iter().collect(), stop });
+    }
+    if verdict.is_ok() && (stop == Some(tip) || chain.contains(&tip)) {
+        // Fast-forward along the first-parent chain: its changesets compose
+        // to exactly the tree diff.
+        return Ok(Verified::Chain { set: chain.into_iter().collect(), stop });
+    }
+    // Fast-forward through history the changesets do not describe relative
+    // to `tip` (tip reached via a merge's second parent, or merges carrying
+    // other people's changes): what changes is the trees' net diff.
+    state.nodes(b, &[tip]).await?;
+    let (old, new) = (state.nodes[&tip].tree, state.nodes[&commit].tree);
+    let changes = graph::diff_trees(b.objects.as_ref(), Some(old), Some(new)).await?;
+    access.check_writable(changes.iter().map(|c| &c.path))?;
+    Ok(Verified::Exact { from: tip })
 }
 
 // Include all backend identities: independent repositories named "main" must
@@ -718,10 +866,18 @@ impl Worker {
     }
 }
 
-fn enqueue(
+#[cfg(test)]
+fn enqueue(b: &Backend, ref_name: &str, commit: ObjectId) -> oneshot::Receiver<OpResult<LandOutcome>> {
+    enqueue_checked(b, ref_name, commit, Verified::All, None)
+}
+
+/// Queue a request already checked by `verify_land` (or `All` in open mode).
+fn enqueue_checked(
     b: &Backend,
     ref_name: &str,
     commit: ObjectId,
+    verified: Verified,
+    policy: Option<Arc<Policy>>,
 ) -> oneshot::Receiver<OpResult<LandOutcome>> {
     let key = QueueKey(
         Arc::as_ptr(&b.objects) as *const () as usize,
@@ -732,7 +888,7 @@ fn enqueue(
     let (reply, receiver) = oneshot::channel();
     let mut queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
     let lead = !queues.contains_key(&key);
-    queues.entry(key.clone()).or_default().push_back(Request { commit, reply });
+    queues.entry(key.clone()).or_default().push_back(Request { commit, verified, policy, reply });
     if lead {
         tokio::spawn(Worker { key, active: true }.run(b.clone()));
     }
@@ -763,7 +919,9 @@ async fn land_batch(
         let mut tip = start;
         let mut outcomes = Vec::with_capacity(batch.len());
         for request in batch {
-            let outcome = state.apply(b, request.commit, tip).await;
+            let outcome = state
+                .apply(b, request.commit, tip, &request.verified, request.policy.as_ref())
+                .await;
             if let Ok(LandOutcome::Landed { new_tip, .. }) = &outcome {
                 tip = Some(*new_tip);
             }
@@ -803,8 +961,25 @@ async fn land_batch(
 }
 
 pub async fn land(b: &Backend, ref_name: &str, commit: ObjectId) -> OpResult<LandOutcome> {
+    land_as(b, None, ref_name, commit).await
+}
+
+/// [`land`] on behalf of `access` (`None` = open mode). The caller must be
+/// allowed to land onto `ref_name` and to write every path changed by every
+/// commit that gets replayed (or, for a fast-forward, by the net diff).
+/// Checked per request before it joins a group-commit batch.
+pub async fn land_as(
+    b: &Backend,
+    access: Option<&Access>,
+    ref_name: &str,
+    commit: ObjectId,
+) -> OpResult<LandOutcome> {
     ant_store::validate_ref_name(ref_name)?;
-    enqueue(b, ref_name, commit)
+    let (verified, policy) = match access {
+        Some(a) => (verify_land(b, a, ref_name, commit).await?, Some(a.policy.clone())),
+        None => (Verified::All, None),
+    };
+    enqueue_checked(b, ref_name, commit, verified, policy)
         .await
         .map_err(|_| OpError::Aborted("land worker stopped before replying".into()))?
 }

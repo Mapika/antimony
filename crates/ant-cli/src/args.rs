@@ -24,6 +24,10 @@ pub struct Cli {
     #[arg(long, global = true, env = "ANT_CACHE_BYTES", default_value_t = 20 * 1024 * 1024 * 1024)]
     pub cache_bytes: u64,
 
+    /// Bearer token for servers running with an access policy.
+    #[arg(long, global = true, env = "ANT_TOKEN", hide_env_values = true)]
+    pub token: Option<String>,
+
     /// Start workspace discovery in this directory instead of the cwd.
     #[arg(short = 'C', global = true, value_name = "DIR")]
     pub directory: Option<PathBuf>,
@@ -81,6 +85,35 @@ pub enum Command {
     },
     /// Mount a read-only FUSE view of a rev.
     Mount { rev: String, mountpoint: PathBuf },
+    /// Administrative commands working directly on the stores.
+    Admin {
+        #[command(subcommand)]
+        cmd: AdminCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminCmd {
+    /// Tag the objects of a rev's tree with their access-control zones (run
+    /// after imports and after changing the policy's path rules).
+    ReindexAcl(ReindexArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ReindexArgs {
+    /// Revision whose tree to index (ref, id, `~N`).
+    pub rev: String,
+    /// Access-control policy file.
+    #[arg(long, env = "ANT_POLICY")]
+    pub policy: PathBuf,
+    /// Re-walk every subtree, ignoring markers from earlier runs.
+    #[arg(long)]
+    pub full: bool,
+    /// Also index every ancestor commit (older versions of restricted files).
+    #[arg(long)]
+    pub history: bool,
+    #[command(flatten)]
+    pub store: StoreArgs,
 }
 
 #[derive(Args, Debug)]
@@ -93,6 +126,10 @@ pub struct ImportArgs {
     /// antimony ref to create/advance.
     #[arg(long = "ref", default_value = "main")]
     pub ref_name: String,
+    /// Access-control policy: zone-tag the imported history
+    /// (`admin reindex-acl --history`).
+    #[arg(long, env = "ANT_POLICY")]
+    pub policy: Option<PathBuf>,
     #[command(flatten)]
     pub store: StoreArgs,
 }
