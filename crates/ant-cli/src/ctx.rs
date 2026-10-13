@@ -97,24 +97,10 @@ pub fn id_from(bytes: &[u8]) -> Result<ObjectId> {
 }
 
 pub fn mode_from_pb(v: i32) -> Result<EntryMode> {
-    Ok(match pb::EntryMode::try_from(v) {
-        Ok(pb::EntryMode::File) => EntryMode::File,
-        Ok(pb::EntryMode::Executable) => EntryMode::Executable,
-        Ok(pb::EntryMode::Symlink) => EntryMode::Symlink,
-        Ok(pb::EntryMode::Tree) => EntryMode::Tree,
-        Ok(pb::EntryMode::Gitlink) => EntryMode::Gitlink,
-        _ => return Err(anyhow!("server sent unknown entry mode {v}")),
-    })
-}
-
-pub fn mode_to_pb(m: EntryMode) -> pb::EntryMode {
-    match m {
-        EntryMode::File => pb::EntryMode::File,
-        EntryMode::Executable => pb::EntryMode::Executable,
-        EntryMode::Symlink => pb::EntryMode::Symlink,
-        EntryMode::Tree => pb::EntryMode::Tree,
-        EntryMode::Gitlink => pb::EntryMode::Gitlink,
-    }
+    pb::EntryMode::try_from(v)
+        .ok()
+        .and_then(ant_proto::entry_mode)
+        .ok_or_else(|| anyhow!("server sent unknown entry mode {v}"))
 }
 
 pub fn kind_name(m: EntryMode) -> &'static str {

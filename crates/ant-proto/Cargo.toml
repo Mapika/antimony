@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ant-core.workspace = true
 prost.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true

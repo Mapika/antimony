@@ -148,42 +148,15 @@ fn parse_rev_path(path: &str) -> Result<RepoPath, Status> {
     RepoPath::new(path).map_err(|e| Status::invalid_argument(e.to_string()))
 }
 
-fn sig_from_pb(s: pb::Signature) -> Signature {
-    Signature { name: s.name, email: s.email, time: s.time, tz_offset_minutes: s.tz_offset_minutes }
-}
-
-fn sig_to_pb(s: &Signature) -> pb::Signature {
-    pb::Signature {
-        name: s.name.clone(),
-        email: s.email.clone(),
-        time: s.time,
-        tz_offset_minutes: s.tz_offset_minutes,
-    }
-}
-
 fn mode_from_pb(v: i32) -> Result<EntryMode, Status> {
     let mode = pb::EntryMode::try_from(v)
         .map_err(|_| Status::invalid_argument(format!("unknown entry mode {v}")))?;
-    Ok(match mode {
-        pb::EntryMode::File => EntryMode::File,
-        pb::EntryMode::Executable => EntryMode::Executable,
-        pb::EntryMode::Symlink => EntryMode::Symlink,
-        pb::EntryMode::Tree => EntryMode::Tree,
-        pb::EntryMode::Gitlink => EntryMode::Gitlink,
-        pb::EntryMode::Unspecified => {
-            return Err(Status::invalid_argument("entry mode must be specified"));
-        }
-    })
+    ant_proto::entry_mode(mode)
+        .ok_or_else(|| Status::invalid_argument("entry mode must be specified"))
 }
 
 fn mode_to_pb(m: EntryMode) -> i32 {
-    (match m {
-        EntryMode::File => pb::EntryMode::File,
-        EntryMode::Executable => pb::EntryMode::Executable,
-        EntryMode::Symlink => pb::EntryMode::Symlink,
-        EntryMode::Tree => pb::EntryMode::Tree,
-        EntryMode::Gitlink => pb::EntryMode::Gitlink,
-    }) as i32
+    pb::EntryMode::from(m) as i32
 }
 
 fn kind_to_pb(k: ChangeKind) -> i32 {
@@ -223,8 +196,8 @@ fn commit_info_to_pb(e: query::LogEntry) -> pb::CommitInfo {
         tree: e.commit.tree.0.to_vec(),
         parents: e.commit.parents.iter().map(|p| p.0.to_vec()).collect(),
         generation: e.generation,
-        author: Some(sig_to_pb(&e.commit.author)),
-        committer: Some(sig_to_pb(&e.commit.committer)),
+        author: Some((&e.commit.author).into()),
+        committer: Some((&e.commit.committer).into()),
         message: e.commit.message,
     }
 }
@@ -411,9 +384,9 @@ impl Ant for AntService {
         let ops = req.ops.into_iter().map(file_op_from_pb).collect::<Result<Vec<_>, _>>()?;
         let author = req
             .author
-            .map(sig_from_pb)
+            .map(Signature::from)
             .ok_or_else(|| Status::invalid_argument("author is required"))?;
-        let committer = req.committer.map(sig_from_pb);
+        let committer = req.committer.map(Signature::from);
         let commit = changeset::create_changeset_as(
             &self.backend,
             access.as_ref(),

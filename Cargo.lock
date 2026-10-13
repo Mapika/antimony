@@ -188,6 +188,7 @@ dependencies = [
 name = "ant-proto"
 version = "0.1.0"
 dependencies = [
+ "ant-core",
  "prost",
  "protox",
  "tonic",

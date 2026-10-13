@@ -10,7 +10,7 @@ use antd::workspace::{LocalChange, LocalChangeKind, Sparse, Workspace};
 use anyhow::{Context as _, Result, anyhow, bail};
 
 use crate::author::current_author;
-use crate::ctx::{Ctx, Outcome, RpcResult, id_from, mode_to_pb};
+use crate::ctx::{Ctx, Outcome, RpcResult, id_from};
 use crate::discover::require_workspace;
 
 const LAST_SUBMIT: &str = ".ant/last_submit";
@@ -84,7 +84,7 @@ pub async fn submit(ctx: &Ctx, message: &str) -> Result<Outcome> {
             path: c.path.to_string(),
             op: Some(match c.new {
                 Some((mode, id)) => pb::file_op::Op::Write(pb::WriteOp {
-                    mode: mode_to_pb(mode) as i32,
+                    mode: pb::EntryMode::from(mode) as i32,
                     content: Some(pb::write_op::Content::BlobId(id.as_bytes().to_vec())),
                 }),
                 None => pb::file_op::Op::Delete(pb::DeleteOp {}),
@@ -92,12 +92,7 @@ pub async fn submit(ctx: &Ctx, message: &str) -> Result<Outcome> {
         })
         .collect();
     let a = tokio::task::spawn_blocking(current_author).await?;
-    let author = pb::Signature {
-        name: a.name,
-        email: a.email,
-        time: a.time,
-        tz_offset_minutes: a.tz_offset_minutes,
-    };
+    let author = pb::Signature::from(&a);
     let r = remote
         .client()
         .create_changeset(pb::CreateChangesetRequest {
