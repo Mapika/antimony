@@ -278,10 +278,15 @@ impl ObjectStore for PgStore {
         if objects.is_empty() {
             return Ok(());
         }
-        let owned: Vec<(Vec<u8>, Bytes)> = objects
+        let mut owned: Vec<(Vec<u8>, Bytes)> = objects
             .iter()
             .map(|o| (o.id().as_bytes().to_vec(), o.as_bytes().clone()))
             .collect();
+        // Insert in key order so concurrent batches sharing objects take row
+        // locks in the same order; arrival order deadlocks (found importing
+        // the Linux kernel with concurrent writers).
+        owned.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        owned.dedup_by(|a, b| a.0 == b.0);
         let (ids, data): (Vec<Vec<u8>>, Vec<Vec<u8>>) = tokio::task::spawn_blocking(move || {
             owned
                 .into_iter()
@@ -414,6 +419,11 @@ impl RefStore for PgStore {
 impl MetaStore for PgStore {
     async fn index_history(&self, ref_name: &str, rows: &[crate::HistoryRow]) -> Result<()> {
         // Large batches: one statement per chunk keeps parameter payloads sane.
+        // Primary-key order for a consistent lock order across writers.
+        let mut rows = rows.to_vec();
+        rows.sort_unstable_by(|a, b| {
+            (a.path.as_str(), a.generation, a.commit).cmp(&(b.path.as_str(), b.generation, b.commit))
+        });
         for chunk in rows.chunks(50_000) {
             let paths: Vec<&str> = chunk.iter().map(|r| r.path.as_str()).collect();
             let gens: Vec<i64> = chunk.iter().map(|r| r.generation as i64).collect();
@@ -844,6 +854,10 @@ impl MetaStore for PgStore {
         if entries.is_empty() {
             return Ok(());
         }
+        // Key order for a consistent lock order across concurrent writers.
+        let mut entries = entries;
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        entries.dedup_by(|a, b| a.0 == b.0);
         let (keys, values): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
             entries.into_iter().map(|(k, v)| (k, v.to_vec())).unzip();
         sqlx::query(
@@ -906,6 +920,39 @@ mod tests {
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_meta_batch_conforms() {
         conformance::meta_store_batch(Arc::new(fresh().await)).await;
+    }
+
+    /// Concurrent batches sharing objects in opposite orders used to deadlock
+    /// (seen importing the Linux kernel). Inserts are now key-ordered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_concurrent_overlapping_batches_do_not_deadlock() {
+        use ant_core::ObjectKind;
+        let s = Arc::new(fresh().await);
+        let objs: Vec<EncodedObject> = (0..400u32)
+            .map(|i| EncodedObject::new(ObjectKind::Blob, &i.to_be_bytes()))
+            .collect();
+        for round in 0..5 {
+            let mut tasks = Vec::new();
+            for t in 0..16 {
+                let s = s.clone();
+                let mut batch: Vec<_> = objs.iter().skip(round * 50).take(300).cloned().collect();
+                if t % 2 == 1 {
+                    batch.reverse();
+                }
+                let entries: Vec<(Vec<u8>, Bytes)> =
+                    batch.iter().map(|o| (o.id().as_bytes().to_vec(), Bytes::from_static(b"x"))).collect();
+                tasks.push(tokio::spawn(async move {
+                    s.put_many(&batch).await.unwrap();
+                    s.put_derived_many("k/v1", entries).await.unwrap();
+                }));
+            }
+            for t in tasks {
+                t.await.unwrap();
+            }
+        }
+        let ids: Vec<_> = objs.iter().map(|o| o.id()).collect();
+        assert!(s.has_many(&ids).await.unwrap().into_iter().take(350).all(|b| b));
     }
 
     #[tokio::test]
