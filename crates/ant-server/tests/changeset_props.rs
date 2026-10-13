@@ -291,7 +291,7 @@ async fn run_case(base: Model, use_base: bool, specs: Vec<OpSpec>, strict: bool)
             prop_assert_eq!(&commit.parents, &base_id.into_iter().collect::<Vec<_>>());
             prop_assert_eq!(&commit.author, &sig());
             prop_assert_eq!(&commit.committer, &sig());
-            prop_assert_eq!(&commit.message, "msg\n");
+            prop_assert_eq!(&commit.message, b"msg\n");
 
             // Tree equals the model, and is the canonical tree for it.
             let flat = flatten(&b, commit.tree).await;

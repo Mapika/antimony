@@ -226,4 +226,9 @@ mod tests {
         conformance::meta_store(Arc::new(MemoryMetaStore::default())).await;
         conformance::history_index(Arc::new(MemoryMetaStore::default())).await;
     }
+
+    #[tokio::test]
+    async fn memory_meta_batch_conforms() {
+        conformance::meta_store_batch(Arc::new(MemoryMetaStore::default())).await;
+    }
 }

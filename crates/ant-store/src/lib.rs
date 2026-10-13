@@ -252,6 +252,27 @@ pub trait MetaStore: Send + Sync + 'static {
         }
         Ok(out)
     }
+
+    /// Record many commits (parents before children) with their changesets.
+    /// Equivalent to calling [`Self::put_commit`] for each entry in order;
+    /// returns the sequence numbers index-aligned with the input. Persistent
+    /// stores should override this with one transaction.
+    async fn put_commits(&self, commits: Vec<(CommitNode, Vec<PathChange>)>) -> Result<Vec<u64>> {
+        let mut out = Vec::with_capacity(commits.len());
+        for (node, changes) in commits {
+            out.push(self.put_commit(node, changes).await?);
+        }
+        Ok(out)
+    }
+
+    /// Batch of [`Self::put_derived`] under one `kind`. Persistent stores
+    /// should override this with a single round trip.
+    async fn put_derived_many(&self, kind: &str, entries: Vec<(Vec<u8>, Bytes)>) -> Result<()> {
+        for (k, v) in entries {
+            self.put_derived(kind, &k, v).await?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

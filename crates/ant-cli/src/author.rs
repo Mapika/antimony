@@ -20,7 +20,7 @@ pub fn resolve_author(
     let email = non_empty(env("ANT_AUTHOR_EMAIL"))
         .or_else(|| non_empty(git("user.email")))
         .unwrap_or_else(|| format!("{user}@localhost"));
-    Signature { name, email, time, tz_offset_minutes: 0 }
+    Signature { name: name.into_bytes(), email: email.into_bytes(), time, tz_offset_minutes: 0 }
 }
 
 /// Resolve from the real environment, `git config` and the clock.
@@ -47,7 +47,7 @@ mod tests {
         let env = lookup(&[("ANT_AUTHOR_NAME", "E"), ("ANT_AUTHOR_EMAIL", "e@x"), ("USER", "u")]);
         let git = lookup(&[("user.name", "G"), ("user.email", "g@x")]);
         let s = resolve_author(&env, &git, 5);
-        assert_eq!((s.name.as_str(), s.email.as_str(), s.time, s.tz_offset_minutes), ("E", "e@x", 5, 0));
+        assert_eq!((&s.name[..], &s.email[..], s.time, s.tz_offset_minutes), (&b"E"[..], &b"e@x"[..], 5, 0));
     }
 
     #[test]
@@ -55,8 +55,8 @@ mod tests {
         let env = lookup(&[("USER", "u")]);
         let git = lookup(&[("user.name", "G")]);
         let s = resolve_author(&env, &git, 0);
-        assert_eq!((s.name.as_str(), s.email.as_str()), ("G", "u@localhost"));
+        assert_eq!((&s.name[..], &s.email[..]), (&b"G"[..], &b"u@localhost"[..]));
         let s = resolve_author(&env, &lookup(&[]), 0);
-        assert_eq!((s.name.as_str(), s.email.as_str()), ("u", "u@localhost"));
+        assert_eq!((&s.name[..], &s.email[..]), (&b"u"[..], &b"u@localhost"[..]));
     }
 }

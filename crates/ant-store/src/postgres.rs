@@ -470,6 +470,116 @@ impl MetaStore for PgStore {
         Ok(seq as u64)
     }
 
+    async fn put_commits(&self, commits: Vec<(CommitNode, Vec<PathChange>)>) -> Result<Vec<u64>> {
+        if commits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<Vec<u8>> = commits.iter().map(|(n, _)| n.id.as_bytes().to_vec()).collect();
+        let trees: Vec<Vec<u8>> = commits.iter().map(|(n, _)| n.tree.as_bytes().to_vec()).collect();
+        let parents: Vec<Vec<u8>> = commits
+            .iter()
+            .map(|(n, _)| n.parents.iter().flat_map(|p| p.as_bytes().iter().copied()).collect())
+            .collect();
+        let gens: Vec<i64> = commits.iter().map(|(n, _)| n.generation as i64).collect();
+        let times: Vec<i64> = commits.iter().map(|(n, _)| n.committer_time).collect();
+
+        let mut tx = self.pool.begin().await.map_err(be)?;
+        // Rows that were actually inserted (not already recorded).
+        let inserted: Vec<Vec<u8>> = sqlx::query_scalar(
+            "INSERT INTO commits (id, tree, parents, generation, committer_time) \
+             SELECT id, tree, parents, generation, committer_time \
+             FROM unnest($1::bytea[], $2::bytea[], $3::bytea[], $4::bigint[], $5::bigint[]) \
+                  WITH ORDINALITY AS t(id, tree, parents, generation, committer_time, ord) \
+             ORDER BY ord \
+             ON CONFLICT (id) DO NOTHING RETURNING id",
+        )
+        .bind(&ids)
+        .bind(&trees)
+        .bind(&parents)
+        .bind(&gens)
+        .bind(&times)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(be)?;
+        let inserted: HashSet<Vec<u8>> = inserted.into_iter().collect();
+
+        if !inserted.is_empty() {
+            // Input order = sequence order (parents first).
+            let mut seen = HashSet::with_capacity(inserted.len());
+            let new_ids: Vec<&Vec<u8>> =
+                ids.iter().filter(|i| inserted.contains(*i) && seen.insert(*i)).collect();
+            sqlx::query(
+                "INSERT INTO log (commit_id) \
+                 SELECT id FROM unnest($1::bytea[]) WITH ORDINALITY AS t(id, ord) ORDER BY ord",
+            )
+            .bind(&new_ids)
+            .execute(&mut *tx)
+            .await
+            .map_err(be)?;
+
+            let mut c_ids: Vec<&[u8]> = Vec::new();
+            let mut idx = Vec::new();
+            let mut paths = Vec::new();
+            let mut kinds = Vec::new();
+            let mut old_modes: Vec<Option<String>> = Vec::new();
+            let mut old_ids: Vec<Option<Vec<u8>>> = Vec::new();
+            let mut new_modes: Vec<Option<String>> = Vec::new();
+            let mut new_ids: Vec<Option<Vec<u8>>> = Vec::new();
+            let mut done = HashSet::new();
+            for (raw, (_, changes)) in ids.iter().zip(&commits) {
+                if !inserted.contains(raw) || !done.insert(raw) {
+                    continue;
+                }
+                for (i, c) in changes.iter().enumerate() {
+                    c_ids.push(raw);
+                    idx.push(i as i32);
+                    paths.push(c.path.as_str().to_string());
+                    kinds.push(change_kind_code(c.kind));
+                    old_modes.push(c.old.map(|(m, _)| m.as_octal().to_string()));
+                    old_ids.push(c.old.map(|(_, id)| id.as_bytes().to_vec()));
+                    new_modes.push(c.new.map(|(m, _)| m.as_octal().to_string()));
+                    new_ids.push(c.new.map(|(_, id)| id.as_bytes().to_vec()));
+                }
+            }
+            if !c_ids.is_empty() {
+                sqlx::query(
+                    "INSERT INTO changes (commit_id, idx, path, kind, old_mode, old_id, new_mode, new_id) \
+                     SELECT * FROM unnest($1::bytea[], $2::integer[], $3::text[], $4::smallint[], \
+                                          $5::text[], $6::bytea[], $7::text[], $8::bytea[])",
+                )
+                .bind(&c_ids)
+                .bind(&idx)
+                .bind(&paths)
+                .bind(&kinds)
+                .bind(&old_modes)
+                .bind(&old_ids)
+                .bind(&new_modes)
+                .bind(&new_ids)
+                .execute(&mut *tx)
+                .await
+                .map_err(be)?;
+            }
+        }
+
+        let rows = sqlx::query("SELECT commit_id, seq FROM log WHERE commit_id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(be)?;
+        tx.commit().await.map_err(be)?;
+        let mut seqs: HashMap<Vec<u8>, i64> = HashMap::with_capacity(rows.len());
+        for r in &rows {
+            seqs.insert(r.try_get("commit_id").map_err(be)?, r.try_get("seq").map_err(be)?);
+        }
+        ids.iter()
+            .map(|i| {
+                seqs.get(i)
+                    .map(|s| *s as u64)
+                    .ok_or_else(|| StoreError::InvalidArgument("commit missing from log".into()))
+            })
+            .collect()
+    }
+
     async fn get_commits(&self, ids: &[ObjectId]) -> Result<Vec<Option<CommitNode>>> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -598,6 +708,44 @@ impl MetaStore for PgStore {
         .map_err(be)?;
         Ok(())
     }
+
+    async fn put_derived_many(&self, kind: &str, entries: Vec<(Vec<u8>, Bytes)>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let (keys, values): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
+            entries.into_iter().map(|(k, v)| (k, v.to_vec())).unzip();
+        sqlx::query(
+            "INSERT INTO derived (kind, key, value) \
+             SELECT $1, k, v FROM unnest($2::bytea[], $3::bytea[]) AS t(k, v) \
+             ON CONFLICT (kind, key) DO NOTHING",
+        )
+        .bind(kind)
+        .bind(&keys)
+        .bind(&values)
+        .execute(&self.pool)
+        .await
+        .map_err(be)?;
+        Ok(())
+    }
+
+    async fn get_derived_many(&self, kind: &str, keys: &[&[u8]]) -> Result<Vec<Option<Bytes>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query("SELECT key, value FROM derived WHERE kind = $1 AND key = ANY($2)")
+            .bind(kind)
+            .bind(keys.iter().map(|k| k.to_vec()).collect::<Vec<_>>())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(be)?;
+        let mut found: HashMap<Vec<u8>, Bytes> = HashMap::with_capacity(rows.len());
+        for r in &rows {
+            let value: Vec<u8> = r.try_get("value").map_err(be)?;
+            found.insert(r.try_get("key").map_err(be)?, Bytes::from(value));
+        }
+        Ok(keys.iter().map(|k| found.get(*k).cloned()).collect())
+    }
 }
 
 #[cfg(test)]
@@ -639,6 +787,12 @@ mod tests {
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_meta_store_conforms() {
         conformance::meta_store(Arc::new(fresh().await)).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_meta_batch_conforms() {
+        conformance::meta_store_batch(Arc::new(fresh().await)).await;
     }
 
     #[tokio::test]

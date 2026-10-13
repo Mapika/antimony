@@ -78,8 +78,8 @@ enum EntryMode {
 }
 
 message Signature {
-  string name = 1;
-  string email = 2;
+  bytes name = 1;
+  bytes email = 2;
   int64 time = 3;
   int32 tz_offset_minutes = 4;
 }
@@ -163,7 +163,7 @@ message CommitInfo {
   uint64 generation = 4;
   Signature author = 5;
   Signature committer = 6;
-  string message = 7;
+  bytes message = 7;
 }
 message LogResponse { repeated CommitInfo commits = 1; }
 

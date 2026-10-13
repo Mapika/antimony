@@ -333,7 +333,7 @@ async fn grpc_and_http_see_the_same_objects() {
 // ---------------------------------------------------------------------------
 
 fn sig(name: &str) -> pb::Signature {
-    pb::Signature { name: name.into(), email: format!("{name}@example.com"), time: 1_700_000_000, tz_offset_minutes: 0 }
+    pb::Signature { name: name.into(), email: format!("{name}@example.com").into_bytes(), time: 1_700_000_000, tz_offset_minutes: 0 }
 }
 
 fn write_file(path: &str, content: &str) -> pb::FileOp {
@@ -450,9 +450,9 @@ async fn changeset_resolve_read_log_diff_land() {
         .commits;
     let ids: Vec<_> = log.iter().map(|c| c.id.clone()).collect();
     assert_eq!(ids, [c2.clone(), c1.clone()]);
-    assert_eq!(log[0].message, "second");
+    assert_eq!(log[0].message, b"second");
     assert_eq!(log[0].parents, std::slice::from_ref(&c1));
-    assert_eq!(log[0].author.as_ref().unwrap().name, "alice");
+    assert_eq!(log[0].author.as_ref().unwrap().name, b"alice");
 
     let log = s
         .grpc

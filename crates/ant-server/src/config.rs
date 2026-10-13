@@ -41,6 +41,11 @@ pub struct StoreArgs {
 
     #[arg(long, env = "ANT_S3_REGION", default_value = "us-east-1")]
     s3_region: String,
+
+    /// Objects whose encoded size is at most this many bytes live in Postgres;
+    /// larger ones go to S3 (only with --s3-*).
+    #[arg(long, env = "ANT_INLINE_THRESHOLD", default_value_t = DEFAULT_INLINE_THRESHOLD)]
+    inline_threshold: usize,
 }
 
 impl StoreArgs {
@@ -92,7 +97,7 @@ impl StoreArgs {
                         Arc::new(TieredObjectStore::new(
                             pg.clone(),
                             Arc::new(s3),
-                            DEFAULT_INLINE_THRESHOLD,
+                            self.inline_threshold,
                         ))
                     }
                 };

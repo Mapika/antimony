@@ -35,6 +35,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let timed = instrument(&backend, &metrics, "store");
     let put_objects = metrics.counter("store.put_many");
     let put_commit = metrics.counter("store.put_commit");
+    let put_commits = metrics.counter("store.put_commits");
+    // Commits recorded so far: single `put_commit` calls plus batched ones.
+    let recorded = {
+        let (a, b) = (put_commit.clone(), put_commits.clone());
+        move || a.calls() + b.items()
+    };
 
     let mut opts = ImportOptions::single(&args.git_ref, &args.ant_ref);
     opts.batch_objects = args.batch_objects;
@@ -44,14 +50,14 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let cpu0 = cpu_seconds().unwrap_or((0.0, 0.0));
 
     // Progress ticker: per-interval throughput and per-op store time.
-    let (po, pc, pm) = (put_objects.clone(), put_commit.clone(), metrics.clone());
+    let (po, pc, pm) = (put_objects.clone(), recorded.clone(), metrics.clone());
     let ticker = tokio::spawn(async move {
         let mut last = (0u64, 0u64, Instant::now());
         let mut last_ops: std::collections::HashMap<String, (u64, f64)> = Default::default();
         let mut last_cpu = cpu_seconds().map_or(0.0, |c| c.0 + c.1);
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
-            let (o, c) = (po.items(), pc.calls());
+            let (o, c) = (po.items(), pc());
             let dt = last.2.elapsed().as_secs_f64();
             let cpu = cpu_seconds().map_or(0.0, |c| c.0 + c.1);
             println!(
@@ -92,7 +98,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         Some(Ok(s)) => s,
         Some(Err(e)) => return Err(e).context("import failed"),
         // Partial: derive from what the writer persisted.
-        None => ImportStats { commits: put_commit.calls(), trees: 0, blobs: put_objects.items() },
+        None => ImportStats { commits: recorded(), trees: 0, blobs: put_objects.items() },
     };
     let objects = if timed_out { put_objects.items() } else { stats.commits + stats.trees + stats.blobs };
 
@@ -111,13 +117,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         cpu1.1 - cpu0.1
     );
     if timed_out {
-        println!("objects written {objects} (commits {} recorded)", put_commit.calls());
+        println!("objects written {objects} (commits {} recorded)", recorded());
     } else {
         println!("commits         {}", stats.commits);
         println!("trees           {}", stats.trees);
         println!("blobs           {}", stats.blobs);
     }
-    println!("commits/s       {:.1}", if timed_out { put_commit.calls() } else { stats.commits } as f64 / wall);
+    println!("commits/s       {:.1}", if timed_out { recorded() } else { stats.commits } as f64 / wall);
     println!("objects/s       {:.1}", objects as f64 / wall);
     println!("object bytes    {:.1} MiB written ({:.2} MiB/s)", mib(put_objects.bytes()), mib(put_objects.bytes()) / wall);
     if let Some(r) = rss {
@@ -130,7 +136,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
     }
     metrics.print("store-call timing (sum over all callers; writer is sequential)");
-    let writer_secs: f64 = ["has_many", "put_many", "get_many", "put_commit", "get_commits", "put_derived", "cas_ref", "get_ref"]
+    let writer_secs: f64 = ["has_many", "put_many", "get_many", "put_commit", "put_commits", "get_commits", "put_derived", "put_derived_many", "cas_ref", "get_ref"]
         .iter()
         .map(|n| metrics.counter(&format!("store.{n}")).secs())
         .sum();
@@ -148,11 +154,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .with("wall_s", wall)
         .with("cpu_user_s", cpu1.0 - cpu0.0)
         .with("cpu_sys_s", cpu1.1 - cpu0.1)
-        .with("commits", if timed_out { put_commit.calls() } else { stats.commits })
+        .with("commits", if timed_out { recorded() } else { stats.commits })
         .with("trees", stats.trees)
         .with("blobs", stats.blobs)
         .with("objects", objects)
-        .with("commits_per_s", if timed_out { put_commit.calls() } else { stats.commits } as f64 / wall)
+        .with("commits_per_s", if timed_out { recorded() } else { stats.commits } as f64 / wall)
         .with("objects_per_s", objects as f64 / wall)
         .with("object_bytes_written", put_objects.bytes())
         .with("peak_rss_bytes", rss)
