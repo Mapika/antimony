@@ -364,3 +364,59 @@ pub async fn history_index(s: Arc<dyn MetaStore>) {
         vec![(9, c(9))]
     );
 }
+
+/// Ref-lock suite for stores with real writer locks. `a` and `b` must share
+/// the same underlying refs (two connections to one database, or the same
+/// instance).
+pub async fn ref_lock(a: Arc<dyn RefStore>, b: Arc<dyn RefStore>) {
+    use std::time::Duration;
+    const SOON: Duration = Duration::from_secs(10);
+
+    let held = a.lock_ref("main").await.unwrap();
+    assert!(held.is_held());
+    let waiter = {
+        let b = b.clone();
+        tokio::spawn(async move { b.lock_ref("main").await.unwrap() })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!waiter.is_finished(), "a second writer must wait for the first");
+    // Other refs are independent.
+    let other = tokio::time::timeout(SOON, b.lock_ref("other")).await.unwrap().unwrap();
+    other.release().await.unwrap();
+    held.release().await.unwrap();
+    let second = tokio::time::timeout(SOON, waiter).await.unwrap().unwrap();
+    assert!(second.is_held());
+    second.release().await.unwrap();
+
+    // Dropping without release frees the ref too (possibly after a moment).
+    drop(a.lock_ref("main").await.unwrap());
+    let again = tokio::time::timeout(SOON, b.lock_ref("main")).await.unwrap().unwrap();
+    again.release().await.unwrap();
+
+    // Mutual exclusion under contention: plain read-then-CAS increments under
+    // the lock never see a concurrent writer.
+    const N: u8 = 16;
+    a.cas_ref("locked-counter", None, Some(ObjectId([0; 32]))).await.unwrap();
+    let mut tasks = Vec::new();
+    for i in 0..N {
+        let s = if i % 2 == 0 { a.clone() } else { b.clone() };
+        tasks.push(tokio::spawn(async move {
+            let lock = s.lock_ref("locked-counter").await.unwrap();
+            let cur = s.get_ref("locked-counter").await.unwrap().unwrap();
+            tokio::task::yield_now().await;
+            let next = ObjectId([cur.0[0] + 1; 32]);
+            assert_eq!(
+                s.cas_ref("locked-counter", Some(cur), Some(next)).await.unwrap(),
+                CasOutcome::Updated,
+                "the lock must exclude other writers"
+            );
+            lock.release().await.unwrap();
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    assert_eq!(a.get_ref("locked-counter").await.unwrap(), Some(ObjectId([N; 32])));
+
+    assert!(matches!(a.lock_ref("a//b").await, Err(StoreError::InvalidArgument(_))));
+}

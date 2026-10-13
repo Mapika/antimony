@@ -38,6 +38,34 @@ const ZSTD_LEVEL: i32 = 3;
 #[derive(Clone)]
 pub struct PgStore {
     pool: sqlx::PgPool,
+    /// Connections that hold (or wait for) ref locks, separate from `pool`
+    /// so lock holders can never starve the work they lock for.
+    locks: sqlx::PgPool,
+    schema: String,
+}
+
+/// Connection limits of a [`PgStore`]. Every process connected to one
+/// database adds up to `max_connections + lock_connections` connections.
+#[derive(Debug, Clone)]
+pub struct PgOptions {
+    /// Query pool size.
+    pub max_connections: u32,
+    /// Ref-lock pool size: refs that can be locked (or awaited) at once by
+    /// this process. Connections close after a minute idle.
+    pub lock_connections: u32,
+    /// Longest wait for a ref lock before `lock_ref` fails (callers then
+    /// fall back to plain CAS).
+    pub lock_timeout: std::time::Duration,
+}
+
+impl Default for PgOptions {
+    fn default() -> Self {
+        Self {
+            max_connections: 64,
+            lock_connections: 8,
+            lock_timeout: std::time::Duration::from_secs(10),
+        }
+    }
 }
 
 /// Quote a SQL identifier, doubling any embedded double quotes.
