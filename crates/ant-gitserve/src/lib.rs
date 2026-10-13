@@ -1,8 +1,12 @@
 //! Read-only Git protocol-v2 smart HTTP export of an antimony backend.
 //!
-//! Serves SHA-256 upload-pack with shallow and blobless fetches, streaming
-//! packs incrementally with bounded memory. Exported commits must be recorded
-//! in the `MetaStore` (generation numbers drive negotiation).
+//! Serves SHA-256 `upload-pack` (`ls-refs`, `fetch` with `shallow` and
+//! `filter blob:none`) at `/repo.git`; `receive-pack` is refused. Packs are
+//! streamed with bounded memory and delta-compress trees and blobs against
+//! the previous version of the same path (see `delta.rs`, `README.md`).
+//! Commits served must be recorded in the MetaStore (generation numbers bound
+//! the `have` walk).
+mod delta;
 mod pack;
 mod protocol;
 mod select;
@@ -166,7 +170,9 @@ async fn fetch_response(b: Backend, fetch: Fetch) -> Result<Response> {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tx.send(Ok(prefix.into())).await?;
     tokio::spawn(async move {
-        if let Err(error) = pack::send(b, selection.ids, tx.clone()).await {
+        if let Err(error) =
+            pack::send_planned(b, selection.ids, selection.paths, fetch.ofs_delta, tx.clone()).await
+        {
             let _ = tx.send(Err(std::io::Error::other(error.to_string()))).await;
         }
     });

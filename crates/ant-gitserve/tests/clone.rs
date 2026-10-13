@@ -1,3 +1,4 @@
+mod support;
 use ant_core::{Commit, EncodedObject, EntryMode, ObjectId, ObjectKind, Signature, TreeEntry};
 use ant_store::{
     Backend, ObjectStoreExt,
@@ -238,4 +239,111 @@ async fn partial_clone_lazy_fetch_of_many_blobs() {
     for (path, content) in &files {
         assert_eq!(&std::fs::read(dir.join(path)).unwrap(), content, "{path}");
     }
+}
+
+fn pack_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir.join(".git/objects/pack"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "pack"))
+        .map(|p| std::fs::metadata(p).unwrap().len())
+        .sum()
+}
+
+fn rss_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:")?.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Includes the in-memory store in RSS; reports the pre-clone resident set
+/// separately so fixture storage is not confused with pack working memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_blobless_history_is_delta_compressed() {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Instant,
+    };
+    const REVISIONS: usize = 2000;
+    let (b, undeltified) = support::history(REVISIONS, 2000).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, ant_gitserve::router(b)).await.unwrap();
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let before = rss_kib();
+    let peak = Arc::new(AtomicU64::new(before));
+    let monitor_peak = peak.clone();
+    let monitor = tokio::spawn(async move {
+        loop {
+            monitor_peak.fetch_max(rss_kib(), Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let start = Instant::now();
+    git(temp.path(), &["clone", "--filter=blob:none", "--no-checkout", &url, "large"]).await;
+    let elapsed = start.elapsed();
+    monitor.abort();
+    let dir = temp.path().join("large");
+    let packed = pack_bytes(&dir);
+    eprintln!(
+        "synthetic {REVISIONS} x 2000: undeltified={undeltified} pack={packed} clone={elapsed:?} RSS before={before} KiB peak={} KiB",
+        peak.load(Ordering::Relaxed)
+    );
+    git(&dir, &["fsck", "--full"]).await;
+    assert_eq!(git(&dir, &["rev-list", "--count", "HEAD"]).await, REVISIONS.to_string());
+    task.abort();
+    assert!(packed * 100 <= undeltified * 30, "pack {packed} exceeds 30% of {undeltified}");
+}
+
+#[tokio::test]
+async fn delta_chains_path_type_changes_and_incremental_fetch() {
+    let f = Fixture::new().await;
+    let tip = support::revisions(&f.b, Some(f.ids[2]), 0..125).await;
+    f.b.refs.cas_ref("main", Some(f.ids[2]), Some(tip)).await.unwrap();
+    let dir = f.clone_into("chains", &["--no-checkout"]).await;
+    git(&dir, &["fsck", "--full"]).await;
+    let old = objects(&dir).await;
+    let mut tree_deltas = 0;
+    let mut blob_deltas = 0;
+    let mut max_depth = 0;
+    for entry in std::fs::read_dir(dir.join(".git/objects/pack")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "idx") {
+            for line in git(&dir, &["verify-pack", "-v", path.to_str().unwrap()]).await.lines() {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if fields.len() == 7 && fields[0].len() == 64 {
+                    max_depth = max_depth.max(fields[5].parse::<usize>().unwrap());
+                    tree_deltas += usize::from(fields[1] == "tree");
+                    blob_deltas += usize::from(fields[1] == "blob");
+                }
+            }
+        }
+    }
+    assert!(tree_deltas > 50 && blob_deltas > 50);
+    assert!((2..=50).contains(&max_depth));
+    let next = support::revisions(&f.b, Some(tip), 125..135).await;
+    f.b.refs.cas_ref("main", Some(tip), Some(next)).await.unwrap();
+    git(&dir, &["fetch", "origin"]).await;
+    git(&dir, &["fsck", "--full"]).await;
+    let new = objects(&dir).await;
+    assert_eq!(new.difference(&old).count(), 30);
+    let mut packed_count = 0;
+    for entry in std::fs::read_dir(dir.join(".git/objects/pack")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "idx") {
+            packed_count += git(&dir, &["verify-pack", "-v", path.to_str().unwrap()])
+                .await
+                .lines()
+                .filter(|line| line.split_whitespace().next().is_some_and(|id| id.len() == 64))
+                .count();
+        }
+    }
+    assert_eq!(packed_count, new.len(), "incremental pack repeated known objects");
 }
