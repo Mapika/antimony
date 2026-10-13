@@ -275,6 +275,8 @@ pub struct TimedMeta {
     put_derived_many: Arc<Counter>,
     get_commits: Arc<Counter>,
     get_changeset: Arc<Counter>,
+    get_changesets: Arc<Counter>,
+    first_parent_chain: Arc<Counter>,
     tail: Arc<Counter>,
     get_derived: Arc<Counter>,
     put_derived: Arc<Counter>,
@@ -303,6 +305,21 @@ impl MetaStore for TimedMeta {
 
     async fn get_changeset(&self, id: &ObjectId) -> Result<Option<Vec<PathChange>>> {
         timed(&self.get_changeset, 1, self.inner.get_changeset(id)).await
+    }
+
+    // Forward the batched variants: the trait defaults would turn one store
+    // round trip into one per id and distort the measured server load.
+    async fn get_changesets(&self, ids: &[ObjectId]) -> Result<Vec<Option<Vec<PathChange>>>> {
+        timed(&self.get_changesets, ids.len() as u64, self.inner.get_changesets(ids)).await
+    }
+
+    async fn first_parent_chain(
+        &self,
+        tip: ObjectId,
+        stop: Option<ObjectId>,
+        limit: usize,
+    ) -> Result<Vec<CommitNode>> {
+        timed(&self.first_parent_chain, 1, self.inner.first_parent_chain(tip, stop, limit)).await
     }
 
     async fn tail(&self, after: u64, limit: usize) -> Result<Vec<(u64, ObjectId)>> {
@@ -368,6 +385,8 @@ pub fn instrument(backend: &Backend, m: &Metrics, prefix: &str) -> Backend {
             put_derived_many: c("put_derived_many"),
             get_commits: c("get_commits"),
             get_changeset: c("get_changeset"),
+            get_changesets: c("get_changesets"),
+            first_parent_chain: c("first_parent_chain"),
             tail: c("tail"),
             get_derived: c("get_derived"),
             put_derived: c("put_derived"),

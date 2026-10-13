@@ -22,24 +22,27 @@
 //!   ids. Store all new blobs/trees with as few `put_many` calls as
 //!   practical (one per batch, not one per object).
 //! - Build the `Commit` (parents = `[base]` or `[]`, committer defaults to
-//!   author, message verbatim), then persist via
-//!   `ant_store::graph::write_commit`, which also records generation and
-//!   changeset. Return the commit id.
+//!   author, message verbatim), then persist it with generation and
+//!   changeset exactly as `ant_store::graph::write_commit` would. (The
+//!   implementation stores the commit object in the same `put_many` as the
+//!   trees and computes the changeset from the ops instead of re-reading
+//!   the trees it just built.) Return the commit id.
 //! - An empty ops list is allowed (produces a commit with the same tree).
 //!
 //! Performance target: O(changed paths × depth) object reads/writes,
 //! independent of repo size.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use ant_core::{
     Commit, EncodedObject, EntryMode, Object, ObjectId, ObjectKind, RepoPath, Signature, Tree,
     TreeEntry,
 };
-use ant_store::{Backend, graph};
+use ant_store::{Backend, ChangeKind, CommitNode, PathChange};
 use bytes::Bytes;
 
-use super::{OpError, OpResult};
+use super::{OpError, OpResult, cache};
 use crate::acl::{self, Access};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,13 +92,14 @@ pub async fn create_changeset_as(
     if let Some(access) = access {
         access.check_writable(req.ops.iter().map(FileOp::path))?;
     }
-    let base_tree = match req.base {
+    let base = match req.base {
         Some(id) => {
-            let node = b.meta.get_commits(&[id]).await?.pop().flatten();
-            Some(node.ok_or_else(|| OpError::NotFound(format!("commit {id}")))?.tree)
+            let node = cache::get_nodes(b, &[id]).await?.pop().flatten();
+            Some(node.ok_or_else(|| OpError::NotFound(format!("commit {id}")))?)
         }
         None => None,
     };
+    let base_tree = base.as_ref().map(|n| n.tree);
 
     // Validate ops and resolve their content into (mode, blob id).
     let mut seen = HashSet::new();
@@ -148,7 +152,6 @@ pub async fn create_changeset_as(
     }
     check_blobs(b, &referenced).await?;
 
-    edits.sort_by(|a, b| a.0.cmp(&b.0));
     let mut directories = match base_tree {
         Some(root) => {
             let paths: Vec<_> = req.ops.iter().map(|op| op.path().clone()).collect();
@@ -157,6 +160,32 @@ pub async fn create_changeset_as(
         }
         None => Default::default(),
     };
+    // The changeset is exactly the ops that change a leaf: `apply` rejects
+    // every op that would replace or remove a directory, and pruning only
+    // removes directories. Computed from the base before `apply` consumes it.
+    let mut changes: Vec<PathChange> = req
+        .ops
+        .iter()
+        .zip(&edits)
+        .filter_map(|(op, (_, edit))| {
+            let path = op.path();
+            let old = super::land::entry(&directories, path).filter(|(mode, _)| !mode.is_tree());
+            let new = match *edit {
+                Edit::Write(mode, id) => Some((mode, id)),
+                Edit::Delete => None,
+            };
+            let kind = match (old, new) {
+                _ if old == new => return None,
+                (None, _) => ChangeKind::Added,
+                (_, None) => ChangeKind::Deleted,
+                _ => ChangeKind::Modified,
+            };
+            Some(PathChange { path: path.clone(), kind, old, new })
+        })
+        .collect();
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    edits.sort_by(|a, b| a.0.cmp(&b.0));
+
     let mut trees = Vec::new();
     let root = apply(&mut directories, base_tree, &edits, 0, &mut new_objects, &mut trees)?;
     let tree = match root {
@@ -165,16 +194,15 @@ pub async fn create_changeset_as(
             let empty = Object::Tree(Tree::empty()).encode();
             let id = empty.id();
             new_objects.push(empty);
-            trees.push((RepoPath::root(), id));
+            trees.push((RepoPath::root(), id, Arc::new(Tree::empty())));
             id
         }
     };
     if let Some(access) = access {
-        let mut writes = trees;
+        let mut writes: Vec<_> = trees.iter().map(|(path, id, _)| (path.clone(), *id)).collect();
         writes.extend(blob_writes);
         acl::tag_written(b, &access.policy, &writes).await?;
     }
-    b.objects.put_many(&new_objects).await?;
 
     let commit = Commit {
         tree,
@@ -184,7 +212,39 @@ pub async fn create_changeset_as(
         extra_headers: vec![],
         message: req.message.into_bytes(),
     };
-    Ok(graph::write_commit(b, &commit).await?)
+    let encoded = EncodedObject::new(ObjectKind::Commit, &commit.encode());
+    let id = encoded.id();
+    new_objects.push(encoded);
+    let node = CommitNode {
+        id,
+        tree,
+        parents: commit.parents.clone(),
+        generation: base.map_or(0, |n| n.generation) + 1,
+        committer_time: commit.committer.time,
+    };
+    let changes_weight = cache::changeset_weight(&changes);
+    let recorded = Arc::new(changes.clone());
+    // One write for every new object (blobs, trees, the commit) and, at the
+    // same time, the commit record with the changeset computed above: no
+    // tree is read back. The id is returned only once both are durable; a
+    // record whose objects failed to write is unreachable, and a retry of
+    // the same request completes it.
+    futures::try_join!(
+        async { b.objects.put_many(&new_objects).await },
+        async { b.meta.put_commit(node.clone(), changes).await },
+    )?;
+
+    let objects = cache::objects(&b.objects);
+    objects.trees.insert_many(trees.into_iter().map(|(_, id, tree)| {
+        let weight = cache::tree_weight(&tree);
+        (id, tree, weight)
+    }));
+    let commit_weight = cache::commit_weight(&commit);
+    objects.commits.insert(id, Arc::new(commit), commit_weight);
+    let meta = cache::meta(&b.meta);
+    meta.nodes.insert(id, node, cache::NODE_WEIGHT);
+    meta.changesets.insert(id, recorded, changes_weight);
+    Ok(id)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -223,7 +283,7 @@ fn apply(
     edits: &[(Vec<&str>, Edit)],
     depth: usize,
     out: &mut Vec<EncodedObject>,
-    trees: &mut Vec<(RepoPath, ObjectId)>,
+    trees: &mut Vec<(RepoPath, ObjectId, Arc<Tree>)>,
 ) -> OpResult<Option<ObjectId>> {
     let dir = RepoPath::new(
         edits.first().map(|(parts, _)| parts[..depth].join("/")).unwrap_or_default(),
@@ -302,10 +362,10 @@ fn apply(
     if tree.is_empty() {
         return Ok(None);
     }
-    let obj = Object::Tree(tree).encode();
+    let obj = EncodedObject::new(ObjectKind::Tree, &tree.encode());
     let id = obj.id();
     out.push(obj);
-    trees.push((dir, id));
+    trees.push((dir, id, Arc::new(tree)));
     Ok(Some(id))
 }
 
