@@ -258,7 +258,7 @@ mod tests {
                 author: sig.clone(),
                 committer: sig,
                 extra_headers: vec![],
-                message: format!("{time}\n"),
+                message: format!("{time}\n").into_bytes(),
             },
         )
         .await

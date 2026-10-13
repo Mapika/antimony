@@ -77,7 +77,7 @@ async fn commit(b: &Backend, parents: Vec<ObjectId>, version: u8) -> ObjectId {
             author: sig.clone(),
             committer: sig,
             extra_headers: vec![],
-            message: format!("version {version}\n"),
+            message: format!("version {version}\n").into_bytes(),
         },
     )
     .await

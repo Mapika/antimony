@@ -63,7 +63,8 @@ pub async fn log(ctx: &Ctx, rev: &str, limit: Option<u32>, path: Option<String>)
         .into_inner();
     let mut out = String::new();
     for c in r.commits {
-        let subject = c.message.lines().next().unwrap_or("");
+        let subject = String::from_utf8_lossy(&c.message);
+        let subject = subject.lines().next().unwrap_or("");
         writeln!(out, "{} {}", id_from(&c.id)?, subject)?;
     }
     Ok(Outcome::ok(out))

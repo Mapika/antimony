@@ -226,6 +226,68 @@ pub async fn meta_store(s: Arc<dyn MetaStore>) {
     assert_eq!(many[2].as_ref().map(|v| v.len()), Some(100));
 }
 
+/// Batch methods of the meta store (`put_commits`, `put_derived_many`,
+/// `get_derived_many`).
+pub async fn meta_store_batch(s: Arc<dyn MetaStore>) {
+    let id = |n: u8| ObjectId([n; 32]);
+    let node = |n: u8, parents: Vec<ObjectId>, generation: u64| CommitNode {
+        id: id(n),
+        tree: ObjectId([n + 50; 32]),
+        parents,
+        generation,
+        committer_time: n as i64,
+    };
+    let change = |p: &str, n: u8| PathChange {
+        path: RepoPath::new(p).unwrap(),
+        kind: ChangeKind::Added,
+        old: None,
+        new: Some((EntryMode::File, ObjectId([n; 32]))),
+    };
+    assert_eq!(s.put_commits(vec![]).await.unwrap(), Vec::<u64>::new());
+
+    // Pre-existing commit: keeps its original seq and changeset.
+    let pre = s.put_commit(node(1, vec![], 1), vec![change("pre", 1)]).await.unwrap();
+
+    let batch = vec![
+        (node(2, vec![id(1)], 2), vec![change("a", 2), change("b/c", 3)]),
+        (node(1, vec![], 1), vec![change("ignored", 9)]),
+        (node(3, vec![id(2)], 3), vec![]),
+        (node(4, vec![id(3)], 4), vec![change("z", 4)]),
+    ];
+    let seqs = s.put_commits(batch.clone()).await.unwrap();
+    assert_eq!(seqs.len(), 4);
+    assert_eq!(seqs[1], pre);
+    assert!(pre < seqs[0] && seqs[0] < seqs[2] && seqs[2] < seqs[3], "{pre} {seqs:?}");
+    assert_eq!(s.get_changeset(&id(1)).await.unwrap(), Some(vec![change("pre", 1)]));
+    assert_eq!(s.get_changeset(&id(2)).await.unwrap(), Some(batch[0].1.clone()));
+    assert_eq!(s.get_changeset(&id(3)).await.unwrap(), Some(vec![]));
+    assert_eq!(s.get_changeset(&id(4)).await.unwrap(), Some(vec![change("z", 4)]));
+    assert_eq!(s.get_commits(&[id(3)]).await.unwrap(), vec![Some(batch[2].0.clone())]);
+    assert_eq!(
+        s.tail(0, 10).await.unwrap(),
+        vec![(pre, id(1)), (seqs[0], id(2)), (seqs[2], id(3)), (seqs[3], id(4))]
+    );
+    // Idempotent re-run returns the same sequence numbers.
+    assert_eq!(s.put_commits(batch).await.unwrap(), seqs);
+    assert_eq!(s.tail(0, 10).await.unwrap().len(), 4);
+
+    // Derived data in bulk.
+    assert_eq!(s.get_derived_many("b/v1", &[b"a", b"b"]).await.unwrap(), vec![None, None]);
+    s.put_derived_many("b/v1", vec![]).await.unwrap();
+    s.put_derived_many(
+        "b/v1",
+        vec![(b"a".to_vec(), Bytes::from_static(b"1")), (vec![0, 255], Bytes::from_static(b"2"))],
+    )
+    .await
+    .unwrap();
+    s.put_derived_many("b/v1", vec![(b"a".to_vec(), Bytes::from_static(b"1"))]).await.unwrap();
+    let got = s.get_derived_many("b/v1", &[b"a", b"zz", &[0, 255]]).await.unwrap();
+    assert_eq!(got[0].as_deref(), Some(&b"1"[..]));
+    assert_eq!(got[1], None);
+    assert_eq!(got[2].as_deref(), Some(&b"2"[..]));
+    assert_eq!(s.get_derived("b/v1", b"a").await.unwrap().as_deref(), Some(&b"1"[..]));
+}
+
 /// History-index suite (part of the meta-store contract).
 pub async fn history_index(s: Arc<dyn MetaStore>) {
     let c = |n: u8| ObjectId([n; 32]);

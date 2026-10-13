@@ -271,6 +271,8 @@ impl RefStore for TimedRefs {
 pub struct TimedMeta {
     inner: Arc<dyn MetaStore>,
     put_commit: Arc<Counter>,
+    put_commits: Arc<Counter>,
+    put_derived_many: Arc<Counter>,
     get_commits: Arc<Counter>,
     get_changeset: Arc<Counter>,
     tail: Arc<Counter>,
@@ -283,6 +285,16 @@ impl MetaStore for TimedMeta {
     async fn put_commit(&self, node: CommitNode, changes: Vec<PathChange>) -> Result<u64> {
         let n = changes.len() as u64;
         timed(&self.put_commit, n, self.inner.put_commit(node, changes)).await
+    }
+
+    async fn put_commits(&self, commits: Vec<(CommitNode, Vec<PathChange>)>) -> Result<Vec<u64>> {
+        let n = commits.len() as u64;
+        timed(&self.put_commits, n, self.inner.put_commits(commits)).await
+    }
+
+    async fn put_derived_many(&self, kind: &str, entries: Vec<(Vec<u8>, Bytes)>) -> Result<()> {
+        let n = entries.len() as u64;
+        timed(&self.put_derived_many, n, self.inner.put_derived_many(kind, entries)).await
     }
 
     async fn get_commits(&self, ids: &[ObjectId]) -> Result<Vec<Option<CommitNode>>> {
@@ -352,6 +364,8 @@ pub fn instrument(backend: &Backend, m: &Metrics, prefix: &str) -> Backend {
         meta: Arc::new(TimedMeta {
             inner: backend.meta.clone(),
             put_commit: c("put_commit"),
+            put_commits: c("put_commits"),
+            put_derived_many: c("put_derived_many"),
             get_commits: c("get_commits"),
             get_changeset: c("get_changeset"),
             tail: c("tail"),

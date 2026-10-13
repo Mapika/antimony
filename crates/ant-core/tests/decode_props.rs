@@ -76,9 +76,24 @@ fn any_tree() -> impl Strategy<Value = Tree> {
     entries().prop_shuffle().prop_map(|es| Tree::new(es).expect("valid entries"))
 }
 
-/// Text that survives a signature name/email roundtrip.
-fn sane_ident() -> impl Strategy<Value = String> {
-    "[^<>\\s\0]([^<>\n\r\0]{0,10}[^<>\\s\0])?"
+/// Arbitrary bytes (not necessarily UTF-8) for a signature name: anything but
+/// `<` and newline.
+fn sane_name() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        prop::collection::vec(any::<u8>(), 0..12)
+            .prop_map(|v| v.into_iter().filter(|b| !matches!(b, b'<' | b'\n')).collect()),
+        "[^<>\\s\0]([^<>\n\r\0]{0,10}[^<>\\s\0])?".prop_map(String::into_bytes),
+        Just(b"J\xf6rg".to_vec()),
+    ]
+}
+
+/// Arbitrary bytes for an email: anything but `>` and newline.
+fn sane_email() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        prop::collection::vec(any::<u8>(), 0..12)
+            .prop_map(|v| v.into_iter().filter(|b| !matches!(b, b'>' | b'\n')).collect()),
+        "[^<>\\s\0]([^<>\n\r\0]{0,10}[^<>\\s\0])?".prop_map(String::into_bytes),
+    ]
 }
 
 fn tz_minutes() -> impl Strategy<Value = i32> {
@@ -94,8 +109,8 @@ fn tz_minutes() -> impl Strategy<Value = i32> {
 
 fn any_sig() -> impl Strategy<Value = Signature> {
     (
-        prop_oneof![sane_ident(), Just(String::new())],
-        sane_ident(),
+        sane_name(),
+        sane_email(),
         prop_oneof![any::<i64>(), 0..2_000_000_000i64, Just(0), Just(-1)],
         tz_minutes(),
     )
@@ -111,26 +126,29 @@ fn header_key() -> impl Strategy<Value = String> {
     prop_oneof!["[a-z][a-z0-9-]{0,8}", Just("gpgsig".to_string()), Just("encoding".to_string())]
 }
 
-fn header_value() -> impl Strategy<Value = String> {
+fn header_value() -> impl Strategy<Value = Vec<u8>> {
     prop_oneof![
-        Just(String::new()),
-        "[^\n]{0,12}",
+        Just(Vec::new()),
+        prop::collection::vec(any::<u8>(), 0..16),
+        "[^\n]{0,12}".prop_map(String::into_bytes),
         // multi-line, including blank lines and lines with leading spaces
-        prop::collection::vec("[ a-z-]{0,10}", 1..5).prop_map(|ls| ls.join("\n")),
-        Just("a\n\nb".to_string()),
-        Just("trailing\n".to_string()),
-        Just("\nleading".to_string()),
-        Just("\n".to_string()),
+        prop::collection::vec("[ a-z-]{0,10}", 1..5).prop_map(|ls| ls.join("\n").into_bytes()),
+        Just(b"a\n\nb".to_vec()),
+        Just(b"trailing\n".to_vec()),
+        Just(b"\nleading".to_vec()),
+        Just(b"\n".to_vec()),
     ]
 }
 
-fn any_message() -> impl Strategy<Value = String> {
+fn any_message() -> impl Strategy<Value = Vec<u8>> {
     prop_oneof![
-        Just(String::new()),
-        Just("\n".to_string()),
-        Just("\n\n".to_string()),
-        "\\PC{0,40}",
-        "[a-z\n ]{0,40}",
+        Just(Vec::new()),
+        Just(b"\n".to_vec()),
+        Just(b"\n\n".to_vec()),
+        prop::collection::vec(any::<u8>(), 0..40),
+        "\\PC{0,40}".prop_map(String::into_bytes),
+        "[a-z\n ]{0,40}".prop_map(String::into_bytes),
+        Just(b"caf\xe9 \xff\xfe\n".to_vec()),
     ]
 }
 
@@ -214,6 +232,15 @@ proptest! {
         let _ = Commit::decode(&data);
     }
 
+    /// Arbitrary non-UTF-8 bodies must decode (or fail) without panicking, and
+    /// a commit built from arbitrary bytes roundtrips byte-identically.
+    #[test]
+    fn commit_arbitrary_bytes_roundtrip(c in any_commit()) {
+        let enc = c.encode();
+        let dec = Commit::decode(&enc).unwrap();
+        prop_assert_eq!(dec.encode(), enc);
+    }
+
     #[test]
     fn commit_decode_never_panics_on_arbitrary_text(s in "\\PC{0,200}") {
         let _ = Commit::decode(s.as_bytes());
@@ -295,10 +322,10 @@ proptest! {
 
     #[test]
     fn commit_roundtrip_extreme_tz(tz in -5999..=5999i32, time in any::<i64>()) {
-        let sig = Signature { name: "n".into(), email: "e".into(), time, tz_offset_minutes: tz };
+        let sig = Signature { name: b"n".to_vec(), email: b"e".to_vec(), time, tz_offset_minutes: tz };
         let c = Commit {
             tree: ObjectId([0; 32]), parents: vec![], author: sig.clone(), committer: sig,
-            extra_headers: vec![], message: String::new(),
+            extra_headers: vec![], message: Vec::new(),
         };
         prop_assert_eq!(Commit::decode(&c.encode()).unwrap(), c);
     }
@@ -308,8 +335,8 @@ proptest! {
 // Edge cases the "sane" generators avoid
 // ---------------------------------------------------------------------------
 
-fn sig_with(name: &str, email: &str) -> Signature {
-    Signature { name: name.into(), email: email.into(), time: 1, tz_offset_minutes: 0 }
+fn sig_with(name: &[u8], email: &[u8]) -> Signature {
+    Signature { name: name.to_vec(), email: email.to_vec(), time: 1, tz_offset_minutes: 0 }
 }
 
 fn commit_with(author: Signature) -> Commit {
@@ -319,7 +346,7 @@ fn commit_with(author: Signature) -> Commit {
         committer: author.clone(),
         author,
         extra_headers: vec![],
-        message: "m".into(),
+        message: b"m".to_vec(),
     }
 }
 
@@ -327,7 +354,8 @@ proptest! {
     /// Any signature that avoids `<`/newline in the name must roundtrip.
     #[test]
     fn commit_signature_name_roundtrip_arbitrary(
-        name in "[^<\n\0]{0,8}", email in "[^\n\0]{0,8}"
+        name in prop::collection::vec(any::<u8>().prop_filter("no < or newline", |b| !matches!(b, b'<' | b'\n')), 0..8),
+        email in prop::collection::vec(any::<u8>().prop_filter("no > or newline", |b| !matches!(b, b'>' | b'\n')), 0..8),
     ) {
         let c = commit_with(sig_with(&name, &email));
         prop_assert_eq!(Commit::decode(&c.encode()).unwrap(), c);
@@ -337,8 +365,8 @@ proptest! {
     /// carrying one must fail to decode, not panic or silently change.
     #[test]
     fn commit_extra_header_empty_key_rejected(v in "[a-z]{0,3}") {
-        let mut c = commit_with(sig_with("n", "e"));
-        c.extra_headers.push((String::new(), v));
+        let mut c = commit_with(sig_with(b"n", b"e"));
+        c.extra_headers.push((String::new(), v.into_bytes()));
         prop_assert!(Commit::decode(&c.encode()).map(|d| d != c).unwrap_or(true));
     }
 }
@@ -356,14 +384,14 @@ fn regression_tz_multibyte_panics() {
 
 #[test]
 fn regression_signature_name_trailing_space() {
-    let c = commit_with(sig_with("a ", "e"));
+    let c = commit_with(sig_with(b"a ", b"e"));
     assert_eq!(Commit::decode(&c.encode()).unwrap(), c);
 }
 
 #[test]
 fn regression_empty_header_key() {
-    let mut c = commit_with(sig_with("n", "e"));
-    c.extra_headers.push((String::new(), "v".into()));
+    let mut c = commit_with(sig_with(b"n", b"e"));
+    c.extra_headers.push((String::new(), b"v".to_vec()));
     assert!(Commit::decode(&c.encode()).map(|d| d != c).unwrap_or(true));
 }
 

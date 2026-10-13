@@ -271,7 +271,7 @@ mod tests {
                 author: sig(t),
                 committer: sig(t),
                 extra_headers: vec![],
-                message: format!("c{t}\n"),
+                message: format!("c{t}\n").into_bytes(),
             },
         )
         .await

@@ -730,7 +730,7 @@ async fn concurrency_case(b: Backend, ref_name: String, plans: Vec<TaskPlan>) ->
     // Chain order of tasks, by message.
     let order: Vec<usize> = chain
         .iter()
-        .map(|(_, m)| m.trim().strip_prefix("task-").unwrap().parse::<usize>().unwrap())
+        .map(|(_, m)| String::from_utf8_lossy(m).trim().strip_prefix("task-").unwrap().parse::<usize>().unwrap())
         .collect();
     prop_assert_eq!(order.iter().copied().collect::<BTreeSet<_>>(), landed.clone());
 

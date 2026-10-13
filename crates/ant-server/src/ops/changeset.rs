@@ -146,7 +146,7 @@ pub async fn create_changeset(b: &Backend, req: ChangesetRequest) -> OpResult<Ob
         committer: req.committer.unwrap_or_else(|| req.author.clone()),
         author: req.author,
         extra_headers: vec![],
-        message: req.message,
+        message: req.message.into_bytes(),
     };
     Ok(graph::write_commit(b, &commit).await?)
 }
@@ -322,7 +322,7 @@ pub(crate) mod tests {
         let commit_obj = b.objects.read_commit(&c).await.unwrap();
         assert!(commit_obj.parents.is_empty());
         assert_eq!(commit_obj.committer, sig());
-        assert_eq!(commit_obj.message, "msg\n");
+        assert_eq!(commit_obj.message, b"msg\n");
         // Recorded in meta with generation 1 and a full changeset.
         let node = b.meta.get_commits(&[c]).await.unwrap().pop().unwrap().unwrap();
         assert_eq!(node.generation, 1);
