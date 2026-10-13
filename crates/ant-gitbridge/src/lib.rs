@@ -36,7 +36,6 @@ use anyhow::{anyhow, bail, Context as _};
 use ant_core::{Commit, EncodedObject, EntryMode, ObjectId, ObjectKind, Signature, Tree, TreeEntry};
 use ant_store::graph;
 use ant_store::{Backend, CasOutcome};
-use bytes::Bytes;
 use tokio::sync::mpsc;
 
 /// Derived-data kind mapping a source commit id to its antimony commit id.
@@ -100,7 +99,7 @@ async fn write(backend: &Backend, mut rx: mpsc::Receiver<Msg>, stats: &mut Impor
                 store_objects(backend, objects, stats).await?;
                 for (id, git) in commits {
                     graph::record_commit(backend, id).await?;
-                    let value = Bytes::copy_from_slice(id.as_bytes());
+                    let value = id.as_bytes().to_vec().into();
                     backend.meta.put_derived(COMMIT_KIND, git.as_slice(), value).await?;
                     stats.commits += 1;
                 }
@@ -206,7 +205,9 @@ struct RawCommit {
 
 enum Frame {
     Enter(gix::ObjectId),
-    Exit(gix::ObjectId, Box<RawCommit>),
+    /// Only the id: the commit is re-read when its turn comes, so the DFS
+    /// stack never holds the parsed metadata of many commits at once.
+    Exit(gix::ObjectId),
 }
 
 impl Producer {
@@ -260,23 +261,29 @@ impl Producer {
         while let Some(frame) = stack.pop() {
             match frame {
                 Frame::Enter(id) => {
-                    if !visited.insert(id) || self.known_commit(id)?.is_some() {
+                    if !visited.insert(id) {
+                        continue;
+                    }
+                    // Already imported (earlier run or this one): remember the
+                    // answer so children do not query the meta store again.
+                    if let Some(a) = self.known_commit(id)? {
+                        self.memo.insert(id, a);
                         continue;
                     }
                     let raw = parse_commit(id, &self.read(id)?)?;
-                    let parents = raw.parents.clone();
-                    stack.push(Frame::Exit(id, Box::new(raw)));
-                    for p in parents.into_iter().rev() {
+                    stack.push(Frame::Exit(id));
+                    for p in raw.parents.into_iter().rev() {
                         stack.push(Frame::Enter(p));
                     }
                 }
-                Frame::Exit(id, raw) => self.convert_commit(id, *raw)?,
+                Frame::Exit(id) => self.convert_commit(id)?,
             }
         }
         Ok(())
     }
 
-    fn convert_commit(&mut self, id: gix::ObjectId, raw: RawCommit) -> anyhow::Result<()> {
+    fn convert_commit(&mut self, id: gix::ObjectId) -> anyhow::Result<()> {
+        let raw = parse_commit(id, &self.read(id)?)?;
         let tree = self.convert_tree(raw.tree)?;
         let mut parents = Vec::with_capacity(raw.parents.len());
         for p in &raw.parents {

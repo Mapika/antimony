@@ -120,7 +120,6 @@ dependencies = [
  "ant-core",
  "ant-store",
  "anyhow",
- "bytes",
  "gix",
  "tempfile",
  "thiserror",
