@@ -22,9 +22,11 @@
 //!   ids. Store all new blobs/trees with as few `put_many` calls as
 //!   practical (one per batch, not one per object).
 //! - Build the `Commit` (parents = `[base]` or `[]`, committer defaults to
-//!   author, message verbatim), then persist via
-//!   `ant_store::graph::write_commit`, which also records generation and
-//!   changeset. Return the commit id.
+//!   author, message verbatim), then persist it with generation and
+//!   changeset exactly as `ant_store::graph::write_commit` would. (The
+//!   implementation stores the commit object in the same `put_many` as the
+//!   trees and computes the changeset from the ops instead of re-reading
+//!   the trees it just built.) Return the commit id.
 //! - An empty ops list is allowed (produces a commit with the same tree).
 //!
 //! Performance target: O(changed paths × depth) object reads/writes,
