@@ -96,6 +96,38 @@ fn ids_to_vecs(ids: &[ObjectId]) -> Vec<Vec<u8>> {
     ids.iter().map(|id| id.as_bytes().to_vec()).collect()
 }
 
+/// Changeset rows for a batch of commits, as parallel arrays for `unnest`.
+#[derive(Default)]
+struct ChangeRows<'a> {
+    commit_ids: Vec<&'a [u8]>,
+    idx: Vec<i32>,
+    paths: Vec<&'a str>,
+    kinds: Vec<i16>,
+    old_modes: Vec<Option<&'static str>>,
+    old_ids: Vec<Option<&'a [u8]>>,
+    new_modes: Vec<Option<&'static str>>,
+    new_ids: Vec<Option<&'a [u8]>>,
+}
+
+impl<'a> ChangeRows<'a> {
+    fn new(commits: impl Iterator<Item = (&'a ObjectId, &'a [PathChange])>) -> Self {
+        let mut rows = Self::default();
+        for (id, changes) in commits {
+            for (i, c) in changes.iter().enumerate() {
+                rows.commit_ids.push(id.as_bytes().as_slice());
+                rows.idx.push(i as i32);
+                rows.paths.push(c.path.as_str());
+                rows.kinds.push(change_kind_code(c.kind));
+                rows.old_modes.push(c.old.as_ref().map(|(m, _)| m.as_octal()));
+                rows.old_ids.push(c.old.as_ref().map(|(_, id)| id.as_bytes().as_slice()));
+                rows.new_modes.push(c.new.as_ref().map(|(m, _)| m.as_octal()));
+                rows.new_ids.push(c.new.as_ref().map(|(_, id)| id.as_bytes().as_slice()));
+            }
+        }
+        rows
+    }
+}
+
 impl PgStore {
     /// Connect and ensure `schema` and all tables exist.
     pub async fn connect(url: &str, schema: &str) -> Result<Self> {
@@ -588,193 +620,99 @@ impl MetaStore for PgStore {
     }
 
     async fn put_commit(&self, node: CommitNode, changes: Vec<PathChange>) -> Result<u64> {
-        let mut tx = self.pool.begin().await.map_err(be)?;
-        let parents: Vec<u8> = node
-            .parents
-            .iter()
-            .flat_map(|p| p.as_bytes().iter().copied())
-            .collect();
-        let inserted = sqlx::query(
-            "INSERT INTO commits (id, tree, parents, generation, committer_time) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(node.id.as_bytes().as_slice())
-        .bind(node.tree.as_bytes().as_slice())
-        .bind(&parents)
-        .bind(node.generation as i64)
-        .bind(node.committer_time)
-        .execute(&mut *tx)
-        .await
-        .map_err(be)?
-        .rows_affected();
-
-        if inserted == 0 {
-            // Already recorded: return the original sequence number, change nothing.
-            let seq: i64 = sqlx::query("SELECT seq FROM log WHERE commit_id = $1")
-                .bind(node.id.as_bytes().as_slice())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(be)?
-                .try_get("seq")
-                .map_err(be)?;
-            tx.commit().await.map_err(be)?;
-            return Ok(seq as u64);
-        }
-
-        let seq: i64 = sqlx::query("INSERT INTO log (commit_id) VALUES ($1) RETURNING seq")
-            .bind(node.id.as_bytes().as_slice())
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(be)?
-            .try_get("seq")
-            .map_err(be)?;
-
-        if !changes.is_empty() {
-            let n = changes.len();
-            let mut idx = Vec::with_capacity(n);
-            let mut paths = Vec::with_capacity(n);
-            let mut kinds = Vec::with_capacity(n);
-            let mut old_modes: Vec<Option<String>> = Vec::with_capacity(n);
-            let mut old_ids: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
-            let mut new_modes: Vec<Option<String>> = Vec::with_capacity(n);
-            let mut new_ids: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
-            for (i, c) in changes.iter().enumerate() {
-                idx.push(i as i32);
-                paths.push(c.path.as_str().to_string());
-                kinds.push(change_kind_code(c.kind));
-                old_modes.push(c.old.map(|(m, _)| m.as_octal().to_string()));
-                old_ids.push(c.old.map(|(_, id)| id.as_bytes().to_vec()));
-                new_modes.push(c.new.map(|(m, _)| m.as_octal().to_string()));
-                new_ids.push(c.new.map(|(_, id)| id.as_bytes().to_vec()));
-            }
-            sqlx::query(
-                "INSERT INTO changes (commit_id, idx, path, kind, old_mode, old_id, new_mode, new_id) \
-                 SELECT $1, t.idx, t.path, t.kind, t.old_mode, t.old_id, t.new_mode, t.new_id \
-                 FROM unnest($2::integer[], $3::text[], $4::smallint[], $5::text[], $6::bytea[], \
-                              $7::text[], $8::bytea[]) \
-                      AS t(idx, path, kind, old_mode, old_id, new_mode, new_id)",
-            )
-            .bind(node.id.as_bytes().as_slice())
-            .bind(&idx)
-            .bind(&paths)
-            .bind(&kinds)
-            .bind(&old_modes)
-            .bind(&old_ids)
-            .bind(&new_modes)
-            .bind(&new_ids)
-            .execute(&mut *tx)
-            .await
-            .map_err(be)?;
-        }
-        tx.commit().await.map_err(be)?;
-        Ok(seq as u64)
+        Ok(self.put_commits(vec![(node, changes)]).await?[0])
     }
 
     async fn put_commits(&self, commits: Vec<(CommitNode, Vec<PathChange>)>) -> Result<Vec<u64>> {
         if commits.is_empty() {
             return Ok(Vec::new());
         }
-        let ids: Vec<Vec<u8>> = commits.iter().map(|(n, _)| n.id.as_bytes().to_vec()).collect();
-        let trees: Vec<Vec<u8>> = commits.iter().map(|(n, _)| n.tree.as_bytes().to_vec()).collect();
-        let parents: Vec<Vec<u8>> = commits
+        // Equal ids are equal commits: only the first occurrence is recorded.
+        let mut first = HashSet::with_capacity(commits.len());
+        let unique: Vec<&(CommitNode, Vec<PathChange>)> =
+            commits.iter().filter(|(n, _)| first.insert(n.id)).collect();
+        let ids: Vec<&[u8]> = unique.iter().map(|(n, _)| n.id.as_bytes().as_slice()).collect();
+        let trees: Vec<&[u8]> = unique.iter().map(|(n, _)| n.tree.as_bytes().as_slice()).collect();
+        let parents: Vec<Vec<u8>> = unique
             .iter()
             .map(|(n, _)| n.parents.iter().flat_map(|p| p.as_bytes().iter().copied()).collect())
             .collect();
-        let gens: Vec<i64> = commits.iter().map(|(n, _)| n.generation as i64).collect();
-        let times: Vec<i64> = commits.iter().map(|(n, _)| n.committer_time).collect();
+        let gens: Vec<i64> = unique.iter().map(|(n, _)| n.generation as i64).collect();
+        let times: Vec<i64> = unique.iter().map(|(n, _)| n.committer_time).collect();
+        let rows = ChangeRows::new(unique.iter().map(|(n, c)| (&n.id, c.as_slice())));
 
-        let mut tx = self.pool.begin().await.map_err(be)?;
-        // Rows that were actually inserted (not already recorded).
-        let inserted: Vec<Vec<u8>> = sqlx::query_scalar(
-            "INSERT INTO commits (id, tree, parents, generation, committer_time) \
-             SELECT id, tree, parents, generation, committer_time \
-             FROM unnest($1::bytea[], $2::bytea[], $3::bytea[], $4::bigint[], $5::bigint[]) \
-                  WITH ORDINALITY AS t(id, tree, parents, generation, committer_time, ord) \
-             ORDER BY ord \
-             ON CONFLICT (id) DO NOTHING RETURNING id",
+        // One atomic statement (no explicit transaction round trips): insert
+        // the new nodes, append them to the log in input order (parents
+        // first), insert their changesets, and return every input's seq.
+        // Already-recorded commits keep their seq and changeset.
+        let result = sqlx::query(
+            "WITH input AS ( \
+                 SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::bytea[], $4::bigint[], \
+                                      $5::bigint[]) \
+                 WITH ORDINALITY AS t(id, tree, parents, generation, committer_time, ord)), \
+             ins AS ( \
+                 INSERT INTO commits (id, tree, parents, generation, committer_time) \
+                 SELECT id, tree, parents, generation, committer_time FROM input ORDER BY ord \
+                 ON CONFLICT (id) DO NOTHING RETURNING id), \
+             lg AS ( \
+                 INSERT INTO log (commit_id) \
+                 SELECT input.id FROM input JOIN ins ON ins.id = input.id ORDER BY input.ord \
+                 RETURNING commit_id, seq), \
+             ch AS ( \
+                 INSERT INTO changes \
+                     (commit_id, idx, path, kind, old_mode, old_id, new_mode, new_id) \
+                 SELECT c.* FROM unnest($6::bytea[], $7::integer[], $8::text[], \
+                                        $9::smallint[], $10::text[], $11::bytea[], \
+                                        $12::text[], $13::bytea[]) \
+                     AS c(commit_id, idx, path, kind, old_mode, old_id, new_mode, new_id) \
+                 WHERE c.commit_id IN (SELECT id FROM ins)) \
+             SELECT commit_id, seq FROM lg \
+             UNION ALL \
+             SELECT commit_id, seq FROM log \
+              WHERE commit_id = ANY($1) AND commit_id NOT IN (SELECT id FROM ins)",
         )
         .bind(&ids)
         .bind(&trees)
         .bind(&parents)
         .bind(&gens)
         .bind(&times)
-        .fetch_all(&mut *tx)
+        .bind(&rows.commit_ids)
+        .bind(&rows.idx)
+        .bind(&rows.paths)
+        .bind(&rows.kinds)
+        .bind(&rows.old_modes)
+        .bind(&rows.old_ids)
+        .bind(&rows.new_modes)
+        .bind(&rows.new_ids)
+        .fetch_all(&self.pool)
         .await
         .map_err(be)?;
-        let inserted: HashSet<Vec<u8>> = inserted.into_iter().collect();
-
-        if !inserted.is_empty() {
-            // Input order = sequence order (parents first).
-            let mut seen = HashSet::with_capacity(inserted.len());
-            let new_ids: Vec<&Vec<u8>> =
-                ids.iter().filter(|i| inserted.contains(*i) && seen.insert(*i)).collect();
-            sqlx::query(
-                "INSERT INTO log (commit_id) \
-                 SELECT id FROM unnest($1::bytea[]) WITH ORDINALITY AS t(id, ord) ORDER BY ord",
-            )
-            .bind(&new_ids)
-            .execute(&mut *tx)
-            .await
-            .map_err(be)?;
-
-            let mut c_ids: Vec<&[u8]> = Vec::new();
-            let mut idx = Vec::new();
-            let mut paths = Vec::new();
-            let mut kinds = Vec::new();
-            let mut old_modes: Vec<Option<String>> = Vec::new();
-            let mut old_ids: Vec<Option<Vec<u8>>> = Vec::new();
-            let mut new_modes: Vec<Option<String>> = Vec::new();
-            let mut new_ids: Vec<Option<Vec<u8>>> = Vec::new();
-            let mut done = HashSet::new();
-            for (raw, (_, changes)) in ids.iter().zip(&commits) {
-                if !inserted.contains(raw) || !done.insert(raw) {
-                    continue;
-                }
-                for (i, c) in changes.iter().enumerate() {
-                    c_ids.push(raw);
-                    idx.push(i as i32);
-                    paths.push(c.path.as_str().to_string());
-                    kinds.push(change_kind_code(c.kind));
-                    old_modes.push(c.old.map(|(m, _)| m.as_octal().to_string()));
-                    old_ids.push(c.old.map(|(_, id)| id.as_bytes().to_vec()));
-                    new_modes.push(c.new.map(|(m, _)| m.as_octal().to_string()));
-                    new_ids.push(c.new.map(|(_, id)| id.as_bytes().to_vec()));
-                }
-            }
-            if !c_ids.is_empty() {
-                sqlx::query(
-                    "INSERT INTO changes (commit_id, idx, path, kind, old_mode, old_id, new_mode, new_id) \
-                     SELECT * FROM unnest($1::bytea[], $2::integer[], $3::text[], $4::smallint[], \
-                                          $5::text[], $6::bytea[], $7::text[], $8::bytea[])",
-                )
-                .bind(&c_ids)
-                .bind(&idx)
-                .bind(&paths)
-                .bind(&kinds)
-                .bind(&old_modes)
-                .bind(&old_ids)
-                .bind(&new_modes)
-                .bind(&new_ids)
-                .execute(&mut *tx)
+        let mut seqs: HashMap<ObjectId, u64> = HashMap::with_capacity(ids.len());
+        for r in &result {
+            seqs.insert(object_id_col(r, "commit_id")?, r.try_get::<i64, _>("seq").map_err(be)? as u64);
+        }
+        // A commit recorded concurrently by another transaction is invisible
+        // to this statement's snapshot; read its seq with a fresh one.
+        let late: Vec<&[u8]> = ids
+            .iter()
+            .copied()
+            .filter(|id| ObjectId::from_bytes(id).is_ok_and(|id| !seqs.contains_key(&id)))
+            .collect();
+        if !late.is_empty() {
+            let rows = sqlx::query("SELECT commit_id, seq FROM log WHERE commit_id = ANY($1)")
+                .bind(&late)
+                .fetch_all(&self.pool)
                 .await
                 .map_err(be)?;
+            for r in &rows {
+                seqs.insert(object_id_col(r, "commit_id")?, r.try_get::<i64, _>("seq").map_err(be)? as u64);
             }
         }
-
-        let rows = sqlx::query("SELECT commit_id, seq FROM log WHERE commit_id = ANY($1)")
-            .bind(&ids)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(be)?;
-        tx.commit().await.map_err(be)?;
-        let mut seqs: HashMap<Vec<u8>, i64> = HashMap::with_capacity(rows.len());
-        for r in &rows {
-            seqs.insert(r.try_get("commit_id").map_err(be)?, r.try_get("seq").map_err(be)?);
-        }
-        ids.iter()
-            .map(|i| {
-                seqs.get(i)
-                    .map(|s| *s as u64)
+        commits
+            .iter()
+            .map(|(n, _)| {
+                seqs.get(&n.id)
+                    .copied()
                     .ok_or_else(|| StoreError::InvalidArgument("commit missing from log".into()))
             })
             .collect()
