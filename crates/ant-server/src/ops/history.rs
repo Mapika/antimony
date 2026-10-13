@@ -509,9 +509,9 @@ pub async fn blame(b: &Backend, rev: &str, path: &RepoPath) -> OpResult<Vec<Blam
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::changeset::tests::{commit, delete, write};
     use crate::ops::land::{LandOutcome, land};
     use crate::ops::query;
+    use crate::ops::test_support::{commit, delete, write};
     use ant_store::HistoryRow;
 
     async fn landed(

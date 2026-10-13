@@ -234,7 +234,7 @@ async fn diff_unfiltered(b: &Backend, from: Option<&str>, to: &str) -> OpResult<
 mod tests {
     use super::*;
     use crate::ops::OpError;
-    use crate::ops::changeset::tests::{commit, delete, write};
+    use crate::ops::test_support::{commit, delete, write};
     use ant_store::{CasOutcome, ChangeKind};
 
     async fn setup() -> (Backend, Vec<ObjectId>) {

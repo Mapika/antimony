@@ -155,7 +155,7 @@ pub async fn create_changeset_as(
     let mut directories = match base_tree {
         Some(root) => {
             let paths: Vec<_> = req.ops.iter().map(|op| op.path().clone()).collect();
-            let [dirs] = super::land::load_directories(b, [root], &paths).await?;
+            let [dirs] = super::tree_edit::load_directories(b, [root], &paths).await?;
             dirs
         }
         None => Default::default(),
@@ -169,7 +169,8 @@ pub async fn create_changeset_as(
         .zip(&edits)
         .filter_map(|(op, (_, edit))| {
             let path = op.path();
-            let old = super::land::entry(&directories, path).filter(|(mode, _)| !mode.is_tree());
+            let old =
+                super::tree_edit::entry(&directories, path).filter(|(mode, _)| !mode.is_tree());
             let new = match *edit {
                 Edit::Write(mode, id) => Some((mode, id)),
                 Edit::Delete => None,
@@ -277,7 +278,7 @@ async fn check_blobs(b: &Backend, ids: &[ObjectId]) -> OpResult<()> {
 /// components) to the tree `base`. Returns the new tree id, or `None` if the
 /// directory ends up empty. New trees are appended to `out`.
 fn apply(
-    directories: &mut super::land::Directories,
+    directories: &mut super::tree_edit::Directories,
     base: Option<ObjectId>,
     edits: &[(Vec<&str>, Edit)],
     depth: usize,
@@ -369,54 +370,13 @@ fn apply(
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use crate::ops::OpError;
+    use crate::ops::test_support::{commit, delete, read, sig, write};
     use ant_core::{EncodedObject, ObjectKind};
     use ant_store::graph::{diff_trees, lookup_path};
     use ant_store::{ChangeKind, ObjectStoreExt};
-
-    pub fn sig() -> Signature {
-        Signature {
-            name: "agent".into(),
-            email: "a@x".into(),
-            time: 1_700_000_000,
-            tz_offset_minutes: 0,
-        }
-    }
-
-    pub fn write(path: &str, content: &str) -> FileOp {
-        FileOp::Write {
-            path: RepoPath::new(path).unwrap(),
-            mode: EntryMode::File,
-            content: WriteContent::Inline(Bytes::copy_from_slice(content.as_bytes())),
-        }
-    }
-
-    pub fn delete(path: &str) -> FileOp {
-        FileOp::Delete { path: RepoPath::new(path).unwrap() }
-    }
-
-    pub async fn commit(
-        b: &Backend,
-        base: Option<ObjectId>,
-        ops: Vec<FileOp>,
-    ) -> OpResult<ObjectId> {
-        create_changeset(
-            b,
-            ChangesetRequest { base, ops, author: sig(), committer: None, message: "msg\n".into() },
-        )
-        .await
-    }
-
-    pub async fn read(b: &Backend, commit_id: ObjectId, path: &str) -> Option<String> {
-        let c = b.objects.read_commit(&commit_id).await.unwrap();
-        let (mode, id) = lookup_path(b.objects.as_ref(), c.tree, &RepoPath::new(path).unwrap())
-            .await
-            .unwrap()?;
-        assert!(mode.is_blob(), "{path} is not a blob");
-        Some(String::from_utf8(b.objects.read_blob(&id).await.unwrap().to_vec()).unwrap())
-    }
 
     #[tokio::test]
     async fn root_commit_and_nested_writes() {
