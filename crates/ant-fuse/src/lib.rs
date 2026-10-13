@@ -42,6 +42,8 @@ use ant_core::ObjectId;
 use ant_store::ObjectStore;
 
 mod filesystem;
+pub mod rw;
+pub use rw::mount_rw;
 
 #[derive(Debug, Clone)]
 pub struct MountOptions {
@@ -88,6 +90,20 @@ pub fn mount(
     fuser::spawn_mount(filesystem::View::new(objects, root_tree, rt, opts), mountpoint, &config)
 }
 
+/// Serializes every in-process kernel mount test.
+///
+/// Mounting and unmounting spawn `fusermount3` through a real `fork` (fuser
+/// clears CLOEXEC in a `pre_exec` hook, which rules out `posix_spawn`). A test
+/// process is both FUSE client and daemon, so another test may be inside a
+/// direct-I/O `read` whose destination pages the kernel has grabbed with
+/// `get_user_pages`. If a sibling thread forks then, those pages become
+/// copy-on-write: the kernel fills the pre-fork copy, the reader's mapping
+/// moves to a fresh one, and the read returns success with stale heap bytes.
+/// Real deployments do not hit this because the daemon and its clients are
+/// separate processes; only tests that mix both in one process need the gate.
+#[cfg(test)]
+pub(crate) static KERNEL_GATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -126,13 +142,16 @@ mod tests {
         (s, root)
     }
 
-    fn mount_fixture(rt: &tokio::runtime::Runtime) -> (tempfile::TempDir, PathBuf, fuser::BackgroundSession) {
+    fn mount_fixture(
+        rt: &tokio::runtime::Runtime,
+    ) -> (parking_lot::MutexGuard<'static, ()>, tempfile::TempDir, PathBuf, fuser::BackgroundSession) {
+        let gate = crate::KERNEL_GATE.lock();
         let (s, root) = rt.block_on(fixture());
         let tmp = tempfile::tempdir().unwrap();
         let mnt = tmp.path().join("mnt");
         std::fs::create_dir(&mnt).unwrap();
         let sess = mount(s, root, &mnt, rt.handle().clone(), MountOptions::default()).unwrap();
-        (tmp, mnt, sess)
+        (gate, tmp, mnt, sess)
     }
 
     fn rt() -> tokio::runtime::Runtime {
@@ -142,7 +161,7 @@ mod tests {
     #[test]
     fn reads_files_dirs_links() {
         let rt = rt();
-        let (_tmp, mnt, _sess) = mount_fixture(&rt);
+        let (_gate, _tmp, mnt, _sess) = mount_fixture(&rt);
         assert_eq!(std::fs::read_to_string(mnt.join("src/lib.rs")).unwrap(), "pub fn x() {}\n");
         assert_eq!(std::fs::read_to_string(mnt.join("src/deep/er/f")).unwrap(), "deep");
         assert_eq!(std::fs::read_link(mnt.join("link")).unwrap(), PathBuf::from("src/lib.rs"));
@@ -168,7 +187,7 @@ mod tests {
     #[test]
     fn large_file_and_wide_dir() {
         let rt = rt();
-        let (_tmp, mnt, _sess) = mount_fixture(&rt);
+        let (_gate, _tmp, mnt, _sess) = mount_fixture(&rt);
         let big = std::fs::read(mnt.join("big.bin")).unwrap();
         assert_eq!(big.len(), 3_000_000);
         assert!(big.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8));
@@ -178,7 +197,7 @@ mod tests {
     #[test]
     fn read_only() {
         let rt = rt();
-        let (_tmp, mnt, _sess) = mount_fixture(&rt);
+        let (_gate, _tmp, mnt, _sess) = mount_fixture(&rt);
         let e = std::fs::write(mnt.join("new"), b"x").unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::EROFS));
         let e = std::fs::OpenOptions::new().write(true).open(mnt.join("src/lib.rs")).unwrap_err();

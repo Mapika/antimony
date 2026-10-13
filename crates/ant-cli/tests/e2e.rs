@@ -102,6 +102,18 @@ impl Ctx {
     }
 }
 
+struct LazyMounts<'a> {
+    ctx: &'a Ctx,
+    dirs: Vec<&'a Path>,
+}
+impl Drop for LazyMounts<'_> {
+    fn drop(&mut self) {
+        for dir in &self.dirs {
+            let _ = self.ctx.run(None, &["ws", "unmount", dir.to_str().unwrap()]);
+        }
+    }
+}
+
 struct KillOnDrop(Child);
 
 impl Drop for KillOnDrop {
@@ -232,6 +244,16 @@ fn cargo_build_server() -> PathBuf {
 #[test]
 #[ignore = "needs docker compose up -d"]
 fn cli_end_to_end() {
+    run_end_to_end(false);
+}
+
+#[test]
+#[ignore = "needs docker compose up -d and FUSE"]
+fn cli_lazy_end_to_end() {
+    run_end_to_end(true);
+}
+
+fn run_end_to_end(lazy: bool) {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
     let uniq = format!("{}_{}", std::process::id(), nanos);
     let schema = format!("e2e_{uniq}");
@@ -385,7 +407,7 @@ fn cli_end_to_end() {
     // B, C and D are all created at the same (soon to be old) base.
     let new_ws = |dir: &Path, extra: &[&str]| -> String {
         let mut a = vec!["ws", "new", dir.to_str().expect("utf8"), "--at", "main"];
-        a.extend_from_slice(extra);
+        if lazy { a.push("--lazy"); } else { a.extend_from_slice(extra); }
         let r = ctx.run(None, &a);
         let id = r.stdout().trim_end().to_string();
         assert_id(&r, &id);
@@ -395,6 +417,7 @@ fn cli_end_to_end() {
     let dir_b = root.join("ws-b");
     let dir_c = root.join("ws-c");
     let dir_d = root.join("ws-d");
+    let _mounts = LazyMounts { ctx: &ctx, dirs: if lazy { vec![&dir_a, &dir_b, &dir_c, &dir_d] } else { vec![] } };
     check_str(&new_ws(&dir_b, &[]), &tip);
     check_str(&new_ws(&dir_c, &[]), &tip);
     check_str(&new_ws(&dir_d, &[]), &tip);
@@ -409,7 +432,7 @@ fn cli_end_to_end() {
         .filter(|n| n != ".ant")
         .collect();
     top.sort();
-    assert_eq!(top, strs(&["src"]), "sparse workspace should only contain src/");
+    if !lazy { assert_eq!(top, strs(&["src"]), "sparse workspace should only contain src/"); }
     // full workspace has everything, including exec bit
     assert_eq!(fs::read(dir_b.join("big.bin")).expect("big.bin"), big_blob());
     let mode = fs::metadata(dir_b.join("scripts/run.sh")).expect("run.sh").permissions().mode();
@@ -512,6 +535,17 @@ fn cli_end_to_end() {
         .map(|l| l.split_once(' ').map(|x| x.1.to_string()).unwrap_or_default())
         .collect();
     check_eq(&r, "final log", subjects, strs(&["D edits guide", "B edits shared", "agent change"]));
+    if lazy {
+        for dir in [&dir_a, &dir_b, &dir_c, &dir_d] {
+            let before = ctx.run(Some(dir), &["status"]).ok_text();
+            ctx.run(None, &["ws", "unmount", dir.to_str().unwrap()]).ok();
+            assert!(dir.join(".ant/workspace").is_file());
+            assert!(!dir.join("src").exists());
+            ctx.run(None, &["ws", "new", "--lazy", dir.to_str().unwrap()]).ok();
+            assert_eq!(ctx.run(Some(dir), &["status"]).ok_text(), before);
+            ctx.run(None, &["ws", "unmount", dir.to_str().unwrap()]).ok();
+        }
+    }
 }
 
 fn check_str(actual: &str, expected: &str) {
