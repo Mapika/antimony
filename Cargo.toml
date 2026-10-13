@@ -29,6 +29,7 @@ clap = { version = "4", features = ["derive", "env"] }
 diffy = "0.4"
 fuser = { version = "0.18", default-features = false }
 futures = "0.3"
+flate2 = "1"
 gix = { version = "0.89", default-features = false, features = ["max-performance-safe", "revision", "sha1"] }
 globset = "0.4"
 hex = "0.4"
