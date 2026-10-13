@@ -31,6 +31,9 @@ use crate::{ObjectStore, Result, StoreError};
 const FANOUT: usize = 64;
 /// zstd level for stored object bodies.
 const ZSTD_LEVEL: i32 = 3;
+/// Bodies larger than this are compressed/decompressed/hashed on the blocking
+/// pool instead of an async worker thread.
+const BLOCKING_THRESHOLD: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct S3Config {
@@ -128,16 +131,36 @@ impl S3ObjectStore {
             }
         };
         let compressed: Bytes = resp.body.collect().await.map_err(StoreError::backend)?.into_bytes();
-        let raw = zstd::stream::decode_all(&compressed[..]).map_err(StoreError::backend)?;
-        let obj = EncodedObject::from_bytes(Bytes::from(raw))
-            .map_err(|e| corrupt(format!("object {id}: {e}")))?;
-        obj.verify(&id).map_err(|e| corrupt(format!("object {id}: {e}")))?;
+        let compressed_len = compressed.len();
+        let decode = move || -> Result<EncodedObject> {
+            let raw = zstd::stream::decode_all(&compressed[..]).map_err(StoreError::backend)?;
+            let obj = EncodedObject::from_bytes(Bytes::from(raw))
+                .map_err(|e| corrupt(format!("object {id}: {e}")))?;
+            obj.verify(&id).map_err(|e| corrupt(format!("object {id}: {e}")))?;
+            Ok(obj)
+        };
+        // Large bodies are CPU-heavy to decompress and hash; keep them off the
+        // async worker threads.
+        let obj = if compressed_len > BLOCKING_THRESHOLD {
+            tokio::task::spawn_blocking(decode).await.map_err(StoreError::backend)??
+        } else {
+            decode()?
+        };
         Ok(Some(obj))
     }
 
     async fn put_one(&self, id: ObjectId, obj: &EncodedObject) -> Result<()> {
-        let compressed =
-            zstd::stream::encode_all(&obj.as_bytes()[..], ZSTD_LEVEL).map_err(StoreError::backend)?;
+        let compressed = if obj.as_bytes().len() > BLOCKING_THRESHOLD {
+            let body = obj.clone();
+            tokio::task::spawn_blocking(move || {
+                zstd::stream::encode_all(&body.as_bytes()[..], ZSTD_LEVEL)
+            })
+            .await
+            .map_err(StoreError::backend)?
+            .map_err(StoreError::backend)?
+        } else {
+            zstd::stream::encode_all(&obj.as_bytes()[..], ZSTD_LEVEL).map_err(StoreError::backend)?
+        };
         self.client
             .put_object()
             .bucket(&self.bucket)
