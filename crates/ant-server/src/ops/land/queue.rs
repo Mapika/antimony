@@ -80,6 +80,12 @@ impl Worker {
     }
 }
 
+/// Live land queues and the requests waiting in them (process-wide).
+pub(crate) fn queue_stats() -> (usize, usize) {
+    let queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+    (queues.len(), queues.values().map(VecDeque::len).sum())
+}
+
 #[cfg(test)]
 pub(super) fn enqueue(
     b: &Backend,
