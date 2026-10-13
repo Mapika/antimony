@@ -25,9 +25,11 @@ const CONTENT_TYPE: &str = "application/x-ant-object";
 const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const CACHE_NO_STORE: &str = "no-store";
 
-/// Serve the HTTP object endpoint on an already-bound listener until it fails.
+/// Serve the HTTP object endpoint plus the read-only git export
+/// (`/repo.git`) on an already-bound listener until it fails.
 pub async fn serve_on(backend: Backend, listener: tokio::net::TcpListener) -> std::io::Result<()> {
-    axum::serve(listener, router(backend)).await
+    let app = router(backend.clone()).merge(ant_gitserve::router(backend));
+    axum::serve(listener, app).await
 }
 
 pub fn router(backend: Backend) -> Router {

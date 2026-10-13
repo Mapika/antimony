@@ -14,7 +14,7 @@ use axum::{
     Router,
     body::Body,
     extract::{Query, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -72,7 +72,11 @@ async fn advertise(Query(query): Query<HashMap<String, String>>) -> Response {
     response(body, true)
 }
 
-async fn upload(State(backend): State<Backend>, body: Bytes) -> Response {
+async fn upload(State(backend): State<Backend>, headers: HeaderMap, body: Bytes) -> Response {
+    let body = match decode_body(&headers, body) {
+        Ok(body) => body,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
     let request = match protocol::parse(&body) {
         Ok(request) => request,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
@@ -94,6 +98,21 @@ async fn upload(State(backend): State<Backend>, body: Bytes) -> Response {
         }
         _ => StatusCode::BAD_REQUEST.into_response(),
     }
+}
+
+/// git gzips large request bodies (e.g. many `want` lines during a lazy
+/// partial-clone checkout) and says so with `Content-Encoding: gzip`.
+fn decode_body(headers: &HeaderMap, body: Bytes) -> std::io::Result<Bytes> {
+    let gzip = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("gzip") || v.eq_ignore_ascii_case("x-gzip"));
+    if !gzip {
+        return Ok(body);
+    }
+    let mut out = Vec::with_capacity(body.len() * 4);
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&body[..]), &mut out)?;
+    Ok(out.into())
 }
 
 async fn refs(b: &Backend, args: &[&str]) -> Result<Vec<u8>> {

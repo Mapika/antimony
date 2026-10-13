@@ -286,3 +286,32 @@ async fn incremental_fetch_sends_exactly_new_objects() {
     assert_eq!(packed.len(), new.len(), "incremental pack repeated objects");
     git(&dir, &["fsck", "--full"]).await;
 }
+
+/// git gzips large upload-pack requests; a lazy checkout of a partial clone
+/// with many missing blobs must still work.
+#[tokio::test]
+async fn partial_clone_lazy_fetch_of_many_blobs() {
+    let b = Backend::in_memory();
+    let files: Vec<(String, Vec<u8>)> =
+        (0..300).map(|i| (format!("d{}/f{i:03}.txt", i % 7), format!("content {i}\n").into_bytes())).collect();
+    let refs: Vec<(&str, &[u8])> = files.iter().map(|(p, c)| (p.as_str(), c.as_slice())).collect();
+    let tree = ant_store::graph::build_tree(b.objects.as_ref(), &refs).await.unwrap();
+    let sig = ant_core::Signature { name: "t".into(), email: "t@t".into(), time: 1, tz_offset_minutes: 0 };
+    let c = ant_store::graph::write_commit(
+        &b,
+        &ant_core::Commit { tree, parents: vec![], author: sig.clone(), committer: sig, extra_headers: vec![], message: "many\n".into() },
+    )
+    .await
+    .unwrap();
+    b.refs.cas_ref("main", None, Some(c)).await.unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, ant_gitserve::router(b)).await });
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["clone", "-q", "--filter=blob:none", &url, "p"]).await;
+    let dir = tmp.path().join("p");
+    for (path, content) in &files {
+        assert_eq!(&std::fs::read(dir.join(path)).unwrap(), content, "{path}");
+    }
+}

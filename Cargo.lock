@@ -166,6 +166,7 @@ name = "ant-server"
 version = "0.1.0"
 dependencies = [
  "ant-core",
+ "ant-gitserve",
  "ant-proto",
  "ant-store",
  "anyhow",
