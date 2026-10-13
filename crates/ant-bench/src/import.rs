@@ -43,23 +43,35 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let start = Instant::now();
     let cpu0 = cpu_seconds().unwrap_or((0.0, 0.0));
 
-    // Progress ticker (also the time series for the report).
-    let (po, pc) = (put_objects.clone(), put_commit.clone());
+    // Progress ticker: per-interval throughput and per-op store time.
+    let (po, pc, pm) = (put_objects.clone(), put_commit.clone(), metrics.clone());
     let ticker = tokio::spawn(async move {
-        let mut series: Vec<(f64, u64, u64)> = Vec::new();
         let mut last = (0u64, 0u64, Instant::now());
+        let mut last_ops: std::collections::HashMap<String, (u64, f64)> = Default::default();
+        let mut last_cpu = cpu_seconds().map_or(0.0, |c| c.0 + c.1);
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             let (o, c) = (po.items(), pc.calls());
             let dt = last.2.elapsed().as_secs_f64();
+            let cpu = cpu_seconds().map_or(0.0, |c| c.0 + c.1);
             println!(
-                "  [{:>6.0}s] objects={o} commits={c}  (+{:.0} obj/s, +{:.0} commits/s over last interval)",
+                "  [{:>6.0}s] objects={o} commits={c}  (+{:.0} obj/s, +{:.0} commits/s; process cpu {:.0}%; rss {:.0} MiB)",
                 start.elapsed().as_secs_f64(),
                 (o - last.0) as f64 / dt,
-                (c - last.1) as f64 / dt
+                (c - last.1) as f64 / dt,
+                100.0 * (cpu - last_cpu) / dt,
+                mib(peak_rss_bytes().unwrap_or(0))
             );
-            series.push((start.elapsed().as_secs_f64(), o, c));
+            let mut parts = Vec::new();
+            for (name, calls, secs, _) in pm.totals() {
+                let (pcalls, psecs) = last_ops.insert(name.clone(), (calls, secs)).unwrap_or((0, 0.0));
+                if calls > pcalls {
+                    parts.push(format!("{}={}x/{:.2}s", name.trim_start_matches("store."), calls - pcalls, secs - psecs));
+                }
+            }
+            println!("           ops in interval: {}", parts.join(" "));
             last = (o, c, Instant::now());
+            last_cpu = cpu;
         }
     });
 

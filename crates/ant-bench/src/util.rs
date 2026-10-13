@@ -159,6 +159,15 @@ impl Metrics {
         map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 
+    /// (name, calls, seconds, items) for every counter that has been used.
+    pub fn totals(&self) -> Vec<(String, u64, f64, u64)> {
+        self.snapshot()
+            .into_iter()
+            .filter(|(_, c)| c.calls() > 0)
+            .map(|(k, c)| (k, c.calls(), c.secs(), c.items()))
+            .collect()
+    }
+
     pub fn json(&self) -> J {
         self.snapshot().into_iter().fold(J::obj(), |o, (k, c)| o.with(&k, c.json()))
     }
