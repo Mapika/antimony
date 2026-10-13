@@ -41,6 +41,8 @@ use std::time::{Duration, SystemTime};
 use ant_core::ObjectId;
 use ant_store::ObjectStore;
 
+mod filesystem;
+
 #[derive(Debug, Clone)]
 pub struct MountOptions {
     pub attr_ttl: Duration,
@@ -61,7 +63,9 @@ impl Default for MountOptions {
 }
 
 /// Mount `root_tree` read-only at `mountpoint`. Requires `rt` to be a
-/// multi-threaded runtime.
+/// multi-threaded runtime, kept alive until the session is dropped.
+/// This function and session drop perform blocking mount/unmount I/O; async
+/// callers should use `spawn_blocking` for both.
 pub fn mount(
     objects: Arc<dyn ObjectStore>,
     root_tree: ObjectId,
@@ -69,8 +73,19 @@ pub fn mount(
     rt: tokio::runtime::Handle,
     opts: MountOptions,
 ) -> std::io::Result<fuser::BackgroundSession> {
-    let _ = (objects, root_tree, mountpoint, rt, opts);
-    todo!("fuse")
+    if rt.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ant-fuse requires a multi-threaded Tokio runtime",
+        ));
+    }
+    let mut config = fuser::Config::default();
+    config.mount_options = vec![
+        fuser::MountOption::RO,
+        fuser::MountOption::DefaultPermissions,
+        fuser::MountOption::FSName(opts.fs_name.clone()),
+    ];
+    fuser::spawn_mount(filesystem::View::new(objects, root_tree, rt, opts), mountpoint, &config)
 }
 
 #[cfg(test)]
