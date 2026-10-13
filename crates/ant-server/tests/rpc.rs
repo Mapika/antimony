@@ -2,14 +2,13 @@
 //! `Backend::in_memory()` on ephemeral ports.
 
 use std::collections::HashMap;
-use std::future::IntoFuture;
 
 use ant_core::{EncodedObject, ObjectId, ObjectKind};
 use ant_proto::v1 as pb;
 use ant_proto::v1::ant_client::AntClient;
-use ant_server::{http, rpc};
+use ant_server::acl::Acl;
+use ant_server::serve::spawn_local;
 use ant_store::{Backend, ObjectStoreExt};
-use tokio::net::TcpListener;
 use tonic::Code;
 use tonic::transport::Channel;
 
@@ -23,18 +22,11 @@ struct Server {
 async fn spawn_server() -> Server {
     let backend = Backend::in_memory();
 
-    let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let grpc_addr = grpc_listener.local_addr().unwrap();
-    tokio::spawn(rpc::serve_on(backend.clone(), grpc_listener));
-
-    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_addr = http_listener.local_addr().unwrap();
-    tokio::spawn(axum::serve(http_listener, http::router(backend.clone())).into_future());
-
-    let grpc = AntClient::connect(format!("http://{grpc_addr}")).await.unwrap();
+    let server = spawn_local(backend.clone(), Acl::open()).await.unwrap();
+    let grpc = AntClient::connect(server.grpc_url()).await.unwrap();
     Server {
         grpc,
-        http_base: format!("http://{http_addr}"),
+        http_base: server.http_url(),
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()

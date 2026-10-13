@@ -7,7 +7,6 @@
 //! `reader` is an agent without security access, `writer` an agent with it,
 //! `admin` bypasses everything.
 
-use std::future::IntoFuture;
 use std::path::Path;
 use std::time::Duration;
 
@@ -22,11 +21,10 @@ use ant_server::acl::{self, Access, Acl};
 use ant_server::ops::changeset::{self, ChangesetRequest, FileOp, WriteContent};
 use ant_server::ops::land::{self, LandOutcome};
 use ant_server::ops::{OpError, query};
-use ant_server::{http, rpc};
+use ant_server::serve::spawn_local;
 use ant_store::Backend;
 use ant_store::graph::{build_tree, write_commit};
 use bytes::Bytes;
-use tokio::net::TcpListener;
 use tonic::Code;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::Interceptor;
@@ -137,21 +135,9 @@ impl Server {
     }
 
     async fn start_on(backend: Backend, acl: Acl) -> Self {
-        let grpc = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let grpc_addr = grpc.local_addr().unwrap();
-        tokio::spawn(rpc::serve_with_acl(backend.clone(), acl.clone(), grpc));
-        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let http_addr = http_listener.local_addr().unwrap();
-        let app = http::app_with_acl(backend.clone(), acl);
-        tokio::spawn(axum::serve(http_listener, app).into_future());
-        let channel =
-            Channel::from_shared(format!("http://{grpc_addr}")).unwrap().connect().await.unwrap();
-        Self {
-            backend,
-            channel,
-            http_base: format!("http://{http_addr}"),
-            http: reqwest::Client::new(),
-        }
+        let server = spawn_local(backend.clone(), acl).await.unwrap();
+        let channel = Channel::from_shared(server.grpc_url()).unwrap().connect().await.unwrap();
+        Self { backend, channel, http_base: server.http_url(), http: reqwest::Client::new() }
     }
 
     fn client(&self, token: Option<&str>) -> Client {

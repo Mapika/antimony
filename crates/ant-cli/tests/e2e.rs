@@ -4,14 +4,16 @@
 //! Run with `docker compose up -d` and then
 //! `cargo test -p ant-cli -- --include-ignored`.
 
+mod common;
+
 use std::fs;
-use std::net::TcpListener;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const PG_URL: &str = "postgres://ant:ant@localhost:54329/ant";
+use common::{KillOnDrop, PG_URL, free_ports};
+
 const S3_ENDPOINT: &str = "http://localhost:9009";
 const S3_BUCKET: &str = "ant-e2e";
 
@@ -112,24 +114,6 @@ impl Drop for LazyMounts<'_> {
             let _ = self.ctx.run(None, &["ws", "unmount", dir.to_str().unwrap()]);
         }
     }
-}
-
-struct KillOnDrop(Child);
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn free_ports() -> (u16, u16) {
-    let a = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let b = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let ports = (a.local_addr().expect("addr").port(), b.local_addr().expect("addr").port());
-    drop(a);
-    drop(b);
-    ports
 }
 
 fn git(repo: &Path, date: &str, args: &[&str]) {

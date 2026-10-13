@@ -2,7 +2,8 @@
 
 use ant_core::{EncodedObject, ObjectId, ObjectKind};
 use ant_proto::v1 as pb;
-use ant_server::{http, rpc};
+use ant_server::acl::Acl;
+use ant_server::serve::spawn_local;
 use ant_store::{Backend, ObjectStore, ObjectStoreExt};
 use antd::remote::RemoteObjectStore;
 use std::sync::Arc;
@@ -18,19 +19,8 @@ struct Running {
 
 async fn spawn_server() -> Running {
     let backend = Backend::in_memory();
-    let grpc = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let grpc_addr = grpc.local_addr().unwrap();
-    tokio::spawn(rpc::serve_on(backend.clone(), grpc));
-
-    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_addr = http.local_addr().unwrap();
-    tokio::spawn(http::serve_on(backend.clone(), http));
-
-    Running {
-        grpc_url: format!("http://{grpc_addr}"),
-        http_url: format!("http://{http_addr}"),
-        backend,
-    }
+    let server = spawn_local(backend.clone(), Acl::open()).await.unwrap();
+    Running { grpc_url: server.grpc_url(), http_url: server.http_url(), backend }
 }
 
 fn blob(body: &str) -> EncodedObject {

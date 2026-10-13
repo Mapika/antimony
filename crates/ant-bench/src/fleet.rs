@@ -15,8 +15,9 @@ use ant_core::ObjectId;
 use ant_proto::MAX_MESSAGE_BYTES;
 use ant_proto::v1 as pb;
 use ant_proto::v1::ant_client::AntClient;
+use ant_server::acl::Acl;
 use ant_server::config::StoreArgs;
-use ant_server::{http, rpc};
+use ant_server::serve::spawn_local;
 use anyhow::{Context as _, Result, anyhow, bail};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -308,12 +309,8 @@ pub async fn run(args: Args) -> Result<i32> {
         (None, true) => {
             let backend = args.store.backend().await?;
             let backend = instrument(&backend, &metrics, "server.store");
-            let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-            let http_l = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-            let addr = grpc.local_addr()?;
-            tokio::spawn(rpc::serve_on(backend.clone(), grpc));
-            tokio::spawn(http::serve_on(backend, http_l));
-            (format!("http://{addr}"), "embedded")
+            let server = spawn_local(backend, Acl::open()).await?;
+            (server.grpc_url(), "embedded")
         }
     };
     let mut admin = connect(&url).await?;
