@@ -110,11 +110,7 @@ impl View {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             state: Mutex::new(State {
-                nodes: vec![Node {
-                    parent: INodeNo(1),
-                    mode: EntryMode::Tree,
-                    id: root,
-                }],
+                nodes: vec![Node { parent: INodeNo(1), mode: EntryMode::Tree, id: root }],
                 paths: HashMap::new(),
                 trees: HashMap::new(),
                 prefetched: HashSet::new(),
@@ -125,25 +121,16 @@ impl View {
     }
 
     fn node(s: &State, ino: INodeNo) -> Result<Node> {
-        let index = ino
-            .0
-            .checked_sub(1)
-            .and_then(|n| usize::try_from(n).ok())
-            .ok_or(Errno::ENOENT)?;
+        let index =
+            ino.0.checked_sub(1).and_then(|n| usize::try_from(n).ok()).ok_or(Errno::ENOENT)?;
         s.nodes.get(index).copied().ok_or(Errno::ENOENT)
     }
 
     pub(super) fn inode(s: &mut State, parent: INodeNo, entry: &TreeEntry) -> INodeNo {
-        *s.paths
-            .entry((parent, entry.name.clone()))
-            .or_insert_with(|| {
-                s.nodes.push(Node {
-                    parent,
-                    mode: entry.mode,
-                    id: entry.id,
-                });
-                INodeNo(s.nodes.len() as u64)
-            })
+        *s.paths.entry((parent, entry.name.clone())).or_insert_with(|| {
+            s.nodes.push(Node { parent, mode: entry.mode, id: entry.id });
+            INodeNo(s.nodes.len() as u64)
+        })
     }
 
     fn tree(&self, s: &mut State, ino: INodeNo) -> Result<Arc<Tree>> {
@@ -168,8 +155,13 @@ impl View {
 
     pub(super) fn batch_objects(&self, ids: &[ObjectId]) -> Result<Vec<ant_core::EncodedObject>> {
         let objects = self.rt.block_on(self.objects.get_many(ids)).map_err(io_error)?;
-        if objects.len() != ids.len() { return Err(io_error("misaligned object batch")); }
-        ids.iter().zip(objects).map(|(id, o)| o.ok_or_else(|| io_error(StoreError::NotFound(*id)))).collect()
+        if objects.len() != ids.len() {
+            return Err(io_error("misaligned object batch"));
+        }
+        ids.iter()
+            .zip(objects)
+            .map(|(id, o)| o.ok_or_else(|| io_error(StoreError::NotFound(*id))))
+            .collect()
     }
 
     pub(super) fn cache_trees(&self, s: &mut State, ids: &[ObjectId]) -> Result<()> {
@@ -178,7 +170,9 @@ impl View {
         ids.dedup();
         for batch in ids.chunks(512) {
             for (id, object) in batch.iter().zip(self.batch_objects(batch)?) {
-                if object.kind() != ObjectKind::Tree { return Err(io_error("expected tree")); }
+                if object.kind() != ObjectKind::Tree {
+                    return Err(io_error("expected tree"));
+                }
                 s.trees.insert(*id, Arc::new(Tree::decode(object.body()).map_err(io_error)?));
             }
         }
@@ -199,10 +193,7 @@ impl View {
         ids.sort_unstable();
         ids.dedup();
         if !ids.is_empty() {
-            let objects = self
-                .rt
-                .block_on(self.objects.get_many(&ids))
-                .map_err(io_error)?;
+            let objects = self.rt.block_on(self.objects.get_many(&ids)).map_err(io_error)?;
             if objects.len() != ids.len() {
                 return Err(io_error("misaligned get_many response"));
             }
@@ -215,8 +206,7 @@ impl View {
                         actual: object.kind(),
                     }));
                 }
-                s.trees
-                    .insert(id, Arc::new(Tree::decode(object.body()).map_err(io_error)?));
+                s.trees.insert(id, Arc::new(Tree::decode(object.body()).map_err(io_error)?));
             }
         }
         s.prefetched.insert(node.id);
@@ -227,10 +217,7 @@ impl View {
         if let Some(data) = s.blobs.get(&id) {
             return Ok(data);
         }
-        let data = self
-            .rt
-            .block_on(self.objects.read_blob(&id))
-            .map_err(io_error)?;
+        let data = self.rt.block_on(self.objects.read_blob(&id)).map_err(io_error)?;
         s.sizes.insert(id, data.len() as u64);
         s.blobs.insert(id, data.clone(), self.opts.blob_cache_bytes);
         Ok(data)
@@ -260,11 +247,7 @@ impl View {
                 EntryMode::Symlink => 0o777,
                 _ => 0o555,
             },
-            nlink: if kind(node.mode) == FileType::Directory {
-                2
-            } else {
-                1
-            },
+            nlink: if kind(node.mode) == FileType::Directory { 2 } else { 1 },
             uid: self.uid,
             gid: self.gid,
             rdev: 0,
@@ -281,10 +264,7 @@ impl View {
         if name == ".." {
             return Ok(Self::node(s, parent)?.parent);
         }
-        let entry = name
-            .to_str()
-            .and_then(|name| tree.get(name))
-            .ok_or(Errno::ENOENT)?;
+        let entry = name.to_str().and_then(|name| tree.get(name)).ok_or(Errno::ENOENT)?;
         Ok(Self::inode(s, parent, entry))
     }
     fn read_range(&self, s: &mut State, ino: INodeNo, offset: u64, size: u32) -> Result<Bytes> {
@@ -296,9 +276,7 @@ impl View {
             return Err(Errno::EINVAL);
         }
         let data = self.blob(s, node.id)?;
-        let start = usize::try_from(offset)
-            .unwrap_or(usize::MAX)
-            .min(data.len());
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(data.len());
         let end = start.saturating_add(size as usize).min(data.len());
         Ok(data.slice(start..end))
     }
@@ -320,11 +298,7 @@ impl View {
                 1 => (parent, FileType::Directory, ".."),
                 _ => {
                     let entry = &tree.entries()[index - 2];
-                    (
-                        Self::inode(s, ino, entry),
-                        kind(entry.mode),
-                        entry.name.as_str(),
-                    )
+                    (Self::inode(s, ino, entry), kind(entry.mode), entry.name.as_str())
                 }
             };
             if add(entry_ino, (index + 1) as u64, entry_kind, name) {
@@ -338,10 +312,7 @@ impl View {
 impl Filesystem for View {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let mut s = self.state.lock();
-        match self
-            .lookup_inode(&mut s, parent, name)
-            .and_then(|ino| self.attr(&mut s, ino))
-        {
+        match self.lookup_inode(&mut s, parent, name).and_then(|ino| self.attr(&mut s, ino)) {
             Ok(attr) => reply.entry(&self.opts.attr_ttl, &attr, Generation(0)),
             Err(e) => reply.error(e),
         }
@@ -421,12 +392,10 @@ impl Filesystem for View {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let result = self.directory_page(
-            &mut self.state.lock(),
-            ino,
-            offset,
-            |ino, offset, kind, name| reply.add(ino, offset, kind, name),
-        );
+        let result =
+            self.directory_page(&mut self.state.lock(), ino, offset, |ino, offset, kind, name| {
+                reply.add(ino, offset, kind, name)
+            });
         match result {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -677,12 +646,7 @@ mod tests {
                 &[("a/x", b"same"), ("b/y", b"same"), ("c/x", b"same")],
             ))
             .unwrap();
-        let view = View::new(
-            store.clone(),
-            root,
-            rt.handle().clone(),
-            MountOptions::default(),
-        );
+        let view = View::new(store.clone(), root, rt.handle().clone(), MountOptions::default());
         assert!(store.reads.lock().is_empty());
         let mut s = view.state.lock();
         let tree = view.tree(&mut s, INodeNo(1)).unwrap();
@@ -690,46 +654,28 @@ mod tests {
         view.prefetch(&mut s, INodeNo(1), &tree).unwrap();
         assert_eq!(store.reads.lock()[1].len(), 2); // a and c share a tree.
         view.prefetch(&mut s, INodeNo(1), &tree).unwrap();
-        let a = view
-            .lookup_inode(&mut s, INodeNo(1), OsStr::new("a"))
-            .unwrap();
-        let c = view
-            .lookup_inode(&mut s, INodeNo(1), OsStr::new("c"))
-            .unwrap();
+        let a = view.lookup_inode(&mut s, INodeNo(1), OsStr::new("a")).unwrap();
+        let c = view.lookup_inode(&mut s, INodeNo(1), OsStr::new("c")).unwrap();
         assert_ne!(a, c);
         let ax = view.lookup_inode(&mut s, a, OsStr::new("x")).unwrap();
         let cx = view.lookup_inode(&mut s, c, OsStr::new("x")).unwrap();
         assert_ne!(ax, cx);
         assert_eq!(view.lookup_inode(&mut s, a, OsStr::new("x")).unwrap(), ax);
-        assert_eq!(
-            view.lookup_inode(&mut s, a, OsStr::new("..")).unwrap(),
-            INodeNo(1)
-        );
+        assert_eq!(view.lookup_inode(&mut s, a, OsStr::new("..")).unwrap(), INodeNo(1));
         assert_eq!(store.reads.lock().len(), 2);
         assert_eq!(view.attr(&mut s, ax).unwrap().size, 4);
         assert_eq!(view.attr(&mut s, cx).unwrap().size, 4);
         assert_eq!(store.reads.lock().len(), 3);
-        assert_eq!(
-            view.lookup_inode(&mut s, ax, OsStr::new("x")),
-            Err(Errno::ENOTDIR)
-        );
-        assert_eq!(
-            view.lookup_inode(&mut s, a, OsStr::new("missing")),
-            Err(Errno::ENOENT)
-        );
+        assert_eq!(view.lookup_inode(&mut s, ax, OsStr::new("x")), Err(Errno::ENOTDIR));
+        assert_eq!(view.lookup_inode(&mut s, a, OsStr::new("missing")), Err(Errno::ENOENT));
     }
 
     #[test]
     fn missing_wrong_kind_gitlinks_and_cached_sizes() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let store = Arc::new(RecordingStore::default());
-        let blob = rt
-            .block_on(store.put(EncodedObject::new(ObjectKind::Blob, b"hello")))
-            .unwrap();
-        let opts = MountOptions {
-            blob_cache_bytes: 0,
-            ..MountOptions::default()
-        };
+        let blob = rt.block_on(store.put(EncodedObject::new(ObjectKind::Blob, b"hello"))).unwrap();
+        let opts = MountOptions { blob_cache_bytes: 0, ..MountOptions::default() };
         let view = View::new(store.clone(), blob, rt.handle().clone(), opts);
         let mut s = view.state.lock();
         assert_eq!(view.tree(&mut s, INodeNo(1)).unwrap_err(), Errno::EIO);
@@ -737,11 +683,7 @@ mod tests {
         let gitlink = View::inode(
             &mut s,
             INodeNo(1),
-            &TreeEntry {
-                mode: EntryMode::Gitlink,
-                id: missing,
-                name: "vendor".into(),
-            },
+            &TreeEntry { mode: EntryMode::Gitlink, id: missing, name: "vendor".into() },
         );
         let reads = store.reads.lock().len();
         assert!(view.tree(&mut s, gitlink).unwrap().is_empty());
@@ -752,11 +694,7 @@ mod tests {
         let file = View::inode(
             &mut s,
             INodeNo(1),
-            &TreeEntry {
-                mode: EntryMode::File,
-                id: blob,
-                name: "file".into(),
-            },
+            &TreeEntry { mode: EntryMode::File, id: blob, name: "file".into() },
         );
         assert_eq!(view.attr(&mut s, file).unwrap().size, 5);
         let reads = store.reads.lock().len();
@@ -771,23 +709,15 @@ mod tests {
     fn concurrent_lookup_reuses_inode_and_fetch() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let store = Arc::new(RecordingStore::default());
-        let root = rt
-            .block_on(build_tree(store.as_ref(), &[("file", b"data")]))
-            .unwrap();
-        let view = View::new(
-            store.clone(),
-            root,
-            rt.handle().clone(),
-            MountOptions::default(),
-        );
+        let root = rt.block_on(build_tree(store.as_ref(), &[("file", b"data")])).unwrap();
+        let view = View::new(store.clone(), root, rt.handle().clone(), MountOptions::default());
         std::thread::scope(|scope| {
             let threads: Vec<_> = (0..8)
                 .map(|_| {
                     scope.spawn(|| {
                         let mut s = view.state.lock();
-                        let ino = view
-                            .lookup_inode(&mut s, INodeNo(1), OsStr::new("file"))
-                            .unwrap();
+                        let ino =
+                            view.lookup_inode(&mut s, INodeNo(1), OsStr::new("file")).unwrap();
                         let attr = view.attr(&mut s, ino).unwrap();
                         assert_eq!(attr.size, 4);
                         ino
@@ -805,34 +735,16 @@ mod tests {
     fn reads_at_eof_and_extreme_offsets() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let store = Arc::new(RecordingStore::default());
-        let root = rt
-            .block_on(build_tree(store.as_ref(), &[("file", b"abcdef")]))
-            .unwrap();
-        let view = View::new(
-            store.clone(),
-            root,
-            rt.handle().clone(),
-            MountOptions::default(),
-        );
+        let root = rt.block_on(build_tree(store.as_ref(), &[("file", b"abcdef")])).unwrap();
+        let view = View::new(store.clone(), root, rt.handle().clone(), MountOptions::default());
         let mut s = view.state.lock();
-        let ino = view
-            .lookup_inode(&mut s, INodeNo(1), OsStr::new("file"))
-            .unwrap();
+        let ino = view.lookup_inode(&mut s, INodeNo(1), OsStr::new("file")).unwrap();
         assert_eq!(view.read_range(&mut s, ino, 2, 2).unwrap().as_ref(), b"cd");
-        assert_eq!(
-            view.read_range(&mut s, ino, 4, u32::MAX).unwrap().as_ref(),
-            b"ef"
-        );
+        assert_eq!(view.read_range(&mut s, ino, 4, u32::MAX).unwrap().as_ref(), b"ef");
         assert!(view.read_range(&mut s, ino, 6, 1).unwrap().is_empty());
-        assert!(view
-            .read_range(&mut s, ino, u64::MAX, u32::MAX)
-            .unwrap()
-            .is_empty());
+        assert!(view.read_range(&mut s, ino, u64::MAX, u32::MAX).unwrap().is_empty());
         assert!(view.read_range(&mut s, ino, 0, 0).unwrap().is_empty());
-        assert_eq!(
-            view.read_range(&mut s, INodeNo(1), 0, 1),
-            Err(Errno::EISDIR)
-        );
+        assert_eq!(view.read_range(&mut s, INodeNo(1), 0, 1), Err(Errno::EISDIR));
         assert_eq!(store.reads.lock().len(), 2);
     }
 
@@ -841,17 +753,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let store = Arc::new(RecordingStore::default());
         let names: Vec<_> = (0..1500).map(|i| format!("f{i:04}")).collect();
-        let files: Vec<_> = names
-            .iter()
-            .map(|n| (n.as_str(), b"x".as_slice()))
-            .collect();
+        let files: Vec<_> = names.iter().map(|n| (n.as_str(), b"x".as_slice())).collect();
         let root = rt.block_on(build_tree(store.as_ref(), &files)).unwrap();
-        let view = View::new(
-            store.clone(),
-            root,
-            rt.handle().clone(),
-            MountOptions::default(),
-        );
+        let view = View::new(store.clone(), root, rt.handle().clone(), MountOptions::default());
         let mut s = view.state.lock();
         let mut offset = 0;
         let mut listing = Vec::new();
@@ -876,24 +780,15 @@ mod tests {
         assert_eq!((listing[1].0, listing[1].3.as_str()), (INodeNo(1), ".."));
         for (entry, name) in listing[2..].iter().zip(names) {
             assert_eq!(entry.3, name);
-            assert_eq!(
-                entry.0,
-                view.lookup_inode(&mut s, INodeNo(1), OsStr::new(&name))
-                    .unwrap()
-            );
+            assert_eq!(entry.0, view.lookup_inode(&mut s, INodeNo(1), OsStr::new(&name)).unwrap());
         }
-        view.directory_page(&mut s, INodeNo(1), u64::MAX, |_, _, _, _| {
-            panic!("past EOF")
-        })
-        .unwrap();
+        view.directory_page(&mut s, INodeNo(1), u64::MAX, |_, _, _, _| panic!("past EOF")).unwrap();
         assert_eq!(store.reads.lock().len(), 1); // Listing never fetches file blobs.
     }
 
     #[test]
     fn rejects_current_thread_runtime_before_mounting() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let result = crate::mount(
             Arc::new(MemoryObjectStore::default()),
             ObjectId::empty_tree(),
@@ -901,9 +796,6 @@ mod tests {
             rt.handle().clone(),
             MountOptions::default(),
         );
-        assert_eq!(
-            result.err().unwrap().kind(),
-            std::io::ErrorKind::InvalidInput
-        );
+        assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::InvalidInput);
     }
 }

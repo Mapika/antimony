@@ -86,7 +86,8 @@ impl Tree {
     /// Build a tree from entries in any order. Fails on duplicate or invalid names.
     pub fn new(mut entries: Vec<TreeEntry>) -> Result<Self> {
         for e in &entries {
-            if e.name.is_empty() || e.name == "." || e.name == ".." || e.name.contains(['/', '\0']) {
+            if e.name.is_empty() || e.name == "." || e.name == ".." || e.name.contains(['/', '\0'])
+            {
                 return Err(Error::Malformed(format!("bad tree entry name {:?}", e.name)));
             }
         }

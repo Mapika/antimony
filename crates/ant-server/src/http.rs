@@ -1,8 +1,6 @@
 //! Plain-HTTP immutable object endpoint, designed to sit behind any HTTP
 //! cache or CDN.
 //!
-//! TASK (transport): implement `router`.
-//!
 //! - `GET /o/{hex}` → 200, body = encoded object bytes,
 //!   `Content-Type: application/x-ant-object`,
 //!   `Cache-Control: public, max-age=31536000, immutable`, `ETag: "<hex>"`.

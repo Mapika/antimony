@@ -1,4 +1,5 @@
-//! Server startup shared by the `ant-server` binary and `ant serve`.
+//! Server startup shared by the `ant-server` binary and `ant serve`, plus
+//! [`spawn_local`] for in-process servers on ephemeral ports.
 //!
 //! Flags (clap, each also readable from env `ANT_*`):
 //!   --grpc-listen <addr>   default 127.0.0.1:7420
@@ -10,6 +11,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use ant_store::Backend;
 use anyhow::Context;
 use clap::Args;
 use tracing_subscriber::EnvFilter;
@@ -42,7 +44,9 @@ pub struct ServeArgs {
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // Ignore the error: a subscriber may already be installed.
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .try_init();
 
     let backend = args.store.backend().await?;
@@ -72,4 +76,33 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     };
     tokio::try_join!(grpc_fut, http_fut)?;
     Ok(())
+}
+
+/// Addresses of a server started by [`spawn_local`].
+#[derive(Debug, Clone, Copy)]
+pub struct LocalServer {
+    pub grpc: SocketAddr,
+    pub http: SocketAddr,
+}
+
+impl LocalServer {
+    pub fn grpc_url(&self) -> String {
+        format!("http://{}", self.grpc)
+    }
+
+    pub fn http_url(&self) -> String {
+        format!("http://{}", self.http)
+    }
+}
+
+/// Serve gRPC and HTTP (object endpoint plus git export) for `backend` on
+/// ephemeral 127.0.0.1 ports, in background tasks of the current runtime.
+/// For tests, benchmarks and embedded use; logging is left to the caller.
+pub async fn spawn_local(backend: Backend, acl: Acl) -> std::io::Result<LocalServer> {
+    let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addrs = LocalServer { grpc: grpc.local_addr()?, http: http_listener.local_addr()? };
+    tokio::spawn(rpc::serve_with_acl(backend.clone(), acl.clone(), grpc));
+    tokio::spawn(http::serve_with_acl(backend, acl, http_listener));
+    Ok(addrs)
 }

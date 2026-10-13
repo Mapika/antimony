@@ -156,7 +156,10 @@ impl Policy {
             }
             let mut hash = [0u8; 32];
             hex::decode_to_slice(&p.token_sha256, &mut hash).map_err(|_| {
-                PolicyError::Invalid(format!("principal {:?}: token_sha256 must be 64 hex chars", p.name))
+                PolicyError::Invalid(format!(
+                    "principal {:?}: token_sha256 must be 64 hex chars",
+                    p.name
+                ))
             })?;
             principals.push((hash, Principal { name: p.name, groups: p.groups, admin: p.admin }));
         }

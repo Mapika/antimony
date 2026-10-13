@@ -1,7 +1,5 @@
 //! Read-only queries that let agents and CI work without a checkout.
 //!
-//! TASK (server-changeset): implement everything marked `todo!()`.
-//!
 //! - `resolve_rev`: `<ref>` | `<64-hex id>`, optionally suffixed `~N`
 //!   (walk N first parents). A bare hex id must be a recorded commit. A
 //!   string that is both a valid ref name and 64-hex is treated as an id.
@@ -12,8 +10,8 @@
 //! - `log`: first-parent history from the rev, newest first, at most
 //!   `limit` commits (0 = no limit). With `path`, keep only commits whose
 //!   recorded changeset has a change at or under `path`
-//!   (`RepoPath::starts_with`). Use `MetaStore` changesets — do not diff
-//!   trees here.
+//!   (`RepoPath::starts_with`), from recorded `MetaStore` changesets (or the
+//!   history index, see `history`) — no tree diffs.
 //! - `diff`: changes between two revs' trees (`from = None` = empty tree),
 //!   via `ant_store::graph::diff_trees`.
 
@@ -44,9 +42,8 @@ pub struct LogEntry {
 pub async fn resolve_rev(b: &Backend, rev: &str) -> OpResult<ObjectId> {
     let (base, steps) = match rev.rsplit_once('~') {
         Some((base, n)) => {
-            let n: usize = n
-                .parse()
-                .map_err(|_| OpError::InvalidArgument(format!("bad rev {rev:?}")))?;
+            let n: usize =
+                n.parse().map_err(|_| OpError::InvalidArgument(format!("bad rev {rev:?}")))?;
             (base, n)
         }
         None => (rev, 0),
@@ -176,7 +173,8 @@ pub async fn log_as(
         if let Some(path) = path {
             let changes = b.meta.get_changeset(&id).await?.unwrap_or_default();
             if !changes.iter().any(|c| {
-                c.path.starts_with(path) && (!restricted || access.is_none_or(|a| a.can_read(&c.path)))
+                c.path.starts_with(path)
+                    && (!restricted || access.is_none_or(|a| a.can_read(&c.path)))
             }) {
                 continue;
             }
@@ -234,15 +232,17 @@ async fn diff_unfiltered(b: &Backend, from: Option<&str>, to: &str) -> OpResult<
 mod tests {
     use super::*;
     use crate::ops::OpError;
-    use crate::ops::changeset::tests::{commit, delete, write};
+    use crate::ops::test_support::{commit, delete, write};
     use ant_store::{CasOutcome, ChangeKind};
 
     async fn setup() -> (Backend, Vec<ObjectId>) {
         let b = Backend::in_memory();
-        let c1 = commit(&b, None, vec![write("src/a.rs", "a1"), write("README", "r")]).await.unwrap();
+        let c1 =
+            commit(&b, None, vec![write("src/a.rs", "a1"), write("README", "r")]).await.unwrap();
         let c2 = commit(&b, Some(c1), vec![write("src/a.rs", "a2")]).await.unwrap();
         let c3 = commit(&b, Some(c2), vec![write("docs/x.md", "x")]).await.unwrap();
-        let c4 = commit(&b, Some(c3), vec![delete("README"), write("src/b/c.rs", "c")]).await.unwrap();
+        let c4 =
+            commit(&b, Some(c3), vec![delete("README"), write("src/b/c.rs", "c")]).await.unwrap();
         assert_eq!(b.refs.cas_ref("main", None, Some(c4)).await.unwrap(), CasOutcome::Updated);
         (b, vec![c1, c2, c3, c4])
     }
@@ -269,15 +269,23 @@ mod tests {
         let names: Vec<_> = root.entries.unwrap().into_iter().map(|e| e.name).collect();
         assert_eq!(names, ["docs", "src"]);
 
-        let f = read_path(&b, "main~3", &RepoPath::new("src/a.rs").unwrap(), true).await.unwrap().unwrap();
+        let f = read_path(&b, "main~3", &RepoPath::new("src/a.rs").unwrap(), true)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(f.mode, EntryMode::File);
         assert_eq!(f.content.as_deref(), Some(&b"a1"[..]));
         assert!(f.entries.is_none());
 
-        let f = read_path(&b, "main", &RepoPath::new("src/a.rs").unwrap(), false).await.unwrap().unwrap();
+        let f = read_path(&b, "main", &RepoPath::new("src/a.rs").unwrap(), false)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(f.content.is_none());
 
-        assert!(read_path(&b, "main", &RepoPath::new("README").unwrap(), true).await.unwrap().is_none());
+        assert!(
+            read_path(&b, "main", &RepoPath::new("README").unwrap(), true).await.unwrap().is_none()
+        );
     }
 
     #[tokio::test]
@@ -302,7 +310,11 @@ mod tests {
         let s: Vec<_> = d.iter().map(|c| (c.path.as_str(), c.kind)).collect();
         assert_eq!(
             s,
-            [("README", ChangeKind::Deleted), ("docs/x.md", ChangeKind::Added), ("src/b/c.rs", ChangeKind::Added)]
+            [
+                ("README", ChangeKind::Deleted),
+                ("docs/x.md", ChangeKind::Added),
+                ("src/b/c.rs", ChangeKind::Added)
+            ]
         );
         assert_eq!(diff(&b, None, "main~3").await.unwrap().len(), 2);
     }

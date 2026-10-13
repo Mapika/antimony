@@ -18,17 +18,28 @@ use antd::workspace::{Sparse, Workspace};
 use anyhow::{Context as _, Result};
 
 use crate::json::J;
-use crate::util::{Metrics, cpu_seconds, mib, timed_store};
-use crate::{dir_size, dir_size_skip, write_json};
+use crate::util::{Metrics, cpu_seconds, dir_size, dir_size_skip, mib, timed_store, write_json};
 
+#[derive(clap::Args, Debug)]
 pub struct Args {
+    #[arg(long)]
     pub server: String,
+    #[arg(long)]
     pub http: Option<String>,
+    #[arg(long, default_value = "main")]
     pub rev: String,
+    /// Sparse pattern (repeatable); none = full checkout.
+    #[arg(long)]
     pub sparse: Vec<String>,
+    #[arg(long, default_value_t = 1)]
     pub iterations: usize,
+    /// Disk cache directory (wiped for cold runs).
+    #[arg(long)]
     pub cache: PathBuf,
+    /// Workspace directory (default: `<cache>.ws`).
+    #[arg(long)]
     pub workdir: Option<PathBuf>,
+    #[arg(long)]
     pub json: Option<PathBuf>,
 }
 
@@ -73,7 +84,8 @@ async fn materialize(
     let secs = start.elapsed().as_secs_f64();
     let cpu = cpu_seconds().map_or(0.0, |c| c.0 + c.1) - cpu0;
     let w = work.to_path_buf();
-    let (files, bytes) = tokio::task::spawn_blocking(move || dir_size_skip(&w, Some(".ant"))).await?;
+    let (files, bytes) =
+        tokio::task::spawn_blocking(move || dir_size_skip(&w, Some(".ant"))).await?;
     let (wsc, nc) = (metrics.counter("ws.get_many"), metrics.counter("net.get_many"));
     Ok((
         Phase {

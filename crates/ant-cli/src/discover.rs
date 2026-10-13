@@ -15,7 +15,9 @@ pub fn require_workspace(override_dir: Option<&Path>) -> Result<PathBuf> {
         Some(d) => std::path::absolute(d)?,
         None => std::env::current_dir()?,
     };
-    find_workspace(&start).ok_or_else(|| anyhow!("not inside an ant workspace (no .ant/workspace found from {})", start.display()))
+    find_workspace(&start).ok_or_else(|| {
+        anyhow!("not inside an ant workspace (no .ant/workspace found from {})", start.display())
+    })
 }
 
 #[cfg(test)]
@@ -29,7 +31,10 @@ mod tests {
         std::fs::create_dir_all(root.join("ws/.ant")).unwrap();
         std::fs::write(root.join("ws/.ant/workspace"), "x").unwrap();
         std::fs::create_dir_all(root.join("ws/a/b")).unwrap();
-        assert_eq!(find_workspace(&root.join("ws/a/b")).as_deref(), Some(root.join("ws").as_path()));
+        assert_eq!(
+            find_workspace(&root.join("ws/a/b")).as_deref(),
+            Some(root.join("ws").as_path())
+        );
         assert_eq!(find_workspace(&root.join("ws")).as_deref(), Some(root.join("ws").as_path()));
         assert_eq!(find_workspace(root), None);
         // `.ant` without the workspace file does not count.

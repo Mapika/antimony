@@ -3,25 +3,18 @@
 //! (`ant import --policy` + `ant admin reindex-acl`) needs
 //! `docker compose up -d` and `--include-ignored`.
 
+mod common;
+
 use std::fs;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const PG_URL: &str = "postgres://ant:ant@localhost:54329/ant";
+use common::{KillOnDrop, PG_URL, free_ports};
+
 const READER: &str = "reader-token";
 const WRITER: &str = "writer-token";
 const ADMIN: &str = "admin-token";
-
-struct KillOnDrop(Child);
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 fn sha256_hex(s: &str) -> String {
     ant_core::ObjectId(ant_auth::hash_token(s)).to_hex()
@@ -64,15 +57,6 @@ land = ["group:agents"]
         sha256_hex(WRITER),
         sha256_hex(ADMIN)
     )
-}
-
-fn free_ports() -> (u16, u16) {
-    let a = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let b = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let ports = (a.local_addr().expect("addr").port(), b.local_addr().expect("addr").port());
-    drop(a);
-    drop(b);
-    ports
 }
 
 struct Env {
@@ -137,7 +121,11 @@ impl Env {
             if let Ok(Some(st)) = server.0.try_wait() {
                 panic!("ant-server exited early: {st}");
             }
-            assert!(Instant::now() < deadline, "server not ready: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                Instant::now() < deadline,
+                "server not ready: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             std::thread::sleep(Duration::from_millis(200));
         }
     }
@@ -149,10 +137,15 @@ fn start_server(root: &Path, store: &[&str]) -> (Env, KillOnDrop) {
     fs::write(&policy_file, policy()).expect("policy");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ant"));
     cmd.arg("serve");
-    cmd.args(["--grpc-listen", &format!("127.0.0.1:{grpc}"), "--http-listen", &format!("127.0.0.1:{http}")])
-        .args(store)
-        .env("ANT_POLICY", &policy_file)
-        .stdin(Stdio::null());
+    cmd.args([
+        "--grpc-listen",
+        &format!("127.0.0.1:{grpc}"),
+        "--http-listen",
+        &format!("127.0.0.1:{http}"),
+    ])
+    .args(store)
+    .env("ANT_POLICY", &policy_file)
+    .stdin(Stdio::null());
     let mut server = KillOnDrop(cmd.spawn().expect("spawning ant-server"));
     let env = Env { grpc, http, root: root.to_path_buf() };
     env.wait_ready(&mut server);
@@ -203,7 +196,16 @@ fn cli_with_tokens() {
     let url = format!("http://127.0.0.1:{}/o/{secret_id}", env.http);
     let status = |token: &str| -> String {
         let out = Command::new("curl")
-            .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-H", &format!("Authorization: Bearer {token}"), &url])
+            .args([
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-H",
+                &format!("Authorization: Bearer {token}"),
+                &url,
+            ])
             .output()
             .expect("curl");
         String::from_utf8_lossy(&out.stdout).into_owned()
@@ -213,7 +215,11 @@ fn cli_with_tokens() {
 
     // Reader works in a sparse workspace outside secrets/ and lands.
     let r_dir = root.join("ws-reader");
-    env.ok(Some(READER), None, &["ws", "new", r_dir.to_str().expect("utf8"), "--at", "main", "--sparse", "src"]);
+    env.ok(
+        Some(READER),
+        None,
+        &["ws", "new", r_dir.to_str().expect("utf8"), "--at", "main", "--sparse", "src"],
+    );
     fs::write(r_dir.join("src/reader.rs"), b"// reader\n").expect("write");
     env.ok(Some(READER), Some(&r_dir), &["submit", "-m", "reader change"]);
     let out = env.ok(Some(READER), Some(&r_dir), &["land"]);
@@ -223,7 +229,8 @@ fn cli_with_tokens() {
     env.fails(Some(READER), None, &["ws", "new", full.to_str().expect("utf8"), "--at", "main"]);
     // Refs: main is admin-only for direct updates.
     let tip = env.ok(Some(READER), None, &["ref", "get", "main"]);
-    let err = env.fails(Some(READER), None, &["ref", "set", "main", "main~1", "--expect", tip.trim()]);
+    let err =
+        env.fails(Some(READER), None, &["ref", "set", "main", "main~1", "--expect", tip.trim()]);
     assert!(err.contains("cannot update ref main"), "{err}");
     env.ok(Some(ADMIN), None, &["ref", "set", "main", "main~1", "--expect", tip.trim()]);
 }
@@ -234,16 +241,21 @@ fn seed_main(env: &Env) {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     rt.block_on(async {
         use ant_proto::v1 as pb;
-        let channel = tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", env.grpc))
-            .expect("url")
-            .connect()
-            .await
-            .expect("connect");
-        let token: tonic::metadata::MetadataValue<_> = format!("Bearer {WRITER}").parse().expect("header");
-        let mut c = pb::ant_client::AntClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
-            req.metadata_mut().insert("authorization", token.clone());
-            Ok(req)
-        });
+        let channel =
+            tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", env.grpc))
+                .expect("url")
+                .connect()
+                .await
+                .expect("connect");
+        let token: tonic::metadata::MetadataValue<_> =
+            format!("Bearer {WRITER}").parse().expect("header");
+        let mut c = pb::ant_client::AntClient::with_interceptor(
+            channel,
+            move |mut req: tonic::Request<()>| {
+                req.metadata_mut().insert("authorization", token.clone());
+                Ok(req)
+            },
+        );
         let write = |path: &str, content: &str| pb::FileOp {
             path: path.into(),
             op: Some(pb::file_op::Op::Write(pb::WriteOp {
@@ -251,11 +263,19 @@ fn seed_main(env: &Env) {
                 content: Some(pb::write_op::Content::Inline(content.as_bytes().to_vec())),
             })),
         };
-        let sig = pb::Signature { name: "s".into(), email: "s@x".into(), time: 1_700_000_000, tz_offset_minutes: 0 };
+        let sig = pb::Signature {
+            name: "s".into(),
+            email: "s@x".into(),
+            time: 1_700_000_000,
+            tz_offset_minutes: 0,
+        };
         let commit = c
             .create_changeset(pb::CreateChangesetRequest {
                 base: None,
-                ops: vec![write("src/lib.rs", "pub fn v1() {}\n"), write("secrets/key", "seed secret\n")],
+                ops: vec![
+                    write("src/lib.rs", "pub fn v1() {}\n"),
+                    write("secrets/key", "seed secret\n"),
+                ],
                 author: Some(sig),
                 committer: None,
                 message: "seed\n".into(),
@@ -332,7 +352,15 @@ fn import_and_reindex_with_policy_postgres() {
         let id = env.ok(Some(WRITER), None, &["ls", "main:secrets/key"]);
         let id = id.split_whitespace().nth(2).expect("id").to_string();
         let out = Command::new("curl")
-            .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "-H", &format!("Authorization: Bearer {READER}")])
+            .args([
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-H",
+                &format!("Authorization: Bearer {READER}"),
+            ])
             .arg(format!("http://127.0.0.1:{}/o/{id}", env.http))
             .output()
             .expect("curl");

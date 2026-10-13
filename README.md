@@ -36,9 +36,10 @@ clients are always online, history lives on the server, and nobody pushes.
 | `ant-gitserve` | read-only git smart-HTTP (protocol v2) export |
 | `ant-gitbridge` | git → antimony import |
 | `antd` | client engine: shared disk cache, read-through, sparse workspaces |
-| `ant-fuse` | lazy FUSE view of a tree |
+| `ant-fuse` | lazy FUSE views: read-only and copy-on-write workspaces |
 | `ant-auth` | token + path/ref access policy |
 | `ant-cli` | the `ant` command |
+| `ant-bench` | load and scale harness |
 
 ## Quickstart
 
@@ -84,9 +85,9 @@ Early prototype, built in the open with AI agents. Working end to end against
 real Postgres + S3 (see `crates/ant-cli/tests/e2e.rs`), with property-based
 tests for codecs, changeset construction and concurrent landing.
 
-In progress: scale benchmarks (fleet load generator, large-repo import),
-indexed path history and blame, writable lazy
-(FUSE copy-on-write) workspaces.
+Also implemented: indexed path history and blame, and writable lazy
+workspaces (`ant ws new --lazy`, FUSE copy-on-write). In progress: scale
+benchmarks (`ant-bench`: fleet load generator, large-repo import, checkout).
 
 ## Access control and threat model
 

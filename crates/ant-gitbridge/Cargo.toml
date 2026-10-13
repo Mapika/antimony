@@ -9,7 +9,6 @@ ant-core.workspace = true
 ant-store.workspace = true
 anyhow.workspace = true
 gix.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

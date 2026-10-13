@@ -25,42 +25,20 @@ async fn git_result(dir: &Path, args: &[&str]) -> std::process::Output {
 
 async fn git(dir: &Path, args: &[&str]) -> String {
     let result = git_result(dir, args).await;
-    assert!(
-        result.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&result.stderr)
-    );
+    assert!(result.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&result.stderr));
     String::from_utf8(result.stdout).unwrap().trim().to_string()
 }
 
 async fn commit(b: &Backend, parents: Vec<ObjectId>, version: u8) -> ObjectId {
-    let nested = build_tree(b.objects.as_ref(), &[("deep/file", b"nested\n")])
-        .await
-        .unwrap();
-    let mut entries = vec![TreeEntry {
-        mode: EntryMode::Tree,
-        name: "dir".into(),
-        id: nested,
-    }];
+    let nested = build_tree(b.objects.as_ref(), &[("deep/file", b"nested\n")]).await.unwrap();
+    let mut entries = vec![TreeEntry { mode: EntryMode::Tree, name: "dir".into(), id: nested }];
     for (name, mode, content) in [
         ("readme", EntryMode::File, vec![version; 10]),
-        (
-            "run",
-            EntryMode::Executable,
-            b"#!/bin/sh\necho hello\n".to_vec(),
-        ),
+        ("run", EntryMode::Executable, b"#!/bin/sh\necho hello\n".to_vec()),
         ("link", EntryMode::Symlink, b"dir/deep/file".to_vec()),
     ] {
-        let id = b
-            .objects
-            .put(EncodedObject::new(ObjectKind::Blob, &content))
-            .await
-            .unwrap();
-        entries.push(TreeEntry {
-            mode,
-            name: name.into(),
-            id,
-        });
+        let id = b.objects.put(EncodedObject::new(ObjectKind::Blob, &content)).await.unwrap();
+        entries.push(TreeEntry { mode, name: name.into(), id });
     }
     let tree = write_tree(b.objects.as_ref(), entries).await.unwrap();
     let sig = Signature {
@@ -113,13 +91,7 @@ impl Fixture {
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        Self {
-            b,
-            ids,
-            url,
-            task,
-            temp: tempfile::tempdir().unwrap(),
-        }
+        Self { b, ids, url, task, temp: tempfile::tempdir().unwrap() }
     }
 
     async fn clone_into(&self, name: &str, options: &[&str]) -> std::path::PathBuf {
@@ -134,26 +106,10 @@ impl Fixture {
 fn assert_files(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(std::fs::read(dir.join("readme")).unwrap(), vec![3; 10]);
-    assert_eq!(
-        std::fs::read(dir.join("dir/deep/file")).unwrap(),
-        b"nested\n"
-    );
-    assert_eq!(
-        std::fs::read(dir.join("run")).unwrap(),
-        b"#!/bin/sh\necho hello\n"
-    );
-    assert_ne!(
-        std::fs::metadata(dir.join("run"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o111,
-        0
-    );
-    assert_eq!(
-        std::fs::read_link(dir.join("link")).unwrap(),
-        Path::new("dir/deep/file")
-    );
+    assert_eq!(std::fs::read(dir.join("dir/deep/file")).unwrap(), b"nested\n");
+    assert_eq!(std::fs::read(dir.join("run")).unwrap(), b"#!/bin/sh\necho hello\n");
+    assert_ne!(std::fs::metadata(dir.join("run")).unwrap().permissions().mode() & 0o111, 0);
+    assert_eq!(std::fs::read_link(dir.join("link")).unwrap(), Path::new("dir/deep/file"));
 }
 
 #[tokio::test]
@@ -163,17 +119,9 @@ async fn full_clone_and_push_rejected() {
     assert_files(&dir);
     assert_eq!(
         git(&dir, &["log", "--format=%H"]).await,
-        f.ids
-            .iter()
-            .rev()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n")
+        f.ids.iter().rev().map(ToString::to_string).collect::<Vec<_>>().join("\n")
     );
-    assert_eq!(
-        git(&dir, &["rev-parse", "origin/topic"]).await,
-        f.ids[1].to_string()
-    );
+    assert_eq!(git(&dir, &["rev-parse", "origin/topic"]).await, f.ids[1].to_string());
     assert_eq!(
         git(&dir, &["symbolic-ref", "refs/remotes/origin/HEAD"]).await,
         "refs/remotes/origin/main"
@@ -183,46 +131,25 @@ async fn full_clone_and_push_rejected() {
     assert!(!push.status.success());
     assert!(String::from_utf8_lossy(&push.stderr).contains("403"));
     assert_eq!(f.b.refs.list_refs("").await.unwrap().len(), 2);
-    let result = reqwest::Client::new()
-        .post(format!("{}/git-receive-pack", f.url))
-        .send()
-        .await
-        .unwrap();
+    let result =
+        reqwest::Client::new().post(format!("{}/git-receive-pack", f.url)).send().await.unwrap();
     assert_eq!(result.status(), 403);
 }
 
 #[tokio::test]
 async fn partial_clone_fetches_blobs_on_checkout() {
     let f = Fixture::new().await;
-    let dir = f
-        .clone_into("partial", &["--filter=blob:none", "--no-checkout"])
-        .await;
-    let objects = git(
-        &dir,
-        &[
-            "cat-file",
-            "--batch-all-objects",
-            "--batch-check=%(objecttype)",
-        ],
-    )
-    .await;
+    let dir = f.clone_into("partial", &["--filter=blob:none", "--no-checkout"]).await;
+    let objects =
+        git(&dir, &["cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"]).await;
     assert!(!objects.lines().any(|line| line == "blob"));
     assert!(objects.lines().any(|line| line == "commit"));
     git(&dir, &["checkout", "main"]).await;
     assert_files(&dir);
-    let objects = git(
-        &dir,
-        &[
-            "cat-file",
-            "--batch-all-objects",
-            "--batch-check=%(objecttype)",
-        ],
-    )
-    .await;
+    let objects =
+        git(&dir, &["cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"]).await;
     assert_eq!(objects.lines().filter(|line| *line == "blob").count(), 4);
-    let checked_out = f
-        .clone_into("partial-checkout", &["--filter=blob:none"])
-        .await;
+    let checked_out = f.clone_into("partial-checkout", &["--filter=blob:none"]).await;
     assert_files(&checked_out);
 }
 
@@ -232,25 +159,15 @@ async fn shallow_clone() {
     let dir = f.clone_into("shallow", &["--depth", "1"]).await;
     assert_files(&dir);
     assert_eq!(git(&dir, &["rev-list", "--count", "HEAD"]).await, "1");
-    assert_eq!(
-        git(&dir, &["rev-parse", "--is-shallow-repository"]).await,
-        "true"
-    );
+    assert_eq!(git(&dir, &["rev-parse", "--is-shallow-repository"]).await, "true");
 }
 
 async fn objects(dir: &Path) -> HashSet<String> {
-    git(
-        dir,
-        &[
-            "cat-file",
-            "--batch-all-objects",
-            "--batch-check=%(objectname)",
-        ],
-    )
-    .await
-    .lines()
-    .map(str::to_owned)
-    .collect()
+    git(dir, &["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"])
+        .await
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 #[tokio::test]
@@ -259,15 +176,9 @@ async fn incremental_fetch_sends_exactly_new_objects() {
     let dir = f.clone_into("incremental", &[]).await;
     let old = objects(&dir).await;
     let next = commit(&f.b, vec![f.ids[2]], 4).await;
-    f.b.refs
-        .cas_ref("main", Some(f.ids[2]), Some(next))
-        .await
-        .unwrap();
+    f.b.refs.cas_ref("main", Some(f.ids[2]), Some(next)).await.unwrap();
     git(&dir, &["fetch", "origin"]).await;
-    assert_eq!(
-        git(&dir, &["rev-parse", "origin/main"]).await,
-        next.to_string()
-    );
+    assert_eq!(git(&dir, &["rev-parse", "origin/main"]).await, next.to_string());
     let new = objects(&dir).await;
     assert_eq!(new.difference(&old).count(), 3); // commit, root tree, changed blob
     // Inspect every pack, including duplicates: counting the object database
@@ -292,14 +203,27 @@ async fn incremental_fetch_sends_exactly_new_objects() {
 #[tokio::test]
 async fn partial_clone_lazy_fetch_of_many_blobs() {
     let b = Backend::in_memory();
-    let files: Vec<(String, Vec<u8>)> =
-        (0..300).map(|i| (format!("d{}/f{i:03}.txt", i % 7), format!("content {i}\n").into_bytes())).collect();
+    let files: Vec<(String, Vec<u8>)> = (0..300)
+        .map(|i| (format!("d{}/f{i:03}.txt", i % 7), format!("content {i}\n").into_bytes()))
+        .collect();
     let refs: Vec<(&str, &[u8])> = files.iter().map(|(p, c)| (p.as_str(), c.as_slice())).collect();
     let tree = ant_store::graph::build_tree(b.objects.as_ref(), &refs).await.unwrap();
-    let sig = ant_core::Signature { name: "t".into(), email: "t@t".into(), time: 1, tz_offset_minutes: 0 };
+    let sig = ant_core::Signature {
+        name: "t".into(),
+        email: "t@t".into(),
+        time: 1,
+        tz_offset_minutes: 0,
+    };
     let c = ant_store::graph::write_commit(
         &b,
-        &ant_core::Commit { tree, parents: vec![], author: sig.clone(), committer: sig, extra_headers: vec![], message: "many\n".into() },
+        &ant_core::Commit {
+            tree,
+            parents: vec![],
+            author: sig.clone(),
+            committer: sig,
+            extra_headers: vec![],
+            message: "many\n".into(),
+        },
     )
     .await
     .unwrap();

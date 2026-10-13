@@ -22,6 +22,10 @@ pub async fn reindex_acl(a: ReindexArgs) -> Result<Outcome> {
         acl::reindex_with(&backend, policy, commit, a.full).await?
     };
     let mut out = String::new();
-    writeln!(out, "{commit} {} {} {}", stats.trees_walked, stats.trees_skipped, stats.tags_written)?;
+    writeln!(
+        out,
+        "{commit} {} {} {}",
+        stats.trees_walked, stats.trees_skipped, stats.tags_written
+    )?;
     Ok(Outcome::ok(out))
 }

@@ -182,7 +182,6 @@ pub enum WsCmd {
     },
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,7 +190,10 @@ mod tests {
     fn lazy_workspace_commands() {
         let cli = Cli::try_parse_from(["ant", "ws", "new", "--lazy", "/tmp/ws"]).unwrap();
         assert!(matches!(cli.command, Command::Ws { cmd: WsCmd::New { lazy: true, .. } }));
-        assert!(Cli::try_parse_from(["ant", "ws", "new", "--lazy", "--sparse", "src", "/tmp/ws"]).is_err());
+        assert!(
+            Cli::try_parse_from(["ant", "ws", "new", "--lazy", "--sparse", "src", "/tmp/ws"])
+                .is_err()
+        );
         let cli = Cli::try_parse_from(["ant", "ws", "unmount", "/tmp/ws"]).unwrap();
         assert!(matches!(cli.command, Command::Ws { cmd: WsCmd::Unmount { .. } }));
     }

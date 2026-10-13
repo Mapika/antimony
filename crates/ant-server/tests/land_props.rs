@@ -29,7 +29,12 @@ use proptest::prelude::*;
 // ---------------------------------------------------------------------------
 
 fn author() -> Signature {
-    Signature { name: "dev".into(), email: "d@x".into(), time: 1_700_000_123, tz_offset_minutes: -270 }
+    Signature {
+        name: "dev".into(),
+        email: "d@x".into(),
+        time: 1_700_000_123,
+        tz_offset_minutes: -270,
+    }
 }
 
 /// Commit that turns model `from` into model `to` on top of `parent`.
@@ -141,8 +146,11 @@ fn blob_mode() -> impl Strategy<Value = EntryMode> {
 
 /// Text made of base lines plus lines unique to `side`.
 fn text(side: char) -> impl Strategy<Value = Vec<u8>> {
-    let pool: Vec<String> =
-        ["b0", "b1", "b2", "b3"].iter().map(|s| s.to_string()).chain((0..2).map(|i| format!("{side}{i}"))).collect();
+    let pool: Vec<String> = ["b0", "b1", "b2", "b3"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain((0..2).map(|i| format!("{side}{i}")))
+        .collect();
     prop::collection::vec(prop::sample::select(pool), 0..6).prop_map(|ls| {
         let mut s = ls.join("\n");
         if !s.is_empty() {
@@ -195,15 +203,18 @@ fn runtime() -> tokio::runtime::Runtime {
 // Disjoint changes always land; overlapping ones never lose work
 // ---------------------------------------------------------------------------
 
-async fn check_pair(base: Model, mx: Vec<Mutation>, my: Vec<Mutation>) -> Result<(), TestCaseError> {
+async fn check_pair(
+    base: Model,
+    mx: Vec<Mutation>,
+    my: Vec<Mutation>,
+) -> Result<(), TestCaseError> {
     let b = Backend::in_memory();
     let c0 = init_ref(&b, "main", &base).await;
     let xm = apply_mutations(&base, &mx);
     let ym = apply_mutations(&base, &my);
-    let (Some(x), Some(y)) = (
-        mk_commit(&b, c0, &base, &xm, "x\n").await,
-        mk_commit(&b, c0, &base, &ym, "y\n").await,
-    ) else {
+    let (Some(x), Some(y)) =
+        (mk_commit(&b, c0, &base, &xm, "x\n").await, mk_commit(&b, c0, &base, &ym, "y\n").await)
+    else {
         return Err(TestCaseError::reject("not expressible as one changeset"));
     };
     let cx = changed(&base, &xm);
@@ -276,7 +287,8 @@ async fn check_pair(base: Model, mx: Vec<Mutation>, my: Vec<Mutation>) -> Result
                 for l in lines(&xv.1).into_iter().filter(|l| l.starts_with('x')) {
                     prop_assert!(fl.contains(&l), "{}: x line {} lost: {:?}", p, l, fv);
                 }
-                let allowed: BTreeSet<&str> = [bv, xv, yv].iter().flat_map(|v| lines(&v.1)).collect();
+                let allowed: BTreeSet<&str> =
+                    [bv, xv, yv].iter().flat_map(|v| lines(&v.1)).collect();
                 for l in fl {
                     prop_assert!(allowed.contains(l), "{}: line {} invented", p, l);
                 }
@@ -315,7 +327,10 @@ fn disjoint_pools() -> impl Strategy<Value = (Model, Vec<Mutation>, Vec<Mutation
     let pool_x = ["d/a", "d/e/a", "f/a", "f/g/a", "xs"];
     let pool_y = ["d/b", "d/e/b", "f/b", "f/g/b", "ys"];
     let item = |pool: &'static [&'static str], side: char| {
-        (prop::sample::select(pool.to_vec()), prop::option::weighted(0.6, (blob_mode(), text(side))))
+        (
+            prop::sample::select(pool.to_vec()),
+            prop::option::weighted(0.6, (blob_mode(), text(side))),
+        )
             .prop_map(|(p, v)| (p.to_string(), v))
     };
     let all: Vec<&'static str> = pool_x.iter().chain(pool_y.iter()).copied().collect();
@@ -325,7 +340,8 @@ fn disjoint_pools() -> impl Strategy<Value = (Model, Vec<Mutation>, Vec<Mutation
         prop::collection::vec(item(&["d/b", "d/e/b", "f/b", "f/g/b", "ys"], 'y'), 0..5),
     )
         .prop_map(|(files, mx, my)| {
-            let base: Model = files.into_iter().map(|(p, c)| (p.to_string(), (EntryMode::File, c))).collect();
+            let base: Model =
+                files.into_iter().map(|(p, c)| (p.to_string(), (EntryMode::File, c))).collect();
             (base, mx, my)
         })
 }
@@ -633,12 +649,11 @@ fn task_plan() -> impl Strategy<Value = TaskPlan> {
         5 => (0usize..8).prop_map(TaskKind::Line),
         2 => Just(TaskKind::Delete),
     ];
-    prop::collection::vec((0..POOL.len(), kind), 1..3)
-        .prop_map(|mut edits| {
-            let mut seen = BTreeSet::new();
-            edits.retain(|(p, _)| seen.insert(*p));
-            TaskPlan { edits }
-        })
+    prop::collection::vec((0..POOL.len(), kind), 1..3).prop_map(|mut edits| {
+        let mut seen = BTreeSet::new();
+        edits.retain(|(p, _)| seen.insert(*p));
+        TaskPlan { edits }
+    })
 }
 
 fn target_for(base: &Model, i: usize, plan: &TaskPlan) -> Model {
@@ -658,7 +673,9 @@ fn target_for(base: &Model, i: usize, plan: &TaskPlan) -> Model {
                 let new: String = old
                     .lines()
                     .enumerate()
-                    .map(|(n, l)| if n == *k { format!("edit-{i}-{n}\n") } else { format!("{l}\n") })
+                    .map(
+                        |(n, l)| if n == *k { format!("edit-{i}-{n}\n") } else { format!("{l}\n") },
+                    )
                     .collect();
                 t.insert(path, (EntryMode::File, new.into_bytes()));
             }
@@ -667,7 +684,11 @@ fn target_for(base: &Model, i: usize, plan: &TaskPlan) -> Model {
     t
 }
 
-async fn concurrency_case(b: Backend, ref_name: String, plans: Vec<TaskPlan>) -> Result<(), TestCaseError> {
+async fn concurrency_case(
+    b: Backend,
+    ref_name: String,
+    plans: Vec<TaskPlan>,
+) -> Result<(), TestCaseError> {
     let base = pool_base();
     let c0 = init_ref(&b, &ref_name, &base).await;
     let mut commits = Vec::new();
@@ -730,14 +751,22 @@ async fn concurrency_case(b: Backend, ref_name: String, plans: Vec<TaskPlan>) ->
     // Chain order of tasks, by message.
     let order: Vec<usize> = chain
         .iter()
-        .map(|(_, m)| String::from_utf8_lossy(m).trim().strip_prefix("task-").unwrap().parse::<usize>().unwrap())
+        .map(|(_, m)| {
+            String::from_utf8_lossy(m)
+                .trim()
+                .strip_prefix("task-")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+        })
         .collect();
     prop_assert_eq!(order.iter().copied().collect::<BTreeSet<_>>(), landed.clone());
 
     let fin = final_contents(&b, final_tip).await;
     let flat = flatten(&b, tree_of(&b, final_tip).await).await;
     prop_assert!(flat.empty_dirs.is_empty());
-    let all_text: String = fin.values().map(|v| String::from_utf8_lossy(&v.1).to_string()).collect();
+    let all_text: String =
+        fin.values().map(|v| String::from_utf8_lossy(&v.1).to_string()).collect();
 
     for (pos, &i) in order.iter().enumerate() {
         let later: Vec<usize> = order[pos + 1..].to_vec();
@@ -752,11 +781,25 @@ async fn concurrency_case(b: Backend, ref_name: String, plans: Vec<TaskPlan>) ->
             match kind {
                 TaskKind::Delete => prop_assert!(!fin.contains_key(path), "{} resurrected", path),
                 TaskKind::Whole => {
-                    prop_assert_eq!(fin.get(path), targets[i].get(path), "task {} lost whole write to {}", i, path)
+                    prop_assert_eq!(
+                        fin.get(path),
+                        targets[i].get(path),
+                        "task {} lost whole write to {}",
+                        i,
+                        path
+                    )
                 }
                 TaskKind::Line(k) => {
-                    let got = fin.get(path).map(|v| lines(&v.1).get(*k).copied().unwrap_or("").to_string());
-                    prop_assert_eq!(got, Some(format!("edit-{i}-{k}")), "task {} lost line edit in {}", i, path);
+                    let got = fin
+                        .get(path)
+                        .map(|v| lines(&v.1).get(*k).copied().unwrap_or("").to_string());
+                    prop_assert_eq!(
+                        got,
+                        Some(format!("edit-{i}-{k}")),
+                        "task {} lost line edit in {}",
+                        i,
+                        path
+                    );
                 }
             }
         }
@@ -765,7 +808,11 @@ async fn concurrency_case(b: Backend, ref_name: String, plans: Vec<TaskPlan>) ->
     for (i, o) in outcomes.iter().enumerate() {
         if matches!(o, Ok(LandOutcome::Conflict { .. })) {
             prop_assert!(!all_text.contains(&format!("edit-{i}-")), "conflicted task {} leaked", i);
-            prop_assert!(!all_text.contains(&format!("whole-{i}-")), "conflicted task {} leaked", i);
+            prop_assert!(
+                !all_text.contains(&format!("whole-{i}-")),
+                "conflicted task {} leaked",
+                i
+            );
         }
     }
     Ok(())
@@ -792,7 +839,8 @@ proptest! {
 }
 
 fn pg_url() -> String {
-    std::env::var("ANT_TEST_PG_URL").unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into())
+    std::env::var("ANT_TEST_PG_URL")
+        .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into())
 }
 
 #[test]

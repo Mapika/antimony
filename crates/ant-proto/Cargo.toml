@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ant-core.workspace = true
 prost.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
@@ -12,3 +13,7 @@ tonic-prost.workspace = true
 [build-dependencies]
 protox.workspace = true
 tonic-prost-build.workspace = true
+
+# Used by the generated code in OUT_DIR, which cargo-machete does not scan.
+[package.metadata.cargo-machete]
+ignored = ["prost", "tonic-prost"]

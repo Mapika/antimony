@@ -63,10 +63,7 @@ fn object(writer: &mut PackWriter, object: &EncodedObject) -> io::Result<()> {
 pub async fn send(b: Backend, ids: Vec<ObjectId>, tx: Sender<Chunk>) -> Result<()> {
     let count = u32::try_from(ids.len())?;
     let mut writer = tokio::task::spawn_blocking(move || -> Result<_> {
-        let mut writer = PackWriter {
-            tx,
-            hash: Sha256::new(),
-        };
+        let mut writer = PackWriter { tx, hash: Sha256::new() };
         writer.write_all(b"PACK")?;
         writer.write_all(&2_u32.to_be_bytes())?;
         writer.write_all(&count.to_be_bytes())?;
@@ -77,10 +74,7 @@ pub async fn send(b: Backend, ids: Vec<ObjectId>, tx: Sender<Chunk>) -> Result<(
         let objects = b.objects.get_many(chunk).await?;
         writer = tokio::task::spawn_blocking(move || -> Result<_> {
             for item in objects {
-                object(
-                    &mut writer,
-                    &item.ok_or_else(|| anyhow!("object disappeared"))?,
-                )?;
+                object(&mut writer, &item.ok_or_else(|| anyhow!("object disappeared"))?)?;
             }
             Ok(writer)
         })
@@ -104,9 +98,8 @@ mod tests {
     #[tokio::test]
     async fn real_git_accepts_streamed_pack_across_batches_and_sidebands() {
         let b = Backend::in_memory();
-        let mut objects: Vec<_> = (0_u32..520)
-            .map(|n| EncodedObject::new(ObjectKind::Blob, &n.to_be_bytes()))
-            .collect();
+        let mut objects: Vec<_> =
+            (0_u32..520).map(|n| EncodedObject::new(ObjectKind::Blob, &n.to_be_bytes())).collect();
         // Incompressible payload crosses several maximum-size sidebands.
         let mut state = 123456789_u32;
         let data: Vec<_> = (0..200_000)
@@ -159,10 +152,6 @@ mod tests {
         task.await.unwrap().unwrap();
         assert!(flushed && total > 200_000);
         let output = child.wait_with_output().await.unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     }
 }
