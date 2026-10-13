@@ -1,0 +1,7 @@
+# Test tiers (see AGENTS.md):
+#   fast: cargo nextest run --workspace                      (no external services)
+#   full: cargo nextest run --workspace --run-ignored all     (Postgres/S3/FUSE/e2e)
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 10 }
+fail-fast = false
+
