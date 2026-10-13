@@ -229,10 +229,9 @@ pub async fn create_changeset_as(
     // tree is read back. The id is returned only once both are durable; a
     // record whose objects failed to write is unreachable, and a retry of
     // the same request completes it.
-    futures::try_join!(
-        async { b.objects.put_many(&new_objects).await },
-        async { b.meta.put_commit(node.clone(), changes).await },
-    )?;
+    futures::try_join!(async { b.objects.put_many(&new_objects).await }, async {
+        b.meta.put_commit(node.clone(), changes).await
+    },)?;
 
     let objects = cache::objects(&b.objects);
     objects.trees.insert_many(trees.into_iter().map(|(_, id, tree)| {
@@ -378,7 +377,12 @@ pub(crate) mod tests {
     use ant_store::{ChangeKind, ObjectStoreExt};
 
     pub fn sig() -> Signature {
-        Signature { name: "agent".into(), email: "a@x".into(), time: 1_700_000_000, tz_offset_minutes: 0 }
+        Signature {
+            name: "agent".into(),
+            email: "a@x".into(),
+            time: 1_700_000_000,
+            tz_offset_minutes: 0,
+        }
     }
 
     pub fn write(path: &str, content: &str) -> FileOp {
@@ -393,7 +397,11 @@ pub(crate) mod tests {
         FileOp::Delete { path: RepoPath::new(path).unwrap() }
     }
 
-    pub async fn commit(b: &Backend, base: Option<ObjectId>, ops: Vec<FileOp>) -> OpResult<ObjectId> {
+    pub async fn commit(
+        b: &Backend,
+        base: Option<ObjectId>,
+        ops: Vec<FileOp>,
+    ) -> OpResult<ObjectId> {
         create_changeset(
             b,
             ChangesetRequest { base, ops, author: sig(), committer: None, message: "msg\n".into() },
@@ -403,8 +411,9 @@ pub(crate) mod tests {
 
     pub async fn read(b: &Backend, commit_id: ObjectId, path: &str) -> Option<String> {
         let c = b.objects.read_commit(&commit_id).await.unwrap();
-        let (mode, id) =
-            lookup_path(b.objects.as_ref(), c.tree, &RepoPath::new(path).unwrap()).await.unwrap()?;
+        let (mode, id) = lookup_path(b.objects.as_ref(), c.tree, &RepoPath::new(path).unwrap())
+            .await
+            .unwrap()?;
         assert!(mode.is_blob(), "{path} is not a blob");
         Some(String::from_utf8(b.objects.read_blob(&id).await.unwrap().to_vec()).unwrap())
     }
@@ -436,7 +445,12 @@ pub(crate) mod tests {
         assert_eq!(read(&b, c2, "d/y").await.as_deref(), Some("2"));
         let tree = b.objects.read_commit(&c2).await.unwrap().tree;
         // "e" became empty and must be gone entirely.
-        assert!(lookup_path(b.objects.as_ref(), tree, &RepoPath::new("e").unwrap()).await.unwrap().is_none());
+        assert!(
+            lookup_path(b.objects.as_ref(), tree, &RepoPath::new("e").unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let cs = b.meta.get_changeset(&c2).await.unwrap().unwrap();
         let kinds: Vec<_> = cs.iter().map(|c| (c.path.as_str(), c.kind)).collect();
@@ -559,7 +573,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn many_files_wide_directory() {
         let b = Backend::in_memory();
-        let ops: Vec<_> = (0..2000).map(|i| write(&format!("w/{:04}/f.rs", i % 100 * 100 + i / 100), "x")).collect();
+        let ops: Vec<_> = (0..2000)
+            .map(|i| write(&format!("w/{:04}/f.rs", i % 100 * 100 + i / 100), "x"))
+            .collect();
         let c = commit(&b, None, ops).await.unwrap();
         assert_eq!(b.meta.get_changeset(&c).await.unwrap().unwrap().len(), 2000);
     }

@@ -3,9 +3,7 @@
 
 use std::collections::{BinaryHeap, HashSet};
 
-use ant_core::{
-    Commit, EncodedObject, EntryMode, Object, ObjectId, RepoPath, Tree, TreeEntry,
-};
+use ant_core::{Commit, EncodedObject, EntryMode, Object, ObjectId, RepoPath, Tree, TreeEntry};
 
 use crate::{
     Backend, ChangeKind, CommitNode, ObjectStore, ObjectStoreExt, PathChange, Result, StoreError,
@@ -33,12 +31,8 @@ pub async fn diff_trees(
             Some(id) => objects.read_tree(&id).await?,
             None => Tree::empty(),
         };
-        let mut names: Vec<&str> = old_t
-            .entries()
-            .iter()
-            .chain(new_t.entries())
-            .map(|e| e.name.as_str())
-            .collect();
+        let mut names: Vec<&str> =
+            old_t.entries().iter().chain(new_t.entries()).map(|e| e.name.as_str()).collect();
         names.sort_unstable();
         names.dedup();
         for name in names {
@@ -158,7 +152,9 @@ pub async fn is_ancestor(b: &Backend, ancestor: ObjectId, descendant: ObjectId) 
         let nodes = b.meta.get_commits(&frontier).await?;
         let mut next = Vec::new();
         for (id, n) in frontier.iter().zip(nodes) {
-            let n = n.ok_or_else(|| StoreError::InvalidArgument(format!("commit {id} is not recorded")))?;
+            let n = n.ok_or_else(|| {
+                StoreError::InvalidArgument(format!("commit {id} is not recorded"))
+            })?;
             if n.generation <= target_gen {
                 continue;
             }
@@ -220,9 +216,8 @@ pub async fn build_tree(objects: &dyn ObjectStore, files: &[(&str, &[u8])]) -> R
     let mut blobs = Vec::new();
     for (path, content) in files {
         let p = RepoPath::new(*path)?;
-        let (parent, name) = p
-            .split_last()
-            .ok_or_else(|| StoreError::InvalidArgument("empty path".into()))?;
+        let (parent, name) =
+            p.split_last().ok_or_else(|| StoreError::InvalidArgument("empty path".into()))?;
         let obj = EncodedObject::new(ant_core::ObjectKind::Blob, content);
         let mut d = &mut root;
         for c in parent.components() {
@@ -240,7 +235,11 @@ pub async fn build_tree(objects: &dyn ObjectStore, files: &[(&str, &[u8])]) -> R
             .map(|(n, id)| TreeEntry { mode: EntryMode::File, name: n.clone(), id: *id })
             .collect();
         for (n, sub) in &d.dirs {
-            entries.push(TreeEntry { mode: EntryMode::Tree, name: n.clone(), id: encode(sub, out)? });
+            entries.push(TreeEntry {
+                mode: EntryMode::Tree,
+                name: n.clone(),
+                id: encode(sub, out)?,
+            });
         }
         let obj = Object::Tree(Tree::new(entries)?).encode();
         let id = obj.id();

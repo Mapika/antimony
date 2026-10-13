@@ -58,12 +58,10 @@ impl ObjectStore for TieredObjectStore {
             }
         }
         // The tiers are independent: write them concurrently.
-        let put_small = async {
-            if small.is_empty() { Ok(()) } else { self.small.put_many(&small).await }
-        };
-        let put_large = async {
-            if large.is_empty() { Ok(()) } else { self.large.put_many(&large).await }
-        };
+        let put_small =
+            async { if small.is_empty() { Ok(()) } else { self.small.put_many(&small).await } };
+        let put_large =
+            async { if large.is_empty() { Ok(()) } else { self.large.put_many(&large).await } };
         futures::try_join!(put_small, put_large)?;
         Ok(())
     }

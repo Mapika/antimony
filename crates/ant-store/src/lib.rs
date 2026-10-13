@@ -114,7 +114,9 @@ fn expect_kind(id: &ObjectId, o: &EncodedObject, expected: ObjectKind) -> Result
 pub enum CasOutcome {
     Updated,
     /// The ref did not hold `expected`; nothing was written.
-    Mismatch { actual: Option<ObjectId> },
+    Mismatch {
+        actual: Option<ObjectId>,
+    },
 }
 
 #[async_trait]
@@ -140,9 +142,7 @@ pub fn validate_ref_name(name: &str) -> Result<()> {
     let bad = name.is_empty()
         || name.len() > 255
         || name.split('/').any(|c| c.is_empty() || c == "." || c == "..")
-        || name
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c));
+        || name.chars().any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c));
     if bad {
         return Err(StoreError::InvalidArgument(format!("invalid ref name {name:?}")));
     }

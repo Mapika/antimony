@@ -35,11 +35,11 @@ use futures::stream::{BoxStream, StreamExt};
 use tonic::{Request, Response, Status};
 
 use crate::acl::{self, Access, Acl};
+use crate::ops::OpError;
 use crate::ops::changeset::{self, ChangesetRequest, FileOp, WriteContent};
 use crate::ops::history;
 use crate::ops::land::{self, LandOutcome};
 use crate::ops::query;
-use crate::ops::OpError;
 
 /// Ids per `get_many` call when serving `GetObjects`.
 const OBJECT_CHUNK: usize = 256;
@@ -149,12 +149,7 @@ fn parse_rev_path(path: &str) -> Result<RepoPath, Status> {
 }
 
 fn sig_from_pb(s: pb::Signature) -> Signature {
-    Signature {
-        name: s.name,
-        email: s.email,
-        time: s.time,
-        tz_offset_minutes: s.tz_offset_minutes,
-    }
+    Signature { name: s.name, email: s.email, time: s.time, tz_offset_minutes: s.tz_offset_minutes }
 }
 
 fn sig_to_pb(s: &Signature) -> pb::Signature {
@@ -205,7 +200,9 @@ fn file_op_from_pb(op: pb::FileOp) -> Result<FileOp, Status> {
         Some(pb::file_op::Op::Write(w)) => {
             let mode = mode_from_pb(w.mode)?;
             let content = match w.content {
-                Some(pb::write_op::Content::Inline(data)) => WriteContent::Inline(Bytes::from(data)),
+                Some(pb::write_op::Content::Inline(data)) => {
+                    WriteContent::Inline(Bytes::from(data))
+                }
                 Some(pb::write_op::Content::BlobId(id)) => WriteContent::Blob(parse_id(&id)?),
                 None => {
                     return Err(Status::invalid_argument(format!(
@@ -263,7 +260,8 @@ impl Ant for AntService {
         let access = self.access(&request)?;
         let ids = parse_ids(&request.into_inner().ids)?;
         let backend = self.backend.clone();
-        let chunks: Vec<Vec<ObjectId>> = ids.chunks(OBJECT_CHUNK).map(<[ObjectId]>::to_vec).collect();
+        let chunks: Vec<Vec<ObjectId>> =
+            ids.chunks(OBJECT_CHUNK).map(<[ObjectId]>::to_vec).collect();
         let stream = futures::stream::iter(chunks)
             .then(move |chunk| {
                 let backend = backend.clone();
@@ -353,9 +351,7 @@ impl Ant for AntService {
         let name = request.into_inner().name;
         ant_store::validate_ref_name(&name).map_err(store_status)?;
         let target = self.backend.refs.get_ref(&name).await.map_err(store_status)?;
-        Ok(Response::new(pb::GetRefResponse {
-            target: target.map(|t| t.0.to_vec()),
-        }))
+        Ok(Response::new(pb::GetRefResponse { target: target.map(|t| t.0.to_vec()) }))
     }
 
     async fn list_refs(
@@ -390,12 +386,8 @@ impl Ant for AntService {
                 .await
                 .map_err(op_status)?;
         }
-        let outcome = self
-            .backend
-            .refs
-            .cas_ref(&req.name, expected, new)
-            .await
-            .map_err(store_status)?;
+        let outcome =
+            self.backend.refs.cas_ref(&req.name, expected, new).await.map_err(store_status)?;
         Ok(Response::new(match outcome {
             CasOutcome::Updated => {
                 if new.is_some() {
@@ -403,10 +395,9 @@ impl Ant for AntService {
                 }
                 pb::UpdateRefResponse { updated: true, actual: None }
             }
-            CasOutcome::Mismatch { actual } => pb::UpdateRefResponse {
-                updated: false,
-                actual: actual.map(|a| a.0.to_vec()),
-            },
+            CasOutcome::Mismatch { actual } => {
+                pb::UpdateRefResponse { updated: false, actual: actual.map(|a| a.0.to_vec()) }
+            }
         }))
     }
 
@@ -417,11 +408,7 @@ impl Ant for AntService {
         let access = self.access(&request)?;
         let req = request.into_inner();
         let base = parse_opt_id(req.base.as_ref())?;
-        let ops = req
-            .ops
-            .into_iter()
-            .map(file_op_from_pb)
-            .collect::<Result<Vec<_>, _>>()?;
+        let ops = req.ops.into_iter().map(file_op_from_pb).collect::<Result<Vec<_>, _>>()?;
         let author = req
             .author
             .map(sig_from_pb)
@@ -437,7 +424,10 @@ impl Ant for AntService {
         Ok(Response::new(pb::CreateChangesetResponse { commit: commit.0.to_vec() }))
     }
 
-    async fn land(&self, request: Request<pb::LandRequest>) -> Result<Response<pb::LandResponse>, Status> {
+    async fn land(
+        &self,
+        request: Request<pb::LandRequest>,
+    ) -> Result<Response<pb::LandResponse>, Status> {
         let access = self.access(&request)?;
         let req = request.into_inner();
         ant_store::validate_ref_name(&req.ref_name).map_err(store_status)?;
@@ -484,10 +474,15 @@ impl Ant for AntService {
         let access = self.access(&request)?;
         let req = request.into_inner();
         let path = parse_rev_path(&req.path)?;
-        let info =
-            query::read_path_as(&self.backend, access.as_ref(), &req.rev, &path, req.include_content)
-                .await
-                .map_err(op_status)?;
+        let info = query::read_path_as(
+            &self.backend,
+            access.as_ref(),
+            &req.rev,
+            &path,
+            req.include_content,
+        )
+        .await
+        .map_err(op_status)?;
         Ok(Response::new(match info {
             None => pb::ReadPathResponse::default(),
             Some(info) => pb::ReadPathResponse {
@@ -509,20 +504,31 @@ impl Ant for AntService {
         }))
     }
 
-    async fn log(&self, request: Request<pb::LogRequest>) -> Result<Response<pb::LogResponse>, Status> {
+    async fn log(
+        &self,
+        request: Request<pb::LogRequest>,
+    ) -> Result<Response<pb::LogResponse>, Status> {
         let access = self.access(&request)?;
         let req = request.into_inner();
         let path = req.path.as_deref().map(parse_rev_path).transpose()?;
-        let entries =
-            query::log_as(&self.backend, access.as_ref(), &req.rev, path.as_ref(), req.limit as usize)
-                .await
-                .map_err(op_status)?;
+        let entries = query::log_as(
+            &self.backend,
+            access.as_ref(),
+            &req.rev,
+            path.as_ref(),
+            req.limit as usize,
+        )
+        .await
+        .map_err(op_status)?;
         Ok(Response::new(pb::LogResponse {
             commits: entries.into_iter().map(commit_info_to_pb).collect(),
         }))
     }
 
-    async fn blame(&self, request: Request<pb::BlameRequest>) -> Result<Response<pb::BlameResponse>, Status> {
+    async fn blame(
+        &self,
+        request: Request<pb::BlameRequest>,
+    ) -> Result<Response<pb::BlameResponse>, Status> {
         let access = self.access(&request)?;
         let req = request.into_inner();
         let path = parse_rev_path(&req.path)?;
@@ -537,7 +543,10 @@ impl Ant for AntService {
         }))
     }
 
-    async fn diff(&self, request: Request<pb::DiffRequest>) -> Result<Response<pb::DiffResponse>, Status> {
+    async fn diff(
+        &self,
+        request: Request<pb::DiffRequest>,
+    ) -> Result<Response<pb::DiffResponse>, Status> {
         let access = self.access(&request)?;
         let req = request.into_inner();
         let from = if req.from_rev.is_empty() { None } else { Some(req.from_rev.as_str()) };

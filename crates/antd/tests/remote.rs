@@ -144,7 +144,8 @@ async fn http_reads_are_used_when_available() {
     assert_eq!(got[2].as_ref().unwrap().as_bytes(), b.as_bytes());
 
     // Trailing slash on the HTTP base is tolerated.
-    let store = RemoteObjectStore::connect(&r.grpc_url, Some(&format!("{}/", r.http_url))).await.unwrap();
+    let store =
+        RemoteObjectStore::connect(&r.grpc_url, Some(&format!("{}/", r.http_url))).await.unwrap();
     assert!(store.get(&a.id()).await.unwrap().is_some());
 }
 
@@ -188,10 +189,13 @@ async fn http_404_is_none_and_500_falls_back() {
     r.backend.objects.put(zero.clone()).await.unwrap();
 
     // 404 from the cache is an answer: the object is reported absent.
-    let flaky = fake_http(|path| {
-        if path.starts_with("/o/0") { (500, Vec::new()) } else { (404, Vec::new()) }
-    })
-    .await;
+    let flaky =
+        fake_http(
+            |path| {
+                if path.starts_with("/o/0") { (500, Vec::new()) } else { (404, Vec::new()) }
+            },
+        )
+        .await;
     let store = RemoteObjectStore::connect(&r.grpc_url, Some(&flaky)).await.unwrap();
     let got = store.get_many(&[blob("unknown to cache").id()]).await.unwrap();
     assert!(got[0].is_none());

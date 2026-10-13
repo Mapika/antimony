@@ -41,7 +41,10 @@ const PUT_BATCH_BYTES: usize = 64 * 1024 * 1024;
 pub struct BearerAuth(Option<MetadataValue<Ascii>>);
 
 impl Interceptor for BearerAuth {
-    fn call(&mut self, mut req: tonic::Request<()>) -> std::result::Result<tonic::Request<()>, tonic::Status> {
+    fn call(
+        &mut self,
+        mut req: tonic::Request<()>,
+    ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
         if let Some(v) = &self.0 {
             req.metadata_mut().insert("authorization", v.clone());
         }
@@ -97,7 +100,11 @@ impl RemoteObjectStore {
 
     /// Fetch every id over HTTP. Any failure (transport, unexpected status,
     /// hash mismatch) is an error so the caller can fall back to gRPC.
-    async fn get_many_http(&self, base: &str, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
+    async fn get_many_http(
+        &self,
+        base: &str,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<EncodedObject>>> {
         let http = self.http.clone();
         let base = base.to_owned();
         let auth = self.authorization.clone();
@@ -128,7 +135,8 @@ impl RemoteObjectStore {
                 .into_inner();
             let mut received = 0usize;
             while let Some(item) = stream.message().await.map_err(StoreError::backend)? {
-                let expected = chunk.get(received).ok_or_else(|| protocol_error("extra object in stream"))?;
+                let expected =
+                    chunk.get(received).ok_or_else(|| protocol_error("extra object in stream"))?;
                 if item.id != expected.0 {
                     return Err(protocol_error("object stream out of order"));
                 }
@@ -187,7 +195,9 @@ impl ObjectStore for RemoteObjectStore {
         if let Some(base) = &self.http_base {
             match self.get_many_http(base, ids).await {
                 Ok(objects) => return Ok(objects),
-                Err(e) => tracing::debug!(error = %e, "HTTP object read failed; falling back to gRPC"),
+                Err(e) => {
+                    tracing::debug!(error = %e, "HTTP object read failed; falling back to gRPC")
+                }
             }
         }
         self.get_many_grpc(ids).await

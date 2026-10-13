@@ -111,14 +111,17 @@ mod tests {
 
     use super::*;
     use ant_core::{EncodedObject, EntryMode, Object, ObjectKind, Tree, TreeEntry};
+    use ant_store::ObjectStoreExt;
     use ant_store::graph::build_tree;
     use ant_store::memory::MemoryObjectStore;
-    use ant_store::ObjectStoreExt;
 
     async fn fixture() -> (Arc<MemoryObjectStore>, ObjectId) {
         let s = Arc::new(MemoryObjectStore::default());
-        let sub = build_tree(s.as_ref(), &[("lib.rs", b"pub fn x() {}\n"), ("deep/er/f", b"deep")]).await.unwrap();
-        let exe = s.put(EncodedObject::new(ObjectKind::Blob, b"#!/bin/sh\necho hi\n")).await.unwrap();
+        let sub = build_tree(s.as_ref(), &[("lib.rs", b"pub fn x() {}\n"), ("deep/er/f", b"deep")])
+            .await
+            .unwrap();
+        let exe =
+            s.put(EncodedObject::new(ObjectKind::Blob, b"#!/bin/sh\necho hi\n")).await.unwrap();
         let link = s.put(EncodedObject::new(ObjectKind::Blob, b"src/lib.rs")).await.unwrap();
         let big: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
         let big_id = s.put(EncodedObject::new(ObjectKind::Blob, &big)).await.unwrap();
@@ -132,8 +135,12 @@ mod tests {
         // Wide directory to exercise readdir offsets.
         let wide = build_tree(
             s.as_ref(),
-            &(0..1500).map(|i| (format!("f{i:04}"), b"w".as_slice())).collect::<Vec<_>>()
-                .iter().map(|(n, c)| (n.as_str(), *c)).collect::<Vec<_>>(),
+            &(0..1500)
+                .map(|i| (format!("f{i:04}"), b"w".as_slice()))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|(n, c)| (n.as_str(), *c))
+                .collect::<Vec<_>>(),
         )
         .await
         .unwrap();
@@ -144,7 +151,8 @@ mod tests {
 
     fn mount_fixture(
         rt: &tokio::runtime::Runtime,
-    ) -> (parking_lot::MutexGuard<'static, ()>, tempfile::TempDir, PathBuf, fuser::BackgroundSession) {
+    ) -> (parking_lot::MutexGuard<'static, ()>, tempfile::TempDir, PathBuf, fuser::BackgroundSession)
+    {
         let gate = crate::KERNEL_GATE.lock();
         let (s, root) = rt.block_on(fixture());
         let tmp = tempfile::tempdir().unwrap();
@@ -169,7 +177,10 @@ mod tests {
         assert!(mnt.join("vendor").is_dir());
         assert_eq!(std::fs::read_dir(mnt.join("vendor")).unwrap().count(), 0);
 
-        let mut names: Vec<_> = std::fs::read_dir(&mnt).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        let mut names: Vec<_> = std::fs::read_dir(&mnt)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
         names.sort();
         assert_eq!(names, ["big.bin", "link", "run.sh", "src", "vendor", "wide"]);
 

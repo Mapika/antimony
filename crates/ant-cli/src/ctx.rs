@@ -42,7 +42,8 @@ impl Ctx {
         let cache = match &cli.cache {
             Some(c) => c.clone(),
             None => {
-                let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set; pass --cache"))?;
+                let home = std::env::var_os("HOME")
+                    .ok_or_else(|| anyhow!("HOME is not set; pass --cache"))?;
                 PathBuf::from(home).join(".cache/antimony")
             }
         };
@@ -57,9 +58,13 @@ impl Ctx {
     }
 
     pub async fn remote(&self) -> Result<RemoteObjectStore> {
-        RemoteObjectStore::connect_with_token(&self.server, self.http.as_deref(), self.token.as_deref())
-            .await
-            .with_context(|| format!("connecting to {}", self.server))
+        RemoteObjectStore::connect_with_token(
+            &self.server,
+            self.http.as_deref(),
+            self.token.as_deref(),
+        )
+        .await
+        .with_context(|| format!("connecting to {}", self.server))
     }
 
     pub fn disk(&self) -> Result<Arc<DiskObjectStore>> {

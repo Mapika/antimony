@@ -142,4 +142,3 @@ pub fn config(default_cases: u32) -> proptest::test_runner::Config {
     c.max_global_rejects = 1_000_000;
     c
 }
-

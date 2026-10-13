@@ -99,7 +99,8 @@ impl ObjectStore for ReadThrough {
                 }
             }
             if !mine.is_empty() {
-                let (local, upstream, batch) = (self.local.clone(), self.upstream.clone(), mine.clone());
+                let (local, upstream, batch) =
+                    (self.local.clone(), self.upstream.clone(), mine.clone());
                 let fut: InFlight = async move {
                     Self::fetch(local, upstream, batch)
                         .await

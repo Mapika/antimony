@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, bail};
 use ant_store::postgres::PgStore;
 use ant_store::s3::{S3Config, S3ObjectStore};
 use ant_store::tiered::{DEFAULT_INLINE_THRESHOLD, TieredObjectStore};
 use ant_store::{Backend, ObjectStore};
+use anyhow::{Context, bail};
 
 /// Backend selection flags (`--memory` | `--pg-url` + optional `--s3-*`).
 #[derive(clap::Args, Debug, Clone)]
@@ -63,7 +63,9 @@ impl StoreArgs {
             self.s3_access_key.clone(),
             self.s3_secret_key.clone(),
         ) else {
-            bail!("--s3-endpoint, --s3-bucket, --s3-access-key and --s3-secret-key must be given together");
+            bail!(
+                "--s3-endpoint, --s3-bucket, --s3-access-key and --s3-secret-key must be given together"
+            );
         };
         Ok(Some(S3Config {
             endpoint,

@@ -51,12 +51,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use tokio::sync::oneshot;
 
-use ant_core::{
-    EncodedObject, EntryMode, Object, ObjectId, ObjectKind, RepoPath, Tree, TreeEntry,
-};
+use ant_core::{EncodedObject, EntryMode, Object, ObjectId, ObjectKind, RepoPath, Tree, TreeEntry};
+use ant_store::{Backend, CasOutcome, ChangeKind, CommitNode, PathChange, StoreError};
 #[cfg(test)]
 use ant_store::{ObjectStoreExt, graph::write_commit};
-use ant_store::{Backend, CasOutcome, ChangeKind, CommitNode, PathChange, StoreError};
 
 use super::{OpError, OpResult, cache};
 use crate::acl::{self, Access};
@@ -135,9 +133,9 @@ async fn load_directories_with<const N: usize>(
                     }
                     fetched.insert(*id, Arc::new(Tree::decode(object.body())?));
                 }
-                caches
-                    .trees
-                    .insert_many(fetched.iter().map(|(id, t)| (*id, t.clone(), cache::tree_weight(t))));
+                caches.trees.insert_many(
+                    fetched.iter().map(|(id, t)| (*id, t.clone(), cache::tree_weight(t))),
+                );
                 for ((_, _, id), slot) in pending.iter().zip(&mut trees) {
                     if slot.is_none() {
                         *slot = fetched.get(id).cloned();
@@ -603,9 +601,9 @@ impl BatchState {
             let object = EncodedObject::new(ObjectKind::Tree, &tree.encode());
             let id = object.id();
             if let Some((parent, name)) = path.split_last() {
-                let parent_tree = dirs
-                    .get_mut(&parent)
-                    .ok_or_else(|| OpError::InvalidArgument(format!("missing directory {parent}")))?;
+                let parent_tree = dirs.get_mut(&parent).ok_or_else(|| {
+                    OpError::InvalidArgument(format!("missing directory {parent}"))
+                })?;
                 if parent_tree.get(name).is_some_and(|e| e.id == id) {
                     continue;
                 }
@@ -621,7 +619,10 @@ impl BatchState {
             new_trees.push((id, Arc::new(tree)));
         }
         let original = cache::read_commits(b, &[commit]).await?;
-        let mut rebased = original.first().map(|c| (**c).clone()).ok_or_else(|| OpError::not_found_object(commit))?;
+        let mut rebased = original
+            .first()
+            .map(|c| (**c).clone())
+            .ok_or_else(|| OpError::not_found_object(commit))?;
         rebased.tree = root;
         rebased.parents = vec![onto];
         let generation = target.generation + 1;
@@ -681,16 +682,13 @@ impl BatchState {
         // whose objects failed to write is unreachable (its id was never
         // returned) and is completed by any retry, which rebuilds it
         // identically.
-        futures::try_join!(
-            async { b.objects.put_many(&writes.objects).await },
-            async { b.meta.put_commits(writes.commits).await },
-        )?;
-        cache::objects(&b.objects).trees.insert_many(
-            writes.trees.into_iter().map(|(id, tree)| {
-                let weight = cache::tree_weight(&tree);
-                (id, tree, weight)
-            }),
-        );
+        futures::try_join!(async { b.objects.put_many(&writes.objects).await }, async {
+            b.meta.put_commits(writes.commits).await
+        },)?;
+        cache::objects(&b.objects).trees.insert_many(writes.trees.into_iter().map(|(id, tree)| {
+            let weight = cache::tree_weight(&tree);
+            (id, tree, weight)
+        }));
         let meta = cache::meta(&b.meta);
         meta.nodes
             .insert_many(entries.iter().map(|(n, _, _)| (n.id, n.clone(), cache::NODE_WEIGHT)));
@@ -876,7 +874,11 @@ impl Worker {
 }
 
 #[cfg(test)]
-fn enqueue(b: &Backend, ref_name: &str, commit: ObjectId) -> oneshot::Receiver<OpResult<LandOutcome>> {
+fn enqueue(
+    b: &Backend,
+    ref_name: &str,
+    commit: ObjectId,
+) -> oneshot::Receiver<OpResult<LandOutcome>> {
     enqueue_checked(b, ref_name, commit, Verified::All, None)
 }
 
@@ -913,10 +915,10 @@ async fn land_batch(
     let ids: Vec<_> = batch.iter().map(|r| r.commit).collect();
     let keys: Vec<_> = ids.iter().map(|id| id.as_bytes().as_slice()).collect();
     // Independent reads, one round trip.
-    let (mut start, mut mapped) = futures::try_join!(
-        async { b.refs.get_ref(ref_name).await },
-        async { b.meta.get_derived_many(LANDED_AS, &keys).await },
-    )?;
+    let (mut start, mut mapped) =
+        futures::try_join!(async { b.refs.get_ref(ref_name).await }, async {
+            b.meta.get_derived_many(LANDED_AS, &keys).await
+        },)?;
     // Batch-wide prefetch: nodes, then the changesets and messages a rebase
     // needs (unrecorded ids are reported per request by `apply`).
     state.prefetch(b, &ids).await?;
@@ -1007,8 +1009,8 @@ mod tests {
     use super::*;
     use crate::ops::OpError;
     use crate::ops::changeset::tests::{commit, delete, read, write};
-    use ant_store::graph::is_ancestor;
     use ant_store::ObjectStoreExt;
+    use ant_store::graph::is_ancestor;
 
     async fn tip(b: &Backend) -> ObjectId {
         b.refs.get_ref("main").await.unwrap().unwrap()
@@ -1018,11 +1020,20 @@ mod tests {
     async fn create_and_fast_forward() {
         let b = Backend::in_memory();
         let c1 = commit(&b, None, vec![write("f", "1")]).await.unwrap();
-        assert_eq!(land(&b, "main", c1).await.unwrap(), LandOutcome::Landed { new_tip: c1, rebased: false });
+        assert_eq!(
+            land(&b, "main", c1).await.unwrap(),
+            LandOutcome::Landed { new_tip: c1, rebased: false }
+        );
         let c2 = commit(&b, Some(c1), vec![write("f", "2")]).await.unwrap();
-        assert_eq!(land(&b, "main", c2).await.unwrap(), LandOutcome::Landed { new_tip: c2, rebased: false });
+        assert_eq!(
+            land(&b, "main", c2).await.unwrap(),
+            LandOutcome::Landed { new_tip: c2, rebased: false }
+        );
         // Re-landing an ancestor is a no-op.
-        assert_eq!(land(&b, "main", c1).await.unwrap(), LandOutcome::Landed { new_tip: c2, rebased: false });
+        assert_eq!(
+            land(&b, "main", c1).await.unwrap(),
+            LandOutcome::Landed { new_tip: c2, rebased: false }
+        );
         assert_eq!(tip(&b).await, c2);
     }
 
@@ -1032,7 +1043,8 @@ mod tests {
         let base = commit(&b, None, vec![write("a", "a"), write("b", "b")]).await.unwrap();
         land(&b, "main", base).await.unwrap();
         let x = commit(&b, Some(base), vec![write("a", "A")]).await.unwrap();
-        let y = commit(&b, Some(base), vec![write("b", "B"), write("new/file", "n")]).await.unwrap();
+        let y =
+            commit(&b, Some(base), vec![write("b", "B"), write("new/file", "n")]).await.unwrap();
         land(&b, "main", x).await.unwrap();
         let out = land(&b, "main", y).await.unwrap();
         let LandOutcome::Landed { new_tip, rebased: true } = out else { panic!("{out:?}") };
@@ -1056,19 +1068,30 @@ mod tests {
         let x = commit(&b, Some(base), vec![write("f", "L1\nl2\nl3\nl4\nl5\nl6\n")]).await.unwrap();
         let y = commit(&b, Some(base), vec![write("f", "l1\nl2\nl3\nl4\nl5\nL6\n")]).await.unwrap();
         land(&b, "main", x).await.unwrap();
-        let LandOutcome::Landed { new_tip, .. } = land(&b, "main", y).await.unwrap() else { panic!() };
+        let LandOutcome::Landed { new_tip, .. } = land(&b, "main", y).await.unwrap() else {
+            panic!()
+        };
         assert_eq!(read(&b, new_tip, "f").await.as_deref(), Some("L1\nl2\nl3\nl4\nl5\nL6\n"));
     }
 
     #[tokio::test]
     async fn conflicts_are_reported_not_landed() {
         let b = Backend::in_memory();
-        let base = commit(&b, None, vec![write("f", "x\n"), write("g", "g\n"), write("h", "h\n")]).await.unwrap();
-        land(&b, "main", base).await.unwrap();
-        let x = commit(&b, Some(base), vec![write("f", "ours\n"), delete("g"), write("h", "same\n")]).await.unwrap();
-        let y = commit(&b, Some(base), vec![write("f", "theirs\n"), write("g", "mod\n"), write("h", "same\n")])
+        let base = commit(&b, None, vec![write("f", "x\n"), write("g", "g\n"), write("h", "h\n")])
             .await
             .unwrap();
+        land(&b, "main", base).await.unwrap();
+        let x =
+            commit(&b, Some(base), vec![write("f", "ours\n"), delete("g"), write("h", "same\n")])
+                .await
+                .unwrap();
+        let y = commit(
+            &b,
+            Some(base),
+            vec![write("f", "theirs\n"), write("g", "mod\n"), write("h", "same\n")],
+        )
+        .await
+        .unwrap();
         land(&b, "main", x).await.unwrap();
         let out = land(&b, "main", y).await.unwrap();
         let paths: Vec<_> = match out {
@@ -1089,7 +1112,9 @@ mod tests {
         let base = commit(&b, None, vec![write("p", "file")]).await.unwrap();
         land(&b, "main", base).await.unwrap();
         let x = commit(&b, Some(base), vec![delete("p"), write("p/q", "dir now")]).await.unwrap();
-        let y = commit(&b, Some(base), vec![write("p2", "unrelated"), write("p", "edited")]).await.unwrap();
+        let y = commit(&b, Some(base), vec![write("p2", "unrelated"), write("p", "edited")])
+            .await
+            .unwrap();
         land(&b, "main", x).await.unwrap();
         assert!(matches!(land(&b, "main", y).await.unwrap(), LandOutcome::Conflict { .. }));
     }
@@ -1125,7 +1150,11 @@ mod tests {
         const N: usize = 24;
         let mut commits = Vec::new();
         for i in 0..N {
-            commits.push(commit(&b, Some(base), vec![write(&format!("agent{i}/out"), "done")]).await.unwrap());
+            commits.push(
+                commit(&b, Some(base), vec![write(&format!("agent{i}/out"), "done")])
+                    .await
+                    .unwrap(),
+            );
         }
         let b = Arc::new(b);
         let mut tasks = Vec::new();
@@ -1138,7 +1167,11 @@ mod tests {
         }
         let t = tip(&b).await;
         for i in 0..N {
-            assert_eq!(read(&b, t, &format!("agent{i}/out")).await.as_deref(), Some("done"), "agent{i}");
+            assert_eq!(
+                read(&b, t, &format!("agent{i}/out")).await.as_deref(),
+                Some("done"),
+                "agent{i}"
+            );
         }
         // Linear first-parent history of N+1 commits.
         let node = b.meta.get_commits(&[t]).await.unwrap().pop().unwrap().unwrap();

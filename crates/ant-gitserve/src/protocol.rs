@@ -49,10 +49,7 @@ pub fn parse(mut input: &[u8]) -> Result<Request<'_>> {
             _ => bail!("invalid packet length"),
         }
     }
-    Ok(Request {
-        command: command.ok_or_else(|| anyhow::anyhow!("missing command"))?,
-        args,
-    })
+    Ok(Request { command: command.ok_or_else(|| anyhow::anyhow!("missing command"))?, args })
 }
 
 #[cfg(test)]

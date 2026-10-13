@@ -120,17 +120,18 @@ impl S3ObjectStore {
     }
 
     async fn get_one(&self, id: ObjectId) -> Result<Option<EncodedObject>> {
-        let resp = match self.client.get_object().bucket(&self.bucket).key(self.key(&id)).send().await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                if e.as_service_error().is_some_and(|s| s.is_no_such_key()) {
-                    return Ok(None);
+        let resp =
+            match self.client.get_object().bucket(&self.bucket).key(self.key(&id)).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    if e.as_service_error().is_some_and(|s| s.is_no_such_key()) {
+                        return Ok(None);
+                    }
+                    return Err(StoreError::backend(e));
                 }
-                return Err(StoreError::backend(e));
-            }
-        };
-        let compressed: Bytes = resp.body.collect().await.map_err(StoreError::backend)?.into_bytes();
+            };
+        let compressed: Bytes =
+            resp.body.collect().await.map_err(StoreError::backend)?.into_bytes();
         let compressed_len = compressed.len();
         let decode = move || -> Result<EncodedObject> {
             let raw = zstd::stream::decode_all(&compressed[..]).map_err(StoreError::backend)?;
@@ -159,7 +160,8 @@ impl S3ObjectStore {
             .map_err(StoreError::backend)?
             .map_err(StoreError::backend)?
         } else {
-            zstd::stream::encode_all(&obj.as_bytes()[..], ZSTD_LEVEL).map_err(StoreError::backend)?
+            zstd::stream::encode_all(&obj.as_bytes()[..], ZSTD_LEVEL)
+                .map_err(StoreError::backend)?
         };
         self.client
             .put_object()

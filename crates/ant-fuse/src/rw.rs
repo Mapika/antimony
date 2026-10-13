@@ -121,10 +121,7 @@ impl MountGuard {
             return Err(busy());
         }
         // From here on the guard owns the registry entry, released on drop.
-        let mut guard = Self {
-            file: None,
-            dir: dir.to_owned(),
-        };
+        let mut guard = Self { file: None, dir: dir.to_owned() };
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -178,11 +175,7 @@ pub fn base(state: &Path) -> io::Result<(ObjectId, ObjectId)> {
 }
 
 fn save_base(state: &Path, commit: ObjectId, tree: ObjectId) -> io::Result<()> {
-    atomic(
-        state,
-        "base",
-        format!("base_commit={commit}\nbase_tree={tree}\n").as_bytes(),
-    )
+    atomic(state, "base", format!("base_commit={commit}\nbase_tree={tree}\n").as_bytes())
 }
 
 fn whiteouts(state: &Path) -> io::Result<BTreeSet<String>> {
@@ -210,9 +203,7 @@ fn recover(state: &Path) -> io::Result<()> {
         Err(e) => return Err(e),
     };
     let fields: Vec<_> = record.lines().collect();
-    let (operation, paths) = fields
-        .split_first()
-        .ok_or_else(|| other("empty mutation intent"))?;
+    let (operation, paths) = fields.split_first().ok_or_else(|| other("empty mutation intent"))?;
     if !matches!((*operation, paths.len()), ("delete", 1) | ("rename", 2)) {
         return Err(other("invalid mutation intent"));
     }
@@ -249,16 +240,10 @@ fn mutate(state: &Path, record: &str) -> io::Result<()> {
 }
 
 fn under(path: &str, prefix: &str) -> bool {
-    path == prefix
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|s| s.starts_with('/'))
+    path == prefix || path.strip_prefix(prefix).is_some_and(|s| s.starts_with('/'))
 }
 fn hidden(paths: &BTreeSet<String>, path: &str) -> bool {
-    paths.contains(path)
-        || path
-            .match_indices('/')
-            .any(|(i, _)| paths.contains(&path[..i]))
+    paths.contains(path) || path.match_indices('/').any(|(i, _)| paths.contains(&path[..i]))
 }
 fn metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
     match fs::symlink_metadata(path) {
@@ -384,11 +369,7 @@ impl Writable {
 }
 impl Operation<'_> {
     fn path(&self, ino: INodeNo) -> io::Result<String> {
-        self.overlay
-            .paths
-            .get(&ino)
-            .cloned()
-            .ok_or_else(|| error(libc::ENOENT))
+        self.overlay.paths.get(&ino).cloned().ok_or_else(|| error(libc::ENOENT))
     }
     fn active(&self, mut ino: INodeNo) -> bool {
         while ino != INodeNo(1) {
@@ -410,27 +391,16 @@ impl Operation<'_> {
             return Err(error(libc::EINVAL));
         }
         let path = self.path(parent)?;
-        Ok(if path.is_empty() {
-            name.into()
-        } else {
-            format!("{path}/{name}")
-        })
+        Ok(if path.is_empty() { name.into() } else { format!("{path}/{name}") })
     }
     fn upper(&self, path: &str) -> PathBuf {
         self.view.dir.join("upper").join(path)
     }
     fn tree(&mut self, id: ObjectId) -> io::Result<Arc<Tree>> {
-        self.view
-            .lower
-            .cached_tree(self.cache, id)
-            .map_err(fuse_error)
+        self.view.lower.cached_tree(self.cache, id).map_err(fuse_error)
     }
     fn lower(&mut self, path: &str) -> io::Result<Option<TreeEntry>> {
-        let mut entry = TreeEntry {
-            name: String::new(),
-            mode: EntryMode::Tree,
-            id: self.root,
-        };
+        let mut entry = TreeEntry { name: String::new(), mode: EntryMode::Tree, id: self.root };
         for part in path.split('/').filter(|s| !s.is_empty()) {
             if entry.mode != EntryMode::Tree {
                 return Ok(None);
@@ -498,19 +468,12 @@ impl Operation<'_> {
             ctime: m.as_ref().and_then(|m| m.modified().ok()).unwrap_or(time),
             crtime: time,
             kind: file_kind(entry.mode),
-            perm: m
-                .as_ref()
-                .map(|m| (m.mode() & 0o7777) as u16)
-                .unwrap_or(match entry.mode {
-                    EntryMode::File => 0o644,
-                    EntryMode::Symlink => 0o777,
-                    _ => 0o755,
-                }),
-            nlink: if file_kind(entry.mode) == FileType::Directory {
-                2
-            } else {
-                1
-            },
+            perm: m.as_ref().map(|m| (m.mode() & 0o7777) as u16).unwrap_or(match entry.mode {
+                EntryMode::File => 0o644,
+                EntryMode::Symlink => 0o777,
+                _ => 0o755,
+            }),
+            nlink: if file_kind(entry.mode) == FileType::Directory { 2 } else { 1 },
             // SAFETY: these calls have no preconditions and cannot fail.
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -530,11 +493,8 @@ impl Operation<'_> {
         {
             let tree = self.tree(entry.id)?;
             for e in tree.entries() {
-                let child = if path.is_empty() {
-                    e.name.clone()
-                } else {
-                    format!("{path}/{}", e.name)
-                };
+                let child =
+                    if path.is_empty() { e.name.clone() } else { format!("{path}/{}", e.name) };
                 if !hidden(&self.deleted, &child) {
                     out.insert(e.name.clone(), e.mode);
                 }
@@ -545,10 +505,7 @@ impl Operation<'_> {
         {
             for e in fs::read_dir(self.upper(path))? {
                 let e = e?;
-                let name = e
-                    .file_name()
-                    .into_string()
-                    .map_err(|_| error(libc::EINVAL))?;
+                let name = e.file_name().into_string().map_err(|_| error(libc::EINVAL))?;
                 out.insert(name, mode(&fs::symlink_metadata(e.path())?));
             }
         }
@@ -572,11 +529,7 @@ impl Operation<'_> {
                 let mut f = File::create(&temp)?;
                 f.write_all(&self.blob(entry.id)?)?;
                 f.set_permissions(fs::Permissions::from_mode(
-                    if entry.mode == EntryMode::Executable {
-                        0o755
-                    } else {
-                        0o644
-                    },
+                    if entry.mode == EntryMode::Executable { 0o755 } else { 0o644 },
                 ))?;
                 f.sync_all()?;
                 fs::rename(temp, &full)?;
@@ -601,10 +554,7 @@ impl Operation<'_> {
                     ids.push(e.id);
                 }
             }
-            self.view
-                .lower
-                .cache_trees(self.cache, &ids)
-                .map_err(fuse_error)?;
+            self.view.lower.cache_trees(self.cache, &ids).map_err(fuse_error)?;
             let mut next = Vec::new();
             for path in todo {
                 let entry = self.entry(&path)?;
@@ -634,11 +584,7 @@ impl Operation<'_> {
                     let mut f = File::create(&temp)?;
                     f.write_all(object.body())?;
                     f.set_permissions(fs::Permissions::from_mode(
-                        if entry.mode == EntryMode::Executable {
-                            0o755
-                        } else {
-                            0o644
-                        },
+                        if entry.mode == EntryMode::Executable { 0o755 } else { 0o644 },
                     ))?;
                     f.sync_all()?;
                     fs::rename(temp, full)?;
@@ -657,11 +603,7 @@ impl Operation<'_> {
         let path = self.child(parent, name)?;
         let is_dir = file_kind(self.entry(&path)?.mode) == FileType::Directory;
         if directory != is_dir {
-            return Err(error(if directory {
-                libc::ENOTDIR
-            } else {
-                libc::EISDIR
-            }));
+            return Err(error(if directory { libc::ENOTDIR } else { libc::EISDIR }));
         }
         if is_dir && !self.children(&path)?.is_empty() {
             return Err(error(libc::ENOTEMPTY));
@@ -693,10 +635,7 @@ impl Operation<'_> {
             fs::create_dir(&full)?;
             fs::set_permissions(&full, fs::Permissions::from_mode(perm))?;
         } else {
-            let f = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&full)?;
+            let f = OpenOptions::new().write(true).create_new(true).open(&full)?;
             f.set_permissions(fs::Permissions::from_mode(perm))?;
         }
         sync_parent(&full)?;
@@ -786,9 +725,7 @@ impl Operation<'_> {
         self.deleted.insert(new.clone());
         self.detach(parent, name);
         self.detach(newparent, newname);
-        self.cache
-            .paths
-            .insert((newparent, newname.to_string_lossy().into_owned()), ino);
+        self.cache.paths.insert((newparent, newname.to_string_lossy().into_owned()), ino);
         self.cache.nodes[(ino.0 - 1) as usize].parent = newparent;
         for path in self.overlay.paths.values_mut() {
             if under(path, &old) {
@@ -824,11 +761,7 @@ impl Filesystem for Writable {
             let children = o.children(&path)?;
             let mut entries = vec![
                 (ino, FileType::Directory, ".".into()),
-                (
-                    o.cache.nodes[(ino.0 - 1) as usize].parent,
-                    FileType::Directory,
-                    "..".into(),
-                ),
+                (o.cache.nodes[(ino.0 - 1) as usize].parent, FileType::Directory, "..".into()),
             ];
             for (name, mode) in children {
                 entries.push((o.inode(ino, OsStr::new(&name))?, file_kind(mode), name));
@@ -858,10 +791,8 @@ impl Filesystem for Writable {
             reply.error(Errno::EBADF);
             return;
         };
-        for (i, (ino, kind, name)) in entries
-            .iter()
-            .enumerate()
-            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+        for (i, (ino, kind, name)) in
+            entries.iter().enumerate().skip(usize::try_from(offset).unwrap_or(usize::MAX))
         {
             if reply.add(*ino, (i + 1) as u64, *kind, name) {
                 break;
@@ -891,11 +822,7 @@ impl Filesystem for Writable {
         reply: ReplyData,
     ) {
         let result = self.run(|o| {
-            let handle = o
-                .overlay
-                .handles
-                .get(&fh.0)
-                .ok_or_else(|| error(libc::EBADF))?;
+            let handle = o.overlay.handles.get(&fh.0).ok_or_else(|| error(libc::EBADF))?;
             let lower = match handle {
                 OpenFile::Lower(id) => Some(*id),
                 _ => None,
@@ -917,9 +844,7 @@ impl Filesystem for Writable {
                 return Ok(bytes::Bytes::from(out));
             }
             let data = o.blob(lower.ok_or_else(|| error(libc::EBADF))?)?;
-            let start = usize::try_from(offset)
-                .unwrap_or(usize::MAX)
-                .min(data.len());
+            let start = usize::try_from(offset).unwrap_or(usize::MAX).min(data.len());
             Ok(data.slice(start..start.saturating_add(size as usize).min(data.len())))
         });
         match result {
@@ -1051,10 +976,7 @@ impl Filesystem for Writable {
         match self.run(|o| {
             let path = o.path(ino)?;
             if metadata(&o.upper(&path))?.is_some() {
-                return Ok(fs::read_link(o.upper(&path))?
-                    .as_os_str()
-                    .as_bytes()
-                    .to_vec());
+                return Ok(fs::read_link(o.upper(&path))?.as_os_str().as_bytes().to_vec());
             }
             let entry = o.entry(&path)?;
             if entry.mode != EntryMode::Symlink {
@@ -1137,10 +1059,7 @@ impl Filesystem for Writable {
             if atime.is_some() || mtime.is_some() {
                 let ts = |t: Option<TimeOrNow>| -> io::Result<libc::timespec> {
                     let Some(t) = t else {
-                        return Ok(libc::timespec {
-                            tv_sec: 0,
-                            tv_nsec: libc::UTIME_OMIT,
-                        });
+                        return Ok(libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT });
                     };
                     let t = match t {
                         TimeOrNow::Now => SystemTime::now(),
@@ -1183,27 +1102,16 @@ struct Upper {
 }
 fn scan_upper(state: &Path) -> io::Result<Upper> {
     let root = state.join("upper");
-    let mut out = Upper {
-        files: BTreeMap::new(),
-        dirs: BTreeSet::new(),
-        blobs: Vec::new(),
-    };
+    let mut out = Upper { files: BTreeMap::new(), dirs: BTreeSet::new(), blobs: Vec::new() };
     let mut todo = vec![String::new()];
     while let Some(dir) = todo.pop() {
         for entry in fs::read_dir(root.join(&dir))? {
             let entry = entry?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| other("non-UTF8 repo path"))?;
+            let name = entry.file_name().into_string().map_err(|_| other("non-UTF8 repo path"))?;
             if dir.is_empty() && name == ".ant" {
                 continue;
             }
-            let path = if dir.is_empty() {
-                name
-            } else {
-                format!("{dir}/{name}")
-            };
+            let path = if dir.is_empty() { name } else { format!("{dir}/{name}") };
             RepoPath::new(&path).map_err(other)?;
             let m = fs::symlink_metadata(entry.path())?;
             if m.is_dir() {
@@ -1297,9 +1205,7 @@ fn compare(
         let new = upper.files.get(&path).copied().or_else(|| {
             if hidden(deleted, &path)
                 || upper.dirs.contains(&path)
-                || path
-                    .match_indices('/')
-                    .any(|(i, _)| upper.files.contains_key(&path[..i]))
+                || path.match_indices('/').any(|(i, _)| upper.files.contains_key(&path[..i]))
             {
                 None
             } else {
@@ -1314,11 +1220,7 @@ fn compare(
             (Some(_), None) => LocalChangeKind::Deleted,
             _ => LocalChangeKind::Modified,
         };
-        out.push(LocalChange {
-            path: RepoPath::new(path).map_err(other)?,
-            kind,
-            new,
-        });
+        out.push(LocalChange { path: RepoPath::new(path).map_err(other)?, kind, new });
     }
     Ok(out)
 }
@@ -1340,15 +1242,9 @@ pub async fn changes(
         let upper = scan_upper(&state)?;
         let lower = rt.block_on(affected_base(objects.as_ref(), root, &upper, &deleted))?;
         let result = compare(&upper, &deleted, &lower)?;
-        let changed: BTreeSet<_> = result
-            .iter()
-            .filter_map(|c| c.new.map(|(_, id)| id))
-            .collect();
-        let blobs = upper
-            .blobs
-            .into_iter()
-            .filter(|b| changed.contains(&b.id()))
-            .collect::<Vec<_>>();
+        let changed: BTreeSet<_> = result.iter().filter_map(|c| c.new.map(|(_, id)| id)).collect();
+        let blobs =
+            upper.blobs.into_iter().filter(|b| changed.contains(&b.id())).collect::<Vec<_>>();
         for batch in blobs.chunks(512) {
             rt.block_on(objects.put_many(batch)).map_err(other)?;
         }
@@ -1413,11 +1309,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
-            .unwrap()
+        tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap()
     }
     struct Fixture {
         session: Option<BackgroundSession>,
@@ -1460,27 +1352,13 @@ mod tests {
                 MountOptions::default(),
             )
             .unwrap();
-            Self {
-                session: Some(session),
-                mount,
-                state,
-                objects,
-                tree,
-                rt,
-                _tmp: tmp,
-                _gate: gate,
-            }
+            Self { session: Some(session), mount, state, objects, tree, rt, _tmp: tmp, _gate: gate }
         }
         fn changes(&self) -> Vec<LocalChange> {
-            self.rt
-                .block_on(changes(self.objects.clone(), &self.state))
-                .unwrap()
+            self.rt.block_on(changes(self.objects.clone(), &self.state)).unwrap()
         }
         fn summary(&self) -> Vec<(String, LocalChangeKind)> {
-            self.changes()
-                .into_iter()
-                .map(|c| (c.path.to_string(), c.kind))
-                .collect()
+            self.changes().into_iter().map(|c| (c.path.to_string(), c.kind)).collect()
         }
     }
     impl Drop for Fixture {
@@ -1499,10 +1377,7 @@ mod tests {
         assert!(!f.state.join("upper/untouched").exists());
         assert!(f.changes().is_empty());
         let ino = fs::metadata(f.mount.join("file")).unwrap().ino();
-        let file = OpenOptions::new()
-            .write(true)
-            .open(f.mount.join("file"))
-            .unwrap();
+        let file = OpenOptions::new().write(true).open(f.mount.join("file")).unwrap();
         file.write_all_at(b"OR", 0).unwrap();
         file.sync_all().unwrap();
         assert_eq!(fs::read(f.mount.join("file")).unwrap(), b"ORiginal");
@@ -1528,9 +1403,7 @@ mod tests {
     fn delete_dir_recreate_and_rename_lower_dir() {
         let f = Fixture::new();
         assert_eq!(
-            fs::remove_dir(f.mount.join("dir"))
-                .unwrap_err()
-                .raw_os_error(),
+            fs::remove_dir(f.mount.join("dir")).unwrap_err().raw_os_error(),
             Some(libc::ENOTEMPTY)
         );
         fs::remove_dir_all(f.mount.join("dir")).unwrap();
@@ -1539,11 +1412,7 @@ mod tests {
         assert!(!f.mount.join("dir/a").exists());
         assert_eq!(
             f.summary(),
-            [
-                ("dir/a".into(), Deleted),
-                ("dir/new".into(), Added),
-                ("dir/sub/b".into(), Deleted)
-            ]
+            [("dir/a".into(), Deleted), ("dir/new".into(), Added), ("dir/sub/b".into(), Deleted)]
         );
         // One mount at a time (see `KERNEL_GATE`); `f`'s edits are checked.
         drop(f);
@@ -1551,10 +1420,7 @@ mod tests {
         let ino = fs::metadata(g.mount.join("dir/sub/b")).unwrap().ino();
         fs::rename(g.mount.join("dir"), g.mount.join("moved")).unwrap();
         assert_eq!(fs::read(g.mount.join("moved/sub/b")).unwrap(), b"b");
-        assert_eq!(
-            fs::metadata(g.mount.join("moved/sub/b")).unwrap().ino(),
-            ino
-        );
+        assert_eq!(fs::metadata(g.mount.join("moved/sub/b")).unwrap().ino(), ino);
         assert!(!g.mount.join("dir").exists());
         assert_eq!(
             g.summary(),
@@ -1570,27 +1436,16 @@ mod tests {
     fn chmod_symlink_times_and_hardlink() {
         let f = Fixture::new();
         fs::set_permissions(f.mount.join("file"), fs::Permissions::from_mode(0o751)).unwrap();
-        assert_eq!(
-            fs::metadata(f.mount.join("file")).unwrap().mode() & 0o777,
-            0o751
-        );
+        assert_eq!(fs::metadata(f.mount.join("file")).unwrap().mode() & 0o777, 0o751);
         symlink("file", f.mount.join("link")).unwrap();
-        assert_eq!(
-            fs::read_link(f.mount.join("link")).unwrap(),
-            PathBuf::from("file")
-        );
+        assert_eq!(fs::read_link(f.mount.join("link")).unwrap(), PathBuf::from("file"));
         assert_eq!(fs::read(f.mount.join("link")).unwrap(), b"original");
-        assert_eq!(
-            f.summary(),
-            [("file".into(), Modified), ("link".into(), Added)]
-        );
+        assert_eq!(f.summary(), [("file".into(), Modified), ("link".into(), Added)]);
         let changes = f.changes();
         assert_eq!(changes[0].new.unwrap().0, EntryMode::Executable);
         assert_eq!(changes[1].new.unwrap().0, EntryMode::Symlink);
         assert_eq!(
-            fs::hard_link(f.mount.join("file"), f.mount.join("hard"))
-                .unwrap_err()
-                .raw_os_error(),
+            fs::hard_link(f.mount.join("file"), f.mount.join("hard")).unwrap_err().raw_os_error(),
             Some(libc::EPERM)
         );
         let time = SystemTime::UNIX_EPOCH + Duration::from_secs(1234567);
@@ -1598,13 +1453,7 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(time))
             .unwrap();
-        assert_eq!(
-            fs::metadata(f.mount.join("file"))
-                .unwrap()
-                .modified()
-                .unwrap(),
-            time
-        );
+        assert_eq!(fs::metadata(f.mount.join("file")).unwrap().modified().unwrap(), time);
     }
     #[test]
     fn remount_preserves_edits() {
@@ -1683,14 +1532,11 @@ mod tests {
                         // Neighbours' files are either absent yet or exact.
                         for e in fs::read_dir(&neighbour).into_iter().flatten().flatten() {
                             let name = e.file_name().into_string().unwrap();
-                            if let Some(n) = name.strip_prefix('b').and_then(|n| n.parse::<usize>().ok())
+                            if let Some(n) =
+                                name.strip_prefix('b').and_then(|n| n.parse::<usize>().ok())
                                 && let Ok(got) = fs::read(e.path())
                             {
-                                let want = format!(
-                                    "t{} i{n} {}",
-                                    (t + 1) % 12,
-                                    "x".repeat(n * 37)
-                                );
+                                let want = format!("t{} i{n} {}", (t + 1) % 12, "x".repeat(n * 37));
                                 assert_eq!(got, want.as_bytes(), "{:?}", e.path());
                             }
                         }
@@ -1731,15 +1577,10 @@ mod tests {
         let tree =
             f.rt.block_on(build_tree(
                 f.objects.as_ref(),
-                &[
-                    ("file", b"landed"),
-                    ("dir/sub/b", b"b"),
-                    ("upstream", b"new"),
-                ],
+                &[("file", b"landed"), ("dir/sub/b", b"b"), ("upstream", b"new")],
             ))
             .unwrap();
-        f.rt.block_on(reset(f.objects.clone(), &f.state, ObjectId([2; 32]), tree))
-            .unwrap();
+        f.rt.block_on(reset(f.objects.clone(), &f.state, ObjectId([2; 32]), tree)).unwrap();
         assert_eq!(fs::read(f.mount.join("file")).unwrap(), b"landed");
         assert_eq!(fs::read(f.mount.join("upstream")).unwrap(), b"new");
         assert!(!f.mount.join("untouched").exists());
@@ -1792,13 +1633,9 @@ mod tests {
         let _gate = crate::KERNEL_GATE.lock();
         let rt = runtime();
         let objects = Arc::new(CountingStore::default());
-        let paths = (0..20_000)
-            .map(|i| format!("d{:03}/f{:03}", i / 100, i % 100))
-            .collect::<Vec<_>>();
-        let entries = paths
-            .iter()
-            .map(|p| (p.as_str(), b"base".as_slice()))
-            .collect::<Vec<_>>();
+        let paths =
+            (0..20_000).map(|i| format!("d{:03}/f{:03}", i / 100, i % 100)).collect::<Vec<_>>();
+        let entries = paths.iter().map(|p| (p.as_str(), b"base".as_slice())).collect::<Vec<_>>();
         let tree = rt.block_on(build_tree(objects.as_ref(), &entries)).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let mount = tmp.path().join("mount");
@@ -1819,13 +1656,9 @@ mod tests {
         objects.reads.store(0, Ordering::Relaxed);
         let changes = rt.block_on(changes(objects.clone(), &state)).unwrap();
         assert_eq!(changes.len(), 2);
-        assert!(
-            objects.reads.load(Ordering::Relaxed) <= 24,
-            "too many base reads"
-        );
+        assert!(objects.reads.load(Ordering::Relaxed) <= 24, "too many base reads");
         assert_eq!(
-            &rt.block_on(objects.read_blob(&changes[0].new.unwrap().1))
-                .unwrap()[..],
+            &rt.block_on(objects.read_blob(&changes[0].new.unwrap().1)).unwrap()[..],
             b"one"
         );
         session.umount_and_join().unwrap();
@@ -1841,10 +1674,7 @@ mod operation_tests {
     // /dev/fuse; the mount tests above independently cover kernel integration.
     #[test]
     fn mutations_and_reset_without_kernel() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         let objects = Arc::new(MemoryObjectStore::default());
         let tree = rt
             .block_on(build_tree(
@@ -1859,12 +1689,7 @@ mod operation_tests {
         save_whiteouts(state, &BTreeSet::new()).unwrap();
         let view = Writable {
             _mount_lock: MountGuard::take(state).unwrap(),
-            lower: View::new(
-                objects.clone(),
-                tree,
-                rt.handle().clone(),
-                MountOptions::default(),
-            ),
+            lower: View::new(objects.clone(), tree, rt.handle().clone(), MountOptions::default()),
             dir: state.to_path_buf(),
             overlay: Mutex::new(Overlay {
                 paths: HashMap::from([(INodeNo(1), String::new())]),
@@ -1883,13 +1708,7 @@ mod operation_tests {
             let dir = o.inode(root, OsStr::new("dir"))?;
             let sub = o.inode(dir, OsStr::new("sub"))?;
             let b = o.inode(sub, OsStr::new("b"))?;
-            o.rename(
-                root,
-                OsStr::new("dir"),
-                root,
-                OsStr::new("moved"),
-                RenameFlags::empty(),
-            )?;
+            o.rename(root, OsStr::new("dir"), root, OsStr::new("moved"), RenameFlags::empty())?;
             assert_eq!(o.path(b)?, "moved/sub/b");
             assert_eq!(fs::read(o.upper("moved/sub/b"))?, b"b");
             assert!(o.entry("dir").is_err());
@@ -1897,21 +1716,12 @@ mod operation_tests {
             let dir = o.create(root, OsStr::new("dir"), 0o755, None, true)?;
             o.create(dir, OsStr::new("new"), 0o644, None, false)?;
             assert_eq!(o.children("dir")?.len(), 1);
-            o.create(
-                root,
-                OsStr::new("link"),
-                0o777,
-                Some(Path::new("dir/new")),
-                false,
-            )?;
+            o.create(root, OsStr::new("link"), 0o777, Some(Path::new("dir/new")), false)?;
             Ok(())
         })
         .unwrap();
         let changes = rt.block_on(changes(objects.clone(), state)).unwrap();
-        let summary = changes
-            .iter()
-            .map(|c| (c.path.as_str(), c.kind))
-            .collect::<Vec<_>>();
+        let summary = changes.iter().map(|c| (c.path.as_str(), c.kind)).collect::<Vec<_>>();
         use LocalChangeKind::{Added, Deleted};
         assert_eq!(
             summary,
@@ -1926,13 +1736,9 @@ mod operation_tests {
             ]
         );
         let new_tree = rt
-            .block_on(build_tree(
-                objects.as_ref(),
-                &[("dir/new", b""), ("upstream", b"new")],
-            ))
+            .block_on(build_tree(objects.as_ref(), &[("dir/new", b""), ("upstream", b"new")]))
             .unwrap();
-        rt.block_on(reset(objects.clone(), state, ObjectId([2; 32]), new_tree))
-            .unwrap();
+        rt.block_on(reset(objects.clone(), state, ObjectId([2; 32]), new_tree)).unwrap();
         view.run(|o| {
             assert_eq!(o.children("dir")?.len(), 1);
             assert_eq!(o.entry("upstream")?.mode, EntryMode::File);
@@ -1941,27 +1747,17 @@ mod operation_tests {
         })
         .unwrap();
         assert!(!state.join("upper/dir/new").exists());
-        assert_eq!(
-            rt.block_on(super::changes(objects, state)).unwrap().len(),
-            3
-        );
+        assert_eq!(rt.block_on(super::changes(objects, state)).unwrap().len(), 3);
     }
 
     #[test]
     fn status_scales_with_changed_paths_without_kernel() {
         use std::sync::atomic::Ordering;
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         let objects = Arc::new(super::tests::CountingStore::default());
-        let paths = (0..20_000)
-            .map(|i| format!("d{:03}/f{:03}", i / 100, i % 100))
-            .collect::<Vec<_>>();
-        let entries = paths
-            .iter()
-            .map(|p| (p.as_str(), b"base".as_slice()))
-            .collect::<Vec<_>>();
+        let paths =
+            (0..20_000).map(|i| format!("d{:03}/f{:03}", i / 100, i % 100)).collect::<Vec<_>>();
+        let entries = paths.iter().map(|p| (p.as_str(), b"base".as_slice())).collect::<Vec<_>>();
         let tree = rt.block_on(build_tree(objects.as_ref(), &entries)).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path();
@@ -1992,10 +1788,7 @@ mod operation_tests {
         recover(state).unwrap();
         assert_eq!(fs::read(state.join("upper/new")).unwrap(), b"new data");
         assert!(!state.join("upper/old").exists());
-        assert_eq!(
-            whiteouts(state).unwrap(),
-            BTreeSet::from(["old".into(), "new".into()])
-        );
+        assert_eq!(whiteouts(state).unwrap(), BTreeSet::from(["old".into(), "new".into()]));
         // Crash after the physical rename, before clearing the intent.
         atomic(state, "intent", b"rename\nold\nnew\n").unwrap();
         recover(state).unwrap();
@@ -2008,10 +1801,7 @@ mod operation_tests {
 
     #[test]
     fn reset_drops_unchanged_copies_and_splits_directory_whiteouts() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         let objects = Arc::new(MemoryObjectStore::default());
         let old = rt
             .block_on(build_tree(
@@ -2022,11 +1812,7 @@ mod operation_tests {
         let new = rt
             .block_on(build_tree(
                 objects.as_ref(),
-                &[
-                    ("untouched", b"upstream"),
-                    ("dir/a", b"landed"),
-                    ("dir/b", b"old"),
-                ],
+                &[("untouched", b"upstream"), ("dir/a", b"landed"), ("dir/b", b"old")],
             ))
             .unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -2036,8 +1822,7 @@ mod operation_tests {
         fs::write(state.join("upper/dir/a"), b"landed").unwrap();
         save_base(state, ObjectId([1; 32]), old).unwrap();
         save_whiteouts(state, &BTreeSet::from(["dir".into()])).unwrap();
-        rt.block_on(reset(objects.clone(), state, ObjectId([2; 32]), new))
-            .unwrap();
+        rt.block_on(reset(objects.clone(), state, ObjectId([2; 32]), new)).unwrap();
         assert!(!state.join("upper/untouched").exists());
         assert!(!state.join("upper/dir/a").exists());
         assert_eq!(whiteouts(state).unwrap(), BTreeSet::from(["dir/b".into()]));

@@ -81,7 +81,8 @@ impl Sparse {
     }
 
     pub fn new(patterns: Vec<String>) -> anyhow::Result<Self> {
-        let patterns = patterns.into_iter().map(normalize_pattern).collect::<anyhow::Result<Vec<_>>>()?;
+        let patterns =
+            patterns.into_iter().map(normalize_pattern).collect::<anyhow::Result<Vec<_>>>()?;
         let sparse = Self { patterns };
         // Validates glob syntax up front.
         sparse.compile()?;
@@ -134,7 +135,8 @@ fn normalize_pattern(pattern: String) -> anyhow::Result<String> {
     if trimmed.is_empty() {
         bail!("invalid sparse pattern {pattern:?}");
     }
-    RepoPath::new(trimmed.as_str()).with_context(|| format!("invalid sparse pattern {pattern:?}"))?;
+    RepoPath::new(trimmed.as_str())
+        .with_context(|| format!("invalid sparse pattern {pattern:?}"))?;
     Ok(trimmed)
 }
 
@@ -225,7 +227,8 @@ type Index = BTreeMap<String, Entry>;
 /// Shape of a file on disk: git mode plus its body (target for symlinks).
 fn hash_disk(full: &Path, meta: &fs::Metadata) -> anyhow::Result<(EntryMode, Vec<u8>)> {
     if meta.file_type().is_symlink() {
-        let target = fs::read_link(full).with_context(|| format!("reading link {}", full.display()))?;
+        let target =
+            fs::read_link(full).with_context(|| format!("reading link {}", full.display()))?;
         return Ok((EntryMode::Symlink, target.into_os_string().into_vec()));
     }
     let mode = if meta.mode() & 0o111 != 0 { EntryMode::Executable } else { EntryMode::File };
@@ -336,7 +339,13 @@ fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
 }
 
 /// Persist config and index. Both are replaced atomically per file.
-fn save_state(dir: &Path, commit: ObjectId, tree: ObjectId, patterns: &[String], index: &Index) -> anyhow::Result<()> {
+fn save_state(
+    dir: &Path,
+    commit: ObjectId,
+    tree: ObjectId,
+    patterns: &[String],
+    index: &Index,
+) -> anyhow::Result<()> {
     let state = state_dir(dir);
     fs::create_dir_all(&state)?;
     let mut cfg = format!("base_commit={}\nbase_tree={}\n", commit.to_hex(), tree.to_hex());
@@ -429,7 +438,8 @@ fn write_items(dir: &Path, items: Vec<WriteItem>) -> anyhow::Result<Vec<(String,
                     .with_context(|| format!("creating symlink {}", full.display()))?;
             }
             EntryMode::File | EntryMode::Executable => {
-                fs::write(&full, &it.body).with_context(|| format!("writing {}", full.display()))?;
+                fs::write(&full, &it.body)
+                    .with_context(|| format!("writing {}", full.display()))?;
                 let perm = if it.mode == EntryMode::Executable { 0o755 } else { 0o644 };
                 fs::set_permissions(&full, fs::Permissions::from_mode(perm))?;
             }
@@ -502,7 +512,11 @@ async fn put_blobs(objects: &dyn ObjectStore, blobs: &[EncodedObject]) -> anyhow
 
 /// Blocking: walk `dir` and compare it against `index`. Returns the changes
 /// plus the encoded blobs for every Added/Modified entry.
-fn scan(dir: &Path, index: &Index, index_mtime: Option<i64>) -> anyhow::Result<(Vec<LocalChange>, Vec<EncodedObject>)> {
+fn scan(
+    dir: &Path,
+    index: &Index,
+    index_mtime: Option<i64>,
+) -> anyhow::Result<(Vec<LocalChange>, Vec<EncodedObject>)> {
     let mut changes = Vec::new();
     let mut blobs = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
@@ -518,9 +532,7 @@ fn scan(dir: &Path, index: &Index, index_mtime: Option<i64>) -> anyhow::Result<(
             continue; // directories (including empty ones) are not tracked
         }
         let rel = entry.path().strip_prefix(dir)?;
-        let rel_str = rel
-            .to_str()
-            .ok_or_else(|| anyhow!("non-UTF-8 path {}", rel.display()))?;
+        let rel_str = rel.to_str().ok_or_else(|| anyhow!("non-UTF-8 path {}", rel.display()))?;
         let meta = entry.metadata()?;
         let (kind, new) = match index.get_key_value(rel_str) {
             Some((key, rec)) => {
@@ -603,7 +615,10 @@ impl Workspace {
         }
         let d = dir.to_path_buf();
         let patterns = sparse.patterns.clone();
-        tokio::task::spawn_blocking(move || save_state(&d, base_commit, base_tree, &patterns, &index)).await??;
+        tokio::task::spawn_blocking(move || {
+            save_state(&d, base_commit, base_tree, &patterns, &index)
+        })
+        .await??;
 
         Ok(Self { dir: dir.to_path_buf(), base_commit, base_tree, sparse })
     }
@@ -626,7 +641,8 @@ impl Workspace {
                 _ => {}
             }
         }
-        let base_commit = base_commit.ok_or_else(|| anyhow!("workspace config has no base_commit"))?;
+        let base_commit =
+            base_commit.ok_or_else(|| anyhow!("workspace config has no base_commit"))?;
         let base_tree = base_tree.ok_or_else(|| anyhow!("workspace config has no base_tree"))?;
         Ok(Self { dir: dir.to_path_buf(), base_commit, base_tree, sparse: Sparse::new(patterns)? })
     }
@@ -718,7 +734,8 @@ impl Workspace {
                 index.remove(key);
             }
             for (key, mode, id) in out_added {
-                let meta = fs::symlink_metadata(d.join(&key)).with_context(|| format!("statting {key}"))?;
+                let meta = fs::symlink_metadata(d.join(&key))
+                    .with_context(|| format!("statting {key}"))?;
                 index.insert(key, Entry { mode, id, stat: stat_of(&meta) });
             }
             Ok(index)
@@ -738,7 +755,10 @@ impl Workspace {
 
         let d = self.dir.clone();
         let patterns = self.sparse.patterns.clone();
-        tokio::task::spawn_blocking(move || save_state(&d, new_commit, new_tree, &patterns, &index)).await??;
+        tokio::task::spawn_blocking(move || {
+            save_state(&d, new_commit, new_tree, &patterns, &index)
+        })
+        .await??;
         self.base_commit = new_commit;
         self.base_tree = new_tree;
         Ok(())
@@ -805,7 +825,8 @@ mod tests {
     #[tokio::test]
     async fn materialize_full_and_status_clean() {
         let objs = MemoryObjectStore::default();
-        let t = build_tree(&objs, &[("a.txt", b"A"), ("d/e/f.rs", b"F"), ("d/g", b"G")]).await.unwrap();
+        let t =
+            build_tree(&objs, &[("a.txt", b"A"), ("d/e/f.rs", b"F"), ("d/g", b"G")]).await.unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("ws");
         let ws = Workspace::materialize(&objs, &dir, C, t, Sparse::all()).await.unwrap();
@@ -826,15 +847,22 @@ mod tests {
             files.push((format!("other{i}/x/y.rs"), b"o".to_vec()));
         }
         files.push(("want/a.rs".into(), b"w".to_vec()));
-        let refs: Vec<(&str, &[u8])> = files.iter().map(|(a, b)| (a.as_str(), b.as_slice())).collect();
+        let refs: Vec<(&str, &[u8])> =
+            files.iter().map(|(a, b)| (a.as_str(), b.as_slice())).collect();
         let t = build_tree(&objs.inner, &refs).await.unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("ws");
-        Workspace::materialize(&objs, &dir, C, t, Sparse::new(vec!["want".into()]).unwrap()).await.unwrap();
+        Workspace::materialize(&objs, &dir, C, t, Sparse::new(vec!["want".into()]).unwrap())
+            .await
+            .unwrap();
         assert!(dir.join("want/a.rs").exists());
         assert!(!dir.join("other0").exists());
         // root tree level + "want" level + one blob batch; definitely not ~150.
-        assert!(objs.calls.load(Ordering::SeqCst) <= 4, "calls = {}", objs.calls.load(Ordering::SeqCst));
+        assert!(
+            objs.calls.load(Ordering::SeqCst) <= 4,
+            "calls = {}",
+            objs.calls.load(Ordering::SeqCst)
+        );
     }
 
     #[tokio::test]
@@ -865,12 +893,16 @@ mod tests {
     #[tokio::test]
     async fn status_detects_changes() {
         let objs = MemoryObjectStore::default();
-        let t = build_tree(&objs, &[("keep", b"k"), ("mod", b"m"), ("del", b"d"), ("in/scope", b"s"), ("out/side", b"o")])
-            .await
-            .unwrap();
+        let t = build_tree(
+            &objs,
+            &[("keep", b"k"), ("mod", b"m"), ("del", b"d"), ("in/scope", b"s"), ("out/side", b"o")],
+        )
+        .await
+        .unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("ws");
-        let sparse = Sparse::new(vec!["keep".into(), "mod".into(), "del".into(), "in".into()]).unwrap();
+        let sparse =
+            Sparse::new(vec!["keep".into(), "mod".into(), "del".into(), "in".into()]).unwrap();
         let ws = Workspace::materialize(&objs, &dir, C, t, sparse).await.unwrap();
         assert!(!dir.join("out").exists());
 
@@ -911,7 +943,8 @@ mod tests {
         let t2 = build_tree(objs.as_ref(), &[("a", b"1-mine"), ("d", b"upstream")]).await.unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("ws");
-        let mut ws = Workspace::materialize(objs.as_ref(), &dir, C, t1, Sparse::all()).await.unwrap();
+        let mut ws =
+            Workspace::materialize(objs.as_ref(), &dir, C, t1, Sparse::all()).await.unwrap();
         // Local change that is identical in t2 (we "landed" it).
         std::fs::write(dir.join("a"), b"1-mine").unwrap();
         ws.reset_to(objs.as_ref(), C2, t2).await.unwrap();
@@ -929,7 +962,9 @@ mod tests {
     async fn reset_to_indexes_landed_out_of_scope_add() {
         let objs = Arc::new(MemoryObjectStore::default());
         let t1 = build_tree(objs.as_ref(), &[("a", b"1"), ("b/c", b"2")]).await.unwrap();
-        let t2 = build_tree(objs.as_ref(), &[("a", b"1"), ("b/c", b"2"), ("x", b"landed")]).await.unwrap();
+        let t2 = build_tree(objs.as_ref(), &[("a", b"1"), ("b/c", b"2"), ("x", b"landed")])
+            .await
+            .unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("ws");
         let sparse = Sparse::new(vec!["a".into()]).unwrap();

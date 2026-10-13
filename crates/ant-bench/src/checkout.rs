@@ -73,7 +73,8 @@ async fn materialize(
     let secs = start.elapsed().as_secs_f64();
     let cpu = cpu_seconds().map_or(0.0, |c| c.0 + c.1) - cpu0;
     let w = work.to_path_buf();
-    let (files, bytes) = tokio::task::spawn_blocking(move || dir_size_skip(&w, Some(".ant"))).await?;
+    let (files, bytes) =
+        tokio::task::spawn_blocking(move || dir_size_skip(&w, Some(".ant"))).await?;
     let (wsc, nc) = (metrics.counter("ws.get_many"), metrics.counter("net.get_many"));
     Ok((
         Phase {

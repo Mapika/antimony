@@ -17,7 +17,12 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
         Command::Serve(a) => return ant_server::serve::run(a).await.map(|()| Outcome::empty()),
         Command::Completions { shell } => {
             let mut out = Vec::new();
-            clap_complete::generate(shell, &mut <Cli as clap::CommandFactory>::command(), "ant", &mut out);
+            clap_complete::generate(
+                shell,
+                &mut <Cli as clap::CommandFactory>::command(),
+                "ant",
+                &mut out,
+            );
             return Ok(Outcome::ok(out));
         }
         _ => cli,
@@ -34,11 +39,17 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
         Command::Ref { cmd } => match cmd {
             RefCmd::Get { name } => refs::get(&ctx, &name).await,
             RefCmd::List { prefix } => refs::list(&ctx, &prefix).await,
-            RefCmd::Set { name, rev, expect, create } => refs::set(&ctx, &name, &rev, expect, create).await,
+            RefCmd::Set { name, rev, expect, create } => {
+                refs::set(&ctx, &name, &rev, expect, create).await
+            }
         },
         Command::Ws { cmd: WsCmd::New { dir, at, sparse, lazy } } => {
-            if lazy { ws::new_lazy(&ctx, &dir, &at).await } else { ws::new(&ctx, &dir, &at, sparse).await }
-        },
+            if lazy {
+                ws::new_lazy(&ctx, &dir, &at).await
+            } else {
+                ws::new(&ctx, &dir, &at, sparse).await
+            }
+        }
         Command::Ws { cmd: WsCmd::Unmount { dir } } => ws::unmount(&dir).await,
         Command::Ws { cmd: WsCmd::Serve { dir, state } } => ws::serve(&ctx, &dir, &state).await,
         Command::Status => ws::status(&ctx).await,

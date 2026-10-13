@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ant_core::{EncodedObject, ObjectId};
-use ant_store::{Backend, CasOutcome, CommitNode, MetaStore, ObjectStore, PathChange, RefStore, Result};
+use ant_store::{
+    Backend, CasOutcome, CommitNode, MetaStore, ObjectStore, PathChange, RefStore, Result,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -174,7 +176,10 @@ impl Metrics {
 
     pub fn print(&self, title: &str) {
         println!("{title}");
-        println!("  {:<24} {:>9} {:>10} {:>9} {:>10} {:>10}", "op", "calls", "total_s", "mean_ms", "max_ms", "items");
+        println!(
+            "  {:<24} {:>9} {:>10} {:>9} {:>10} {:>10}",
+            "op", "calls", "total_s", "mean_ms", "max_ms", "items"
+        );
         for (name, c) in self.snapshot() {
             let calls = c.calls();
             let mean = if calls == 0 { 0.0 } else { c.secs() * 1000.0 / calls as f64 };
@@ -253,7 +258,12 @@ impl RefStore for TimedRefs {
         timed(&self.get, 1, self.inner.get_ref(name)).await
     }
 
-    async fn cas_ref(&self, name: &str, expected: Option<ObjectId>, new: Option<ObjectId>) -> Result<CasOutcome> {
+    async fn cas_ref(
+        &self,
+        name: &str,
+        expected: Option<ObjectId>,
+        new: Option<ObjectId>,
+    ) -> Result<CasOutcome> {
         let start = Instant::now();
         let out = self.inner.cas_ref(name, expected, new).await;
         self.cas.record(start, 1, 0);
@@ -357,7 +367,12 @@ impl MetaStore for TimedMeta {
         self.inner.history_watermark(ref_name).await
     }
 
-    async fn set_history_watermark(&self, ref_name: &str, expected: Option<ObjectId>, new: ObjectId) -> Result<bool> {
+    async fn set_history_watermark(
+        &self,
+        ref_name: &str,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+    ) -> Result<bool> {
         self.inner.set_history_watermark(ref_name, expected, new).await
     }
 

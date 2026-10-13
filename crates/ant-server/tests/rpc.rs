@@ -35,7 +35,10 @@ async fn spawn_server() -> Server {
     Server {
         grpc,
         http_base: format!("http://{http_addr}"),
-        http: reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap(),
+        http: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
         backend,
     }
 }
@@ -48,7 +51,10 @@ fn ids_of(objs: &[EncodedObject]) -> Vec<Vec<u8>> {
     objs.iter().map(|o| o.id().0.to_vec()).collect()
 }
 
-async fn get_objects(s: &mut Server, ids: Vec<Vec<u8>>) -> Result<Vec<pb::ObjectResult>, tonic::Status> {
+async fn get_objects(
+    s: &mut Server,
+    ids: Vec<Vec<u8>>,
+) -> Result<Vec<pb::ObjectResult>, tonic::Status> {
     let mut stream = s.grpc.get_objects(pb::GetObjectsRequest { ids }).await?.into_inner();
     let mut out = Vec::new();
     while let Some(item) = stream.message().await? {
@@ -70,7 +76,9 @@ async fn put_has_get_roundtrip() {
 
     let ids = s
         .grpc
-        .put_objects(pb::PutObjectsRequest { data: vec![a.as_bytes().to_vec(), b.as_bytes().to_vec()] })
+        .put_objects(pb::PutObjectsRequest {
+            data: vec![a.as_bytes().to_vec(), b.as_bytes().to_vec()],
+        })
         .await
         .unwrap()
         .into_inner()
@@ -79,7 +87,9 @@ async fn put_has_get_roundtrip() {
 
     let present = s
         .grpc
-        .has_objects(pb::HasObjectsRequest { ids: ids_of(&[b.clone(), missing.clone(), a.clone()]) })
+        .has_objects(pb::HasObjectsRequest {
+            ids: ids_of(&[b.clone(), missing.clone(), a.clone()]),
+        })
         .await
         .unwrap()
         .into_inner()
@@ -216,7 +226,13 @@ async fn ref_crud_and_cas() {
         .into_inner()
         .refs;
     assert_eq!(refs, [pb::RefEntry { name: "release/1.0".into(), target: a.0.to_vec() }]);
-    let all = s.grpc.list_refs(pb::ListRefsRequest { prefix: String::new() }).await.unwrap().into_inner().refs;
+    let all = s
+        .grpc
+        .list_refs(pb::ListRefsRequest { prefix: String::new() })
+        .await
+        .unwrap()
+        .into_inner()
+        .refs;
     assert_eq!(all.len(), 2);
 
     // Delete: absent new_target removes the ref.
@@ -333,7 +349,12 @@ async fn grpc_and_http_see_the_same_objects() {
 // ---------------------------------------------------------------------------
 
 fn sig(name: &str) -> pb::Signature {
-    pb::Signature { name: name.into(), email: format!("{name}@example.com").into_bytes(), time: 1_700_000_000, tz_offset_minutes: 0 }
+    pb::Signature {
+        name: name.into(),
+        email: format!("{name}@example.com").into_bytes(),
+        time: 1_700_000_000,
+        tz_offset_minutes: 0,
+    }
 }
 
 fn write_file(path: &str, content: &str) -> pb::FileOp {
@@ -353,7 +374,13 @@ fn delete_file(path: &str) -> pb::FileOp {
 #[tokio::test]
 async fn delete_op_removes_entry() {
     let mut s = spawn_server().await;
-    let c1 = commit(&mut s, None, vec![write_file("keep.txt", "k"), write_file("gone.txt", "g")], "base").await;
+    let c1 = commit(
+        &mut s,
+        None,
+        vec![write_file("keep.txt", "k"), write_file("gone.txt", "g")],
+        "base",
+    )
+    .await;
     let c2 = commit(&mut s, Some(c1), vec![delete_file("gone.txt")], "delete").await;
     let rev: String = c2.iter().map(|b| format!("{b:02x}")).collect();
     let gone = s
@@ -365,7 +392,12 @@ async fn delete_op_removes_entry() {
     assert!(!gone.found);
 }
 
-async fn commit(s: &mut Server, base: Option<Vec<u8>>, ops: Vec<pb::FileOp>, message: &str) -> Vec<u8> {
+async fn commit(
+    s: &mut Server,
+    base: Option<Vec<u8>>,
+    ops: Vec<pb::FileOp>,
+    message: &str,
+) -> Vec<u8> {
     s.grpc
         .create_changeset(pb::CreateChangesetRequest {
             base,
@@ -383,7 +415,13 @@ async fn commit(s: &mut Server, base: Option<Vec<u8>>, ops: Vec<pb::FileOp>, mes
 #[tokio::test]
 async fn changeset_resolve_read_log_diff_land() {
     let mut s = spawn_server().await;
-    let c1 = commit(&mut s, None, vec![write_file("src/a.rs", "a1"), write_file("README", "r")], "first").await;
+    let c1 = commit(
+        &mut s,
+        None,
+        vec![write_file("src/a.rs", "a1"), write_file("README", "r")],
+        "first",
+    )
+    .await;
     let c2 = commit(&mut s, Some(c1.clone()), vec![write_file("src/a.rs", "a2")], "second").await;
 
     // Landing creates the ref at c2 and fast-forwards nothing else.
@@ -401,7 +439,12 @@ async fn changeset_resolve_read_log_diff_land() {
         other => panic!("expected Landed, got {other:?}"),
     }
 
-    let resolved = s.grpc.resolve_rev(pb::ResolveRevRequest { rev: "main~1".into() }).await.unwrap().into_inner();
+    let resolved = s
+        .grpc
+        .resolve_rev(pb::ResolveRevRequest { rev: "main~1".into() })
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(resolved.commit, c1);
     let err = s.grpc.resolve_rev(pb::ResolveRevRequest { rev: "nope".into() }).await.unwrap_err();
     assert_eq!(err.code(), Code::NotFound);
@@ -425,7 +468,11 @@ async fn changeset_resolve_read_log_diff_land() {
 
     let root = s
         .grpc
-        .read_path(pb::ReadPathRequest { rev: "main".into(), path: String::new(), include_content: false })
+        .read_path(pb::ReadPathRequest {
+            rev: "main".into(),
+            path: String::new(),
+            include_content: false,
+        })
         .await
         .unwrap()
         .into_inner();
@@ -435,7 +482,11 @@ async fn changeset_resolve_read_log_diff_land() {
 
     let missing = s
         .grpc
-        .read_path(pb::ReadPathRequest { rev: "main".into(), path: "nope".into(), include_content: false })
+        .read_path(pb::ReadPathRequest {
+            rev: "main".into(),
+            path: "nope".into(),
+            include_content: false,
+        })
         .await
         .unwrap()
         .into_inner();
@@ -490,21 +541,21 @@ async fn changeset_resolve_read_log_diff_land() {
 async fn land_rebases_and_reports_conflicts() {
     let mut s = spawn_server().await;
     let base = commit(&mut s, None, vec![write_file("a.txt", "one\n")], "base").await;
-    s.grpc
-        .land(pb::LandRequest { ref_name: "main".into(), commit: base.clone() })
-        .await
-        .unwrap();
+    s.grpc.land(pb::LandRequest { ref_name: "main".into(), commit: base.clone() }).await.unwrap();
 
     // Two non-conflicting changes based on the same parent.
     let left = commit(&mut s, Some(base.clone()), vec![write_file("left.txt", "l")], "left").await;
-    let right = commit(&mut s, Some(base.clone()), vec![write_file("right.txt", "r")], "right").await;
+    let right =
+        commit(&mut s, Some(base.clone()), vec![write_file("right.txt", "r")], "right").await;
     let first = s
         .grpc
         .land(pb::LandRequest { ref_name: "main".into(), commit: left.clone() })
         .await
         .unwrap()
         .into_inner();
-    assert!(matches!(first.outcome, Some(pb::land_response::Outcome::Landed(ref l)) if l.new_tip == left && !l.rebased));
+    assert!(
+        matches!(first.outcome, Some(pb::land_response::Outcome::Landed(ref l)) if l.new_tip == left && !l.rebased)
+    );
 
     let second = s
         .grpc
@@ -520,7 +571,12 @@ async fn land_rebases_and_reports_conflicts() {
         }
         other => panic!("expected rebased Landed, got {other:?}"),
     };
-    let tip = s.grpc.resolve_rev(pb::ResolveRevRequest { rev: "main".into() }).await.unwrap().into_inner();
+    let tip = s
+        .grpc
+        .resolve_rev(pb::ResolveRevRequest { rev: "main".into() })
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(tip.commit, rebased_tip);
 
     // Conflicting edit of a.txt against the current tip.
@@ -591,9 +647,18 @@ async fn blame_rpc() {
     let c1 = commit(&mut s, None, vec![write_file("f", "a\nb\n")], "first").await;
     let c2 = commit(&mut s, Some(c1.clone()), vec![write_file("f", "a\nB\nc\n")], "second").await;
     s.grpc.land(pb::LandRequest { ref_name: "main".into(), commit: c2.clone() }).await.unwrap();
-    let r = s.grpc.blame(pb::BlameRequest { rev: "main".into(), path: "f".into() }).await.unwrap().into_inner();
+    let r = s
+        .grpc
+        .blame(pb::BlameRequest { rev: "main".into(), path: "f".into() })
+        .await
+        .unwrap()
+        .into_inner();
     let got: Vec<_> = r.lines.iter().map(|l| (l.commit.clone(), l.line.as_str())).collect();
     assert_eq!(got, vec![(c1.clone(), "a"), (c2.clone(), "B"), (c2.clone(), "c")]);
-    let e = s.grpc.blame(pb::BlameRequest { rev: "main".into(), path: "nope".into() }).await.unwrap_err();
+    let e = s
+        .grpc
+        .blame(pb::BlameRequest { rev: "main".into(), path: "nope".into() })
+        .await
+        .unwrap_err();
     assert_eq!(e.code(), Code::NotFound);
 }

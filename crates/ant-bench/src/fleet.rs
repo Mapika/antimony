@@ -48,15 +48,24 @@ pub struct Args {
 type Client = AntClient<Channel>;
 
 async fn connect(url: &str) -> Result<Client> {
-    let channel = Channel::from_shared(url.to_owned())?.connect().await.with_context(|| format!("connecting to {url}"))?;
+    let channel = Channel::from_shared(url.to_owned())?
+        .connect()
+        .await
+        .with_context(|| format!("connecting to {url}"))?;
     Ok(AntClient::new(channel)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES))
 }
 
 fn sig() -> pb::Signature {
-    let time = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    pb::Signature { name: "bench".into(), email: "bench@example.com".into(), time, tz_offset_minutes: 0 }
+    let time =
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    pb::Signature {
+        name: "bench".into(),
+        email: "bench@example.com".into(),
+        time,
+        tz_offset_minutes: 0,
+    }
 }
 
 fn write_op(path: String, content: Vec<u8>) -> pb::FileOp {
@@ -71,7 +80,8 @@ fn write_op(path: String, content: Vec<u8>) -> pb::FileOp {
 
 /// Create `ref_name` with a small initial tree when it does not exist.
 async fn seed_if_missing(client: &mut Client, ref_name: &str) -> Result<()> {
-    let existing = client.get_ref(pb::GetRefRequest { name: ref_name.into() }).await?.into_inner().target;
+    let existing =
+        client.get_ref(pb::GetRefRequest { name: ref_name.into() }).await?.into_inner().target;
     if existing.is_some() {
         return Ok(());
     }
@@ -79,7 +89,10 @@ async fn seed_if_missing(client: &mut Client, ref_name: &str) -> Result<()> {
     let commit = client
         .create_changeset(pb::CreateChangesetRequest {
             base: None,
-            ops: vec![write_op(HOT_PATH.into(), hot.into_bytes()), write_op("README.md".into(), b"ant-bench seed\n".to_vec())],
+            ops: vec![
+                write_op(HOT_PATH.into(), hot.into_bytes()),
+                write_op("README.md".into(), b"ant-bench seed\n".to_vec()),
+            ],
             author: Some(sig()),
             committer: None,
             message: "bench seed".into(),
@@ -88,7 +101,11 @@ async fn seed_if_missing(client: &mut Client, ref_name: &str) -> Result<()> {
         .into_inner()
         .commit;
     let r = client
-        .update_ref(pb::UpdateRefRequest { name: ref_name.into(), expected: None, new_target: Some(commit) })
+        .update_ref(pb::UpdateRefRequest {
+            name: ref_name.into(),
+            expected: None,
+            new_target: Some(commit),
+        })
         .await?
         .into_inner();
     if !r.updated {
@@ -162,7 +179,11 @@ async fn agent(i: usize, url: String, a: AgentCfg, deadline: Instant) -> Result<
             out.hot_attempts += 1;
             let t = Instant::now();
             let rd = client
-                .read_path(pb::ReadPathRequest { rev: hex(&tip), path: HOT_PATH.into(), include_content: true })
+                .read_path(pb::ReadPathRequest {
+                    rev: hex(&tip),
+                    path: HOT_PATH.into(),
+                    include_content: true,
+                })
                 .await;
             out.read.push(micros(t));
             match rd {
@@ -355,7 +376,11 @@ pub async fn run(args: Args) -> Result<i32> {
         .ok_or_else(|| anyhow!("ref vanished"))?;
     let final_hex = hex(&final_tip);
     let log = admin
-        .log(pb::LogRequest { rev: final_hex.clone(), path: None, limit: (tot.landed + 2).min(u32::MAX as u64) as u32 })
+        .log(pb::LogRequest {
+            rev: final_hex.clone(),
+            path: None,
+            limit: (tot.landed + 2).min(u32::MAX as u64) as u32,
+        })
         .await?
         .into_inner()
         .commits;
@@ -381,7 +406,11 @@ pub async fn run(args: Args) -> Result<i32> {
             let rev = final_hex.clone();
             set.spawn(async move {
                 let r = c
-                    .read_path(pb::ReadPathRequest { rev, path: path.clone(), include_content: true })
+                    .read_path(pb::ReadPathRequest {
+                        rev,
+                        path: path.clone(),
+                        include_content: true,
+                    })
                     .await
                     .map(|r| r.into_inner());
                 (path, content, r)
@@ -408,11 +437,17 @@ pub async fn run(args: Args) -> Result<i32> {
         }
     }
     if missing + wrong > 0 {
-        failures.push(format!("{missing} agent files missing, {wrong} with wrong content (of {checked} checked)"));
+        failures.push(format!(
+            "{missing} agent files missing, {wrong} with wrong content (of {checked} checked)"
+        ));
     }
     if tot.hot_attempts > 0 {
         let hot = admin
-            .read_path(pb::ReadPathRequest { rev: final_hex.clone(), path: HOT_PATH.into(), include_content: true })
+            .read_path(pb::ReadPathRequest {
+                rev: final_hex.clone(),
+                path: HOT_PATH.into(),
+                include_content: true,
+            })
             .await?
             .into_inner();
         let lines = String::from_utf8_lossy(&hot.content).lines().count();
@@ -457,11 +492,7 @@ pub async fn run(args: Args) -> Result<i32> {
     if let Some(r) = peak_rss_bytes() {
         println!("peak RSS        {:.1} MiB (client + embedded server)", r as f64 / 1048576.0);
     }
-    println!(
-        "cpu             user {:.1}s sys {:.1}s",
-        cpu1.0 - cpu0.0,
-        cpu1.1 - cpu0.1
-    );
+    println!("cpu             user {:.1}s sys {:.1}s", cpu1.0 - cpu0.0, cpu1.1 - cpu0.1);
     if mode == "embedded" {
         metrics.print("server-side store timing (calls from all RPCs)");
     }

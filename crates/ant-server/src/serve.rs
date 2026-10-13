@@ -42,7 +42,9 @@ pub struct ServeArgs {
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     // Ignore the error: a subscriber may already be installed.
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .try_init();
 
     let backend = args.store.backend().await?;

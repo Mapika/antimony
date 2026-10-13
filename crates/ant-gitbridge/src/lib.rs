@@ -40,11 +40,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context as _};
 use ant_core::{
     Commit, EncodedObject, EntryMode, ObjectId, ObjectKind, RepoPath, Signature, Tree, TreeEntry,
 };
 use ant_store::{Backend, CasOutcome, ChangeKind, CommitNode, PathChange};
+use anyhow::{Context as _, anyhow, bail};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -98,10 +98,17 @@ enum Msg {
         /// incremental imports); skipped on fresh imports.
         check_present: bool,
     },
-    Tip { ant_ref: String, id: ObjectId },
+    Tip {
+        ant_ref: String,
+        id: ObjectId,
+    },
 }
 
-pub async fn import(repo: &Path, backend: &Backend, opts: &ImportOptions) -> anyhow::Result<ImportStats> {
+pub async fn import(
+    repo: &Path,
+    backend: &Backend,
+    opts: &ImportOptions,
+) -> anyhow::Result<ImportStats> {
     let batch_objects = opts.batch_objects.max(1);
     let (tx, rx) = mpsc::channel::<Msg>(4);
     let producer = {
@@ -109,7 +116,9 @@ pub async fn import(repo: &Path, backend: &Backend, opts: &ImportOptions) -> any
         let backend = backend.clone();
         let refs = opts.refs.clone();
         let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || produce(&repo, backend, handle, &refs, batch_objects, tx))
+        tokio::task::spawn_blocking(move || {
+            produce(&repo, backend, handle, &refs, batch_objects, tx)
+        })
     };
     let mut stats = ImportStats::default();
     let written = write(backend, rx, &mut stats).await;
@@ -132,13 +141,18 @@ struct Counts {
 
 type InFlight = VecDeque<(JoinHandle<anyhow::Result<Counts>>, Vec<NewCommit>)>;
 
-async fn write(backend: &Backend, mut rx: mpsc::Receiver<Msg>, stats: &mut ImportStats) -> anyhow::Result<()> {
+async fn write(
+    backend: &Backend,
+    mut rx: mpsc::Receiver<Msg>,
+    stats: &mut ImportStats,
+) -> anyhow::Result<()> {
     let mut inflight: InFlight = VecDeque::new();
     while let Some(msg) = rx.recv().await {
         match msg {
             Msg::Batch { objects, commits, check_present } => {
                 let b = backend.clone();
-                let task = tokio::spawn(async move { store_objects(&b, objects, check_present).await });
+                let task =
+                    tokio::spawn(async move { store_objects(&b, objects, check_present).await });
                 inflight.push_back((task, commits));
                 while inflight.len() > BATCHES_IN_FLIGHT {
                     finish_batch(backend, &mut inflight, stats).await?;
@@ -167,7 +181,11 @@ async fn write(backend: &Backend, mut rx: mpsc::Receiver<Msg>, stats: &mut Impor
 /// Wait for the oldest batch's objects, then record its commits. Batches
 /// complete strictly in order, so a commit is only recorded once everything it
 /// can reference is stored.
-async fn finish_batch(backend: &Backend, inflight: &mut InFlight, stats: &mut ImportStats) -> anyhow::Result<()> {
+async fn finish_batch(
+    backend: &Backend,
+    inflight: &mut InFlight,
+    stats: &mut ImportStats,
+) -> anyhow::Result<()> {
     let Some((task, commits)) = inflight.pop_front() else {
         return Ok(());
     };
@@ -191,7 +209,11 @@ async fn finish_batch(backend: &Backend, inflight: &mut InFlight, stats: &mut Im
 }
 
 /// Store the objects the target does not already hold; only those are counted.
-async fn store_objects(backend: &Backend, objects: Vec<EncodedObject>, check_present: bool) -> anyhow::Result<Counts> {
+async fn store_objects(
+    backend: &Backend,
+    objects: Vec<EncodedObject>,
+    check_present: bool,
+) -> anyhow::Result<Counts> {
     let mut counts = Counts::default();
     if objects.is_empty() {
         return Ok(counts);
@@ -228,7 +250,8 @@ fn produce(
     batch_objects: usize,
     tx: mpsc::Sender<Msg>,
 ) -> anyhow::Result<()> {
-    let repo = gix::open(repo_path).with_context(|| format!("opening git repo {}", repo_path.display()))?;
+    let repo = gix::open(repo_path)
+        .with_context(|| format!("opening git repo {}", repo_path.display()))?;
     let mut p = Producer {
         repo,
         backend,
@@ -248,9 +271,7 @@ fn produce(
         let tip = p.resolve(git_ref)?;
         p.discover(tip)?;
         p.walk(tip)?;
-        let id = p
-            .known_commit(tip)
-            .ok_or_else(|| anyhow!("{git_ref} was not converted"))?;
+        let id = p.known_commit(tip).ok_or_else(|| anyhow!("{git_ref} was not converted"))?;
         p.send_batch()?;
         p.send(Msg::Tip { ant_ref: ant_ref.clone(), id })?;
     }
@@ -344,7 +365,8 @@ enum Frame {
 
 impl Producer {
     fn resolve(&self, name: &str) -> anyhow::Result<gix::ObjectId> {
-        let mut reference = self.repo.find_reference(name).with_context(|| format!("resolving {name}"))?;
+        let mut reference =
+            self.repo.find_reference(name).with_context(|| format!("resolving {name}"))?;
         Ok(reference.peel_to_id()?.detach())
     }
 
@@ -376,7 +398,8 @@ impl Producer {
                 }
             }
             let keys: Vec<&[u8]> = batch.iter().map(|id| id.as_slice()).collect();
-            let found = self.handle.block_on(self.backend.meta.get_derived_many(COMMIT_KIND, &keys))?;
+            let found =
+                self.handle.block_on(self.backend.meta.get_derived_many(COMMIT_KIND, &keys))?;
             for (id, value) in batch.into_iter().zip(found) {
                 match value {
                     Some(bytes) => {
@@ -447,9 +470,7 @@ impl Producer {
             return Ok(*i);
         }
         // Imported by an earlier run: ask the store (once per boundary commit).
-        let ant = self
-            .known_commit(id)
-            .ok_or_else(|| anyhow!("parent {id} was not converted"))?;
+        let ant = self.known_commit(id).ok_or_else(|| anyhow!("parent {id} was not converted"))?;
         let node = self
             .handle
             .block_on(self.backend.meta.get_commits(&[ant]))?
@@ -494,7 +515,8 @@ impl Producer {
         let ant = obj.id();
         self.memo.insert(id, ant);
         self.infos.insert(id, CommitInfo { git_tree: raw.tree, generation: generation + 1 });
-        let node = CommitNode { id: ant, tree, parents, generation: generation + 1, committer_time };
+        let node =
+            CommitNode { id: ant, tree, parents, generation: generation + 1, committer_time };
         self.commits.push(NewCommit { node, changes, git: id });
         self.push_object(obj)
     }
@@ -548,7 +570,8 @@ impl Producer {
         for e in raw.iter() {
             let child_id = match e.mode {
                 EntryMode::Tree => {
-                    let sub = if path.is_empty() { e.name.clone() } else { format!("{path}/{}", e.name) };
+                    let sub =
+                        if path.is_empty() { e.name.clone() } else { format!("{path}/{}", e.name) };
                     self.convert_tree(e.child, &sub)?
                 }
                 _ => self.leaf_id(e.mode, e.child)?,
@@ -595,7 +618,11 @@ impl Producer {
     /// `ant_store::graph::diff_trees` on the converted trees, computed from the
     /// producer's own state. Identical subtrees (equal source ids) are skipped
     /// unread, and nothing is fetched from the store.
-    fn changes(&mut self, old: Option<gix::ObjectId>, new: gix::ObjectId) -> anyhow::Result<Vec<PathChange>> {
+    fn changes(
+        &mut self,
+        old: Option<gix::ObjectId>,
+        new: gix::ObjectId,
+    ) -> anyhow::Result<Vec<PathChange>> {
         let mut out = Vec::new();
         let mut stack = vec![(RepoPath::root(), old, Some(new))];
         while let Some((dir, old, new)) = stack.pop() {
@@ -610,8 +637,10 @@ impl Producer {
                 Some(id) => self.tree_entries(id, dir.as_str())?,
                 None => self.empty.clone(),
             };
-            let old_m: HashMap<&str, &RawEntry> = old_e.iter().map(|e| (e.name.as_str(), e)).collect();
-            let new_m: HashMap<&str, &RawEntry> = new_e.iter().map(|e| (e.name.as_str(), e)).collect();
+            let old_m: HashMap<&str, &RawEntry> =
+                old_e.iter().map(|e| (e.name.as_str(), e)).collect();
+            let new_m: HashMap<&str, &RawEntry> =
+                new_e.iter().map(|e| (e.name.as_str(), e)).collect();
             let mut names: Vec<&str> = old_m.keys().chain(new_m.keys()).copied().collect();
             names.sort_unstable();
             names.dedup();
@@ -635,8 +664,12 @@ impl Producer {
                         (Some(_), None) => ChangeKind::Deleted,
                         _ => ChangeKind::Modified,
                     };
-                    let old = o_leaf.map(|(m, c)| Ok::<_, anyhow::Error>((m, self.leaf_id(m, c)?))).transpose()?;
-                    let new = n_leaf.map(|(m, c)| Ok::<_, anyhow::Error>((m, self.leaf_id(m, c)?))).transpose()?;
+                    let old = o_leaf
+                        .map(|(m, c)| Ok::<_, anyhow::Error>((m, self.leaf_id(m, c)?)))
+                        .transpose()?;
+                    let new = n_leaf
+                        .map(|(m, c)| Ok::<_, anyhow::Error>((m, self.leaf_id(m, c)?)))
+                        .transpose()?;
                     out.push(PathChange { path, kind, old, new });
                 }
             }
@@ -739,8 +772,8 @@ mod tests {
 
     use super::*;
     use ant_core::{ObjectId, RepoPath};
-    use ant_store::graph::lookup_path;
     use ant_store::ObjectStoreExt;
+    use ant_store::graph::lookup_path;
 
     fn git(dir: &Path, args: &[&str]) -> String {
         git_env(dir, args, &[])
@@ -773,7 +806,11 @@ mod tests {
         std::fs::create_dir_all(r.join("a/b")).unwrap();
         std::fs::write(r.join("a/b/c.txt"), "c\n").unwrap();
         std::fs::write(r.join("run.sh"), "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(r.join("run.sh"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            r.join("run.sh"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         std::os::unix::fs::symlink("run.sh", r.join("link")).unwrap();
         git(&r, &["add", "-A"]);
         git(&r, &["commit", "-qm", "first\n\nbody line"]);
@@ -826,7 +863,8 @@ mod tests {
         assert_eq!(expected.len(), 4);
 
         let b = Backend::in_memory();
-        let stats = import(&src, &b, &ImportOptions::single("refs/heads/main", "main")).await.unwrap();
+        let stats =
+            import(&src, &b, &ImportOptions::single("refs/heads/main", "main")).await.unwrap();
         assert_eq!(stats.commits, 4);
 
         let tip = b.refs.get_ref("main").await.unwrap().unwrap();
@@ -841,7 +879,10 @@ mod tests {
         let c = b.objects.read_commit(&tip).await.unwrap();
         assert_eq!(c.author.tz_offset_minutes, 330);
         assert_eq!(c.committer.tz_offset_minutes, -420);
-        let f = lookup_path(b.objects.as_ref(), c.tree, &RepoPath::new("a/c.txt").unwrap()).await.unwrap().unwrap();
+        let f = lookup_path(b.objects.as_ref(), c.tree, &RepoPath::new("a/c.txt").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&b.objects.read_blob(&f.1).await.unwrap()[..], b"c\n");
         let node = b.meta.get_commits(&[tip]).await.unwrap().pop().unwrap().unwrap();
         assert_eq!(node.parents.len(), 2);
@@ -890,7 +931,11 @@ mod tests {
             ("GIT_COMMITTER_NAME", b"Committer \xe9"),
         ];
         let commit = |dir: &Path| {
-            git_env(dir, &["-c", "i18n.commitEncoding=ISO-8859-1", "commit", "-q", "-F", msg_file], env);
+            git_env(
+                dir,
+                &["-c", "i18n.commitEncoding=ISO-8859-1", "commit", "-q", "-F", msg_file],
+                env,
+            );
         };
         commit(&r);
         std::fs::write(r.join("f.txt"), "two\n").unwrap();
@@ -921,13 +966,15 @@ mod tests {
         std::fs::create_dir_all(r.join("dir")).unwrap();
         git(&r, &["init", "-q", "-b", "main"]);
         use std::os::unix::ffi::OsStrExt;
-        std::fs::write(r.join("dir").join(std::ffi::OsStr::from_bytes(b"bad-\xe9.txt")), "x").unwrap();
+        std::fs::write(r.join("dir").join(std::ffi::OsStr::from_bytes(b"bad-\xe9.txt")), "x")
+            .unwrap();
         git(&r, &["add", "-A"]);
         git(&r, &["commit", "-qm", "bad name"]);
         let head = git(&r, &["rev-parse", "HEAD"]);
 
         let b = Backend::in_memory();
-        let err = import(&r, &b, &ImportOptions::single("refs/heads/main", "main")).await.unwrap_err();
+        let err =
+            import(&r, &b, &ImportOptions::single("refs/heads/main", "main")).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("non-UTF-8 file name"), "{msg}");
         assert!(msg.contains("bad-"), "{msg}");
@@ -956,10 +1003,17 @@ mod tests {
                 Some(p) => Some(b.objects.read_commit(p).await.unwrap().tree),
                 None => None,
             };
-            let expected = ant_store::graph::diff_trees(b.objects.as_ref(), first, Some(c.tree)).await.unwrap();
-            assert_eq!(b.meta.get_changeset(id).await.unwrap().unwrap(), expected, "changeset of {id}");
+            let expected = ant_store::graph::diff_trees(b.objects.as_ref(), first, Some(c.tree))
+                .await
+                .unwrap();
+            assert_eq!(
+                b.meta.get_changeset(id).await.unwrap().unwrap(),
+                expected,
+                "changeset of {id}"
+            );
             let parent_gens = b.meta.get_commits(&c.parents).await.unwrap();
-            let parent_gen = parent_gens.iter().map(|p| p.as_ref().unwrap().generation).max().unwrap_or(0);
+            let parent_gen =
+                parent_gens.iter().map(|p| p.as_ref().unwrap().generation).max().unwrap_or(0);
             assert_eq!(node.generation, parent_gen + 1);
             assert_eq!(node.committer_time, c.committer.time);
         }

@@ -68,9 +68,7 @@ fn change_kind_from_code(c: i16) -> Result<ChangeKind> {
         1 => ChangeKind::Modified,
         2 => ChangeKind::Deleted,
         other => {
-            return Err(StoreError::InvalidArgument(format!(
-                "bad change kind {other}"
-            )));
+            return Err(StoreError::InvalidArgument(format!("bad change kind {other}")));
         }
     })
 }
@@ -80,19 +78,21 @@ fn object_id_col(row: &sqlx::postgres::PgRow, col: &str) -> Result<ObjectId> {
     Ok(ObjectId::from_bytes(&bytes)?)
 }
 
-fn change_side(mode: Option<String>, oid: Option<Vec<u8>>) -> Result<Option<(EntryMode, ObjectId)>> {
+fn change_side(
+    mode: Option<String>,
+    oid: Option<Vec<u8>>,
+) -> Result<Option<(EntryMode, ObjectId)>> {
     match (mode, oid) {
-        (Some(m), Some(o)) => Ok(Some((EntryMode::from_octal(m.as_bytes())?, ObjectId::from_bytes(&o)?))),
+        (Some(m), Some(o)) => {
+            Ok(Some((EntryMode::from_octal(m.as_bytes())?, ObjectId::from_bytes(&o)?)))
+        }
         (None, None) => Ok(None),
         _ => Err(StoreError::InvalidArgument("corrupt changeset row".into())),
     }
 }
 
 fn decode_ids(bytes: &[u8]) -> Result<Vec<ObjectId>> {
-    bytes
-        .chunks_exact(ObjectId::LEN)
-        .map(|c| Ok(ObjectId::from_bytes(c)?))
-        .collect()
+    bytes.chunks_exact(ObjectId::LEN).map(|c| Ok(ObjectId::from_bytes(c)?)).collect()
 }
 
 fn ids_to_vecs(ids: &[ObjectId]) -> Vec<Vec<u8>> {
@@ -215,10 +215,7 @@ impl PgStore {
         ];
         for stmt in &ddl {
             // Schema name is quoted by `quote_ident`; no user data is interpolated.
-            sqlx::query(sqlx::AssertSqlSafe(stmt.as_str()))
-                .execute(&mut *tx)
-                .await
-                .map_err(be)?;
+            sqlx::query(sqlx::AssertSqlSafe(stmt.as_str())).execute(&mut *tx).await.map_err(be)?;
         }
         tx.commit().await.map_err(be)?;
         conn.close().await.map_err(be)?;
@@ -229,9 +226,7 @@ impl PgStore {
             .after_connect(move |conn, _meta| {
                 let stmt = search_path.clone();
                 Box::pin(async move {
-                    sqlx::query(sqlx::AssertSqlSafe(stmt.as_str()))
-                        .execute(&mut *conn)
-                        .await?;
+                    sqlx::query(sqlx::AssertSqlSafe(stmt.as_str())).execute(&mut *conn).await?;
                     Ok(())
                 })
             })
@@ -278,10 +273,8 @@ impl ObjectStore for PgStore {
         if objects.is_empty() {
             return Ok(());
         }
-        let owned: Vec<(Vec<u8>, Bytes)> = objects
-            .iter()
-            .map(|o| (o.id().as_bytes().to_vec(), o.as_bytes().clone()))
-            .collect();
+        let owned: Vec<(Vec<u8>, Bytes)> =
+            objects.iter().map(|o| (o.id().as_bytes().to_vec(), o.as_bytes().clone())).collect();
         let (ids, data): (Vec<Vec<u8>>, Vec<Vec<u8>>) = tokio::task::spawn_blocking(move || {
             owned
                 .into_iter()
@@ -312,10 +305,8 @@ impl ObjectStore for PgStore {
             .fetch_all(&self.pool)
             .await
             .map_err(be)?;
-        let present: HashSet<ObjectId> = rows
-            .iter()
-            .map(|r| object_id_col(r, "id"))
-            .collect::<Result<_>>()?;
+        let present: HashSet<ObjectId> =
+            rows.iter().map(|r| object_id_col(r, "id")).collect::<Result<_>>()?;
         Ok(ids.iter().map(|id| present.contains(id)).collect())
     }
 }
@@ -417,7 +408,8 @@ impl MetaStore for PgStore {
         for chunk in rows.chunks(50_000) {
             let paths: Vec<&str> = chunk.iter().map(|r| r.path.as_str()).collect();
             let gens: Vec<i64> = chunk.iter().map(|r| r.generation as i64).collect();
-            let commits: Vec<&[u8]> = chunk.iter().map(|r| r.commit.as_bytes().as_slice()).collect();
+            let commits: Vec<&[u8]> =
+                chunk.iter().map(|r| r.commit.as_bytes().as_slice()).collect();
             sqlx::query(
                 "INSERT INTO history (ref, path, generation, commit_id) \
                  SELECT $1, t.p, t.g, t.c FROM unnest($2::text[], $3::bigint[], $4::bytea[]) \
@@ -457,7 +449,8 @@ impl MetaStore for PgStore {
             .fetch_all(&self.pool)
             .await
         } else {
-            let like = format!("{}/%", p.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+            let like =
+                format!("{}/%", p.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
             sqlx::query(
                 "SELECT DISTINCT generation, commit_id FROM history \
                  WHERE ref = $1 AND (path = $4 OR path LIKE $5) AND generation <= $2 \
@@ -495,26 +488,29 @@ impl MetaStore for PgStore {
         expected: Option<ObjectId>,
         new: ObjectId,
     ) -> Result<bool> {
-        let affected = match expected {
-            None => sqlx::query(
-                "INSERT INTO history_watermark (ref, commit_id) VALUES ($1, $2) \
+        let affected =
+            match expected {
+                None => {
+                    sqlx::query(
+                        "INSERT INTO history_watermark (ref, commit_id) VALUES ($1, $2) \
                  ON CONFLICT (ref) DO NOTHING",
-            )
-            .bind(ref_name)
-            .bind(new.as_bytes().as_slice())
-            .execute(&self.pool)
-            .await,
-            Some(e) => sqlx::query(
-                "UPDATE history_watermark SET commit_id = $3 WHERE ref = $1 AND commit_id = $2",
-            )
-            .bind(ref_name)
-            .bind(e.as_bytes().as_slice())
-            .bind(new.as_bytes().as_slice())
-            .execute(&self.pool)
-            .await,
-        }
-        .map_err(be)?
-        .rows_affected();
+                    )
+                    .bind(ref_name)
+                    .bind(new.as_bytes().as_slice())
+                    .execute(&self.pool)
+                    .await
+                }
+                Some(e) => sqlx::query(
+                    "UPDATE history_watermark SET commit_id = $3 WHERE ref = $1 AND commit_id = $2",
+                )
+                .bind(ref_name)
+                .bind(e.as_bytes().as_slice())
+                .bind(new.as_bytes().as_slice())
+                .execute(&self.pool)
+                .await,
+            }
+            .map_err(be)?
+            .rows_affected();
         Ok(affected == 1)
     }
 
@@ -615,8 +611,14 @@ impl MetaStore for PgStore {
             entry.push(PathChange {
                 path: RepoPath::new(path)?,
                 kind: change_kind_from_code(r.try_get("kind").map_err(be)?)?,
-                old: change_side(r.try_get("old_mode").map_err(be)?, r.try_get("old_id").map_err(be)?)?,
-                new: change_side(r.try_get("new_mode").map_err(be)?, r.try_get("new_id").map_err(be)?)?,
+                old: change_side(
+                    r.try_get("old_mode").map_err(be)?,
+                    r.try_get("old_id").map_err(be)?,
+                )?,
+                new: change_side(
+                    r.try_get("new_mode").map_err(be)?,
+                    r.try_get("new_id").map_err(be)?,
+                )?,
             });
         }
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
@@ -692,7 +694,10 @@ impl MetaStore for PgStore {
         .map_err(be)?;
         let mut seqs: HashMap<ObjectId, u64> = HashMap::with_capacity(ids.len());
         for r in &result {
-            seqs.insert(object_id_col(r, "commit_id")?, r.try_get::<i64, _>("seq").map_err(be)? as u64);
+            seqs.insert(
+                object_id_col(r, "commit_id")?,
+                r.try_get::<i64, _>("seq").map_err(be)? as u64,
+            );
         }
         // A commit recorded concurrently by another transaction is invisible
         // to this statement's snapshot; read its seq with a fresh one.
@@ -708,7 +713,10 @@ impl MetaStore for PgStore {
                 .await
                 .map_err(be)?;
             for r in &rows {
-                seqs.insert(object_id_col(r, "commit_id")?, r.try_get::<i64, _>("seq").map_err(be)? as u64);
+                seqs.insert(
+                    object_id_col(r, "commit_id")?,
+                    r.try_get::<i64, _>("seq").map_err(be)? as u64,
+                );
             }
         }
         commits
@@ -776,14 +784,8 @@ impl MetaStore for PgStore {
             out.push(PathChange {
                 path: RepoPath::new(path)?,
                 kind: change_kind_from_code(r.try_get("kind").map_err(be)?)?,
-                old: side(
-                    r.try_get("old_mode").map_err(be)?,
-                    r.try_get("old_id").map_err(be)?,
-                )?,
-                new: side(
-                    r.try_get("new_mode").map_err(be)?,
-                    r.try_get("new_id").map_err(be)?,
-                )?,
+                old: side(r.try_get("old_mode").map_err(be)?, r.try_get("old_id").map_err(be)?)?,
+                new: side(r.try_get("new_mode").map_err(be)?, r.try_get("new_id").map_err(be)?)?,
             });
         }
         Ok(Some(out))
@@ -819,9 +821,7 @@ impl MetaStore for PgStore {
             .await
             .map_err(be)?;
         match row {
-            Some(r) => Ok(Some(Bytes::from(
-                r.try_get::<Vec<u8>, _>("value").map_err(be)?,
-            ))),
+            Some(r) => Ok(Some(Bytes::from(r.try_get::<Vec<u8>, _>("value").map_err(be)?))),
             None => Ok(None),
         }
     }
@@ -873,9 +873,7 @@ mod tests {
         let url = std::env::var("ANT_TEST_PG_URL")
             .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
         let schema = format!("t_{}", rand::random::<u64>());
-        PgStore::connect(&url, &schema)
-            .await
-            .expect("connect (is `docker compose up -d` running?)")
+        PgStore::connect(&url, &schema).await.expect("connect (is `docker compose up -d` running?)")
     }
 
     #[tokio::test]
@@ -915,9 +913,7 @@ mod tests {
             .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
         let schema = format!("t_{}", rand::random::<u64>());
         let a = PgStore::connect(&url, &schema).await.unwrap();
-        a.cas_ref("main", None, Some(ObjectId([1; 32])))
-            .await
-            .unwrap();
+        a.cas_ref("main", None, Some(ObjectId([1; 32]))).await.unwrap();
         let b = PgStore::connect(&url, &schema).await.unwrap();
         assert_eq!(b.get_ref("main").await.unwrap(), Some(ObjectId([1; 32])));
     }

@@ -253,7 +253,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Incompressible-ish payloads so sizes are predictable.
         let mk = |seed: u8| {
-            let body: Vec<u8> = (0..20_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8 ^ seed).collect();
+            let body: Vec<u8> =
+                (0..20_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8 ^ seed).collect();
             EncodedObject::new(ObjectKind::Blob, &body)
         };
         let objs: Vec<_> = (0..10).map(mk).collect();
@@ -280,7 +281,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = Arc::new(DiskObjectStore::open(dir.path(), u64::MAX).unwrap());
         let b = Arc::new(DiskObjectStore::open(dir.path(), u64::MAX).unwrap());
-        let objs: Vec<_> = (0..200).map(|i| EncodedObject::new(ObjectKind::Blob, format!("{i}").as_bytes())).collect();
+        let objs: Vec<_> = (0..200)
+            .map(|i| EncodedObject::new(ObjectKind::Blob, format!("{i}").as_bytes()))
+            .collect();
         let (oa, ob) = (objs.clone(), objs.clone());
         let ta = tokio::spawn(async move { a.put_many(&oa).await });
         let tb = tokio::spawn(async move { b.put_many(&ob).await });

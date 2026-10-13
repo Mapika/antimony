@@ -161,7 +161,9 @@ pub fn dir_size_skip(path: &Path, skip: Option<&str>) -> (u64, u64) {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
         .init();
     let code = match run().await {
         Ok(code) => code,
@@ -180,7 +182,16 @@ async fn run() -> anyhow::Result<i32> {
     let info = sub.map(StoreInfo::from_matches).unwrap_or_default();
     match cli.cmd {
         Cmd::Import { git_dir, git_ref, ant_ref, batch_objects, max_seconds, json, store } => {
-            let args = import::Args { git_dir, git_ref, ant_ref, batch_objects, max_seconds, json, store, info };
+            let args = import::Args {
+                git_dir,
+                git_ref,
+                ant_ref,
+                batch_objects,
+                max_seconds,
+                json,
+                store,
+                info,
+            };
             import::run(args).await?;
             Ok(0)
         }
@@ -214,7 +225,8 @@ async fn run() -> anyhow::Result<i32> {
             fleet::run(args).await
         }
         Cmd::Checkout { server, http, rev, sparse, iterations, cache, workdir, json } => {
-            let args = checkout::Args { server, http, rev, sparse, iterations, cache, workdir, json };
+            let args =
+                checkout::Args { server, http, rev, sparse, iterations, cache, workdir, json };
             checkout::run(args).await?;
             Ok(0)
         }

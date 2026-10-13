@@ -352,12 +352,8 @@ fn decode_blame(v: &[u8], lines: usize) -> Option<Vec<ObjectId>> {
 fn line_map(old: &[&str], new: &[&str]) -> Vec<Option<usize>> {
     let mut map = vec![None; new.len()];
     let pre = old.iter().zip(new).take_while(|(a, b)| a == b).count();
-    let suf = old[pre..]
-        .iter()
-        .rev()
-        .zip(new[pre..].iter().rev())
-        .take_while(|(a, b)| a == b)
-        .count();
+    let suf =
+        old[pre..].iter().rev().zip(new[pre..].iter().rev()).take_while(|(a, b)| a == b).count();
     for (i, m) in map.iter_mut().enumerate().take(pre) {
         *m = Some(i);
     }
@@ -446,7 +442,8 @@ pub async fn blame(b: &Backend, rev: &str, path: &RepoPath) -> OpResult<Vec<Blam
 
     let mut history = match indexed_ref_for(b, rev, id).await? {
         Some(r) => {
-            let g = b.meta.get_commits(&[id]).await?.pop().flatten().map_or(u64::MAX, |n| n.generation);
+            let g =
+                b.meta.get_commits(&[id]).await?.pop().flatten().map_or(u64::MAX, |n| n.generation);
             let hits = b.meta.query_history(&r, path, g, usize::MAX).await?;
             FileHistory::Indexed(hits.into_iter().map(|(_, id)| id).collect())
         }
@@ -512,21 +509,28 @@ pub async fn blame(b: &Backend, rev: &str, path: &RepoPath) -> OpResult<Vec<Blam
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ant_store::HistoryRow;
     use crate::ops::changeset::tests::{commit, delete, write};
     use crate::ops::land::{LandOutcome, land};
     use crate::ops::query;
+    use ant_store::HistoryRow;
 
-    async fn landed(b: &Backend, base: ObjectId, ops: Vec<crate::ops::changeset::FileOp>) -> ObjectId {
+    async fn landed(
+        b: &Backend,
+        base: ObjectId,
+        ops: Vec<crate::ops::changeset::FileOp>,
+    ) -> ObjectId {
         let c = commit(b, Some(base), ops).await.unwrap();
-        let LandOutcome::Landed { new_tip, .. } = land(b, "main", c).await.unwrap() else { panic!() };
+        let LandOutcome::Landed { new_tip, .. } = land(b, "main", c).await.unwrap() else {
+            panic!()
+        };
         new_tip
     }
 
     #[tokio::test]
     async fn index_matches_changeset_scan() {
         let b = Backend::in_memory();
-        let c0 = commit(&b, None, vec![write("src/a.rs", "1"), write("README", "r")]).await.unwrap();
+        let c0 =
+            commit(&b, None, vec![write("src/a.rs", "1"), write("README", "r")]).await.unwrap();
         land(&b, "main", c0).await.unwrap();
         let mut tip = c0;
         for i in 0..30 {
@@ -538,8 +542,18 @@ mod tests {
         for path in ["src", "src/a.rs", "docs", "README", "nope"] {
             let p = RepoPath::new(path).unwrap();
             let gen_ = b.meta.get_commits(&[tip]).await.unwrap()[0].clone().unwrap().generation;
-            let fast: Vec<_> = path_log(&b, "main", gen_, &p, 0).await.unwrap().into_iter().map(|e| e.id).collect();
-            let slow: Vec<_> = query::log(&b, "main", Some(&p), 0).await.unwrap().into_iter().map(|e| e.id).collect();
+            let fast: Vec<_> = path_log(&b, "main", gen_, &p, 0)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|e| e.id)
+                .collect();
+            let slow: Vec<_> = query::log(&b, "main", Some(&p), 0)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|e| e.id)
+                .collect();
             assert_eq!(fast, slow, "{path}");
         }
     }
@@ -557,7 +571,8 @@ mod tests {
         catch_up(&b, "main").await.unwrap();
         let gen_ = b.meta.get_commits(&[other]).await.unwrap()[0].clone().unwrap().generation;
         let f = RepoPath::new("f").unwrap();
-        let ids: Vec<_> = path_log(&b, "main", gen_, &f, 0).await.unwrap().into_iter().map(|e| e.id).collect();
+        let ids: Vec<_> =
+            path_log(&b, "main", gen_, &f, 0).await.unwrap().into_iter().map(|e| e.id).collect();
         assert_eq!(ids, vec![c0], "c1 is no longer on main");
     }
 
@@ -589,7 +604,12 @@ mod tests {
         land(&b, "main", c0).await.unwrap();
         let mut tip = c0;
         for i in 0..5 {
-            tip = landed(&b, tip, vec![write(if i % 2 == 0 { "a/x" } else { "b/y" }, &i.to_string())]).await;
+            tip = landed(
+                &b,
+                tip,
+                vec![write(if i % 2 == 0 { "a/x" } else { "b/y" }, &i.to_string())],
+            )
+            .await;
         }
         assert_eq!(catch_up(&b, "main").await.unwrap(), 6);
         for i in 5..8 {
@@ -607,14 +627,18 @@ mod tests {
         assert_eq!(back, before[2..]);
         // The index really serves it: poison a row the scan would not produce.
         let g = b.meta.get_commits(&[c0]).await.unwrap()[0].clone().unwrap().generation;
-        b.meta.index_history("main", &[HistoryRow { path: a.clone(), generation: g, commit: c0 }]).await.unwrap();
+        b.meta
+            .index_history("main", &[HistoryRow { path: a.clone(), generation: g, commit: c0 }])
+            .await
+            .unwrap();
         assert_eq!(path_log(&b, "main", u64::MAX, &a, 0).await.unwrap().len(), before.len());
     }
 
     #[tokio::test]
     async fn blame_scan_equals_indexed_and_rejects_binary() {
         let b = Backend::in_memory();
-        let c0 = commit(&b, None, vec![write("f", "1\n2\n3\n4\n"), write("bin", "x")]).await.unwrap();
+        let c0 =
+            commit(&b, None, vec![write("f", "1\n2\n3\n4\n"), write("bin", "x")]).await.unwrap();
         land(&b, "main", c0).await.unwrap();
         let c1 = landed(&b, c0, vec![write("f", "1\n2\nnew\n3\n4\n")]).await;
         let c2 = landed(&b, c1, vec![write("f", "1\nnew\n3\n")]).await;
@@ -630,11 +654,17 @@ mod tests {
         let last = blame(&b, "main", &f).await.unwrap();
         assert_eq!((last[0].commit, last[0].line.as_str()), (c4, "again"));
         assert_eq!(last.len(), 1);
-        let bin = commit(&b, Some(c4), vec![crate::ops::changeset::FileOp::Write {
-            path: RepoPath::new("blob").unwrap(),
-            mode: ant_core::EntryMode::File,
-            content: crate::ops::changeset::WriteContent::Inline(bytes::Bytes::from_static(&[0xff, 0xfe, 0])),
-        }])
+        let bin = commit(
+            &b,
+            Some(c4),
+            vec![crate::ops::changeset::FileOp::Write {
+                path: RepoPath::new("blob").unwrap(),
+                mode: ant_core::EntryMode::File,
+                content: crate::ops::changeset::WriteContent::Inline(bytes::Bytes::from_static(&[
+                    0xff, 0xfe, 0,
+                ])),
+            }],
+        )
         .await
         .unwrap();
         land(&b, "main", bin).await.unwrap();
@@ -642,7 +672,10 @@ mod tests {
             blame(&b, "main", &RepoPath::new("blob").unwrap()).await,
             Err(OpError::InvalidArgument(_))
         ));
-        assert!(matches!(blame(&b, "main", &RepoPath::new("src").unwrap()).await, Err(OpError::NotFound(_))));
+        assert!(matches!(
+            blame(&b, "main", &RepoPath::new("src").unwrap()).await,
+            Err(OpError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -679,12 +712,18 @@ mod tests {
         const N: usize = 20_000;
         let url = std::env::var("ANT_TEST_PG_URL")
             .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
-        let schema = format!("hist_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()));
+        let schema = format!(
+            "hist_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos())
+        );
         let pg = Arc::new(PgStore::connect(&url, &schema).await.unwrap());
         let b = Backend { objects: pg.clone(), refs: pg.clone(), meta: pg.clone() };
 
         let t = Instant::now();
-        let sig = Signature { name: "bench".into(), email: "b@x".into(), time: 0, tz_offset_minutes: 0 };
+        let sig =
+            Signature { name: "bench".into(), email: "b@x".into(), time: 0, tz_offset_minutes: 0 };
         let mut parent: Option<ObjectId> = None;
         let (mut objs, mut tip) = (Vec::new(), None);
         for i in 0..N {

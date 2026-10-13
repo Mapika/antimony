@@ -119,7 +119,9 @@ impl EncodedObject {
     pub fn verify(&self, expected: &ObjectId) -> Result<()> {
         let actual = self.id();
         if &actual != expected {
-            return Err(Error::Malformed(format!("hash mismatch: expected {expected}, got {actual}")));
+            return Err(Error::Malformed(format!(
+                "hash mismatch: expected {expected}, got {actual}"
+            )));
         }
         Ok(())
     }

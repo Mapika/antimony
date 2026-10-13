@@ -20,7 +20,6 @@ use proptest::prelude::*;
 mod common;
 use common::*;
 
-
 // ---------------------------------------------------------------------------
 // Generators
 // ---------------------------------------------------------------------------
@@ -208,7 +207,11 @@ fn model_diff(old: &Model, new: &Model) -> Vec<PathChange> {
 // The property
 // ---------------------------------------------------------------------------
 
-fn to_file_ops(b: &Backend, specs: &[OpSpec], missing_seed: &mut u8) -> (Vec<FileOp>, Vec<EncodedObject>) {
+fn to_file_ops(
+    b: &Backend,
+    specs: &[OpSpec],
+    missing_seed: &mut u8,
+) -> (Vec<FileOp>, Vec<EncodedObject>) {
     let _ = b;
     let mut stored = Vec::new();
     let ops = specs
@@ -241,18 +244,21 @@ fn to_file_ops(b: &Backend, specs: &[OpSpec], missing_seed: &mut u8) -> (Vec<Fil
                     mode: s.mode,
                     content: WriteContent::Blob(ObjectId::empty_tree()),
                 },
-                Kind::BadMode(m) => FileOp::Write {
-                    path,
-                    mode: *m,
-                    content: WriteContent::Inline(Bytes::new()),
-                },
+                Kind::BadMode(m) => {
+                    FileOp::Write { path, mode: *m, content: WriteContent::Inline(Bytes::new()) }
+                }
             }
         })
         .collect();
     (ops, stored)
 }
 
-async fn run_case(base: Model, use_base: bool, specs: Vec<OpSpec>, strict: bool) -> Result<(), TestCaseError> {
+async fn run_case(
+    base: Model,
+    use_base: bool,
+    specs: Vec<OpSpec>,
+    strict: bool,
+) -> Result<(), TestCaseError> {
     let b = Backend::in_memory();
     let base = if use_base { base } else { Model::new() };
     let base_tree = store_model(&b, &base).await;
@@ -304,9 +310,8 @@ async fn run_case(base: Model, use_base: bool, specs: Vec<OpSpec>, strict: bool)
 
             // Untouched subtrees keep their ids.
             let before = flatten(&b, base_tree).await;
-            let touched = |dir: &str| {
-                specs.iter().any(|o| o.path == dir || is_prefix(dir, &o.path))
-            };
+            let touched =
+                |dir: &str| specs.iter().any(|o| o.path == dir || is_prefix(dir, &o.path));
             for (dir, id) in &before.dirs {
                 if !touched(dir) {
                     prop_assert_eq!(flat.dirs.get(dir), Some(id), "untouched dir {} changed", dir);
@@ -315,9 +320,8 @@ async fn run_case(base: Model, use_base: bool, specs: Vec<OpSpec>, strict: bool)
 
             // Recorded changeset equals diff_trees and the model diff.
             let recorded = b.meta.get_changeset(&commit_id).await.unwrap().unwrap();
-            let diff = diff_trees(b.objects.as_ref(), Some(base_tree), Some(commit.tree))
-                .await
-                .unwrap();
+            let diff =
+                diff_trees(b.objects.as_ref(), Some(base_tree), Some(commit.tree)).await.unwrap();
             prop_assert_eq!(&recorded, &diff);
             prop_assert_eq!(&recorded, &model_diff(&base, &expected));
         }
@@ -397,7 +401,10 @@ fn spec(path: &str, kind: Kind) -> OpSpec {
 }
 
 fn m(items: &[(&str, &str)]) -> Model {
-    items.iter().map(|(p, c)| ((*p).to_string(), (EntryMode::File, c.as_bytes().to_vec()))).collect()
+    items
+        .iter()
+        .map(|(p, c)| ((*p).to_string(), (EntryMode::File, c.as_bytes().to_vec())))
+        .collect()
 }
 
 #[test]

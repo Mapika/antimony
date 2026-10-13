@@ -294,10 +294,8 @@ pub async fn check_update_ref(
     let Some(new) = new else { return Ok(()) };
     let ids: Vec<ObjectId> = std::iter::once(new).chain(expected).collect();
     let nodes = b.meta.get_commits(&ids).await?;
-    let new_tree = nodes[0]
-        .as_ref()
-        .ok_or_else(|| OpError::NotFound(format!("commit {new}")))?
-        .tree;
+    let new_tree =
+        nodes[0].as_ref().ok_or_else(|| OpError::NotFound(format!("commit {new}")))?.tree;
     if expected.is_none() {
         return Ok(());
     }
@@ -308,7 +306,8 @@ pub async fn check_update_ref(
             OpError::PermissionDenied(format!("{name} does not point at a recorded commit"))
         })?
         .tree;
-    let changes = ant_store::graph::diff_trees(b.objects.as_ref(), Some(old_tree), Some(new_tree)).await?;
+    let changes =
+        ant_store::graph::diff_trees(b.objects.as_ref(), Some(old_tree), Some(new_tree)).await?;
     access.check_writable(changes.iter().map(|c| &c.path))?;
     Ok(())
 }
@@ -387,13 +386,14 @@ pub async fn readable(
 /// Write `(kind, key)` markers with bounded concurrency (the trait has no
 /// bulk write). All writes finish before returning; the first error wins.
 async fn put_markers(b: &Backend, puts: Vec<(String, Vec<u8>)>) -> Result<(), StoreError> {
-    let results: Vec<_> = stream::iter(puts)
-        .map(|(kind, key)| async move {
-            b.meta.put_derived(&kind, &key, Bytes::from_static(TAG)).await
-        })
-        .buffer_unordered(PUT_CONCURRENCY)
-        .collect()
-        .await;
+    let results: Vec<_> =
+        stream::iter(puts)
+            .map(|(kind, key)| async move {
+                b.meta.put_derived(&kind, &key, Bytes::from_static(TAG)).await
+            })
+            .buffer_unordered(PUT_CONCURRENCY)
+            .collect()
+            .await;
     results.into_iter().collect()
 }
 

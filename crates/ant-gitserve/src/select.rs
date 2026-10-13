@@ -84,11 +84,7 @@ impl Known {
         generation: u64,
         shallow: &HashSet<ObjectId>,
     ) -> Result<()> {
-        while self
-            .pending
-            .last_key_value()
-            .is_some_and(|(g, _)| *g > generation)
-        {
+        while self.pending.last_key_value().is_some_and(|(g, _)| *g > generation) {
             let mut parents = HashSet::new();
             let mut count = 0;
             while count < BATCH {
@@ -111,8 +107,7 @@ impl Known {
                     entry.remove();
                 }
             }
-            self.add(b, &parents.into_iter().collect::<Vec<_>>())
-                .await?;
+            self.add(b, &parents.into_iter().collect::<Vec<_>>()).await?;
         }
         Ok(())
     }
@@ -224,11 +219,7 @@ pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
     }
     let mut ids: Vec<_> = selected.into_iter().collect();
     ids.sort_unstable();
-    Ok(Selection {
-        ids,
-        shallow,
-        unshallow,
-    })
+    Ok(Selection { ids, shallow, unshallow })
 }
 
 #[cfg(test)]
@@ -241,9 +232,7 @@ mod tests {
     };
 
     async fn commit(b: &Backend, parents: Vec<ObjectId>, content: &[u8], time: i64) -> ObjectId {
-        let tree = build_tree(b.objects.as_ref(), &[("file", content)])
-            .await
-            .unwrap();
+        let tree = build_tree(b.objects.as_ref(), &[("file", content)]).await.unwrap();
         let sig = Signature {
             name: "test".into(),
             email: "test@test".into(),
@@ -276,22 +265,11 @@ mod tests {
         known.add(&b, &[tip]).await.unwrap();
         known.advance_to(&b, 2, &HashSet::new()).await.unwrap();
         assert!(known.ids.contains(&left));
-        assert!(
-            !known.ids.contains(&root),
-            "walk must stop at the generation floor"
-        );
-        assert!(
-            !known.ids.contains(&right),
-            "equal generation is not equal ancestry"
-        );
+        assert!(!known.ids.contains(&root), "walk must stop at the generation floor");
+        assert!(!known.ids.contains(&right), "equal generation is not equal ancestry");
         let selection = select(
             &b,
-            &Fetch {
-                wants: vec![right],
-                haves: vec![tip],
-                done: true,
-                ..Fetch::default()
-            },
+            &Fetch { wants: vec![right], haves: vec![tip], done: true, ..Fetch::default() },
         )
         .await
         .unwrap();
@@ -300,12 +278,7 @@ mod tests {
         assert!(!selection.ids.contains(&root));
         let empty = select(
             &b,
-            &Fetch {
-                wants: vec![left],
-                haves: vec![tip],
-                done: true,
-                ..Fetch::default()
-            },
+            &Fetch { wants: vec![left], haves: vec![tip], done: true, ..Fetch::default() },
         )
         .await
         .unwrap();
@@ -320,41 +293,19 @@ mod tests {
         let tip = commit(&b, vec![middle], b"old", 3).await;
         let selection = select(
             &b,
-            &Fetch {
-                wants: vec![tip],
-                haves: vec![middle],
-                done: true,
-                ..Fetch::default()
-            },
+            &Fetch { wants: vec![tip], haves: vec![middle], done: true, ..Fetch::default() },
         )
         .await
         .unwrap();
-        assert_eq!(
-            selection.ids,
-            [tip],
-            "old tree and blob already belong to the client"
-        );
-        let blob = b
-            .objects
-            .put(EncodedObject::new(ObjectKind::Blob, b"lazy"))
-            .await
-            .unwrap();
+        assert_eq!(selection.ids, [tip], "old tree and blob already belong to the client");
+        let blob = b.objects.put(EncodedObject::new(ObjectKind::Blob, b"lazy")).await.unwrap();
         let selection = select(
             &b,
-            &Fetch {
-                wants: vec![blob, blob],
-                no_blobs: true,
-                done: true,
-                ..Fetch::default()
-            },
+            &Fetch { wants: vec![blob, blob], no_blobs: true, done: true, ..Fetch::default() },
         )
         .await
         .unwrap();
-        assert_eq!(
-            selection.ids,
-            [blob],
-            "explicit wants override blob filtering"
-        );
+        assert_eq!(selection.ids, [blob], "explicit wants override blob filtering");
     }
 
     #[tokio::test]
@@ -380,12 +331,8 @@ mod tests {
 
     #[test]
     fn invalid_fetch_arguments() {
-        for args in [
-            vec!["want bad"],
-            vec!["deepen 0"],
-            vec!["filter blob:limit=10"],
-            vec!["done"],
-        ] {
+        for args in [vec!["want bad"], vec!["deepen 0"], vec!["filter blob:limit=10"], vec!["done"]]
+        {
             assert!(Fetch::parse(&args).is_err());
         }
     }

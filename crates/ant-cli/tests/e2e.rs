@@ -253,8 +253,20 @@ fn run_end_to_end(lazy: bool) {
     build_repo(&repo);
 
     let store_flags: Vec<String> = [
-        "--pg-url", PG_URL, "--pg-schema", &schema, "--s3-endpoint", S3_ENDPOINT, "--s3-bucket",
-        S3_BUCKET, "--s3-prefix", &prefix, "--s3-access-key", "test", "--s3-secret-key", "test",
+        "--pg-url",
+        PG_URL,
+        "--pg-schema",
+        &schema,
+        "--s3-endpoint",
+        S3_ENDPOINT,
+        "--s3-bucket",
+        S3_BUCKET,
+        "--s3-prefix",
+        &prefix,
+        "--s3-access-key",
+        "test",
+        "--s3-secret-key",
+        "test",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -394,7 +406,11 @@ fn run_end_to_end(lazy: bool) {
     // B, C and D are all created at the same (soon to be old) base.
     let new_ws = |dir: &Path, extra: &[&str]| -> String {
         let mut a = vec!["ws", "new", dir.to_str().expect("utf8"), "--at", "main"];
-        if lazy { a.push("--lazy"); } else { a.extend_from_slice(extra); }
+        if lazy {
+            a.push("--lazy");
+        } else {
+            a.extend_from_slice(extra);
+        }
         let r = ctx.run(None, &a);
         let id = r.stdout().trim_end().to_string();
         assert_id(&r, &id);
@@ -404,7 +420,10 @@ fn run_end_to_end(lazy: bool) {
     let dir_b = root.join("ws-b");
     let dir_c = root.join("ws-c");
     let dir_d = root.join("ws-d");
-    let _mounts = LazyMounts { ctx: &ctx, dirs: if lazy { vec![&dir_a, &dir_b, &dir_c, &dir_d] } else { vec![] } };
+    let _mounts = LazyMounts {
+        ctx: &ctx,
+        dirs: if lazy { vec![&dir_a, &dir_b, &dir_c, &dir_d] } else { vec![] },
+    };
     check_str(&new_ws(&dir_b, &[]), &tip);
     check_str(&new_ws(&dir_c, &[]), &tip);
     check_str(&new_ws(&dir_d, &[]), &tip);
@@ -419,7 +438,9 @@ fn run_end_to_end(lazy: bool) {
         .filter(|n| n != ".ant")
         .collect();
     top.sort();
-    if !lazy { assert_eq!(top, strs(&["src"]), "sparse workspace should only contain src/"); }
+    if !lazy {
+        assert_eq!(top, strs(&["src"]), "sparse workspace should only contain src/");
+    }
     // full workspace has everything, including exec bit
     assert_eq!(fs::read(dir_b.join("big.bin")).expect("big.bin"), big_blob());
     let mode = fs::metadata(dir_b.join("scripts/run.sh")).expect("run.sh").permissions().mode();
@@ -435,7 +456,12 @@ fn run_end_to_end(lazy: bool) {
     fs::remove_file(dir_a.join("src/util/mod.rs")).expect("delete");
     let r = ctx.run(Some(&dir_a), &["status"]);
     let lines = r.stdout().lines().map(str::to_string).collect::<Vec<_>>();
-    check_eq(&r, "status A", lines, strs(&["M\tsrc/lib.rs", "A\tsrc/new.rs", "D\tsrc/util/mod.rs"]));
+    check_eq(
+        &r,
+        "status A",
+        lines,
+        strs(&["M\tsrc/lib.rs", "A\tsrc/new.rs", "D\tsrc/util/mod.rs"]),
+    );
 
     ctx.run(Some(&dir_b), &["submit", "-m", "nothing"]).expect_code(1);
 
@@ -462,7 +488,12 @@ fn run_end_to_end(lazy: bool) {
     ctx.run(None, &["cat", "main:src/util/mod.rs"]).expect_code(1);
     let r = ctx.run(None, &["diff", &tip, "main"]);
     let lines = r.stdout().lines().map(str::to_string).collect::<Vec<_>>();
-    check_eq(&r, "diff base..main", sorted(lines), strs(&["A\tsrc/new.rs", "D\tsrc/util/mod.rs", "M\tsrc/lib.rs"]));
+    check_eq(
+        &r,
+        "diff base..main",
+        sorted(lines),
+        strs(&["A\tsrc/new.rs", "D\tsrc/util/mod.rs", "M\tsrc/lib.rs"]),
+    );
 
     // ---- B and C both change the same line of shared.txt; main already moved ----
     let shared_b = "line one\nline two\nB was here\nline four\nline five\n";
@@ -493,7 +524,12 @@ fn run_end_to_end(lazy: bool) {
         r.fail("C: stdout should start with `conflict`");
     }
     check_eq(&r, "conflict paths", lines[1..].to_vec(), strs(&["shared.txt"]));
-    check_eq(&r, "main unchanged by conflict", ctx.run(None, &["ref", "get", "main"]).ok_text(), tip_after_b.clone());
+    check_eq(
+        &r,
+        "main unchanged by conflict",
+        ctx.run(None, &["ref", "get", "main"]).ok_text(),
+        tip_after_b.clone(),
+    );
 
     // ---- D: old base, disjoint file -> rebased ----
     fs::write(dir_d.join("docs/guide.md"), "# guide\nhello from D\n").expect("edit D");
@@ -504,14 +540,26 @@ fn run_end_to_end(lazy: bool) {
     assert_id(&r, r.stdout().trim_end());
     let r = ctx.run(Some(&dir_d), &["land"]);
     let text = r.stdout();
-    let Some(id_d) = text.trim_end().strip_prefix("landed ").and_then(|s| s.strip_suffix(" rebased")) else {
+    let Some(id_d) =
+        text.trim_end().strip_prefix("landed ").and_then(|s| s.strip_suffix(" rebased"))
+    else {
         r.fail("D: expected `landed <id> rebased`");
     };
     assert_id(&r, id_d);
-    check_eq(&r, "main tip after D", ctx.run(None, &["ref", "get", "main"]).ok_text(), id_d.to_string());
+    check_eq(
+        &r,
+        "main tip after D",
+        ctx.run(None, &["ref", "get", "main"]).ok_text(),
+        id_d.to_string(),
+    );
     check_bytes(&ctx, "docs/guide.md", &cat("docs/guide.md"), b"# guide\nhello from D\n");
     check_bytes(&ctx, "shared.txt still B", &cat("shared.txt"), shared_b.as_bytes());
-    check_bytes(&ctx, "src/lib.rs still A", &cat("src/lib.rs"), b"pub fn answer() -> u32 {\n    43\n}\n");
+    check_bytes(
+        &ctx,
+        "src/lib.rs still A",
+        &cat("src/lib.rs"),
+        b"pub fn answer() -> u32 {\n    43\n}\n",
+    );
     let r = ctx.run(Some(&dir_d), &["status"]);
     check_eq(&r, "status D after land", r.stdout(), String::new());
 
