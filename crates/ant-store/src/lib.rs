@@ -203,6 +203,16 @@ pub trait MetaStore: Send + Sync + 'static {
     /// otherwise is allowed to either keep the first value or replace it.
     async fn get_derived(&self, kind: &str, key: &[u8]) -> Result<Option<Bytes>>;
     async fn put_derived(&self, kind: &str, key: &[u8], value: Bytes) -> Result<()>;
+
+    /// Index-aligned batch of [`Self::get_derived`]. Persistent stores should
+    /// override this with a single round trip.
+    async fn get_derived_many(&self, kind: &str, keys: &[&[u8]]) -> Result<Vec<Option<Bytes>>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            out.push(self.get_derived(kind, k).await?);
+        }
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
