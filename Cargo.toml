@@ -59,5 +59,9 @@ lto = "thin"
 codegen-units = 1
 debug = "line-tables-only"
 
+[profile.dev]
+# Keep the shared agent build cache small; full debuginfo is rarely needed.
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 opt-level = 2
