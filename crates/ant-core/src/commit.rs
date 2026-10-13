@@ -32,12 +32,15 @@ impl Signature {
         if gt < lt {
             return Err(bad());
         }
-        let name = s[..lt].trim_end().to_string();
+        // `encode` writes "<name> <<email>>": strip exactly that one separator so
+        // names keep any whitespace of their own (hash fidelity on import).
+        let name = s[..lt].strip_suffix(' ').unwrap_or(&s[..lt]).to_string();
         let email = s[lt + 1..gt].to_string();
         let mut rest = s[gt + 1..].split_whitespace();
         let time: i64 = rest.next().and_then(|t| t.parse().ok()).ok_or_else(bad)?;
         let tz = rest.next().ok_or_else(bad)?;
-        if tz.len() != 5 || !matches!(&tz[..1], "+" | "-") {
+        // ASCII check first: the slicing below is by byte index.
+        if tz.len() != 5 || !tz.is_ascii() || !matches!(&tz[..1], "+" | "-") {
             return Err(bad());
         }
         let hh: i32 = tz[1..3].parse().map_err(|_| bad())?;

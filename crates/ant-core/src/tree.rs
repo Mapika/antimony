@@ -23,12 +23,14 @@ impl EntryMode {
         }
     }
 
+    /// Parse a canonical mode. Non-canonical spellings are rejected so that a
+    /// tree's bytes (and therefore its id) are unique for its content.
     pub fn from_octal(s: &[u8]) -> Result<Self> {
         Ok(match s {
-            b"100644" | b"100664" => EntryMode::File,
+            b"100644" => EntryMode::File,
             b"100755" => EntryMode::Executable,
             b"120000" => EntryMode::Symlink,
-            b"40000" | b"040000" => EntryMode::Tree,
+            b"40000" => EntryMode::Tree,
             b"160000" => EntryMode::Gitlink,
             other => {
                 return Err(Error::Malformed(format!(
@@ -37,6 +39,16 @@ impl EntryMode {
                 )));
             }
         })
+    }
+
+    /// Like [`Self::from_octal`] but also accepts legacy spellings found in
+    /// old git histories (`100664`, zero-padded `040000`). For importers only.
+    pub fn from_octal_lenient(s: &[u8]) -> Result<Self> {
+        match s {
+            b"100664" => Ok(EntryMode::File),
+            b"040000" => Ok(EntryMode::Tree),
+            _ => Self::from_octal(s),
+        }
     }
 
     pub fn is_tree(self) -> bool {
@@ -153,6 +165,11 @@ impl Tree {
             let id = ObjectId::from_bytes(&body[..ObjectId::LEN])?;
             body = &body[ObjectId::LEN..];
             entries.push(TreeEntry { mode, name, id });
+        }
+        // Canonical form only: strictly increasing git order (which also rules
+        // out duplicates). Re-sorting here would make ids malleable.
+        if entries.windows(2).any(|w| git_cmp(&w[0], &w[1]) != Ordering::Less) {
+            return Err(Error::Malformed("tree entries not in canonical order".into()));
         }
         Tree::new(entries)
     }

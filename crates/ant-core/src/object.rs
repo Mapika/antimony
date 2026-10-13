@@ -75,8 +75,15 @@ impl EncodedObject {
             .position(|&b| b == b' ')
             .ok_or_else(|| Error::Malformed("missing header space".into()))?;
         let kind = ObjectKind::parse(&header[..sp])?;
-        let len: usize = std::str::from_utf8(&header[sp + 1..])
+        // Canonical decimal only (no sign, no leading zeros), so each object
+        // has exactly one encoding.
+        let digits = &header[sp + 1..];
+        let canonical = !digits.is_empty()
+            && digits.iter().all(u8::is_ascii_digit)
+            && (digits == b"0" || digits[0] != b'0');
+        let len: usize = std::str::from_utf8(digits)
             .ok()
+            .filter(|_| canonical)
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| Error::Malformed("bad length".into()))?;
         if data.len() - nul - 1 != len {

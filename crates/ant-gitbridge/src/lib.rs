@@ -326,7 +326,7 @@ impl Producer {
             let name = std::str::from_utf8(&rest[sp + 1..nul])
                 .map_err(|_| anyhow!("non-UTF-8 tree entry name in tree {id}"))?
                 .to_string();
-            let mode = EntryMode::from_octal(&rest[..sp])?;
+            let mode = EntryMode::from_octal_lenient(&rest[..sp])?;
             let child = gix::ObjectId::from_bytes_or_panic(&rest[nul + 1..oid_end]);
             let child_id = match mode {
                 EntryMode::Tree => self.convert_tree(child)?,
