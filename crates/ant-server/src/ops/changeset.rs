@@ -31,14 +31,12 @@
 //! independent of repo size.
 
 use std::collections::HashSet;
-use std::future::Future;
-use std::pin::Pin;
 
 use ant_core::{
     Commit, EncodedObject, EntryMode, Object, ObjectId, ObjectKind, RepoPath, Signature, Tree,
     TreeEntry,
 };
-use ant_store::{Backend, ObjectStoreExt, graph};
+use ant_store::{Backend, graph};
 use bytes::Bytes;
 
 use super::{OpError, OpResult};
@@ -98,7 +96,9 @@ pub async fn create_changeset(b: &Backend, req: ChangesetRequest) -> OpResult<Ob
             FileOp::Delete { .. } => Edit::Delete,
             FileOp::Write { mode, content, .. } => {
                 if !mode.is_blob() {
-                    return Err(OpError::InvalidArgument(format!("{path}: cannot write mode {mode:?}")));
+                    return Err(OpError::InvalidArgument(format!(
+                        "{path}: cannot write mode {mode:?}"
+                    )));
                 }
                 let id = match content {
                     WriteContent::Inline(data) => {
@@ -120,7 +120,15 @@ pub async fn create_changeset(b: &Backend, req: ChangesetRequest) -> OpResult<Ob
     check_blobs(b, &referenced).await?;
 
     edits.sort_by(|a, b| a.0.cmp(&b.0));
-    let root = apply(b, base_tree, &edits, 0, &mut new_objects).await?;
+    let mut directories = match base_tree {
+        Some(root) => {
+            let paths: Vec<_> = req.ops.iter().map(|op| op.path().clone()).collect();
+            let [dirs] = super::land::load_directories(b, [root], &paths).await?;
+            dirs
+        }
+        None => Default::default(),
+    };
+    let root = apply(&mut directories, base_tree, &edits, 0, &mut new_objects)?;
     let tree = match root {
         Some(id) => id,
         None => {
@@ -159,7 +167,10 @@ async fn check_blobs(b: &Backend, ids: &[ObjectId]) -> OpResult<()> {
         match o {
             None => return Err(OpError::not_found_object(*id)),
             Some(o) if o.kind() != ObjectKind::Blob => {
-                return Err(OpError::InvalidArgument(format!("{id} is a {:?}, not a blob", o.kind())));
+                return Err(OpError::InvalidArgument(format!(
+                    "{id} is a {:?}, not a blob",
+                    o.kind()
+                )));
             }
             Some(_) => {}
         }
@@ -170,89 +181,96 @@ async fn check_blobs(b: &Backend, ids: &[ObjectId]) -> OpResult<()> {
 /// Apply `edits` (sorted by components, all sharing the first `depth`
 /// components) to the tree `base`. Returns the new tree id, or `None` if the
 /// directory ends up empty. New trees are appended to `out`.
-fn apply<'a>(
-    b: &'a Backend,
+fn apply(
+    directories: &mut super::land::Directories,
     base: Option<ObjectId>,
-    edits: &'a [(Vec<&'a str>, Edit)],
+    edits: &[(Vec<&str>, Edit)],
     depth: usize,
-    out: &'a mut Vec<EncodedObject>,
-) -> Pin<Box<dyn Future<Output = OpResult<Option<ObjectId>>> + Send + 'a>> {
-    Box::pin(async move {
-        let mut tree = match base {
-            Some(id) => b.objects.read_tree(&id).await?,
-            None => Tree::empty(),
+    out: &mut Vec<EncodedObject>,
+) -> OpResult<Option<ObjectId>> {
+    let mut tree = match base {
+        Some(_) => {
+            let path = RepoPath::new(
+                edits.first().map(|(parts, _)| parts[..depth].join("/")).unwrap_or_default(),
+            )?;
+            directories
+                .remove(&path)
+                .ok_or_else(|| OpError::InvalidArgument(format!("missing directory {path}")))?
+        }
+        None => Tree::empty(),
+    };
+    let mut i = 0;
+    while i < edits.len() {
+        let name = edits[i].0[depth];
+        let end = i + edits[i..].iter().take_while(|(c, _)| c[depth] == name).count();
+        let group = &edits[i..end];
+        i = end;
+
+        // Sorting puts the edit for `name` itself before edits beneath it.
+        let (own, nested) = match group.first() {
+            Some((c, e)) if c.len() == depth + 1 => (Some(*e), &group[1..]),
+            _ => (None, group),
         };
-        let mut i = 0;
-        while i < edits.len() {
-            let name = edits[i].0[depth];
-            let end = i + edits[i..].iter().take_while(|(c, _)| c[depth] == name).count();
-            let group = &edits[i..end];
-            i = end;
+        let existing = tree.get(name).cloned();
+        let display = || group[0].0[..=depth].join("/");
 
-            // Sorting puts the edit for `name` itself before edits beneath it.
-            let (own, nested) = match group.first() {
-                Some((c, e)) if c.len() == depth + 1 => (Some(*e), &group[1..]),
-                _ => (None, group),
-            };
-            let existing = tree.get(name).cloned();
-            let display = || group[0].0[..=depth].join("/");
-
-            if nested.is_empty() {
-                match (own, existing) {
-                    (Some(Edit::Write(..)), Some(e)) if e.mode.is_tree() => {
-                        return Err(OpError::InvalidArgument(format!("{} is a directory", display())));
-                    }
-                    (Some(Edit::Write(mode, id)), _) => {
-                        tree.upsert(TreeEntry { mode, name: name.to_string(), id })?;
-                    }
-                    (Some(Edit::Delete), Some(e)) if !e.mode.is_tree() => {
-                        tree.remove(name);
-                    }
-                    (Some(Edit::Delete), _) => {
-                        return Err(OpError::NotFound(format!("file {}", display())));
-                    }
-                    (None, _) => unreachable!("group has at least one edit"),
+        if nested.is_empty() {
+            match (own, existing) {
+                (Some(Edit::Write(..)), Some(e)) if e.mode.is_tree() => {
+                    return Err(OpError::InvalidArgument(format!("{} is a directory", display())));
                 }
-                continue;
-            }
-
-            let sub_base = match (own, existing) {
-                (Some(Edit::Write(..)), _) => {
-                    return Err(OpError::InvalidArgument(format!(
-                        "{} is written as a file and used as a directory",
-                        display()
-                    )));
+                (Some(Edit::Write(mode, id)), _) => {
+                    tree.upsert(TreeEntry { mode, name: name.to_string(), id })?;
                 }
-                (Some(Edit::Delete), Some(e)) if !e.mode.is_tree() => None,
+                (Some(Edit::Delete), Some(e)) if !e.mode.is_tree() => {
+                    tree.remove(name);
+                }
                 (Some(Edit::Delete), _) => {
                     return Err(OpError::NotFound(format!("file {}", display())));
                 }
-                (None, Some(e)) if e.mode.is_tree() => Some(e.id),
-                // Below a file: writing there is a path conflict, while
-                // deleting there targets a file that does not exist.
-                (None, Some(_)) if nested.iter().all(|(_, e)| matches!(e, Edit::Delete)) => {
-                    return Err(OpError::NotFound(format!("{} is not a directory", display())));
-                }
-                (None, Some(_)) => {
-                    return Err(OpError::InvalidArgument(format!("{} is not a directory", display())));
-                }
-                (None, None) => None,
-            };
-            match apply(b, sub_base, nested, depth + 1, out).await? {
-                Some(id) => tree.upsert(TreeEntry { mode: EntryMode::Tree, name: name.to_string(), id })?,
-                None => {
-                    tree.remove(name);
-                }
+                (None, _) => unreachable!("group has at least one edit"),
+            }
+            continue;
+        }
+
+        let sub_base = match (own, existing) {
+            (Some(Edit::Write(..)), _) => {
+                return Err(OpError::InvalidArgument(format!(
+                    "{} is written as a file and used as a directory",
+                    display()
+                )));
+            }
+            (Some(Edit::Delete), Some(e)) if !e.mode.is_tree() => None,
+            (Some(Edit::Delete), _) => {
+                return Err(OpError::NotFound(format!("file {}", display())));
+            }
+            (None, Some(e)) if e.mode.is_tree() => Some(e.id),
+            // Below a file: writing there is a path conflict, while
+            // deleting there targets a file that does not exist.
+            (None, Some(_)) if nested.iter().all(|(_, e)| matches!(e, Edit::Delete)) => {
+                return Err(OpError::NotFound(format!("{} is not a directory", display())));
+            }
+            (None, Some(_)) => {
+                return Err(OpError::InvalidArgument(format!("{} is not a directory", display())));
+            }
+            (None, None) => None,
+        };
+        match apply(directories, sub_base, nested, depth + 1, out)? {
+            Some(id) => {
+                tree.upsert(TreeEntry { mode: EntryMode::Tree, name: name.to_string(), id })?
+            }
+            None => {
+                tree.remove(name);
             }
         }
-        if tree.is_empty() {
-            return Ok(None);
-        }
-        let obj = Object::Tree(tree).encode();
-        let id = obj.id();
-        out.push(obj);
-        Ok(Some(id))
-    })
+    }
+    if tree.is_empty() {
+        return Ok(None);
+    }
+    let obj = Object::Tree(tree).encode();
+    let id = obj.id();
+    out.push(obj);
+    Ok(Some(id))
 }
 
 #[cfg(test)]
