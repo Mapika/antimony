@@ -15,18 +15,27 @@ use ant_server::config::StoreArgs;
 use anyhow::Context as _;
 
 use crate::json::J;
-use crate::util::{Metrics, cpu_seconds, instrument, mib, peak_rss_bytes};
-use crate::{StoreInfo, write_json};
+use crate::util::{Metrics, cpu_seconds, instrument, mib, peak_rss_bytes, write_json};
 
+#[derive(clap::Args, Debug)]
 pub struct Args {
+    /// Path to the git directory (bare repo or work tree).
     pub git_dir: PathBuf,
+    #[arg(long, default_value = "refs/heads/master")]
     pub git_ref: String,
+    /// Antimony ref to point at the imported tip.
+    #[arg(long, default_value = "main")]
     pub ant_ref: String,
+    /// Objects per store batch (ImportOptions::batch_objects).
+    #[arg(long, default_value_t = 1024)]
     pub batch_objects: usize,
+    /// Stop (and report partial numbers) after this many seconds; 0 = no limit.
+    #[arg(long, default_value_t = 0)]
     pub max_seconds: u64,
+    #[arg(long)]
     pub json: Option<PathBuf>,
+    #[command(flatten)]
     pub store: StoreArgs,
-    pub info: StoreInfo,
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
@@ -115,9 +124,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let objects =
         if timed_out { put_objects.items() } else { stats.commits + stats.trees + stats.blobs };
 
-    let pg = match (&args.info.pg_url, &args.info.pg_schema) {
-        (Some(url), Some(schema)) => Some(pg_size(url, schema).await?),
-        _ => None,
+    let pg = match args.store.pg_url() {
+        Some(url) => Some(pg_size(url, args.store.pg_schema()).await?),
+        None => None,
     };
 
     let rss = peak_rss_bytes();

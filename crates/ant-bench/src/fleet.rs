@@ -23,26 +23,38 @@ use rand::{Rng, SeedableRng};
 use tonic::transport::Channel;
 
 use crate::json::J;
-use crate::util::{Lat, Metrics, cpu_seconds, instrument, peak_rss_bytes};
-use crate::{StoreInfo, write_json};
+use crate::util::{Lat, Metrics, cpu_seconds, instrument, peak_rss_bytes, write_json};
 
 const HOT_PATH: &str = "hot/counter.txt";
 const HOT_LINES: usize = 50;
 
+#[derive(clap::Args, Debug)]
 pub struct Args {
+    #[arg(long, default_value_t = 16)]
     pub agents: usize,
+    /// Run duration in seconds.
+    #[arg(long, default_value_t = 20)]
     pub duration: u64,
+    /// gRPC URL of a running server (e.g. http://127.0.0.1:7420).
+    #[arg(long)]
     pub server: Option<String>,
+    /// Serve in-process using the store flags below.
+    #[arg(long)]
     pub embedded: bool,
+    /// Files written per changeset.
+    #[arg(long, default_value_t = 4)]
     pub files_per_change: usize,
+    /// Probability that a change also rewrites one line of the shared hot file.
+    #[arg(long, default_value_t = 0.0)]
     pub hot_rate: f64,
+    #[arg(long = "ref", default_value = "main")]
     pub ref_name: String,
+    #[arg(long, default_value_t = 1)]
     pub seed: u64,
-    pub nodelay: bool,
+    #[arg(long)]
     pub json: Option<PathBuf>,
+    #[command(flatten)]
     pub store: StoreArgs,
-    #[allow(dead_code)]
-    pub info: StoreInfo,
 }
 
 type Client = AntClient<Channel>;
@@ -299,8 +311,6 @@ pub async fn run(args: Args) -> Result<i32> {
             let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let http_l = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let addr = grpc.local_addr()?;
-            // `serve_on` enables TCP_NODELAY; `--nodelay` is kept as a no-op.
-            let _ = args.nodelay;
             tokio::spawn(rpc::serve_on(backend.clone(), grpc));
             tokio::spawn(http::serve_on(backend, http_l));
             (format!("http://{addr}"), "embedded")

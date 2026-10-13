@@ -49,6 +49,16 @@ pub struct StoreArgs {
 }
 
 impl StoreArgs {
+    /// The Postgres URL, when a Postgres backend is selected.
+    pub fn pg_url(&self) -> Option<&str> {
+        self.pg_url.as_deref()
+    }
+
+    /// The Postgres schema holding the tables.
+    pub fn pg_schema(&self) -> &str {
+        &self.pg_schema
+    }
+
     pub fn s3_config(&self) -> anyhow::Result<Option<S3Config>> {
         let any = self.s3_endpoint.is_some()
             || self.s3_bucket.is_some()

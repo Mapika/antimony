@@ -1,7 +1,9 @@
-//! Shared helpers: latency stats, process metrics, and store-timing wrappers.
+//! Shared helpers: latency stats, process metrics, store-timing wrappers,
+//! JSON output and directory sizes.
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -10,6 +12,7 @@ use ant_core::{EncodedObject, ObjectId};
 use ant_store::{
     Backend, CasOutcome, CommitNode, MetaStore, ObjectStore, PathChange, RefStore, Result,
 };
+use anyhow::Context as _;
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -412,4 +415,44 @@ pub fn instrument(backend: &Backend, m: &Metrics, prefix: &str) -> Backend {
 /// Counting/timing wrapper for any `ObjectStore` (used on the checkout path).
 pub fn timed_store(inner: Arc<dyn ObjectStore>, m: &Metrics, prefix: &str) -> Arc<dyn ObjectStore> {
     Arc::new(TimedObjects::new(inner, m, prefix))
+}
+
+// ---------------------------------------------------------------------------
+// Output and filesystem helpers
+// ---------------------------------------------------------------------------
+
+pub fn write_json(path: &Option<PathBuf>, value: &J) -> anyhow::Result<()> {
+    if let Some(p) = path {
+        std::fs::write(p, value.render()).with_context(|| format!("writing {}", p.display()))?;
+        println!("wrote {}", p.display());
+    }
+    Ok(())
+}
+
+pub fn dir_size(path: &Path) -> (u64, u64) {
+    // (files, bytes); skips the `.ant` state dir at the top level only when asked
+    // by callers via `dir_size_skip`.
+    dir_size_skip(path, None)
+}
+
+pub fn dir_size_skip(path: &Path, skip: Option<&str>) -> (u64, u64) {
+    let mut files = 0;
+    let mut bytes = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            if dir == path && skip.is_some_and(|s| entry.file_name() == s) {
+                continue;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else {
+                files += 1;
+                bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    (files, bytes)
 }
