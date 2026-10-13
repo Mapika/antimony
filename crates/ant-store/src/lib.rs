@@ -181,6 +181,15 @@ pub struct PathChange {
     pub new: Option<(EntryMode, ObjectId)>,
 }
 
+/// One row of a ref's path-history index: `commit` (on the ref's first-parent
+/// chain) changed `path` (a non-tree path, as in its changeset).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryRow {
+    pub path: RepoPath,
+    pub generation: u64,
+    pub commit: ObjectId,
+}
+
 #[async_trait]
 pub trait MetaStore: Send + Sync + 'static {
     /// Record a commit and its changeset (sorted by path) atomically, and
@@ -203,6 +212,36 @@ pub trait MetaStore: Send + Sync + 'static {
     /// otherwise is allowed to either keep the first value or replace it.
     async fn get_derived(&self, kind: &str, key: &[u8]) -> Result<Option<Bytes>>;
     async fn put_derived(&self, kind: &str, key: &[u8], value: Bytes) -> Result<()>;
+
+    /// Add rows to `ref_name`'s path-history index. Idempotent.
+    async fn index_history(&self, ref_name: &str, rows: &[HistoryRow]) -> Result<()>;
+
+    /// Distinct commits in `ref_name`'s index having a row whose path equals
+    /// `prefix` or lies under it (root prefix = every row), with generation
+    /// `<= max_generation`; ordered by generation descending, at most `limit`.
+    async fn query_history(
+        &self,
+        ref_name: &str,
+        prefix: &RepoPath,
+        max_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, ObjectId)>>;
+
+    /// Last commit indexed for `ref_name` (the indexer's watermark).
+    async fn history_watermark(&self, ref_name: &str) -> Result<Option<ObjectId>>;
+
+    /// Atomically move the watermark from `expected` to `new` (CAS, like
+    /// refs). Returns false on mismatch.
+    async fn set_history_watermark(
+        &self,
+        ref_name: &str,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+    ) -> Result<bool>;
+
+    /// Drop all rows and the watermark for `ref_name` (used when a ref is
+    /// moved non-fast-forward and its index must be rebuilt).
+    async fn clear_history(&self, ref_name: &str) -> Result<()>;
 
     /// Index-aligned batch of [`Self::get_derived`]. Persistent stores should
     /// override this with a single round trip.

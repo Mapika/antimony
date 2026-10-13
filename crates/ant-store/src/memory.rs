@@ -8,8 +8,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
+use ant_core::RepoPath;
+
 use crate::{
-    CasOutcome, CommitNode, MetaStore, ObjectStore, PathChange, RefStore, Result,
+    CasOutcome, CommitNode, HistoryRow, MetaStore, ObjectStore, PathChange, RefStore, Result,
     validate_ref_name,
 };
 
@@ -96,6 +98,9 @@ struct MetaInner {
     commits: HashMap<ObjectId, (u64, CommitNode, Vec<PathChange>)>,
     log: Vec<(u64, ObjectId)>,
     derived: HashMap<(String, Vec<u8>), Bytes>,
+    /// ref -> (path, generation, commit) rows, deduplicated.
+    history: HashMap<String, std::collections::BTreeSet<(String, u64, ObjectId)>>,
+    watermarks: HashMap<String, ObjectId>,
 }
 
 #[derive(Default)]
@@ -139,6 +144,64 @@ impl MetaStore for MemoryMetaStore {
         self.inner.lock().derived.insert((kind.to_string(), key.to_vec()), value);
         Ok(())
     }
+
+    async fn index_history(&self, ref_name: &str, rows: &[HistoryRow]) -> Result<()> {
+        let mut m = self.inner.lock();
+        let set = m.history.entry(ref_name.to_string()).or_default();
+        for r in rows {
+            set.insert((r.path.as_str().to_string(), r.generation, r.commit));
+        }
+        Ok(())
+    }
+
+    async fn query_history(
+        &self,
+        ref_name: &str,
+        prefix: &RepoPath,
+        max_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, ObjectId)>> {
+        let m = self.inner.lock();
+        let mut hits: Vec<(u64, ObjectId)> = m
+            .history
+            .get(ref_name)
+            .into_iter()
+            .flatten()
+            .filter(|(p, g, _)| {
+                *g <= max_generation && RepoPath::new(p.clone()).is_ok_and(|p| p.starts_with(prefix))
+            })
+            .map(|(_, g, c)| (*g, *c))
+            .collect();
+        hits.sort_unstable_by(|a, b| b.cmp(a));
+        hits.dedup();
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    async fn history_watermark(&self, ref_name: &str) -> Result<Option<ObjectId>> {
+        Ok(self.inner.lock().watermarks.get(ref_name).copied())
+    }
+
+    async fn set_history_watermark(
+        &self,
+        ref_name: &str,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+    ) -> Result<bool> {
+        let mut m = self.inner.lock();
+        if m.watermarks.get(ref_name).copied() != expected {
+            return Ok(false);
+        }
+        m.watermarks.insert(ref_name.to_string(), new);
+        Ok(true)
+    }
+
+    async fn clear_history(&self, ref_name: &str) -> Result<()> {
+        let mut m = self.inner.lock();
+        m.history.remove(ref_name);
+        m.watermarks.remove(ref_name);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -161,5 +224,6 @@ mod tests {
     #[tokio::test]
     async fn memory_meta_store_conforms() {
         conformance::meta_store(Arc::new(MemoryMetaStore::default())).await;
+        conformance::history_index(Arc::new(MemoryMetaStore::default())).await;
     }
 }

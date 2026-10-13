@@ -348,6 +348,45 @@ impl RefStore for PgStore {
 
 #[async_trait]
 impl MetaStore for PgStore {
+    // TASK (history): implement with a `history(ref, path, generation, commit)`
+    // table (PK on all four; index on (ref, path text_pattern_ops, generation
+    // DESC)) and a `history_watermark(ref PK, commit)` table. query_history
+    // must be ONE query: `path = $p OR path LIKE $p || '/%'` (escape LIKE
+    // metacharacters in $p; root prefix = no path filter), `generation <= $max`,
+    // `SELECT DISTINCT generation, commit ... ORDER BY generation DESC LIMIT`.
+    // Also override get_derived_many with a single `key = ANY($2)` query.
+    async fn index_history(&self, ref_name: &str, rows: &[crate::HistoryRow]) -> Result<()> {
+        let _ = (ref_name, rows);
+        todo!("history")
+    }
+    async fn query_history(
+        &self,
+        ref_name: &str,
+        prefix: &ant_core::RepoPath,
+        max_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, ObjectId)>> {
+        let _ = (ref_name, prefix, max_generation, limit);
+        todo!("history")
+    }
+    async fn history_watermark(&self, ref_name: &str) -> Result<Option<ObjectId>> {
+        let _ = ref_name;
+        todo!("history")
+    }
+    async fn set_history_watermark(
+        &self,
+        ref_name: &str,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+    ) -> Result<bool> {
+        let _ = (ref_name, expected, new);
+        todo!("history")
+    }
+    async fn clear_history(&self, ref_name: &str) -> Result<()> {
+        let _ = ref_name;
+        todo!("history")
+    }
+
     async fn put_commit(&self, node: CommitNode, changes: Vec<PathChange>) -> Result<u64> {
         let mut tx = self.pool.begin().await.map_err(be)?;
         let parents: Vec<u8> = node
@@ -588,6 +627,12 @@ mod tests {
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_ref_store_conforms() {
         conformance::ref_store(Arc::new(fresh().await)).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_history_index_conforms() {
+        conformance::history_index(Arc::new(fresh().await)).await;
     }
 
     #[tokio::test]

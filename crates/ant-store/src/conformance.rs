@@ -7,8 +7,8 @@ use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, RepoPath};
 use bytes::Bytes;
 
 use crate::{
-    CasOutcome, ChangeKind, CommitNode, MetaStore, ObjectStore, ObjectStoreExt, PathChange,
-    RefStore, StoreError,
+    CasOutcome, ChangeKind, CommitNode, HistoryRow, MetaStore, ObjectStore, ObjectStoreExt,
+    PathChange, RefStore, StoreError,
 };
 
 fn blob(s: &[u8]) -> EncodedObject {
@@ -208,4 +208,48 @@ pub async fn meta_store(s: Arc<dyn MetaStore>) {
     assert_eq!(s.get_derived("k/v2", b"key").await.unwrap(), None);
     s.put_derived("k/v1", &[0, 255, 1], Bytes::from_static(&[9; 100])).await.unwrap();
     assert_eq!(s.get_derived("k/v1", &[0, 255, 1]).await.unwrap().unwrap().len(), 100);
+}
+
+/// History-index suite (part of the meta-store contract).
+pub async fn history_index(s: Arc<dyn MetaStore>) {
+    let c = |n: u8| ObjectId([n; 32]);
+    let row = |p: &str, g: u64, n: u8| HistoryRow { path: RepoPath::new(p).unwrap(), generation: g, commit: c(n) };
+    let p = |x: &str| RepoPath::new(x).unwrap();
+
+    assert_eq!(s.query_history("main", &RepoPath::root(), u64::MAX, 10).await.unwrap(), vec![]);
+    s.index_history(
+        "main",
+        &[row("src/a.rs", 1, 1), row("README", 1, 1), row("src/b/c.rs", 2, 2), row("docs/x", 3, 3), row("src/a.rs", 4, 4)],
+    )
+    .await
+    .unwrap();
+    // Idempotent.
+    s.index_history("main", &[row("src/a.rs", 4, 4)]).await.unwrap();
+    s.index_history("other", &[row("src/a.rs", 9, 9)]).await.unwrap();
+
+    let q = |prefix: &str, max: u64, limit: usize| {
+        let s = s.clone();
+        let prefix = if prefix.is_empty() { RepoPath::root() } else { p(prefix) };
+        async move { s.query_history("main", &prefix, max, limit).await.unwrap() }
+    };
+    assert_eq!(q("", u64::MAX, 10).await, vec![(4, c(4)), (3, c(3)), (2, c(2)), (1, c(1))]);
+    assert_eq!(q("src", u64::MAX, 10).await, vec![(4, c(4)), (2, c(2)), (1, c(1))]);
+    assert_eq!(q("src/a.rs", u64::MAX, 10).await, vec![(4, c(4)), (1, c(1))]);
+    assert_eq!(q("src/a.rs", 3, 10).await, vec![(1, c(1))]);
+    assert_eq!(q("src", u64::MAX, 2).await, vec![(4, c(4)), (2, c(2))]);
+    // Prefix is component-wise: "sr" matches nothing, "src/b" only c.rs.
+    assert_eq!(q("sr", u64::MAX, 10).await, vec![]);
+    assert_eq!(q("src/b", u64::MAX, 10).await, vec![(2, c(2))]);
+
+    // Watermark CAS.
+    assert_eq!(s.history_watermark("main").await.unwrap(), None);
+    assert!(s.set_history_watermark("main", None, c(4)).await.unwrap());
+    assert!(!s.set_history_watermark("main", None, c(5)).await.unwrap());
+    assert!(s.set_history_watermark("main", Some(c(4)), c(5)).await.unwrap());
+    assert_eq!(s.history_watermark("main").await.unwrap(), Some(c(5)));
+
+    s.clear_history("main").await.unwrap();
+    assert_eq!(s.history_watermark("main").await.unwrap(), None);
+    assert_eq!(q("", u64::MAX, 10).await, vec![]);
+    assert_eq!(s.query_history("other", &RepoPath::root(), u64::MAX, 10).await.unwrap(), vec![(9, c(9))]);
 }

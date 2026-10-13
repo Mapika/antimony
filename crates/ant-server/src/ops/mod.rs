@@ -3,6 +3,7 @@
 //! `Backend::in_memory()`.
 
 pub mod changeset;
+pub mod history;
 pub mod land;
 pub mod query;
 
