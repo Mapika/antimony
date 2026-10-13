@@ -12,7 +12,7 @@
 //!   fine for idempotency (content is identical by construction).
 //! - A missing key (`NoSuchKey` / 404) is `None`, not an error. `has_many`
 //!   uses HEAD.
-//! - `connect` builds a client with `force_path_style(true)` (MinIO needs
+//! - `connect` builds a client with `force_path_style(true)` (SeaweedFS/MinIO need
 //!   it), static credentials, the given region and endpoint.
 //! - `ensure_bucket` creates the bucket if it does not exist (treat
 //!   "already owned by you" as success).
@@ -33,7 +33,7 @@ pub struct S3Config {
 }
 
 impl S3Config {
-    /// Local MinIO from docker-compose.yml, overridable via `ANT_TEST_S3_*`.
+    /// Local S3 (SeaweedFS) from docker-compose.yml, overridable via `ANT_TEST_S3_*`.
     pub fn for_tests(prefix: &str) -> Self {
         let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
         Self {
@@ -41,8 +41,8 @@ impl S3Config {
             region: "us-east-1".into(),
             bucket: env("ANT_TEST_S3_BUCKET", "ant-test"),
             prefix: prefix.to_string(),
-            access_key: env("ANT_TEST_S3_ACCESS_KEY", "minioadmin"),
-            secret_key: env("ANT_TEST_S3_SECRET_KEY", "minioadmin"),
+            access_key: env("ANT_TEST_S3_ACCESS_KEY", "ant"),
+            secret_key: env("ANT_TEST_S3_SECRET_KEY", "ant"),
         }
     }
 }
@@ -105,13 +105,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs minio: docker compose up -d"]
+    #[ignore = "needs s3: docker compose up -d"]
     async fn s3_object_store_conforms() {
         conformance::object_store(Arc::new(fresh().await)).await;
     }
 
     #[tokio::test]
-    #[ignore = "needs minio: docker compose up -d"]
+    #[ignore = "needs s3: docker compose up -d"]
     async fn key_layout() {
         let s = fresh().await;
         let id = ObjectId([0xab; 32]);
