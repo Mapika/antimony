@@ -15,10 +15,21 @@
 //!   changesets, land, queries) — the CLI uses it directly.
 
 use ant_core::{EncodedObject, ObjectId};
+use ant_proto::MAX_MESSAGE_BYTES;
+use ant_proto::v1 as pb;
 use ant_proto::v1::ant_client::AntClient;
-use ant_store::{ObjectStore, Result};
+use ant_store::{ObjectStore, Result, StoreError};
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use tonic::transport::Channel;
+
+/// Concurrent HTTP object fetches.
+const HTTP_CONCURRENCY: usize = 64;
+/// Max ids per `GetObjects` / `HasObjects` request.
+const RPC_IDS_PER_REQUEST: usize = 4096;
+/// Max total payload bytes per `PutObjects` request.
+const PUT_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct RemoteObjectStore {
@@ -26,31 +37,164 @@ pub struct RemoteObjectStore {
     client: AntClient<Channel>,
     #[allow(dead_code)]
     http_base: Option<String>,
+    http: reqwest::Client,
 }
 
 impl RemoteObjectStore {
     pub async fn connect(grpc_url: &str, http_base: Option<&str>) -> anyhow::Result<Self> {
-        let _ = (grpc_url, http_base);
-        todo!("transport")
+        let channel = Channel::from_shared(grpc_url.to_owned())?.connect().await?;
+        let client = AntClient::new(channel)
+            .max_decoding_message_size(MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES);
+        Ok(Self {
+            client,
+            http_base: http_base.map(|b| b.trim_end_matches('/').to_owned()),
+            http: reqwest::Client::new(),
+        })
     }
 
     pub fn client(&self) -> AntClient<Channel> {
         self.client.clone()
+    }
+
+    /// Fetch every id over HTTP. Any failure (transport, unexpected status,
+    /// hash mismatch) is an error so the caller can fall back to gRPC.
+    async fn get_many_http(&self, base: &str, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
+        let http = self.http.clone();
+        let base = base.to_owned();
+        stream::iter(ids.iter().copied())
+            .map(move |id| {
+                let http = http.clone();
+                let url = format!("{base}/o/{}", id.to_hex());
+                async move { fetch_http_object(&http, &url, id).await }
+            })
+            .buffered(HTTP_CONCURRENCY)
+            .try_collect()
+            .await
+    }
+
+    /// Fetch ids via the `GetObjects` stream, in chunks of at most
+    /// `RPC_IDS_PER_REQUEST`. Results are returned in input order.
+    async fn get_many_grpc(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(RPC_IDS_PER_REQUEST) {
+            let req = pb::GetObjectsRequest { ids: chunk.iter().map(|i| i.0.to_vec()).collect() };
+            let mut stream = self
+                .client
+                .clone()
+                .get_objects(req)
+                .await
+                .map_err(StoreError::backend)?
+                .into_inner();
+            let mut received = 0usize;
+            while let Some(item) = stream.message().await.map_err(StoreError::backend)? {
+                let expected = chunk.get(received).ok_or_else(|| protocol_error("extra object in stream"))?;
+                if item.id != expected.0 {
+                    return Err(protocol_error("object stream out of order"));
+                }
+                out.push(if item.found {
+                    Some(decode_verified(Bytes::from(item.data), expected)?)
+                } else {
+                    None
+                });
+                received += 1;
+            }
+            if received != chunk.len() {
+                return Err(protocol_error("object stream ended early"));
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn protocol_error(msg: &str) -> StoreError {
+    StoreError::backend(std::io::Error::other(format!("protocol error: {msg}")))
+}
+
+fn decode_verified(data: Bytes, id: &ObjectId) -> Result<EncodedObject> {
+    let obj = EncodedObject::from_bytes(data)?;
+    obj.verify(id)?;
+    Ok(obj)
+}
+
+async fn fetch_http_object(http: &reqwest::Client, url: &str, id: ObjectId) -> Result<Option<EncodedObject>> {
+    let resp = http.get(url).send().await.map_err(StoreError::backend)?;
+    match resp.status() {
+        s if s == reqwest::StatusCode::NOT_FOUND => Ok(None),
+        s if s.is_success() => {
+            let body = resp.bytes().await.map_err(StoreError::backend)?;
+            Ok(Some(decode_verified(body, &id)?))
+        }
+        s => Err(StoreError::backend(std::io::Error::other(format!("HTTP {s} for {url}")))),
     }
 }
 
 #[async_trait]
 impl ObjectStore for RemoteObjectStore {
     async fn get_many(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
-        let _ = ids;
-        todo!("transport")
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(base) = &self.http_base {
+            match self.get_many_http(base, ids).await {
+                Ok(objects) => return Ok(objects),
+                Err(e) => tracing::debug!(error = %e, "HTTP object read failed; falling back to gRPC"),
+            }
+        }
+        self.get_many_grpc(ids).await
     }
+
     async fn put_many(&self, objects: &[EncodedObject]) -> Result<()> {
-        let _ = objects;
-        todo!("transport")
+        let mut batch: Vec<Vec<u8>> = Vec::new();
+        let mut batch_bytes = 0usize;
+        for obj in objects {
+            let len = obj.as_bytes().len();
+            if !batch.is_empty() && batch_bytes + len > PUT_BATCH_BYTES {
+                self.put_batch(std::mem::take(&mut batch)).await?;
+                batch_bytes = 0;
+            }
+            batch.push(obj.as_bytes().to_vec());
+            batch_bytes += len;
+        }
+        if !batch.is_empty() {
+            self.put_batch(batch).await?;
+        }
+        Ok(())
     }
+
     async fn has_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {
-        let _ = ids;
-        todo!("transport")
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(RPC_IDS_PER_REQUEST) {
+            let req = pb::HasObjectsRequest { ids: chunk.iter().map(|i| i.0.to_vec()).collect() };
+            let resp = self
+                .client
+                .clone()
+                .has_objects(req)
+                .await
+                .map_err(StoreError::backend)?
+                .into_inner();
+            if resp.present.len() != chunk.len() {
+                return Err(protocol_error("HasObjects response length mismatch"));
+            }
+            out.extend(resp.present);
+        }
+        Ok(out)
+    }
+}
+
+impl RemoteObjectStore {
+    async fn put_batch(&self, data: Vec<Vec<u8>>) -> Result<()> {
+        let expected = data.len();
+        let resp = self
+            .client
+            .clone()
+            .put_objects(pb::PutObjectsRequest { data })
+            .await
+            .map_err(StoreError::backend)?
+            .into_inner();
+        if resp.ids.len() != expected {
+            return Err(protocol_error("PutObjects response length mismatch"));
+        }
+        Ok(())
     }
 }
