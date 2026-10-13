@@ -330,7 +330,14 @@ impl Producer {
             let child = gix::ObjectId::from_bytes_or_panic(&rest[nul + 1..oid_end]);
             let child_id = match mode {
                 EntryMode::Tree => self.convert_tree(child)?,
-                EntryMode::Gitlink => bail!("submodule entry {name:?} in tree {id} is not supported"),
+                // Submodule pointer: carried through, never fetched. The foreign
+                // commit id is zero-padded to 32 bytes (lossless for SHA-1/256).
+                EntryMode::Gitlink => {
+                    let mut raw = [0u8; 32];
+                    let n = child.as_bytes().len().min(32);
+                    raw[..n].copy_from_slice(&child.as_bytes()[..n]);
+                    ObjectId(raw)
+                }
                 _ => self.convert_blob(child)?,
             };
             entries.push(TreeEntry { mode, name, id: child_id });
