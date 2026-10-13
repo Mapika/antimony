@@ -1,7 +1,11 @@
 //! Read-only Git protocol-v2 smart HTTP export of an antimony backend.
 //!
-//! TASK (gitserve): SHA-256 upload-pack, shallow and blobless fetches, and
-//! bounded incremental pack streaming. Commits must be recorded in MetaStore.
+//! Serves SHA-256 `upload-pack` (`ls-refs`, `fetch` with `shallow` and
+//! `filter blob:none`) at `/repo.git`; `receive-pack` is refused. Packs are
+//! streamed with bounded memory and delta-compress trees and blobs against
+//! the previous version of the same path (see `delta.rs`, `README.md`).
+//! Commits served must be recorded in the MetaStore (generation numbers bound
+//! the `have` walk).
 mod delta;
 mod pack;
 mod protocol;
