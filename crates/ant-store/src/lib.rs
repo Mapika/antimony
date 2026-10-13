@@ -202,6 +202,40 @@ pub trait MetaStore: Send + Sync + 'static {
 
     async fn get_changeset(&self, id: &ObjectId) -> Result<Option<Vec<PathChange>>>;
 
+    /// Index-aligned batch of [`Self::get_changeset`]. Persistent stores
+    /// should override this with a single round trip.
+    async fn get_changesets(&self, ids: &[ObjectId]) -> Result<Vec<Option<Vec<PathChange>>>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(self.get_changeset(id).await?);
+        }
+        Ok(out)
+    }
+
+    /// The first-parent chain starting at `tip` (inclusive), newest first, at
+    /// most `limit` nodes, ending before `stop` (exclusive) when it is reached.
+    /// Stops early at a root or an unrecorded commit. The default walks with
+    /// one `get_commits` per commit; persistent stores should override this
+    /// with a single server-side traversal.
+    async fn first_parent_chain(
+        &self,
+        tip: ObjectId,
+        stop: Option<ObjectId>,
+        limit: usize,
+    ) -> Result<Vec<CommitNode>> {
+        let mut out = Vec::new();
+        let mut next = Some(tip);
+        while let Some(id) = next.filter(|id| Some(*id) != stop) {
+            if out.len() >= limit {
+                break;
+            }
+            let Some(node) = self.get_commits(&[id]).await?.pop().flatten() else { break };
+            next = node.parents.first().copied();
+            out.push(node);
+        }
+        Ok(out)
+    }
+
     /// Log entries with sequence number `> after`, ascending, at most `limit`.
     /// Sequence numbers start at 1 and strictly increase (gaps allowed).
     async fn tail(&self, after: u64, limit: usize) -> Result<Vec<(u64, ObjectId)>>;

@@ -170,9 +170,20 @@ pub async fn meta_store(s: Arc<dyn MetaStore>) {
         s.get_commits(&[c2, ObjectId([3; 32]), c1]).await.unwrap(),
         vec![Some(n2.clone()), None, Some(n1.clone())]
     );
-    assert_eq!(s.get_changeset(&c2).await.unwrap(), Some(ch2));
+    assert_eq!(s.get_changeset(&c2).await.unwrap(), Some(ch2.clone()));
     assert_eq!(s.get_changeset(&c1).await.unwrap(), Some(vec![]));
     assert_eq!(s.get_changeset(&ObjectId([3; 32])).await.unwrap(), None);
+    assert_eq!(
+        s.get_changesets(&[c2, ObjectId([3; 32]), c1, c2]).await.unwrap(),
+        vec![Some(ch2.clone()), None, Some(vec![]), Some(ch2.clone())]
+    );
+    assert_eq!(s.get_changesets(&[]).await.unwrap(), vec![]);
+    assert_eq!(s.first_parent_chain(c2, None, 10).await.unwrap(), vec![n2.clone(), n1.clone()]);
+    assert_eq!(s.first_parent_chain(c2, None, 1).await.unwrap(), vec![n2.clone()]);
+    assert_eq!(s.first_parent_chain(c2, Some(c1), 10).await.unwrap(), vec![n2.clone()]);
+    assert_eq!(s.first_parent_chain(c1, Some(c1), 10).await.unwrap(), vec![]);
+    assert_eq!(s.first_parent_chain(c2, None, 0).await.unwrap(), vec![]);
+    assert_eq!(s.first_parent_chain(ObjectId([3; 32]), None, 10).await.unwrap(), vec![]);
 
     assert_eq!(s.tail(0, 10).await.unwrap(), vec![(s1, c1), (s2, c2)]);
     assert_eq!(s.tail(s1, 10).await.unwrap(), vec![(s2, c2)]);
@@ -208,6 +219,11 @@ pub async fn meta_store(s: Arc<dyn MetaStore>) {
     assert_eq!(s.get_derived("k/v2", b"key").await.unwrap(), None);
     s.put_derived("k/v1", &[0, 255, 1], Bytes::from_static(&[9; 100])).await.unwrap();
     assert_eq!(s.get_derived("k/v1", &[0, 255, 1]).await.unwrap().unwrap().len(), 100);
+    let many = s.get_derived_many("k/v1", &[&b"key"[..], b"absent", &[0, 255, 1]]).await.unwrap();
+    assert_eq!(many.len(), 3);
+    assert_eq!(many[0].as_deref(), Some(&b"val"[..]));
+    assert!(many[1].is_none());
+    assert_eq!(many[2].as_ref().map(|v| v.len()), Some(100));
 }
 
 /// History-index suite (part of the meta-store contract).

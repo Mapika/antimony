@@ -77,6 +77,14 @@ fn object_id_col(row: &sqlx::postgres::PgRow, col: &str) -> Result<ObjectId> {
     Ok(ObjectId::from_bytes(&bytes)?)
 }
 
+fn change_side(mode: Option<String>, oid: Option<Vec<u8>>) -> Result<Option<(EntryMode, ObjectId)>> {
+    match (mode, oid) {
+        (Some(m), Some(o)) => Ok(Some((EntryMode::from_octal(m.as_bytes())?, ObjectId::from_bytes(&o)?))),
+        (None, None) => Ok(None),
+        _ => Err(StoreError::InvalidArgument("corrupt changeset row".into())),
+    }
+}
+
 fn decode_ids(bytes: &[u8]) -> Result<Vec<ObjectId>> {
     bytes
         .chunks_exact(ObjectId::LEN)
@@ -147,6 +155,27 @@ impl PgStore {
                     key bytea NOT NULL, \
                     value bytea NOT NULL, \
                     PRIMARY KEY (kind, key))"
+            ),
+            format!(
+                "CREATE TABLE IF NOT EXISTS {qs}.history (\
+                    ref text NOT NULL, \
+                    path text NOT NULL, \
+                    generation bigint NOT NULL, \
+                    commit_id bytea NOT NULL, \
+                    PRIMARY KEY (ref, path, generation, commit_id))"
+            ),
+            format!(
+                "CREATE INDEX IF NOT EXISTS history_by_gen ON {qs}.history \
+                    (ref, generation DESC)"
+            ),
+            format!(
+                "CREATE INDEX IF NOT EXISTS history_by_path ON {qs}.history \
+                    (ref, path text_pattern_ops, generation DESC)"
+            ),
+            format!(
+                "CREATE TABLE IF NOT EXISTS {qs}.history_watermark (\
+                    ref text PRIMARY KEY, \
+                    commit_id bytea NOT NULL)"
             ),
         ];
         for stmt in &ddl {
@@ -348,17 +377,29 @@ impl RefStore for PgStore {
 
 #[async_trait]
 impl MetaStore for PgStore {
-    // TASK (history): implement with a `history(ref, path, generation, commit)`
-    // table (PK on all four; index on (ref, path text_pattern_ops, generation
-    // DESC)) and a `history_watermark(ref PK, commit)` table. query_history
-    // must be ONE query: `path = $p OR path LIKE $p || '/%'` (escape LIKE
-    // metacharacters in $p; root prefix = no path filter), `generation <= $max`,
-    // `SELECT DISTINCT generation, commit ... ORDER BY generation DESC LIMIT`.
-    // Also override get_derived_many with a single `key = ANY($2)` query.
     async fn index_history(&self, ref_name: &str, rows: &[crate::HistoryRow]) -> Result<()> {
-        let _ = (ref_name, rows);
-        todo!("history")
+        // Large batches: one statement per chunk keeps parameter payloads sane.
+        for chunk in rows.chunks(50_000) {
+            let paths: Vec<&str> = chunk.iter().map(|r| r.path.as_str()).collect();
+            let gens: Vec<i64> = chunk.iter().map(|r| r.generation as i64).collect();
+            let commits: Vec<&[u8]> = chunk.iter().map(|r| r.commit.as_bytes().as_slice()).collect();
+            sqlx::query(
+                "INSERT INTO history (ref, path, generation, commit_id) \
+                 SELECT $1, t.p, t.g, t.c FROM unnest($2::text[], $3::bigint[], $4::bytea[]) \
+                      AS t(p, g, c) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(ref_name)
+            .bind(&paths)
+            .bind(&gens)
+            .bind(&commits)
+            .execute(&self.pool)
+            .await
+            .map_err(be)?;
+        }
+        Ok(())
     }
+
     async fn query_history(
         &self,
         ref_name: &str,
@@ -366,25 +407,184 @@ impl MetaStore for PgStore {
         max_generation: u64,
         limit: usize,
     ) -> Result<Vec<(u64, ObjectId)>> {
-        let _ = (ref_name, prefix, max_generation, limit);
-        todo!("history")
+        let max = i64::try_from(max_generation).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let p = prefix.as_str();
+        let rows = if p.is_empty() {
+            sqlx::query(
+                "SELECT DISTINCT generation, commit_id FROM history \
+                 WHERE ref = $1 AND generation <= $2 \
+                 ORDER BY generation DESC, commit_id DESC LIMIT $3",
+            )
+            .bind(ref_name)
+            .bind(max)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            let like = format!("{}/%", p.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+            sqlx::query(
+                "SELECT DISTINCT generation, commit_id FROM history \
+                 WHERE ref = $1 AND (path = $4 OR path LIKE $5) AND generation <= $2 \
+                 ORDER BY generation DESC, commit_id DESC LIMIT $3",
+            )
+            .bind(ref_name)
+            .bind(max)
+            .bind(limit)
+            .bind(p)
+            .bind(like)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(be)?;
+        rows.iter()
+            .map(|r| {
+                let g: i64 = r.try_get("generation").map_err(be)?;
+                Ok((g as u64, object_id_col(r, "commit_id")?))
+            })
+            .collect()
     }
+
     async fn history_watermark(&self, ref_name: &str) -> Result<Option<ObjectId>> {
-        let _ = ref_name;
-        todo!("history")
+        let row = sqlx::query("SELECT commit_id FROM history_watermark WHERE ref = $1")
+            .bind(ref_name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(be)?;
+        row.map(|r| object_id_col(&r, "commit_id")).transpose()
     }
+
     async fn set_history_watermark(
         &self,
         ref_name: &str,
         expected: Option<ObjectId>,
         new: ObjectId,
     ) -> Result<bool> {
-        let _ = (ref_name, expected, new);
-        todo!("history")
+        let affected = match expected {
+            None => sqlx::query(
+                "INSERT INTO history_watermark (ref, commit_id) VALUES ($1, $2) \
+                 ON CONFLICT (ref) DO NOTHING",
+            )
+            .bind(ref_name)
+            .bind(new.as_bytes().as_slice())
+            .execute(&self.pool)
+            .await,
+            Some(e) => sqlx::query(
+                "UPDATE history_watermark SET commit_id = $3 WHERE ref = $1 AND commit_id = $2",
+            )
+            .bind(ref_name)
+            .bind(e.as_bytes().as_slice())
+            .bind(new.as_bytes().as_slice())
+            .execute(&self.pool)
+            .await,
+        }
+        .map_err(be)?
+        .rows_affected();
+        Ok(affected == 1)
     }
+
     async fn clear_history(&self, ref_name: &str) -> Result<()> {
-        let _ = ref_name;
-        todo!("history")
+        let mut tx = self.pool.begin().await.map_err(be)?;
+        sqlx::query("DELETE FROM history WHERE ref = $1")
+            .bind(ref_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(be)?;
+        sqlx::query("DELETE FROM history_watermark WHERE ref = $1")
+            .bind(ref_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(be)?;
+        tx.commit().await.map_err(be)?;
+        Ok(())
+    }
+
+    async fn get_derived_many(&self, kind: &str, keys: &[&[u8]]) -> Result<Vec<Option<Bytes>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query("SELECT key, value FROM derived WHERE kind = $1 AND key = ANY($2)")
+            .bind(kind)
+            .bind(keys)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(be)?;
+        let mut map: HashMap<Vec<u8>, Bytes> = HashMap::with_capacity(rows.len());
+        for r in &rows {
+            let k: Vec<u8> = r.try_get("key").map_err(be)?;
+            let v: Vec<u8> = r.try_get("value").map_err(be)?;
+            map.insert(k, Bytes::from(v));
+        }
+        Ok(keys.iter().map(|k| map.get(*k).cloned()).collect())
+    }
+
+    async fn first_parent_chain(
+        &self,
+        tip: ObjectId,
+        stop: Option<ObjectId>,
+        limit: usize,
+    ) -> Result<Vec<CommitNode>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let stop = stop.map(|s| s.as_bytes().to_vec());
+        let rows = sqlx::query(
+            "WITH RECURSIVE chain(id, tree, parents, generation, committer_time, depth) AS ( \
+                 SELECT id, tree, parents, generation, committer_time, 1::bigint \
+                   FROM commits WHERE id = $1 AND id IS DISTINCT FROM $2::bytea AND $3 > 0 \
+                 UNION ALL \
+                 SELECT c.id, c.tree, c.parents, c.generation, c.committer_time, ch.depth + 1 \
+                   FROM chain ch JOIN commits c ON c.id = substring(ch.parents from 1 for 32) \
+                  WHERE ch.depth < $3 \
+                    AND c.id IS DISTINCT FROM $2::bytea) \
+             SELECT id, tree, parents, generation, committer_time FROM chain ORDER BY depth",
+        )
+        .bind(tip.as_bytes().as_slice())
+        .bind(stop)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(be)?;
+        rows.iter()
+            .map(|r| {
+                let parents: Vec<u8> = r.try_get("parents").map_err(be)?;
+                let generation: i64 = r.try_get("generation").map_err(be)?;
+                Ok(CommitNode {
+                    id: object_id_col(r, "id")?,
+                    tree: object_id_col(r, "tree")?,
+                    parents: decode_ids(&parents)?,
+                    generation: generation as u64,
+                    committer_time: r.try_get("committer_time").map_err(be)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn get_changesets(&self, ids: &[ObjectId]) -> Result<Vec<Option<Vec<PathChange>>>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT c.id AS id, ch.path AS path, ch.kind AS kind, ch.old_mode AS old_mode, \
+                    ch.old_id AS old_id, ch.new_mode AS new_mode, ch.new_id AS new_id \
+             FROM commits c LEFT JOIN changes ch ON ch.commit_id = c.id \
+             WHERE c.id = ANY($1) ORDER BY c.id, ch.idx",
+        )
+        .bind(ids_to_vecs(ids))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(be)?;
+        let mut map: HashMap<ObjectId, Vec<PathChange>> = HashMap::new();
+        for r in &rows {
+            let entry = map.entry(object_id_col(r, "id")?).or_default();
+            let path: Option<String> = r.try_get("path").map_err(be)?;
+            let Some(path) = path else { continue };
+            entry.push(PathChange {
+                path: RepoPath::new(path)?,
+                kind: change_kind_from_code(r.try_get("kind").map_err(be)?)?,
+                old: change_side(r.try_get("old_mode").map_err(be)?, r.try_get("old_id").map_err(be)?)?,
+                new: change_side(r.try_get("new_mode").map_err(be)?, r.try_get("new_id").map_err(be)?)?,
+            });
+        }
+        Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
 
     async fn put_commit(&self, node: CommitNode, changes: Vec<PathChange>) -> Result<u64> {
@@ -518,17 +718,7 @@ impl MetaStore for PgStore {
         .fetch_all(&self.pool)
         .await
         .map_err(be)?;
-        let side =
-            |mode: Option<String>, oid: Option<Vec<u8>>| -> Result<Option<(EntryMode, ObjectId)>> {
-                match (mode, oid) {
-                    (Some(m), Some(o)) => Ok(Some((
-                        EntryMode::from_octal(m.as_bytes())?,
-                        ObjectId::from_bytes(&o)?,
-                    ))),
-                    (None, None) => Ok(None),
-                    _ => Err(StoreError::InvalidArgument("corrupt changeset row".into())),
-                }
-            };
+        let side = change_side;
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             let path: String = r.try_get("path").map_err(be)?;

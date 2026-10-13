@@ -21,7 +21,7 @@ use ant_core::{Commit, EntryMode, ObjectId, RepoPath, TreeEntry};
 use ant_store::{Backend, CommitNode, ObjectStoreExt, PathChange, StoreError, graph};
 use bytes::Bytes;
 
-use super::{OpError, OpResult};
+use super::{OpError, OpResult, history};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathInfo {
@@ -118,9 +118,15 @@ pub async fn log(
     path: Option<&RepoPath>,
     limit: usize,
 ) -> OpResult<Vec<LogEntry>> {
+    let tip = resolve_rev(b, rev).await?;
+    if let Some(path) = path
+        && let Some(indexed) = indexed_path_log(b, rev, tip, path, limit).await
+    {
+        return Ok(indexed);
+    }
     let limit = if limit == 0 { usize::MAX } else { limit };
     let mut out = Vec::new();
-    let mut next = Some(resolve_rev(b, rev).await?);
+    let mut next = Some(tip);
     while let Some(id) = next {
         if out.len() >= limit {
             break;
@@ -137,6 +143,20 @@ pub async fn log(
         out.push(LogEntry { id, generation: n.generation, commit });
     }
     Ok(out)
+}
+
+/// Serve `log --path` from the history index when `tip` is on an indexed
+/// ref's first-parent chain. Any failure falls back to the changeset scan.
+async fn indexed_path_log(
+    b: &Backend,
+    rev: &str,
+    tip: ObjectId,
+    path: &RepoPath,
+    limit: usize,
+) -> Option<Vec<LogEntry>> {
+    let ref_name = history::indexed_ref_for(b, rev, tip).await.ok()??;
+    let generation = node(b, tip).await.ok()?.generation;
+    history::path_log(b, &ref_name, generation, path, limit).await.ok()
 }
 
 pub async fn diff(b: &Backend, from: Option<&str>, to: &str) -> OpResult<Vec<PathChange>> {
