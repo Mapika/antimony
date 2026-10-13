@@ -87,9 +87,8 @@ pub async fn lookup_path(
 /// and the changeset vs. first parent. Parents must already be recorded.
 /// Idempotent; returns the log sequence number.
 pub async fn record_commit(b: &Backend, id: ObjectId) -> Result<u64> {
-    if let Some(Some(_)) = b.meta.get_commits(&[id]).await?.pop() {
+    if let Some(node) = b.meta.get_commits(&[id]).await?.pop().flatten() {
         // Already recorded: put_commit is idempotent and returns the seq.
-        let node = b.meta.get_commits(&[id]).await?.pop().flatten().unwrap();
         return b.meta.put_commit(node, vec![]).await;
     }
     let commit = b.objects.read_commit(&id).await?;
