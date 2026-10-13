@@ -1,13 +1,11 @@
 //! Access control enforcement.
 //!
-//! TASK (acl): implement this module and wire it through `rpc`, `http`,
-//! `ant-gitserve`, the `ant-server` binary and the `ant` CLI. Policy semantics
-//! live in `ant_auth` (read its module docs first) — this module only applies
-//! them.
+//! Policy semantics live in `ant_auth`; this module applies them for `rpc`,
+//! `http`, the git export, `ant serve` and the `ant` CLI.
 //!
 //! Modes:
-//! - No `--policy <file>` → OPEN mode: everything allowed (today's behavior),
-//!   log a startup warning.
+//! - No `--policy <file>` → OPEN mode: everything is allowed (a startup
+//!   warning is logged).
 //! - With a policy, every request must carry a bearer token:
 //!   gRPC metadata `authorization: Bearer <token>`; HTTP header
 //!   `Authorization: Bearer <token>`; git over HTTP uses Basic auth with the
@@ -19,9 +17,9 @@
 //! Object zone tags (prevents fetching restricted blobs by id):
 //! - Stored as derived data: kind `"acl/zone/v1/<zone>"`, key = object id,
 //!   value = b"1" (append-only; a zone is the governing rule prefix, see
-//!   `ant_auth::Policy::zone_of`). Look up with
+//!   `ant_auth::Policy::zone_of`). Looked up with
 //!   `MetaStore::get_derived_many` (one call per restricted zone per batch;
-//!   override it in `PgStore` with a single `= ANY($2)` query).
+//!   a single `= ANY($2)` query in `PgStore`).
 //! - `tag_written(backend, policy, writes: &[(RepoPath, ObjectId)])` is called
 //!   for every object a write path creates or references at a path:
 //!   blobs at their file path, trees at their directory path (root tree at
@@ -33,14 +31,14 @@
 //!   trees), `ops::land` (rebased/merged objects), and after git import.
 //! - `reindex(backend, policy, commit)`: walk the commit's tree and tag every
 //!   object under a non-root zone (and objects also present in the root zone
-//!   with the root tag). Used after `ant import` and when the policy changes;
-//!   expose as `ant admin reindex-acl <rev>` (store flags like `ant import`).
+//!   with the root tag). Used after `ant import` and when the policy changes,
+//!   as `ant admin reindex-acl <rev>` (store flags like `ant import`).
 //! - `readable(backend, policy, principal, ids) -> Vec<bool>`: index-aligned;
-//!   skip all lookups when `policy.can_read_everything(principal)`.
+//!   no lookups when `policy.can_read_everything(principal)`.
 //!
-//! Enforcement points (all must have integration tests in
-//! `crates/ant-server/tests/acl.rs`, using a policy with a restricted
-//! `secrets/` zone, a reader without access, a writer with access, an admin):
+//! Enforcement points (integration tests in `crates/ant-server/tests/acl.rs`
+//! use a restricted `secrets/` zone, a reader without access, a writer with
+//! access and an admin):
 //! - GetObjects / HasObjects / HTTP `GET /o/{id}`: unreadable objects are
 //!   reported exactly like missing ones (not found / `found=false` / 404) —
 //!   never leak existence. HTTP responses for objects outside the root zone
@@ -58,11 +56,10 @@
 //! - git export (`ant-gitserve`): requires `can_read_everything` (it cannot
 //!   filter trees without changing ids) else 403.
 //!
-//! Tests must also cover: fetching a restricted blob by id is denied while
-//! the same bytes written to a public path become readable; open mode keeps
-//! the existing behavior (all existing tests must still pass untouched).
+//! A restricted blob cannot be fetched by id, while the same bytes written to
+//! a public path become readable. Open mode behaves as if no policy existed.
 //!
-//! Implementation notes (beyond the contract above):
+//! Further details:
 //! - Blobs uploaded with `PutObjects` that did not exist before are tagged
 //!   with the synthetic zone [`PENDING_ZONE`] (readable by nobody but
 //!   admins) plus an uploader record for the uploading principal. Without

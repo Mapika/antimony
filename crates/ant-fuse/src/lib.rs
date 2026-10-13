@@ -2,37 +2,27 @@
 //! looked up or read, so an agent can "check out" a huge monorepo instantly
 //! and only pay for what it touches.
 //!
-//! TASK (fuse): implement `mount` with `fuser` (0.18, no libfuse; mounting
-//! goes through `fusermount3`, which is installed).
+//! [`mount`] uses `fuser` without libfuse (mounting goes through
+//! `fusermount3`); [`mount_rw`] adds a copy-on-write layer (see [`rw`]).
 //!
-//! Requirements:
-//! - Inodes: root = 1. Assign inode numbers on first lookup and keep them
-//!   stable for the life of the mount (map (parent ino, name) → ino and ino →
-//!   (mode, object id)). Identical objects at different paths get different
-//!   inodes (hard-link semantics are NOT wanted).
-//! - `lookup`/`getattr`/`readdir`(+`.` and `..`)/`open`/`read`/`readlink`
-//!   implemented. Directories 0o555, files 0o444, executables 0o555,
-//!   symlinks 0o777, gitlinks appear as empty directories. `nlink` = 1 for
-//!   files, 2 for dirs. uid/gid = the mounting process's. mtime = UNIX_EPOCH
-//!   (or a fixed timestamp passed in options).
-//! - File size must be correct in `getattr` *without* necessarily
-//!   downloading the content; it's fine (v1) to fetch the blob to learn its
-//!   size, but cache it.
-//! - All mutating ops (`write`, `create`, `mkdir`, `unlink`, `rename`,
-//!   `setattr`, …) → `EROFS`. Opening for write → `EROFS`.
-//! - Object fetches are async: FUSE callbacks run on fuser's thread; use the
-//!   provided `tokio::runtime::Handle` with `block_on`, or better spawn and
-//!   reply from the task (fuser replies are `Send`). Do not deadlock when
-//!   the runtime is a current-thread runtime used by the caller — tests use a
-//!   multi-thread runtime, and document that requirement.
-//! - In-memory caches: decoded trees (unbounded is fine v1) and blob
-//!   contents (bounded by `MountOptions::blob_cache_bytes`, LRU).
-//! - `readdir` on a large directory must work with offsets (fuser calls it
-//!   repeatedly).
-//! - When a directory is listed, prefetch its subtrees' objects in ONE
-//!   `get_many` (cheap win for `find`/`ls -R`).
-//! - Errors from the store → `EIO` (log with tracing).
-//! - Unmount when the returned `BackgroundSession` is dropped.
+//! - Inodes: root = 1; numbers are assigned on first lookup and stay stable
+//!   for the life of the mount. Identical objects at different paths get
+//!   different inodes (no hard-link semantics).
+//! - Directories 0o555, files 0o444, executables 0o555, symlinks 0o777,
+//!   gitlinks appear as empty directories. `nlink` is 1 for files and 2 for
+//!   directories; uid/gid are the mounting process's; mtime is UNIX_EPOCH or
+//!   the timestamp in [`MountOptions`].
+//! - `getattr` reports exact sizes; a blob is fetched (and its size cached)
+//!   to learn its size.
+//! - Read-only mounts answer every mutation, and opening for write, with
+//!   `EROFS`.
+//! - FUSE callbacks run on fuser's threads and block on the given Tokio
+//!   runtime handle, which must belong to a multi-thread runtime.
+//! - Caches: decoded trees (unbounded) and blob contents (LRU bounded by
+//!   `MountOptions::blob_cache_bytes`). Listing a directory prefetches its
+//!   subtrees with one `get_many`; `readdir` supports offsets.
+//! - Store errors become `EIO` (logged with tracing).
+//! - Dropping the returned `BackgroundSession` unmounts.
 
 use std::path::Path;
 use std::sync::Arc;

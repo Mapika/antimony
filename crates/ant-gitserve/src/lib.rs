@@ -1,7 +1,8 @@
 //! Read-only Git protocol-v2 smart HTTP export of an antimony backend.
 //!
-//! TASK (gitserve): SHA-256 upload-pack, shallow and blobless fetches, and
-//! bounded incremental pack streaming. Commits must be recorded in MetaStore.
+//! Serves SHA-256 upload-pack with shallow and blobless fetches, streaming
+//! packs incrementally with bounded memory. Exported commits must be recorded
+//! in the `MetaStore` (generation numbers drive negotiation).
 mod pack;
 mod protocol;
 mod select;

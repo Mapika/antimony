@@ -1,14 +1,12 @@
 //! `ObjectStore` (and thin helpers for the other RPCs) over the server's
 //! gRPC API, with optional plain-HTTP object reads through a cache/CDN.
 //!
-//! TASK (transport): implement everything marked `todo!()`.
-//!
 //! - `connect(grpc_url, http_base)`: tonic channel with
 //!   `ant_proto::MAX_MESSAGE_BYTES` limits on the generated client.
 //! - `get_many`: if `http_base` is set, GET `{http_base}/o/{hex}` for each id
 //!   with bounded concurrency (64) via reqwest; else (or on HTTP transport
-//!   error) use the `GetObjects` stream, chunking requests to ≤ 4096 ids.
-//!   Results in input order. Verify hashes.
+//!   error) the `GetObjects` stream, in requests of ≤ 4096 ids. Results come
+//!   in input order, hashes verified.
 //! - `put_many`: `PutObjects` in chunks of ≤ 64 MiB total payload.
 //! - `has_many`: `HasObjects`.
 //! - `client()` exposes the raw generated client for other RPCs (refs,

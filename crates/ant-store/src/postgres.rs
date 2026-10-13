@@ -1,28 +1,23 @@
 //! Postgres-backed `RefStore` + `MetaStore` + small-object `ObjectStore`.
 //!
-//! TASK (store-pg): implement everything marked `todo!()`.
-//!
-//! Requirements:
-//! - All tables live in the schema passed to [`PgStore::connect`]; create the
-//!   schema and tables idempotently on connect (`CREATE ... IF NOT EXISTS`).
-//!   Use runtime queries (`sqlx::query`), NOT the `query!` macros — there is
-//!   no DATABASE_URL at build time.
-//! - Refs: one row per ref; `cas_ref` must be a single atomic statement or a
-//!   transaction (e.g. `UPDATE ... WHERE name=$1 AND target=$2`, `INSERT ...
-//!   ON CONFLICT DO NOTHING`, `DELETE ... WHERE target=$2`), then report
+//! - All tables live in the schema passed to [`PgStore::connect`], which
+//!   creates the schema and tables idempotently (`CREATE ... IF NOT EXISTS`).
+//!   Queries are built at runtime (`sqlx::query`), not with the `query!`
+//!   macros: there is no DATABASE_URL at build time.
+//! - Refs: one row per ref; `cas_ref` is a single atomic statement
+//!   (`UPDATE ... WHERE name=$1 AND target=$2`, `INSERT ... ON CONFLICT DO
+//!   NOTHING`, `DELETE ... WHERE target=$2`) and reports
 //!   `Mismatch { actual }` by re-reading when 0 rows were affected.
-//! - Log sequence numbers: a `BIGSERIAL`/identity column is fine (gaps OK).
-//!   `put_commit` inserts the node row and changeset in one transaction
-//!   (implemented as one atomic statement: a single round trip);
-//!   on conflict (already exists) return the existing seq.
-//! - Changesets may be stored as one row per path or as an encoded blob per
-//!   commit — your choice; ordering on read must match what was written.
+//! - Log sequence numbers come from an identity column (gaps are fine).
+//!   `put_commit` inserts the node row and changeset in one atomic statement
+//!   (a single round trip); for an existing commit it returns the existing
+//!   seq.
+//! - Changesets: one `changes` row per path, read back in written order.
 //! - Objects: `bytea` keyed by the 32-byte id, zstd-compressed.
-//! - `get_many`/`has_many` must be ONE round trip (`WHERE id = ANY($1)`), not
-//!   one query per id.
+//! - `get_many`/`has_many` are one round trip each (`WHERE id = ANY($1)`).
 //! - Pool: `sqlx::postgres::PgPoolOptions`, max 64 connections (raised from
 //!   16: with 64 concurrent agents the write path queued on the pool; fleet
-//!   bench 64 agents ~790 → ~1270 lands/s), and set `search_path` to the
+//!   bench 64 agents ~790 → ~1270 lands/s), with `search_path` set to the
 //!   schema on every connection (`after_connect`).
 
 use std::collections::{HashMap, HashSet};

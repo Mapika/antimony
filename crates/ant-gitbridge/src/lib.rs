@@ -1,37 +1,35 @@
 //! Import existing git repositories (SHA-1 or SHA-256) into antimony.
 //!
-//! TASK (gitbridge): implement `import`.
-//!
-//! - Open the repo with `gix`. For each `(git_ref, ant_ref)` in
-//!   `opts.refs`, collect all commits reachable from the git ref that are
-//!   not yet imported, and convert them parents-first (topological order).
+//! - [`import`] opens the repo with `gix`. For each `(git_ref, ant_ref)` in
+//!   `opts.refs` it converts every commit reachable from the git ref that is
+//!   not yet imported, parents first (topological order).
 //! - Conversion rewrites object ids to SHA-256 git objects
 //!   (`ant_core::{Tree, Commit}`) while preserving everything else byte for
 //!   byte: tree entry names/modes, commit author/committer/time zones,
 //!   extra headers (e.g. `encoding`, `mergetag`, `gpgsig`) and messages
-//!   (raw bytes: names and messages need not be UTF-8). The result MUST
-//!   equal what `git fast-export | git fast-import` into a
-//!   `--object-format=sha256` repo produces for unsigned commits (the test
-//!   checks every commit id).
-//! - Memoize SHA-1→SHA-256 for trees and blobs within a run (identical
-//!   subtrees are converted once). Persist the commit mapping in
+//!   (raw bytes: names and messages need not be UTF-8). The result equals
+//!   what `git fast-export | git fast-import` into a
+//!   `--object-format=sha256` repo produces for unsigned commits (the tests
+//!   check every commit id).
+//! - SHA-1→SHA-256 ids of trees and blobs are memoized within a run
+//!   (identical subtrees are converted once). The commit mapping persists in
 //!   `MetaStore` derived data, kind `"git-import/commit/v1"`, key = source
 //!   commit id bytes, value = 32-byte antimony id — this makes re-imports
 //!   incremental (already-imported commits are skipped without reading
 //!   their trees).
-//! - Write objects in batches (`opts.batch_objects` per `put_many`, several
-//!   batches in flight); record each batch's commits (generation and
+//! - Objects are written in batches (`opts.batch_objects` per `put_many`,
+//!   several batches in flight); each batch's commits are recorded (generation and
 //!   changeset computed by the producer from its own conversion state, no
 //!   tree re-reads) with one `put_commits` once the batch's objects and
 //!   those of all earlier batches are stored.
-//! - Finally point each `ant_ref` at the converted tip via `cas_ref`
+//! - Finally each `ant_ref` points at the converted tip via `cas_ref`
 //!   (expected = current value; it's an import tool, not concurrent).
-//! - gix is synchronous: do git reading inside `spawn_blocking`, streaming
+//! - gix is synchronous: git reading runs inside `spawn_blocking`, streaming
 //!   converted objects to the async writer through a bounded channel, so
 //!   memory stays bounded on big repos.
 //! - Non-UTF-8 tree entry names → error naming the path and commit. Commit
 //!   text is carried as raw bytes.
-//! - Return stats counting objects actually written (not skipped). When no
+//! - Stats count objects actually written (not skipped). When no
 //!   previously imported commit is found the target is assumed empty and the
 //!   existence check is skipped (re-puts are idempotent), so stats then count
 //!   every converted object.

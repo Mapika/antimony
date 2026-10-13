@@ -1,36 +1,32 @@
 //! Server-side commit creation from file-level operations.
 //!
-//! TASK (server-changeset): implement `create_changeset`.
-//!
-//! Semantics:
-//! - Start from `base`'s tree (or the empty tree when `base` is `None`).
+//! [`create_changeset`] semantics:
+//! - Starts from `base`'s tree (or the empty tree when `base` is `None`).
 //!   `base`, if given, must be a *recorded* commit (`MetaStore`), else
 //!   `NotFound`.
-//! - Apply every op. Ops may come in any order but at most one op per path
+//! - Applies every op. Ops may come in any order but at most one op per path
 //!   (duplicates → `InvalidArgument`).
 //! - `Write` creates intermediate directories as needed. Writing where an
 //!   ancestor path component is a non-tree (file/symlink/gitlink), or where
 //!   the path itself is currently a tree → `InvalidArgument` (in a single
-//!   request, deleting `p` and writing `p/q` IS allowed and must work).
+//!   request, deleting `p` and writing `p/q` is allowed).
 //! - `Write` mode must be `File`, `Executable` or `Symlink`, else
 //!   `InvalidArgument`. `WriteContent::Blob(id)` must exist in the object
 //!   store and be a blob, else `NotFound`/`InvalidArgument`.
 //! - `Delete` of a path that is not a non-tree entry in the base →
 //!   `NotFound`. Directories left empty by deletes are removed (git cannot
 //!   represent empty trees except the root).
-//! - Only rewrite trees along modified paths; untouched subtrees keep their
-//!   ids. Store all new blobs/trees with as few `put_many` calls as
-//!   practical (one per batch, not one per object).
-//! - Build the `Commit` (parents = `[base]` or `[]`, committer defaults to
-//!   author, message verbatim), then persist it with generation and
-//!   changeset exactly as `ant_store::graph::write_commit` would. (The
-//!   implementation stores the commit object in the same `put_many` as the
-//!   trees and computes the changeset from the ops instead of re-reading
-//!   the trees it just built.) Return the commit id.
+//! - Only trees along modified paths are rewritten; untouched subtrees keep
+//!   their ids. Directories are loaded per depth (`tree_edit`), and every
+//!   new blob, tree and the commit go out in one `put_many`.
+//! - The `Commit` (parents = `[base]` or `[]`, committer defaults to author,
+//!   message verbatim) is recorded with the generation and changeset
+//!   `ant_store::graph::write_commit` would compute; the changeset comes
+//!   from the ops instead of re-reading the trees just built.
 //! - An empty ops list is allowed (produces a commit with the same tree).
 //!
-//! Performance target: O(changed paths × depth) object reads/writes,
-//! independent of repo size.
+//! Cost: O(changed paths × depth) object reads/writes, independent of repo
+//! size.
 
 use std::collections::HashSet;
 use std::sync::Arc;

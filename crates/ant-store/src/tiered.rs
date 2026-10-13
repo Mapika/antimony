@@ -2,8 +2,6 @@
 //! another (e.g. S3). Most trees and source files are small, and S3's
 //! per-request latency would dominate if every tiny object went there.
 //!
-//! TASK (store-s3): implement everything marked `todo!()`.
-//!
 //! - `put_many`: objects whose *encoded* length is `<= threshold` go to
 //!   `small`, the rest to `large`. One `put_many` call per tier.
 //! - `get_many`: one `get_many` on `small` for all ids, then one on `large`

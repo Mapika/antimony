@@ -1,7 +1,5 @@
 //! Read-only queries that let agents and CI work without a checkout.
 //!
-//! TASK (server-changeset): implement everything marked `todo!()`.
-//!
 //! - `resolve_rev`: `<ref>` | `<64-hex id>`, optionally suffixed `~N`
 //!   (walk N first parents). A bare hex id must be a recorded commit. A
 //!   string that is both a valid ref name and 64-hex is treated as an id.
@@ -12,8 +10,8 @@
 //! - `log`: first-parent history from the rev, newest first, at most
 //!   `limit` commits (0 = no limit). With `path`, keep only commits whose
 //!   recorded changeset has a change at or under `path`
-//!   (`RepoPath::starts_with`). Use `MetaStore` changesets — do not diff
-//!   trees here.
+//!   (`RepoPath::starts_with`), from recorded `MetaStore` changesets (or the
+//!   history index, see `history`) — no tree diffs.
 //! - `diff`: changes between two revs' trees (`from = None` = empty tree),
 //!   via `ant_store::graph::diff_trees`.
 

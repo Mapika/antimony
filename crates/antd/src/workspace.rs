@@ -1,13 +1,10 @@
 //! Sparse working copies.
 //!
-//! TASK (antd-workspace): implement everything marked `todo!()`.
-//!
 //! On-disk state lives in `{dir}/.ant/` (never reported as a change):
 //! - `.ant/workspace`: `base_commit=<hex>`, `base_tree=<hex>`, and one
 //!   `sparse=<pattern>` line per pattern. Plain text, one `key=value` per line.
-//! - `.ant/index`: one record per materialized non-tree entry: path, mode,
-//!   object id, size, mtime (ns), inode. Format is yours (keep it simple and
-//!   fast to parse; tab-separated text is fine).
+//! - `.ant/index`: one tab-separated line per materialized non-tree entry
+//!   (path, mode, object id, size, mtime in ns, inode).
 //!
 //! Sparse patterns (`Sparse::matches`):
 //! - Empty pattern list = everything.
@@ -18,19 +15,18 @@
 //!
 //! `materialize`:
 //! - `dir` must not exist or be empty (else `AlreadyExists` io error).
-//! - Walk the tree breadth-first, fetching each level's subtrees with ONE
-//!   `get_many` call (not one per tree). Skip subtrees that cannot contain a
-//!   match (`Sparse::may_contain_under(dir_path)`: true if any prefix pattern
+//! - Walks the tree breadth-first, fetching each level's subtrees with one
+//!   `get_many` call. Skips subtrees that cannot contain a match (`Sparse::may_contain_under(dir_path)`: true if any prefix pattern
 //!   starts with or is under that dir, or any glob pattern exists — globs are
 //!   not pruned).
-//! - Fetch blobs in batches of 512 ids per `get_many`. Write files with the
+//! - Fetches blobs in batches of 512 ids per `get_many`. Files get the
 //!   right mode (0o755 for Executable, 0o644 otherwise), symlinks via
 //!   `std::os::unix::fs::symlink`, gitlinks as empty directories (not
 //!   indexed).
-//! - Record every written entry in the index with its post-write stat.
+//! - Every written entry is indexed with its post-write stat.
 //!
 //! `status` (no network; uses only the index + local hashing):
-//! - Walk the workspace (skip `.ant`). For each file/symlink:
+//! - Walks the workspace (skipping `.ant`). For each file/symlink:
 //!   indexed and (size, mtime_ns, ino, mode) unchanged → unchanged, without
 //!   reading the file; otherwise read + hash as a blob and compare ids/mode.
 //! - Indexed paths missing on disk → `Deleted`.
@@ -42,8 +38,8 @@
 //!
 //! `reset_to(objects, new_commit, new_tree)`: move the workspace to a new base
 //! (e.g. after landing). Requires `status()` to be empty except for changes
-//! that are already identical in `new_tree` (the just-landed changes).
-//! Otherwise returns an error naming the dirty paths. Applies
+//! that are already identical in `new_tree` (the just-landed changes);
+//! otherwise returns an error naming the dirty paths. Applies
 //! `diff_trees(old_base_tree, new_tree)` to the in-scope files on disk
 //! (writes, deletes, removes now-empty dirs), then rewrites the index and
 //! config.

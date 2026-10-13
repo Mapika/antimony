@@ -1,8 +1,6 @@
 //! Read-through cache: local store first, misses fetched from upstream in
 //! one batch, verified, and written back locally.
 //!
-//! TASK (antd-cache): implement everything marked `todo!()`.
-//!
 //! - `get_many`: one `local.get_many(ids)`; collect misses (deduplicated);
 //!   one `upstream.get_many(misses)`; `verify` each fetched object against
 //!   its requested id (mismatch → `StoreError::Backend`); one
@@ -10,9 +8,7 @@
 //! - `put_many`: write to upstream first, then local (write-through).
 //! - `has_many`: local first, upstream for misses.
 //! - In-flight dedup: concurrent `get_many` calls that miss on the same id
-//!   should trigger only ONE upstream fetch for it. Implement with a
-//!   `parking_lot::Mutex<HashMap<ObjectId, Shared future / watch channel>>`
-//!   or similar. (Tested below with a counting upstream.)
+//!   trigger only one upstream fetch for it (a map of shared futures).
 
 use std::collections::HashMap;
 use std::sync::Arc;

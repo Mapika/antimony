@@ -1,21 +1,19 @@
 //! S3-compatible `ObjectStore` for large objects.
 //!
-//! TASK (store-s3): implement everything marked `todo!()`.
-//!
-//! Requirements:
 //! - Key layout: `{prefix}/{hex[0..2]}/{hex}` where hex is the object id.
-//! - Values are the zstd-compressed (level 3) encoded object bytes. Verify the
-//!   hash after decompressing on `get_many`; a mismatch is a `Backend` error.
+//! - Values are the zstd-compressed (level 3) encoded object bytes. The hash
+//!   is verified after decompressing on `get_many`; a mismatch is a
+//!   `Backend` error.
 //! - `get_many`/`has_many`/`put_many` fan out with bounded concurrency
 //!   (`futures::stream::iter(..).buffered(64)`), preserving input order.
-//! - `put_many`: skip ids already present in the same batch; a plain PUT is
-//!   fine for idempotency (content is identical by construction).
+//! - `put_many` skips ids repeated within the batch; a plain PUT is
+//!   idempotent (content is identical by construction).
 //! - A missing key (`NoSuchKey` / 404) is `None`, not an error. `has_many`
 //!   uses HEAD.
-//! - `connect` builds a client with `force_path_style(true)` (SeaweedFS/MinIO need
-//!   it), static credentials, the given region and endpoint.
-//! - `ensure_bucket` creates the bucket if it does not exist (treat
-//!   "already owned by you" as success).
+//! - `connect` builds a client with `force_path_style(true)` (SeaweedFS/MinIO
+//!   need it), static credentials, the given region and endpoint.
+//! - `ensure_bucket` creates the bucket if it does not exist ("already owned
+//!   by you" counts as success).
 
 use std::collections::HashSet;
 

@@ -1,7 +1,7 @@
 //! gRPC adapter over `ops`.
 //!
-//! TASK (transport): implement `AntService` (the generated
-//! `ant_proto::v1::ant_server::Ant` trait) and `serve`.
+//! [`AntService`] implements the generated `ant_proto::v1::ant_server::Ant`
+//! trait.
 //!
 //! - Every RPC is a thin translation layer: decode/validate request →
 //!   call `ops::*` / `Backend` → encode response. No business logic here.
@@ -15,8 +15,7 @@
 //!   `put_many`, return ids in order.
 //! - `Log`/`Diff`/`ReadPath`/`ResolveRev`/`Land`/`CreateChangeset`: map 1:1
 //!   onto `ops::query`, `ops::land`, `ops::changeset`.
-//! - Set max decoding/encoding message size to `ant_proto::MAX_MESSAGE_BYTES`
-//!   on the generated server.
+//! - Max decoding/encoding message size is `ant_proto::MAX_MESSAGE_BYTES`.
 //!
 //! Access control (`crate::acl`): with a policy, every RPC authenticates the
 //! `authorization: Bearer <token>` metadata (missing/unknown →

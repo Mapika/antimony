@@ -1,15 +1,14 @@
 //! Path history and blame, backed by the per-ref history index
 //! (`MetaStore::{index_history, query_history, ...}`).
 //!
-//! TASK (history): implement everything marked `todo!()`, then:
-//! - call `catch_up(b, ref)` after every successful `land` and `UpdateRef`
-//!   (best effort: log and continue on error; queries fall back, see `log`);
-//! - make `ops::query::log` with a path use `path_log` when the rev is on an
+//! - `catch_up(b, ref)` runs after every successful `land` and `UpdateRef`
+//!   (best effort: errors are logged; queries fall back, see `log`).
+//! - `ops::query::log` with a path uses `path_log` when the rev is on an
 //!   indexed ref's first-parent chain (rev resolved from a ref name, or a
 //!   commit id that `is_first_parent_ancestor` of that ref's watermark), else
-//!   keep the existing changeset scan;
-//! - add a `Blame` RPC + `ant blame <rev>:<path>` (output per line:
-//!   `<commit-id> <line-no>\t<line>`), additive proto change only.
+//!   it scans recorded changesets.
+//! - Exposed as the `Blame` RPC and `ant blame <rev>:<path>` (output per
+//!   line: `<commit-id> <line-no>\t<line>`).
 //!
 //! `catch_up(b, ref_name)`:
 //! - Let `tip` = ref target, `wm` = watermark. If `wm` is None → index the
@@ -20,20 +19,20 @@
 //!   changeset (`MetaStore::get_changeset`), with the commit's generation.
 //! - Batches of ≤ 1000 commits; write rows then CAS the watermark forward
 //!   (a concurrent catch-up winning the CAS is fine — rows are idempotent;
-//!   loop until the watermark is `tip` or the ref moves again).
-//! - Must handle long histories without recursion and without loading all
-//!   commits at once (walk first parents in batches via `get_commits`).
+//!   loops until the watermark is `tip` or the ref moves again).
+//! - Long histories are walked iteratively, first parents in batches, never
+//!   loading all commits at once.
 //!
 //! `path_log(b, ref_name, rev_generation, path, limit)`: `query_history` →
 //! `LogEntry`s (read the commit objects in one `get_many`).
 //!
 //! `blame(b, rev, path)`: per-line attribution of the file at `rev`.
-//! Walk the file's history newest→oldest (use the index when available, else
-//! first-parent changesets); for each change, line-diff the previous version
-//! against the newer one (`diffy` or an LCS of your own) and attribute lines
-//! introduced by that commit; lines surviving to the file's creation belong
-//! to the creating commit. Cache results as derived data
-//! `"blame/v1"`, key = rev id ++ path bytes, value = compact encoding.
+//! Walks the file's history newest→oldest (the index when available, else
+//! first-parent changesets); each change line-maps the previous version
+//! against the newer one (`line_map`, an LCS) and attributes lines that
+//! commit introduced; lines surviving to the file's creation belong to the
+//! creating commit. Results are cached as derived data `"blame/v1"`,
+//! key = rev id ++ path bytes, value = compact encoding.
 //! Binary (non-UTF-8) files → `InvalidArgument`. Missing path → `NotFound`.
 
 use std::collections::{HashMap, VecDeque};
