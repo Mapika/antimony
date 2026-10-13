@@ -918,24 +918,6 @@ impl MetaStore for PgStore {
         .map_err(be)?;
         Ok(())
     }
-
-    async fn get_derived_many(&self, kind: &str, keys: &[&[u8]]) -> Result<Vec<Option<Bytes>>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        let rows = sqlx::query("SELECT key, value FROM derived WHERE kind = $1 AND key = ANY($2)")
-            .bind(kind)
-            .bind(keys.iter().map(|k| k.to_vec()).collect::<Vec<_>>())
-            .fetch_all(&self.pool)
-            .await
-            .map_err(be)?;
-        let mut found: HashMap<Vec<u8>, Bytes> = HashMap::with_capacity(rows.len());
-        for r in &rows {
-            let value: Vec<u8> = r.try_get("value").map_err(be)?;
-            found.insert(r.try_get("key").map_err(be)?, Bytes::from(value));
-        }
-        Ok(keys.iter().map(|k| found.get(*k).cloned()).collect())
-    }
 }
 
 #[cfg(test)]

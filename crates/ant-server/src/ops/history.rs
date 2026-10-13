@@ -676,7 +676,7 @@ mod tests {
                 author: sig.clone(),
                 committer: Signature { time: i as i64, ..sig.clone() },
                 extra_headers: vec![],
-                message: format!("commit {i}\n"),
+                message: format!("commit {i}\n").into_bytes(),
             };
             let obj = Object::Commit(commit).encode();
             let id = obj.id();
