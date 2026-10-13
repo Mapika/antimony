@@ -13,8 +13,18 @@ mod refs;
 mod ws;
 
 pub async fn run(cli: Cli) -> Result<Outcome> {
+    let cli = match cli.command {
+        Command::Serve(a) => return ant_server::serve::run(a).await.map(|()| Outcome::empty()),
+        Command::Completions { shell } => {
+            let mut out = Vec::new();
+            clap_complete::generate(shell, &mut <Cli as clap::CommandFactory>::command(), "ant", &mut out);
+            return Ok(Outcome::ok(out));
+        }
+        _ => cli,
+    };
     let ctx = Ctx::from_cli(&cli)?;
     match cli.command {
+        Command::Serve(_) | Command::Completions { .. } => Ok(Outcome::empty()),
         Command::Import(a) => import::run(a).await,
         Command::Ls { target } => query::ls(&ctx, &target).await,
         Command::Cat { target } => query::cat(&ctx, &target).await,

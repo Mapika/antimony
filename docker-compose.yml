@@ -19,3 +19,22 @@ services:
     image: chrislusf/seaweedfs:3.97
     command: ["server", "-s3", "-s3.port=8333", "-dir=/data", "-ip.bind=0.0.0.0"]
     ports: ["9009:8333"]
+
+  # `docker compose --profile server up -d`: the antimony server itself,
+  # against the services above. Not started by plain `docker compose up -d`.
+  ant:
+    profiles: ["server"]
+    build: .
+    command:
+      - serve
+      - --pg-url=postgres://ant:ant@postgres:5432/ant
+      - --s3-endpoint=http://s3:8333
+      - --s3-bucket=ant
+      - --s3-access-key=x
+      - --s3-secret-key=x
+    ports: ["7420:7420", "7421:7421"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      s3:
+        condition: service_started

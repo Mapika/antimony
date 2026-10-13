@@ -75,16 +75,6 @@ fn free_ports() -> (u16, u16) {
     ports
 }
 
-fn cargo_build_server() -> PathBuf {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let st = Command::new(cargo).args(["build", "-p", "ant-server"]).status().expect("cargo build");
-    assert!(st.success(), "cargo build -p ant-server failed");
-    let ant = PathBuf::from(env!("CARGO_BIN_EXE_ant"));
-    let server = ant.parent().expect("bin dir").join("ant-server");
-    assert!(server.exists(), "ant-server not found at {server:?}");
-    server
-}
-
 struct Env {
     grpc: u16,
     http: u16,
@@ -153,11 +143,12 @@ impl Env {
     }
 }
 
-fn start_server(server_bin: &Path, root: &Path, store: &[&str]) -> (Env, KillOnDrop) {
+fn start_server(root: &Path, store: &[&str]) -> (Env, KillOnDrop) {
     let (grpc, http) = free_ports();
     let policy_file = root.join("policy.toml");
     fs::write(&policy_file, policy()).expect("policy");
-    let mut cmd = Command::new(server_bin);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ant"));
+    cmd.arg("serve");
     cmd.args(["--grpc-listen", &format!("127.0.0.1:{grpc}"), "--http-listen", &format!("127.0.0.1:{http}")])
         .args(store)
         .env("ANT_POLICY", &policy_file)
@@ -170,10 +161,9 @@ fn start_server(server_bin: &Path, root: &Path, store: &[&str]) -> (Env, KillOnD
 
 #[test]
 fn cli_with_tokens() {
-    let server_bin = cargo_build_server();
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
-    let (env, _server) = start_server(&server_bin, root, &["--memory"]);
+    let (env, _server) = start_server(root, &["--memory"]);
 
     // No token / wrong token: rejected.
     let err = env.fails(None, None, &["ref", "list"]);
@@ -301,7 +291,6 @@ fn git(repo: &Path, args: &[&str]) {
 fn import_and_reindex_with_policy_postgres() {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
     let schema = format!("acl_e2e_{}_{nanos}", std::process::id());
-    let server_bin = cargo_build_server();
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
     let repo = root.join("repo");
@@ -336,7 +325,7 @@ fn import_and_reindex_with_policy_postgres() {
         let fields: Vec<&str> = out.split_whitespace().collect();
         assert_eq!(fields[1], "3", "{out}");
 
-        let (env, _server) = start_server(&server_bin, root, &store);
+        let (env, _server) = start_server(root, &store);
         assert_eq!(env.ok(Some(READER), None, &["cat", "main:src/lib.rs"]), "pub fn a() {}\n");
         env.fails(Some(READER), None, &["cat", "main:secrets/key"]);
         assert_eq!(env.ok(Some(WRITER), None, &["cat", "main:secrets/key"]), "imported secret\n");

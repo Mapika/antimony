@@ -6,7 +6,7 @@ use ant_server::config::StoreArgs;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "ant", about = "antimony source control client", version)]
+#[command(name = "ant", about = "antimony source control client", version = env!("ANT_VERSION"))]
 pub struct Cli {
     /// gRPC url of the antimony server.
     #[arg(long, global = true, env = "ANT_SERVER", default_value = "http://127.0.0.1:7420")]
@@ -85,6 +85,13 @@ pub enum Command {
     },
     /// Mount a read-only FUSE view of a rev.
     Mount { rev: String, mountpoint: PathBuf },
+    /// Run the antimony server (gRPC + HTTP object endpoint).
+    Serve(ant_server::serve::ServeArgs),
+    /// Print a shell completion script.
+    Completions {
+        /// Target shell.
+        shell: clap_complete::Shell,
+    },
     /// Administrative commands working directly on the stores.
     Admin {
         #[command(subcommand)]
