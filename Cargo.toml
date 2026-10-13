@@ -62,7 +62,10 @@ zstd = "0.13"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-debug = "line-tables-only"
+# No debuginfo in the shipped binary (123 MB with line tables, 30 MB without);
+# the symbol table stays, so backtraces still name functions (no line numbers).
+debug = false
+strip = "debuginfo"
 
 [profile.dev]
 # Keep the shared agent build cache small; full debuginfo is rarely needed.
