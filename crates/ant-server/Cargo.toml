@@ -29,3 +29,5 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true
+proptest.workspace = true
+sqlx.workspace = true
