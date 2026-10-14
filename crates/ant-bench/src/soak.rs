@@ -108,7 +108,8 @@ pub struct Args {
     /// Directory for replica logs (default: the system temp dir).
     #[arg(long)]
     pub log_dir: Option<PathBuf>,
-    /// Extra environment for replica processes (KEY=VALUE, repeatable).
+    /// Extra environment for replica processes (`KEY=VALUE`, or
+    /// `INDEX:KEY=VALUE` for one replica; repeatable).
     #[arg(long)]
     pub replica_env: Vec<String>,
     /// Seconds excluded from the RSS trend (cache warm-up); default: half
@@ -651,9 +652,17 @@ async fn drive(
         let log = log_dir.join(format!("{schema}-r{i}.log"));
         let mut env = vec![("RUST_LOG".to_string(), "warn".to_string())];
         for kv in &args.replica_env {
-            let (k, v) =
-                kv.split_once('=').ok_or_else(|| anyhow!("--replica-env wants KEY=VALUE"))?;
-            env.push((k.to_string(), v.to_string()));
+            // `<index>:KEY=VALUE` applies to one replica only (A/B runs).
+            let (only, kv) = match kv.split_once(':') {
+                Some((n, rest)) if n.parse::<usize>().is_ok() => (n.parse::<usize>().ok(), rest),
+                _ => (None, kv.as_str()),
+            };
+            let (k, v) = kv
+                .split_once('=')
+                .ok_or_else(|| anyhow!("--replica-env wants [INDEX:]KEY=VALUE"))?;
+            if only.is_none_or(|n| n == i) {
+                env.push((k.to_string(), v.to_string()));
+            }
         }
         replicas.push(Replica::spawn(i, exe, &argv, &env, &log).await?);
         println!(

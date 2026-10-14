@@ -50,6 +50,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         .try_init();
 
     let backend = args.store.backend().await?;
+    spawn_malloc_trim();
     let acl = match &args.policy {
         Some(path) => {
             let acl = Acl::load(path)?;
@@ -106,3 +107,24 @@ pub async fn spawn_local(backend: Backend, acl: Acl) -> std::io::Result<LocalSer
     tokio::spawn(http::serve_with_acl(backend, acl, http_listener));
     Ok(addrs)
 }
+
+/// Seconds between `malloc_trim` calls (`ANT_MALLOC_TRIM_SECS`, 0 = never).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn spawn_malloc_trim() {
+    let secs =
+        std::env::var("ANT_MALLOC_TRIM_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    if secs == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
+        loop {
+            tick.tick().await;
+            // SAFETY: malloc_trim only releases free heap memory to the OS.
+            let _ = tokio::task::spawn_blocking(|| unsafe { libc::malloc_trim(0) }).await;
+        }
+    });
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn spawn_malloc_trim() {}

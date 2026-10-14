@@ -214,6 +214,7 @@ dependencies = [
  "clap",
  "diffy",
  "futures",
+ "libc",
  "proptest",
  "rand 0.9.5",
  "reqwest",
