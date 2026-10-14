@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ant_store::packed::PackedS3Store;
 use ant_store::postgres::{PgOptions, PgStore};
-use ant_store::s3::{S3Config, S3ObjectStore};
+use ant_store::s3::{S3Config, S3ObjectStore, S3Timeouts};
 use ant_store::tiered::{DEFAULT_INLINE_THRESHOLD, TieredObjectStore};
 use ant_store::{Backend, ObjectStore};
 use anyhow::{Context, bail};
@@ -93,6 +93,29 @@ pub struct StoreArgs {
     #[arg(long, env = "ANT_S3_REGION", default_value = "us-east-1")]
     s3_region: String,
 
+    /// S3 connect timeout (`5s`, `500ms`; a bare number is seconds).
+    #[arg(long, env = "ANT_S3_CONNECT_TIMEOUT", default_value = "5s", value_parser = parse_duration)]
+    s3_connect_timeout: std::time::Duration,
+
+    /// Fixed part of the per-attempt S3 timeout, which covers the whole
+    /// response body; the time for the bytes (--s3-min-throughput) is added.
+    #[arg(long, env = "ANT_S3_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
+    s3_attempt_timeout: std::time::Duration,
+
+    /// Slowest acceptable S3 transfer rate in bytes per second; sizes the
+    /// per-attempt timeout of large reads and writes.
+    #[arg(long, env = "ANT_S3_MIN_THROUGHPUT", default_value_t = 10_000_000)]
+    s3_min_throughput: u64,
+
+    /// Longest one S3 operation may take, retries included.
+    #[arg(long, env = "ANT_S3_OPERATION_TIMEOUT", default_value = "5m", value_parser = parse_duration)]
+    s3_operation_timeout: std::time::Duration,
+
+    /// Attempts per S3 operation (1 = no retries). Throttling, 5xx,
+    /// connection errors, timeouts and truncated bodies are retried.
+    #[arg(long, env = "ANT_S3_MAX_ATTEMPTS", default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
+    s3_max_attempts: u32,
+
     /// Objects whose encoded size is at most this many bytes live in Postgres;
     /// larger ones go to S3 (only with --s3-*).
     #[arg(long, env = "ANT_INLINE_THRESHOLD", default_value_t = DEFAULT_INLINE_THRESHOLD)]
@@ -141,6 +164,13 @@ impl StoreArgs {
             prefix: self.s3_prefix.clone(),
             access_key,
             secret_key,
+            timeouts: S3Timeouts {
+                connect: self.s3_connect_timeout,
+                attempt: self.s3_attempt_timeout,
+                min_throughput: self.s3_min_throughput,
+                operation: self.s3_operation_timeout,
+                max_attempts: self.s3_max_attempts,
+            },
         }))
     }
 

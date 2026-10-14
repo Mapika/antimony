@@ -34,6 +34,29 @@ Run it behind TLS. Bearer tokens are secrets, and the server itself does not
 terminate TLS. Put a reverse proxy (or a gRPC-aware load balancer) in front
 of both ports.
 
+
+### S3 timeouts and retries
+
+Every S3 request is bounded, so a stalled or throttling object store fails a
+request with an error instead of hanging it (and the read budget it holds).
+An attempt covers the request **and the whole response body**; it may take
+`--s3-timeout + size / --s3-min-throughput`. Throttling (429, 503,
+`SlowDown`), 5xx, connection resets, timeouts and truncated bodies are retried
+with jittered exponential backoff (100 ms doubling to 5 s; a `Retry-After`
+header is honoured, up to 30 s). Only GET, HEAD, PUT and DELETE of
+content-addressed or idempotent keys are issued, so retries are safe. After
+the last attempt the caller gets a `backend error: s3 <op> <key>: gave up
+after N attempt(s) ...` (clone and RPC fail cleanly). `/readyz` probes S3
+with one attempt.
+
+| flag | env | default |
+|---|---|---|
+| `--s3-connect-timeout` | `ANT_S3_CONNECT_TIMEOUT` | `5s` |
+| `--s3-timeout` (fixed part of an attempt) | `ANT_S3_TIMEOUT` | `30s` |
+| `--s3-min-throughput` (bytes/s) | `ANT_S3_MIN_THROUGHPUT` | `10000000` |
+| `--s3-operation-timeout` (retries included) | `ANT_S3_OPERATION_TIMEOUT` | `5m` |
+| `--s3-max-attempts` (1 = no retries) | `ANT_S3_MAX_ATTEMPTS` | `5` |
+
 ## Metrics and logs
 
 **Metrics.** `GET /metrics` on the HTTP port returns Prometheus (OpenMetrics

@@ -12,14 +12,27 @@
 //!   uses HEAD.
 //! - `connect` builds a client with `force_path_style(true)` (SeaweedFS/MinIO
 //!   need it), static credentials, the given region and endpoint.
+//! - Every request is bounded: a connect timeout, a per-attempt timeout that
+//!   covers the whole response body (`attempt + size / min_throughput`) and an
+//!   overall operation timeout ([`S3Timeouts`]). Throttling (429, 503,
+//!   `SlowDown`), 5xx, connection errors, timeouts and truncated bodies are
+//!   retried with jittered exponential backoff (honouring `Retry-After`) up to
+//!   `max_attempts`; GET, HEAD and PUT of content-addressed keys are
+//!   idempotent. The SDK's own retries are disabled so attempts do not
+//!   multiply. After the last attempt a `StoreError::Backend` names the
+//!   operation, key and last failure.
 //! - `ensure_bucket` creates the bucket if it does not exist ("already owned
 //!   by you" counts as success).
 
-use std::collections::HashSet;
+use std::{collections::HashSet, future::Future, time::Duration};
 
 use ant_core::{EncodedObject, ObjectId};
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::{
+    config::{retry::RetryConfig, timeout::TimeoutConfig},
+    error::{DisplayErrorContext, SdkError},
+};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 
@@ -27,13 +40,53 @@ use crate::{ObjectStore, Result, StoreError};
 
 /// Maximum number of concurrent S3 requests per batch call.
 const FANOUT: usize = 64;
-/// Attempts at reading one ranged response body.
-const BODY_ATTEMPTS: u32 = 4;
+/// Size assumed for the per-attempt timeout of a read whose size is unknown.
+const UNKNOWN_SIZE: u64 = 16 * 1024 * 1024;
+/// Longest pause between attempts, including a server's `Retry-After`.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+type HttpResponse = aws_sdk_s3::config::http::HttpResponse;
 /// zstd level for stored object bodies.
 const ZSTD_LEVEL: i32 = 3;
 /// Bodies larger than this are compressed/decompressed/hashed on the blocking
 /// pool instead of an async worker thread.
 const BLOCKING_THRESHOLD: usize = 64 * 1024;
+
+/// Timeout and retry policy of the S3 client (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S3Timeouts {
+    /// Establishing a TCP/TLS connection.
+    pub connect: Duration,
+    /// Fixed part of the per-attempt timeout (request sent, headers and the
+    /// whole body received).
+    pub attempt: Duration,
+    /// Slowest acceptable transfer rate, bytes per second: an attempt moving
+    /// `n` bytes may take `attempt + n / min_throughput`.
+    pub min_throughput: u64,
+    /// Everything about one operation, retries and pauses included.
+    pub operation: Duration,
+    /// Attempts per operation (1 = no retry).
+    pub max_attempts: u32,
+}
+
+impl Default for S3Timeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(5),
+            attempt: Duration::from_secs(30),
+            min_throughput: 10_000_000,
+            operation: Duration::from_secs(300),
+            max_attempts: 5,
+        }
+    }
+}
+
+impl S3Timeouts {
+    /// Time one attempt moving `bytes` bytes may take.
+    pub fn attempt_for(&self, bytes: u64) -> Duration {
+        self.attempt + Duration::from_secs_f64(bytes as f64 / self.min_throughput.max(1) as f64)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct S3Config {
@@ -43,6 +96,7 @@ pub struct S3Config {
     pub prefix: String,
     pub access_key: String,
     pub secret_key: String,
+    pub timeouts: S3Timeouts,
 }
 
 impl S3Config {
@@ -56,6 +110,7 @@ impl S3Config {
             prefix: prefix.to_string(),
             access_key: env("ANT_TEST_S3_ACCESS_KEY", "ant"),
             secret_key: env("ANT_TEST_S3_SECRET_KEY", "ant"),
+            timeouts: S3Timeouts::default(),
         }
     }
 }
@@ -74,6 +129,53 @@ pub struct S3ObjectStore {
     client: aws_sdk_s3::Client,
     bucket: String,
     prefix: String,
+    timeouts: S3Timeouts,
+}
+
+/// Outcome of one failed attempt.
+enum Attempt {
+    /// Transient: try again, after `after` if the server asked for a pause.
+    Retry {
+        why: String,
+        after: Option<Duration>,
+    },
+    Fatal(StoreError),
+}
+
+fn retry_after(resp: &HttpResponse) -> Option<Duration> {
+    let secs: f64 = resp.headers().get("retry-after")?.trim().parse().ok()?;
+    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs).min(MAX_BACKOFF))
+}
+
+/// Sort an SDK failure into retryable and fatal.
+fn classify<E>(op: &str, what: &str, e: SdkError<E, HttpResponse>) -> Attempt
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let status = e.raw_response().map(|r| r.status().as_u16());
+    let after = e.raw_response().and_then(retry_after);
+    let transient_status = |s: u16| matches!(s, 408 | 425 | 429 | 500..=504);
+    let retry = match &e {
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_) => {
+            true
+        }
+        SdkError::ServiceError(_) => status.is_some_and(transient_status),
+        _ => false,
+    };
+    let why = DisplayErrorContext(&e).to_string();
+    if retry {
+        Attempt::Retry { why, after }
+    } else {
+        Attempt::Fatal(corrupt(format!("s3 {op} {what}: {why}")))
+    }
+}
+
+/// Pause after failed attempt `n`: 100 ms doubling to 5 s, jittered over its
+/// upper half.
+fn backoff(n: u32) -> Duration {
+    let cap =
+        Duration::from_millis(100u64 << n.saturating_sub(1).min(6)).min(Duration::from_secs(5));
+    cap.mul_f64(0.5 + 0.5 * rand::random::<f64>())
 }
 
 fn hex_string(bytes: &[u8]) -> String {
@@ -99,33 +201,102 @@ impl S3ObjectStore {
             .endpoint_url(&cfg.endpoint)
             .credentials_provider(credentials)
             .force_path_style(true)
+            // Timeouts and retries are ours (`retrying`), around the body read.
+            .retry_config(RetryConfig::disabled())
+            .timeout_config(TimeoutConfig::builder().connect_timeout(cfg.timeouts.connect).build())
             .build();
         Ok(Self {
             client: aws_sdk_s3::Client::from_conf(conf),
             bucket: cfg.bucket.clone(),
             prefix: cfg.prefix.clone(),
+            timeouts: cfg.timeouts,
         })
     }
 
-    pub async fn ensure_bucket(&self) -> Result<()> {
-        match self.client.create_bucket().bucket(&self.bucket).send().await {
-            Ok(_) => Ok(()),
-            // SeaweedFS (no identities configured) reports an existing bucket as
-            // `BucketAlreadyExists` rather than `BucketAlreadyOwnedByYou`; both mean
-            // the bucket is usable, so creation is idempotent.
-            Err(e) => match e.as_service_error() {
-                Some(s) if s.is_bucket_already_owned_by_you() || s.is_bucket_already_exists() => {
-                    Ok(())
+    /// Run `attempt` until it succeeds, fails for good, or the policy
+    /// ([`S3Timeouts`]) is exhausted. Each attempt, body included, is bounded
+    /// by `attempt_timeout`; dropping a timed-out attempt cancels it, which
+    /// releases whatever it held.
+    async fn retrying<T, F, Fut>(
+        &self,
+        op: &'static str,
+        what: &str,
+        attempt_timeout: Duration,
+        mut attempt: F,
+    ) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = std::result::Result<T, Attempt>>,
+    {
+        let t = self.timeouts;
+        let started = tokio::time::Instant::now();
+        let run = async {
+            let mut n = 0u32;
+            loop {
+                n += 1;
+                let outcome = match tokio::time::timeout(attempt_timeout, attempt()).await {
+                    Ok(r) => r,
+                    Err(_) => Err(Attempt::Retry {
+                        why: format!("attempt timed out after {attempt_timeout:?}"),
+                        after: None,
+                    }),
+                };
+                let (why, after) = match outcome {
+                    Ok(v) => return Ok(v),
+                    Err(Attempt::Fatal(e)) => return Err(e),
+                    Err(Attempt::Retry { why, after }) => (why, after),
+                };
+                let pause = after.map_or_else(|| backoff(n), |a| a.max(backoff(n)));
+                if n >= t.max_attempts.max(1) || started.elapsed() + pause >= t.operation {
+                    return Err(corrupt(format!(
+                        "s3 {op} {what}: gave up after {n} attempt(s) in {:?}: {why}",
+                        started.elapsed()
+                    )));
                 }
-                _ => Err(StoreError::backend(e)),
-            },
+                tracing::warn!(op, what, attempt = n, ?pause, "s3 request failed, retrying: {why}");
+                tokio::time::sleep(pause).await;
+            }
+        };
+        match tokio::time::timeout(t.operation, run).await {
+            Ok(r) => r,
+            Err(_) => {
+                Err(corrupt(format!("s3 {op} {what}: operation timed out after {:?}", t.operation)))
+            }
         }
     }
 
+    pub async fn ensure_bucket(&self) -> Result<()> {
+        let (client, bucket) = (&self.client, &self.bucket);
+        self.retrying("create_bucket", bucket, self.timeouts.attempt, || async move {
+            match client.create_bucket().bucket(bucket).send().await {
+                Ok(_) => Ok(()),
+                // SeaweedFS (no identities configured) reports an existing bucket as
+                // `BucketAlreadyExists` rather than `BucketAlreadyOwnedByYou`; both mean
+                // the bucket is usable, so creation is idempotent.
+                Err(e) => match e.as_service_error() {
+                    Some(s)
+                        if s.is_bucket_already_owned_by_you() || s.is_bucket_already_exists() =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(classify("create_bucket", bucket, e)),
+                },
+            }
+        })
+        .await
+    }
+
     /// Readiness probe: `HEAD` on the bucket (cheap; no listing, no body).
+    /// One attempt, bounded by the attempt timeout: a probe should report a
+    /// struggling store, not retry through it.
     pub async fn ping(&self) -> Result<()> {
-        self.client.head_bucket().bucket(&self.bucket).send().await.map_err(StoreError::backend)?;
-        Ok(())
+        let probe = self.client.head_bucket().bucket(&self.bucket).send();
+        match tokio::time::timeout(self.timeouts.attempt, probe).await {
+            Ok(r) => r.map(|_| ()).map_err(StoreError::backend),
+            Err(_) => {
+                Err(corrupt(format!("s3 head_bucket: timed out after {:?}", self.timeouts.attempt)))
+            }
+        }
     }
 
     /// Object key for `id`.
@@ -159,15 +330,22 @@ impl S3ObjectStore {
         token: Option<String>,
     ) -> Result<(Vec<PackInfo>, Option<String>)> {
         let prefix = self.packs_prefix();
+        let (client, bucket, p) = (&self.client, &self.bucket, &prefix);
         let resp = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(&prefix)
-            .set_continuation_token(token)
-            .send()
-            .await
-            .map_err(StoreError::backend)?;
+            .retrying("list", &prefix, self.timeouts.attempt, || {
+                let token = token.clone();
+                async move {
+                    client
+                        .list_objects_v2()
+                        .bucket(bucket)
+                        .prefix(p)
+                        .set_continuation_token(token)
+                        .send()
+                        .await
+                        .map_err(|e| classify("list", p, e))
+                }
+            })
+            .await?;
         let mut packs = Vec::new();
         for o in resp.contents() {
             let Some(hex) = o.key().and_then(|k| k.strip_prefix(prefix.as_str())) else {
@@ -202,14 +380,19 @@ impl S3ObjectStore {
                 .quiet(true)
                 .build()
                 .map_err(StoreError::backend)?;
+            // Deleting is idempotent: a retry after a lost response is harmless.
+            let (client, bucket, delete) = (&self.client, &self.bucket, &delete);
             let resp = self
-                .client
-                .delete_objects()
-                .bucket(&self.bucket)
-                .delete(delete)
-                .send()
-                .await
-                .map_err(StoreError::backend)?;
+                .retrying("delete_objects", bucket, self.timeouts.attempt, || async move {
+                    client
+                        .delete_objects()
+                        .bucket(bucket)
+                        .delete(delete.clone())
+                        .send()
+                        .await
+                        .map_err(|e| classify("delete_objects", bucket, e))
+                })
+                .await?;
             if let Some(e) = resp.errors().first() {
                 return Err(corrupt(format!(
                     "deleting pack {}: {}",
@@ -222,48 +405,62 @@ impl S3ObjectStore {
     }
 
     pub(crate) async fn put_raw(&self, key: String, body: Vec<u8>) -> Result<()> {
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(body))
-            .send()
-            .await
-            .map_err(StoreError::backend)?;
-        Ok(())
+        self.put_bytes(&key, Bytes::from(body)).await
     }
 
-    /// `len` bytes at `offset` of object `key`.
+    /// PUT `body` at `key`; retried, since a key holds one fixed content.
+    async fn put_bytes(&self, key: &str, body: Bytes) -> Result<()> {
+        let (client, bucket) = (&self.client, &self.bucket);
+        let timeout = self.timeouts.attempt_for(body.len() as u64);
+        self.retrying("put", key, timeout, || {
+            let body = body.clone();
+            async move {
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(ByteStream::from(body))
+                    .send()
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| classify("put", key, e))
+            }
+        })
+        .await
+    }
+
+    /// `len` bytes at `offset` of object `key`. Bounded and retried as a
+    /// whole (request, headers and body): a server that throttles or stalls
+    /// mid-body costs one attempt, not the caller.
     pub(crate) async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes> {
-        // The SDK retries failed requests but not a body cut short mid-stream,
-        // which a busy S3 server does under many concurrent ranged reads.
-        let mut attempt = 0;
-        let body = loop {
-            let resp = self
-                .client
+        let (client, bucket) = (&self.client, &self.bucket);
+        let range = format!("bytes={}-{}", offset, offset + len.max(1) - 1);
+        let range = &range;
+        let timeout = self.timeouts.attempt_for(len);
+        self.retrying("get_range", key, timeout, || async move {
+            let resp = client
                 .get_object()
-                .bucket(&self.bucket)
+                .bucket(bucket)
                 .key(key)
-                .range(format!("bytes={}-{}", offset, offset + len.max(1) - 1))
+                .range(range)
                 .send()
                 .await
-                .map_err(StoreError::backend)?;
-            match resp.body.collect().await {
-                Ok(body) => break body.into_bytes(),
-                Err(e) if attempt + 1 >= BODY_ATTEMPTS => return Err(StoreError::backend(e)),
-                Err(_) => {
-                    attempt += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(20 << attempt)).await;
-                }
+                .map_err(|e| classify("get_range", key, e))?;
+            let body = resp
+                .body
+                .collect()
+                .await
+                .map_err(|e| Attempt::Retry { why: format!("reading body: {e}"), after: None })?
+                .into_bytes();
+            if body.len() as u64 != len {
+                return Err(Attempt::Retry {
+                    why: format!("short range read ({} of {len} bytes)", body.len()),
+                    after: None,
+                });
             }
-        };
-        if body.len() as u64 != len {
-            return Err(corrupt(format!(
-                "{key}: short range read ({} of {len} bytes)",
-                body.len()
-            )));
-        }
-        Ok(body)
+            Ok(body)
+        })
+        .await
     }
 
     /// Decompress and verify one stored body.
@@ -276,18 +473,28 @@ impl S3ObjectStore {
     }
 
     async fn get_one(&self, id: ObjectId) -> Result<Option<EncodedObject>> {
-        let resp =
-            match self.client.get_object().bucket(&self.bucket).key(self.key(&id)).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    if e.as_service_error().is_some_and(|s| s.is_no_such_key()) {
+        let (client, bucket) = (&self.client, &self.bucket);
+        let key = self.key(&id);
+        let key = &key;
+        let compressed: Option<Bytes> = self
+            .retrying("get", key, self.timeouts.attempt_for(UNKNOWN_SIZE), || async move {
+                let resp = match client.get_object().bucket(bucket).key(key).send().await {
+                    Ok(r) => r,
+                    Err(e) if e.as_service_error().is_some_and(|s| s.is_no_such_key()) => {
                         return Ok(None);
                     }
-                    return Err(StoreError::backend(e));
-                }
-            };
-        let compressed: Bytes =
-            resp.body.collect().await.map_err(StoreError::backend)?.into_bytes();
+                    Err(e) => return Err(classify("get", key, e)),
+                };
+                let body = resp.body.collect().await.map_err(|e| Attempt::Retry {
+                    why: format!("reading body: {e}"),
+                    after: None,
+                })?;
+                Ok(Some(body.into_bytes()))
+            })
+            .await?;
+        let Some(compressed) = compressed else {
+            return Ok(None);
+        };
         let compressed_len = compressed.len();
         let decode = move || -> Result<EncodedObject> {
             let raw = zstd::stream::decode_all(&compressed[..]).map_err(StoreError::backend)?;
@@ -319,28 +526,21 @@ impl S3ObjectStore {
             zstd::stream::encode_all(&obj.as_bytes()[..], ZSTD_LEVEL)
                 .map_err(StoreError::backend)?
         };
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(self.key(&id))
-            .body(ByteStream::from(compressed))
-            .send()
-            .await
-            .map_err(StoreError::backend)?;
-        Ok(())
+        self.put_bytes(&self.key(&id), Bytes::from(compressed)).await
     }
 
     async fn has_one(&self, id: ObjectId) -> Result<bool> {
-        match self.client.head_object().bucket(&self.bucket).key(self.key(&id)).send().await {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if e.as_service_error().is_some_and(|s| s.is_not_found()) {
-                    Ok(false)
-                } else {
-                    Err(StoreError::backend(e))
-                }
+        let (client, bucket) = (&self.client, &self.bucket);
+        let key = self.key(&id);
+        let key = &key;
+        self.retrying("head", key, self.timeouts.attempt, || async move {
+            match client.head_object().bucket(bucket).key(key).send().await {
+                Ok(_) => Ok(true),
+                Err(e) if e.as_service_error().is_some_and(|s| s.is_not_found()) => Ok(false),
+                Err(e) => Err(classify("head", key, e)),
             }
-        }
+        })
+        .await
     }
 }
 
@@ -396,8 +596,12 @@ impl ObjectStore for S3ObjectStore {
 mod tests {
     use std::sync::Arc;
 
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
     use super::*;
     use crate::conformance;
+    use crate::s3_fake::{Act, byte_at, config, fast_timeouts, spawn};
 
     async fn fresh() -> S3ObjectStore {
         let cfg = S3Config::for_tests(&format!("t{}", rand::random::<u64>()));
@@ -420,5 +624,137 @@ mod tests {
         let k = s.key(&id);
         assert!(k.ends_with(&format!("/ab/{}", id.to_hex())), "{k}");
         assert!(k.starts_with(&s.prefix));
+    }
+
+    const LEN: u64 = 4096;
+
+    fn expected(offset: u64) -> Vec<u8> {
+        (offset..offset + LEN).map(byte_at).collect()
+    }
+
+    async fn store_for(script: Vec<Act>, attempts: u32) -> (S3ObjectStore, crate::s3_fake::Fake) {
+        let fake = spawn(script).await;
+        let s = S3ObjectStore::connect(&config(&fake, fast_timeouts(attempts))).await.unwrap();
+        (s, fake)
+    }
+
+    #[tokio::test]
+    async fn stalled_body_times_out_and_gives_up() {
+        let (s, fake) = store_for(vec![Act::Stall], 3).await;
+        let t = Instant::now();
+        let err = s.get_range("k", 10, LEN).await.unwrap_err();
+        // 3 attempts x 300 ms plus short backoffs; never a hang.
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 3);
+        assert!(matches!(err, StoreError::Backend(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("gave up after 3") && msg.contains("timed out"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn stall_then_success_returns_correct_bytes() {
+        let (s, fake) = store_for(vec![Act::Stall, Act::Stall, Act::Ok], 4).await;
+        let got = s.get_range("k", 1000, LEN).await.unwrap();
+        assert_eq!(&got[..], &expected(1000)[..]);
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn throttled_then_success() {
+        let (s, fake) = store_for(vec![Act::Throttle(None), Act::Throttle(None), Act::Ok], 4).await;
+        let got = s.get_range("k", 0, LEN).await.unwrap();
+        assert_eq!(&got[..], &expected(0)[..]);
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_honoured() {
+        let (s, fake) = store_for(vec![Act::Throttle(Some(1)), Act::Ok], 3).await;
+        let t = Instant::now();
+        let got = s.get_range("k", 7, LEN).await.unwrap();
+        assert_eq!(&got[..], &expected(7)[..]);
+        assert!(t.elapsed() >= Duration::from_secs(1), "{:?}", t.elapsed());
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn persistent_throttling_is_a_backend_error() {
+        let (s, fake) = store_for(vec![Act::Throttle(None)], 3).await;
+        let err = s.get_range("k", 0, LEN).await.unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)));
+        assert!(err.to_string().contains("gave up after 3"), "{err}");
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn truncated_body_is_retried() {
+        let (s, fake) = store_for(vec![Act::Truncate, Act::Ok], 3).await;
+        let got = s.get_range("k", 5, LEN).await.unwrap();
+        assert_eq!(&got[..], &expected(5)[..]);
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 2);
+
+        let (s, fake) = store_for(vec![Act::Truncate], 3).await;
+        assert!(matches!(s.get_range("k", 5, LEN).await, Err(StoreError::Backend(_))));
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn reset_connection_is_retried() {
+        let (s, fake) = store_for(vec![Act::Reset, Act::Reset, Act::Ok], 4).await;
+        let got = s.get_range("k", 3, LEN).await.unwrap();
+        assert_eq!(&got[..], &expected(3)[..]);
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 3);
+
+        let (s, fake) = store_for(vec![Act::Reset], 2).await;
+        assert!(matches!(s.get_range("k", 3, LEN).await, Err(StoreError::Backend(_))));
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn client_errors_are_not_retried() {
+        let (s, fake) = store_for(vec![Act::Status(403)], 5).await;
+        let err = s.get_range("k", 0, LEN).await.unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)));
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn operation_timeout_bounds_total_time() {
+        let fake = spawn(vec![Act::Stall]).await;
+        let mut t = fast_timeouts(1000);
+        t.operation = Duration::from_millis(1200);
+        let s = S3ObjectStore::connect(&config(&fake, t)).await.unwrap();
+        let start = Instant::now();
+        let err = s.get_range("k", 0, LEN).await.unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+        assert!(matches!(err, StoreError::Backend(_)));
+    }
+
+    #[tokio::test]
+    async fn put_and_head_are_retried() {
+        let (s, fake) = store_for(vec![Act::Throttle(None), Act::Reset, Act::Ok], 4).await;
+        s.put_raw("p/packs/x".into(), vec![1, 2, 3]).await.unwrap();
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 3);
+
+        let (s, fake) = store_for(vec![Act::Throttle(None), Act::Ok], 3).await;
+        let id = ObjectId([7; 32]);
+        assert_eq!(s.has_many(&[id]).await.unwrap(), vec![true]);
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn ping_does_not_retry() {
+        let (s, fake) = store_for(vec![Act::Throttle(None)], 5).await;
+        let t = Instant::now();
+        assert!(s.ping().await.is_err());
+        assert!(t.elapsed() < Duration::from_secs(2));
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn attempt_timeout_scales_with_size() {
+        let t = S3Timeouts::default();
+        assert_eq!(t.attempt_for(0), Duration::from_secs(30));
+        assert_eq!(t.attempt_for(100_000_000), Duration::from_secs(40));
     }
 }
