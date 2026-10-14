@@ -290,21 +290,44 @@ cache keyed by object id alone would hand an object to someone the origin
 would refuse. The two modes:
 
 - `--auth forward` (default; correct for any upstream, including one running
-  with a policy). The caller's `Authorization` header is forwarded on every
-  request. For an object the cache holds, it sends the origin a conditional
-  `GET /o/<id>` with `If-None-Match` and the caller's credentials; the origin
-  authorizes it like any read and answers `304` without reading its stores,
-  and only then does the cache serve the bytes from disk. Any other answer
-  (401, 403, 404, 5xx, no answer) is passed through and nothing is served,
-  so the cache fails closed and revocations take effect immediately. Misses
-  are forwarded with the caller's credentials and stored (the disk is never
-  readable except through that check). A miss by principal B while principal
-  A's fetch of the same object is in flight first passes the conditional
-  check, then takes the bytes: waiting never skips authorization. Tree
-  bundles depend on the caller (objects they cannot read are left out), so
-  `/t/` is forwarded uncached with the origin's own headers; the objects in
-  it are kept for later checked `/o/` reads. What forward mode saves is the
-  object bytes and the origin's store reads, not the requests.
+  with a policy). The caller's `Authorization` header is forwarded to the
+  origin; the cache never serves bytes on its own authority. For an object
+  it holds, it asks the origin with a batched `POST /o/check` (up to 4096
+  ids per request, the same authorization code as `GET /o/<id>`, a hidden
+  object reported like a missing one): requests of one principal that arrive
+  within `--authz-window-ms` (default 2) share one check. Only on a clear
+  "yes" are the bytes served from disk; a no, a 401, a 5xx or no answer
+  serves nothing (the origin's 404 / refusal is passed on), so it fails
+  closed. Misses are forwarded with the caller's credentials and stored (the
+  disk is never readable except through the check). A miss by principal B
+  while principal A's fetch of the same object is in flight first passes a
+  conditional read at the origin, then takes the bytes: waiting never skips
+  authorization.
+  - **Decision TTL (`--authz-ttl-secs`, default 30, env
+    `ANT_CACHE_AUTHZ_TTL`).** An *allowed* answer is reused for the same
+    `Authorization` header and object for at most the TTL (counted from when
+    the question was sent), so a warm tier costs the origin nothing while
+    decisions are fresh. Decisions are per principal (keyed by a SHA-256 of
+    the header; the token is not kept, logged or in metrics), never shared;
+    denials and errors are never remembered, so a new grant works at once.
+    **The TTL is the revocation window:** after you revoke a principal or
+    change a policy at the origin, the cache can still serve it objects it
+    holds for up to the TTL. Set `--authz-ttl-secs 0` if that is not
+    acceptable: every request is then checked (still batched), at one origin
+    request per batch.
+  - **Tree bundles.** A bundle served `public` by the origin (identical for
+    every caller) is indexed; later `/t/<tree>` requests, from any
+    principal, are answered by one batched check of the listed ids and a
+    bundle rebuilt from disk holding exactly the objects that principal may
+    read (`public, immutable` if all, else `private, no-store`, like the
+    origin). Bundles the origin marks caller-specific, an unindexed tree, an
+    evicted object or any failure are forwarded to the origin as before.
+  - **Older origins.** An origin without `POST /o/check` (404/405) is
+    detected; the cache then revalidates each hit with a conditional
+    `GET /o/<id>` (`304` = readable), keeps no decisions, forwards bundles,
+    and probes again after a minute. Chained forward-mode caches therefore
+    use conditional reads between them (a cache-serve does not itself offer
+    `/o/check`).
 - `--auth open`, for an origin started without `--policy` (or a cache-serve in
   open mode in front of one): every object is readable by everyone, so hits
   cost the origin nothing and bundles are rebuilt from disk. The cache checks
@@ -325,9 +348,10 @@ its budget and refreshes its gauges every minute. Metrics (names verified in
 
 | family | labels | meaning |
 |---|---|---|
-| `ant_cacheserve_requests_total` | `route` (`objects`, `bundles`), `result` | `hit` (disk, open mode), `revalidated` (disk, origin confirmed the caller, forward mode), `miss` (fetched by this request), `joined` (shared an in-flight fetch), `passthrough` (forward-mode bundle), `refused` (origin said 401/403/404 to a forward request), `not_found`, `error`. Tier hit ratio = (`hit` + `revalidated`) / all |
+| `ant_cacheserve_requests_total` | `route` (`objects`, `bundles`), `result` | `hit` (disk, open mode), `revalidated` (disk, origin confirmed the caller now or within the TTL, forward mode; rebuilt bundles too), `miss` (fetched by this request), `joined` (shared an in-flight fetch), `passthrough` (forward-mode bundle), `refused` (origin said 401/403/404 to a forward request), `not_found`, `error`. Tier hit ratio = (`hit` + `revalidated`) / all |
+| `ant_cacheserve_authz_total` | `result` (`cached`, `checked`, `fallback`) | forward-mode permission lookups, one per object per request: decision reused within the TTL, asked of the origin (batched), or per-object fallback for an origin without `/o/check` |
 | `ant_cacheserve_response_bytes_total` | `route` | body bytes sent |
-| `ant_cacheserve_upstream_requests_total` | `route`, `kind` (`fetch`, `revalidate`), `status` (`0` = transport error) | requests to the upstream |
+| `ant_cacheserve_upstream_requests_total` | `route`, `kind` (`fetch`, `revalidate`, `check`), `status` (`0` = transport error) | requests to the upstream |
 | `ant_cacheserve_upstream_bytes_total` | `route` | body bytes received |
 | `ant_cacheserve_inflight_fetches` | | upstream fetches in flight |
 | `ant_cacheserve_disk_bytes`, `_disk_budget_bytes`, `_index_bytes` | | tracked cache size (shared counter, no scan), budget, bundle index |
@@ -336,6 +360,17 @@ Useful alerts: a falling hit ratio, a rising `error` or `status="0"` share
 (the upstream is unreachable: forward mode then refuses everything, open mode
 still serves what it holds), `disk_bytes` pinned at the budget with a low hit
 ratio (undersized).
+
+Measured, forward mode (96k-file synthetic checkout over HTTP with tree
+bundles, loopback, open origin, a second client with an empty cache against
+the warm tier; `ant-bench checkout --cache-tier --cache-tier-forward`,
+`--cache-tier-no-batch` for the previous behaviour): requests reaching the
+origin 1,990 (one per bundle and per object, all forwarded) before, 0 to 42
+with batched checks (bundles rebuilt from disk; ids checked in batches or
+reused from the decision cache). Wall time on a shared, noisy machine was
+3.1 to 9.6 s before and 2.6 to 5.0 s after; the gain is origin requests and
+bytes (the origin here enforces no policy, so its per-request authorization
+work, which grows with policy size, is not in the numbers).
 
 Measured (96k-file synthetic checkout over HTTP with tree bundles, open mode,
 loopback, dev machine): a client against a cold tier 4.0 s, origin sees

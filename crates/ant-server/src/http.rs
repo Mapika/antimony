@@ -17,6 +17,20 @@
 //!   (`no-store`). Every `/t/` response carries `x-ant-bundle: 1`, so a
 //!   client tells this 404 from an older server without the route (whose
 //!   404 lacks it) and falls back to `/o/`. Content rules: `crate::bundle`.
+//! - `POST /o/check` → batch read-permission check (for cache tiers). Body: up
+//!   to [`CHECK_MAX_IDS`] raw 32-byte object ids, concatenated (400 for a
+//!   length that is not a multiple of 32, 413 for too many). Response 200:
+//!   one byte per id, in order, `Content-Type: application/x-ant-check`,
+//!   `Cache-Control: no-store`, bit 0 = `GET /o/{id}` would serve this
+//!   caller the object (it exists and the caller may read it), bit 1 =
+//!   it would be served `private` (outside the root zone; only set with
+//!   bit 0). Authorization is exactly that of `GET /o/{id}` (same
+//!   `crate::acl::read_access`): 401 without a valid token under a policy,
+//!   and an object the caller may not read looks exactly like one that does
+//!   not exist (both `0`), so the endpoint reveals no more than GET does.
+//!   Costs one `read` rate-limit token per request, whatever the id count;
+//!   absent on older servers (404/405), which clients detect and fall back
+//!   from.
 //! - Malformed id → 400.
 //! - `GET /healthz` → 200 "ok" (liveness: static, touches nothing).
 //! - `GET /readyz` → 200 `{"status":"ok","postgres":"ok","s3":"ok"}` when the
@@ -54,9 +68,9 @@ use ant_core::ObjectId;
 use ant_store::{Backend, StoreError};
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 
 use crate::acl::{self, Access, Acl, AuthError};
 use crate::bundle::{self, Limits};
@@ -158,6 +172,7 @@ fn router_with_state(
     expose_metrics: bool,
 ) -> Router {
     let mut router = Router::new()
+        .route("/o/check", post(check_objects))
         .route("/o/{hex}", get(get_object))
         .route("/t/{hex}", get(get_tree_bundle))
         .route("/healthz", get(|| async { "ok" }))
@@ -300,18 +315,16 @@ async fn get_object(
     let etag = format!("\"{}\"", id.to_hex());
 
     let mut cache = CACHE_IMMUTABLE;
-    if let Some(access) = &access {
-        let policy = &access.policy;
-        match acl::readable(&backend, policy, &access.principal, &[id]).await {
-            Ok(r) if r.first().copied().unwrap_or(false) => {}
-            Ok(_) => return not_found(),
-            Err(e) => return backend_error(e, &id),
-        }
-        match acl::is_private(&backend, policy, id).await {
-            Ok(true) => cache = CACHE_PRIVATE,
-            Ok(false) => {}
-            Err(e) => return backend_error(e, &id),
-        }
+    match acl::read_access(&backend, access.as_ref(), &[id]).await {
+        Ok(r) => match r.first() {
+            Some(a) if a.readable => {
+                if a.private {
+                    cache = CACHE_PRIVATE;
+                }
+            }
+            _ => return not_found(),
+        },
+        Err(e) => return backend_error(e, &id),
     }
 
     // Immutable content: a matching ETag means the client already holds
@@ -343,6 +356,76 @@ async fn get_object(
         },
         Err(e) => backend_error(e, &id),
     }
+}
+
+/// Most ids one `POST /o/check` may carry.
+pub const CHECK_MAX_IDS: usize = 4096;
+/// `Content-Type` of a `POST /o/check` response.
+pub const CHECK_CONTENT_TYPE: &str = "application/x-ant-check";
+/// Response flag: the object would be served to this caller.
+pub const CHECK_READABLE: u8 = 1;
+/// Response flag: it would be served `private`.
+pub const CHECK_PRIVATE: u8 = 2;
+
+/// `POST /o/check`: which of the posted objects `GET /o/{id}` would serve
+/// this caller (see the module docs).
+async fn check_objects(
+    State(HttpState { backend, acl, .. }): State<HttpState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let access = match acl.authenticate_header(authorization(&headers)) {
+        Ok(a) => a,
+        Err(e) => return unauthorized(BEARER_CHALLENGE, e),
+    };
+    if !body.len().is_multiple_of(32) {
+        return (StatusCode::BAD_REQUEST, "body must be a multiple of 32 bytes").into_response();
+    }
+    if body.len() / 32 > CHECK_MAX_IDS {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "too many ids in one check").into_response();
+    }
+    let ids: Vec<ObjectId> =
+        body.chunks_exact(32).filter_map(|c| <[u8; 32]>::try_from(c).ok()).map(ObjectId).collect();
+    // Existence is part of the answer (a hidden object must look like a
+    // missing one), and is always looked up so the work does not depend on
+    // the decision.
+    let (access_res, exists) = tokio::join!(
+        acl::read_access(&backend, access.as_ref(), &ids),
+        backend.objects.has_many(&ids)
+    );
+    let (decisions, exists) = match (access_res, exists) {
+        (Ok(d), Ok(e)) => (d, e),
+        (Err(e), _) => return check_error(e),
+        (_, Err(e)) => return check_error(e),
+    };
+    let flags: Vec<u8> = decisions
+        .iter()
+        .zip(&exists)
+        .map(|(d, e)| match (d.readable && *e, d.private) {
+            (true, true) => CHECK_READABLE | CHECK_PRIVATE,
+            (true, false) => CHECK_READABLE,
+            (false, _) => 0,
+        })
+        .collect();
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(CHECK_CONTENT_TYPE)),
+            (header::CACHE_CONTROL, HeaderValue::from_static(CACHE_NO_STORE)),
+            (HeaderName::from_static("x-ant-check"), HeaderValue::from_static("1")),
+        ],
+        flags,
+    )
+        .into_response()
+}
+
+fn check_error(e: impl std::fmt::Display) -> Response {
+    tracing::error!(error = %e, "object check failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        [(header::CACHE_CONTROL, HeaderValue::from_static(CACHE_NO_STORE))],
+        "storage backend error",
+    )
+        .into_response()
 }
 
 /// `GET /t/{hex}`: the tree bundle of `hex` (see the module docs).

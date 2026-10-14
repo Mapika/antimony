@@ -34,6 +34,8 @@ pub async fn run(args: CacheServeArgs, cache: Option<PathBuf>, cache_bytes: u64)
         auth,
         disk,
         retry: RetryPolicy::default(),
+        authz_ttl: Duration::from_secs(args.authz_ttl_secs),
+        authz_window: Duration::from_millis(args.authz_window_ms),
     })
     .await?;
     let listener = tokio::net::TcpListener::bind(args.listen)

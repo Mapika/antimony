@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ant_core::{EncodedObject, ObjectId};
 use ant_store::ObjectStore;
@@ -20,6 +20,7 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use parking_lot::Mutex;
 
+use crate::authz::{AuthzState, CredKey, Outcome, Pending, Slot, Verdict, cred_key};
 use crate::index::Index;
 use crate::metrics::{CONTENT_TYPE as METRICS_CONTENT_TYPE, Metrics};
 
@@ -27,14 +28,20 @@ const OBJECT_CONTENT_TYPE: &str = "application/x-ant-object";
 const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const CACHE_PRIVATE: &str = "private, max-age=31536000, immutable";
 const CACHE_NO_STORE: &str = "no-store";
+const CACHE_PRIVATE_NO_STORE: &str = "private, no-store";
+/// Header marking a `POST /o/check` answer (`ant-server`'s `http`).
+const CHECK_HEADER: &str = "x-ant-check";
 /// Response header telling how the cache served a request.
 pub const CACHE_HEADER: &str = "x-ant-cache";
 /// Largest decompressed bundle accepted from an upstream.
 const MAX_BUNDLE_BYTES: usize = 256 * 1024 * 1024;
+/// Most object ids sent in one `POST /o/check` (the origin's limit).
+const CHECK_MAX_IDS: usize = 4096;
 /// Background bundle ingestions at once (forward mode).
 const INGEST_PARALLELISM: usize = 4;
 /// Upstream headers copied into responses.
-const PASS_HEADERS: [&str; 7] = [
+const PASS_HEADERS: [&str; 8] = [
+    CHECK_HEADER,
     "content-type",
     "cache-control",
     "etag",
@@ -60,14 +67,44 @@ pub struct Config {
     pub disk: Arc<DiskObjectStore>,
     /// Retry policy for upstream requests that carry a retry hint.
     pub retry: RetryPolicy,
+    /// Forward mode: how long an allowed read decision for a principal is
+    /// reused without asking the upstream again (`ZERO`: always ask). It
+    /// bounds how long a revoked principal can still read objects this cache
+    /// holds; see the crate docs.
+    pub authz_ttl: Duration,
+    /// Forward mode: how long permission checks wait to be batched into one
+    /// request to the upstream.
+    pub authz_window: Duration,
 }
+
+/// Default [`Config::authz_ttl`].
+pub const DEFAULT_AUTHZ_TTL: Duration = Duration::from_secs(30);
+/// Default [`Config::authz_window`].
+pub const DEFAULT_AUTHZ_WINDOW: Duration = Duration::from_millis(2);
 
 /// A buffered upstream response.
 #[derive(Debug)]
-struct Reply {
-    status: StatusCode,
-    headers: HeaderMap,
-    body: Bytes,
+pub(crate) struct Reply {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Bytes,
+}
+
+/// The answer of `/o/check` for a list of ids.
+enum Checked {
+    Flags(Vec<u8>),
+    Refused(Arc<Reply>),
+    Unsupported,
+}
+
+/// What the upstream says about a set of ids for one caller.
+pub(crate) enum Authz {
+    /// One verdict per id, in order.
+    Verdicts(Vec<Verdict>),
+    /// The upstream refused the request: pass its response on.
+    Refused(Arc<Reply>),
+    /// The upstream has no batch check: authorize per object.
+    Unsupported,
 }
 
 type FlightOut = Result<Arc<Reply>, Arc<String>>;
@@ -99,6 +136,7 @@ pub struct CacheServe {
     objects: Mutex<HashMap<ObjectId, Flight>>,
     bundles: Mutex<HashMap<ObjectId, Flight>>,
     ingest: tokio::sync::Semaphore,
+    authz: AuthzState,
 }
 
 impl CacheServe {
@@ -117,6 +155,7 @@ impl CacheServe {
             objects: Mutex::default(),
             bundles: Mutex::default(),
             ingest: tokio::sync::Semaphore::new(INGEST_PARALLELISM),
+            authz: AuthzState::new(cfg.authz_ttl, cfg.authz_window),
         });
         if me.auth == AuthMode::Open {
             me.check_open_upstream().await?;
@@ -142,6 +181,14 @@ impl CacheServe {
             );
         }
         Ok(())
+    }
+
+    /// Behave as against an origin without `POST /o/check` (per-object
+    /// conditional reads, forwarded bundles). For benchmarks and tests that
+    /// compare with the batch endpoint.
+    #[doc(hidden)]
+    pub fn disable_batch_checks(&self) {
+        self.authz.disable();
     }
 
     pub fn metrics(&self) -> &Arc<Metrics> {
@@ -235,19 +282,7 @@ impl CacheServe {
         if let Some(e) = if_none_match {
             req = req.header(header::IF_NONE_MATCH, e);
         }
-        let result = async {
-            let resp = send_get(req, &self.retry).await?;
-            let status = resp.status();
-            let mut headers = HeaderMap::new();
-            for name in PASS_HEADERS {
-                if let Some(v) = resp.headers().get(name) {
-                    headers.insert(HeaderName::from_static(name), v.clone());
-                }
-            }
-            let body = resp.bytes().await?;
-            Ok::<_, reqwest::Error>(Reply { status, headers, body })
-        }
-        .await;
+        let result = async { collect_reply(send_get(req, &self.retry).await?).await }.await;
         match result {
             Ok(reply) => {
                 self.metrics.upstream(route, kind, reply.status.as_u16(), reply.body.len());
@@ -257,6 +292,188 @@ impl CacheServe {
                 self.metrics.upstream(route, kind, 0, 0);
                 Err(format!("upstream request failed: {e}"))
             }
+        }
+    }
+
+    // -- permission checks (forward mode) ----------------------------------
+
+    /// One `POST /o/check` for at most [`CHECK_MAX_IDS`] ids.
+    async fn check_chunk(
+        &self,
+        route: &'static str,
+        auth: Option<&str>,
+        ids: &[ObjectId],
+    ) -> Result<Checked, String> {
+        let body: Vec<u8> = ids.iter().flat_map(|id| id.0).collect();
+        let mut req = self
+            .http
+            .post(format!("{}/o/check", self.upstream))
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(body);
+        if let Some(a) = auth {
+            req = req.header(header::AUTHORIZATION, a);
+        }
+        let reply = match async { collect_reply(req.send().await?).await }.await {
+            Ok(r) => r,
+            Err(e) => {
+                self.metrics.upstream(route, "check", 0, 0);
+                return Err(format!("upstream request failed: {e}"));
+            }
+        };
+        self.metrics.upstream(route, "check", reply.status.as_u16(), reply.body.len());
+        match reply.status {
+            StatusCode::OK => {
+                let marked = reply.headers.get(CHECK_HEADER).is_some_and(|v| v == "1");
+                if marked && reply.body.len() == ids.len() {
+                    Ok(Checked::Flags(reply.body.to_vec()))
+                } else {
+                    Err("upstream sent a malformed check response".to_owned())
+                }
+            }
+            // An origin without the endpoint (the route exists for GET only,
+            // or not at all): fall back to per-object conditional reads.
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => {
+                self.authz.mark_unsupported(Instant::now());
+                Ok(Checked::Unsupported)
+            }
+            _ => Ok(Checked::Refused(Arc::new(reply))),
+        }
+    }
+
+    /// Ask the upstream about `ids` for the caller `auth`, reusing allowed
+    /// decisions younger than the TTL. `coalesce`: wait a few milliseconds
+    /// so concurrent callers' questions share one request (single objects);
+    /// otherwise ask at once (a caller that already has a large list).
+    /// Anything but a clear answer is an error or a refusal: the caller
+    /// serves nothing from disk then.
+    pub(crate) async fn authorize(
+        self: &Arc<Self>,
+        auth: Option<&str>,
+        ids: &[ObjectId],
+        route: &'static str,
+        coalesce: bool,
+    ) -> Result<Authz, String> {
+        let now = Instant::now();
+        if self.authz.is_unsupported(now) {
+            self.metrics.authz("fallback", ids.len());
+            return Ok(Authz::Unsupported);
+        }
+        let key = cred_key(auth);
+        let mut out: Vec<Option<Verdict>> =
+            ids.iter().map(|id| self.authz.lookup(&key, id, now)).collect();
+        let missing: Vec<usize> = (0..ids.len()).filter(|i| out[*i].is_none()).collect();
+        self.metrics.authz("cached", ids.len() - missing.len());
+        if missing.is_empty() {
+            return Ok(Authz::Verdicts(out.into_iter().flatten().collect()));
+        }
+        self.metrics.authz("checked", missing.len());
+        if coalesce {
+            let receivers: Vec<_> =
+                missing.iter().map(|i| self.enqueue_check(key, auth, ids[*i], route)).collect();
+            for (i, rx) in missing.iter().zip(receivers) {
+                match rx.await {
+                    Ok(Ok(Outcome::Verdict(v))) => out[*i] = Some(v),
+                    Ok(Ok(Outcome::Refused(r))) => return Ok(Authz::Refused(r)),
+                    Ok(Ok(Outcome::Unsupported)) => return Ok(Authz::Unsupported),
+                    Ok(Err(e)) => return Err((*e).clone()),
+                    Err(_) => return Err("permission check abandoned".to_owned()),
+                }
+            }
+        } else {
+            let asked = Instant::now();
+            for chunk in missing.chunks(CHECK_MAX_IDS) {
+                let chunk_ids: Vec<ObjectId> = chunk.iter().map(|i| ids[*i]).collect();
+                match self.check_chunk(route, auth, &chunk_ids).await? {
+                    Checked::Flags(flags) => {
+                        let verdicts: Vec<Verdict> = flags.iter().map(|f| verdict_of(*f)).collect();
+                        self.authz.remember(&key, asked, allowed_of(&chunk_ids, &verdicts));
+                        for (i, v) in chunk.iter().zip(verdicts) {
+                            out[*i] = Some(v);
+                        }
+                    }
+                    Checked::Refused(r) => return Ok(Authz::Refused(r)),
+                    Checked::Unsupported => return Ok(Authz::Unsupported),
+                }
+            }
+        }
+        out.into_iter()
+            .collect::<Option<Vec<_>>>()
+            .map(Authz::Verdicts)
+            .ok_or_else(|| "incomplete permission check".to_owned())
+    }
+
+    /// Queue one object for the next batched check of `key`'s credentials.
+    fn enqueue_check(
+        self: &Arc<Self>,
+        key: CredKey,
+        auth: Option<&str>,
+        id: ObjectId,
+        route: &'static str,
+    ) -> tokio::sync::oneshot::Receiver<Slot> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let first = {
+            let mut pending = self.authz.pending.lock();
+            let first = !pending.contains_key(&key);
+            pending
+                .entry(key)
+                .or_insert_with(|| Pending { creds: auth.map(str::to_owned), waiters: Vec::new() })
+                .waiters
+                .push((id, tx));
+            first
+        };
+        if first {
+            let me = self.clone();
+            tokio::spawn(async move {
+                if !me.authz.window.is_zero() {
+                    tokio::time::sleep(me.authz.window).await;
+                }
+                me.flush_checks(key, route).await;
+            });
+        }
+        rx
+    }
+
+    /// Send the queued questions of `key` (in chunks) and answer the waiters.
+    async fn flush_checks(&self, key: CredKey, route: &'static str) {
+        let Some(batch) = self.authz.pending.lock().remove(&key) else { return };
+        let mut ids: Vec<ObjectId> = batch.waiters.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut answers: HashMap<ObjectId, Slot> = HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(CHECK_MAX_IDS) {
+            let asked = Instant::now();
+            match self.check_chunk(route, batch.creds.as_deref(), chunk).await {
+                Ok(Checked::Flags(flags)) => {
+                    let verdicts: Vec<Verdict> = flags.iter().map(|f| verdict_of(*f)).collect();
+                    self.authz.remember(&key, asked, allowed_of(chunk, &verdicts));
+                    for (id, v) in chunk.iter().zip(verdicts) {
+                        answers.insert(*id, Ok(Outcome::Verdict(v)));
+                    }
+                }
+                Ok(Checked::Refused(r)) => {
+                    for id in chunk {
+                        answers.insert(*id, Ok(Outcome::Refused(r.clone())));
+                    }
+                }
+                Ok(Checked::Unsupported) => {
+                    for id in chunk {
+                        answers.insert(*id, Ok(Outcome::Unsupported));
+                    }
+                }
+                Err(e) => {
+                    let e = Arc::new(e);
+                    for id in chunk {
+                        answers.insert(*id, Err(e.clone()));
+                    }
+                }
+            }
+        }
+        for (id, tx) in batch.waiters {
+            let slot = answers
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| Err(Arc::new("permission check lost an id".to_owned())));
+            let _ = tx.send(slot);
         }
     }
 
@@ -280,6 +497,19 @@ impl CacheServe {
                 verified.map_err(|e| Arc::new(format!("upstream sent a corrupt object: {e}")))?;
             if let Err(e) = self.disk.put_many_trusted(vec![(id, obj)]).await {
                 tracing::warn!(%id, "storing object failed: {e}");
+            }
+            if self.auth == AuthMode::Forward {
+                // The origin just served this caller: that is a fresh decision.
+                let private = reply
+                    .headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.contains("private"));
+                self.authz.remember(
+                    &cred_key(auth.as_deref()),
+                    Instant::now(),
+                    std::iter::once((id, private)),
+                );
             }
         }
         Ok(Arc::new(reply))
@@ -402,6 +632,39 @@ impl CacheServe {
         .ok()?
         .ok()
     }
+}
+
+/// Buffer an upstream response, keeping the headers in [`PASS_HEADERS`].
+async fn collect_reply(resp: reqwest::Response) -> reqwest::Result<Reply> {
+    let status = resp.status();
+    let mut headers = HeaderMap::new();
+    for name in PASS_HEADERS {
+        if let Some(v) = resp.headers().get(name) {
+            headers.insert(HeaderName::from_static(name), v.clone());
+        }
+    }
+    let body = resp.bytes().await?;
+    Ok(Reply { status, headers, body })
+}
+
+/// Decode one flag byte of a `/o/check` answer.
+fn verdict_of(flag: u8) -> Verdict {
+    if flag & 1 != 0 { Verdict::Allowed { private: flag & 2 != 0 } } else { Verdict::Denied }
+}
+
+/// The allowed ids among `ids` with their private flags.
+fn allowed_of<'a>(
+    ids: &'a [ObjectId],
+    verdicts: &'a [Verdict],
+) -> impl Iterator<Item = (ObjectId, bool)> + 'a {
+    ids.iter().zip(verdicts).filter_map(|(id, v)| match v {
+        Verdict::Allowed { private } => Some((*id, *private)),
+        Verdict::Denied => None,
+    })
+}
+
+fn cache_control_of(private: bool) -> &'static str {
+    if private { CACHE_PRIVATE } else { CACHE_IMMUTABLE }
 }
 
 // ---------------------------------------------------------------------------
@@ -540,20 +803,33 @@ async fn get_object(
         }
         (AuthMode::Open, None) => fill_object(&me, id, None).await,
         (AuthMode::Forward, Some(obj)) => {
-            // Never serve on our own authority: the origin must confirm.
-            match me.revalidate(&id, auth.as_deref()).await {
-                Ok(r) if r.status == StatusCode::NOT_MODIFIED || r.status == StatusCode::OK => {
-                    let cache = r
-                        .headers
-                        .get(header::CACHE_CONTROL)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or(CACHE_PRIVATE)
-                        .to_owned();
-                    object_response(&me, &id, obj, &cache, "revalidated", &headers)
-                }
-                Ok(r) => {
+            // Never serve on our own authority: the origin must confirm,
+            // by a batched permission check or, for an origin without one,
+            // a conditional read.
+            match me.authorize(auth.as_deref(), &[id], "objects", true).await {
+                Ok(Authz::Verdicts(v)) => match v.first() {
+                    Some(Verdict::Allowed { private }) => object_response(
+                        &me,
+                        &id,
+                        obj,
+                        cache_control_of(*private),
+                        "revalidated",
+                        &headers,
+                    ),
+                    _ => {
+                        // Exactly the origin's answer for a hidden object.
+                        me.metrics.request("objects", "refused");
+                        let mut res = text(StatusCode::NOT_FOUND, "object not found");
+                        res.headers_mut().insert(CACHE_HEADER, HeaderValue::from_static("refused"));
+                        res
+                    }
+                },
+                Ok(Authz::Refused(r)) => {
                     let tag = tag_for(&r, true);
                     reply_response(&me, "objects", &r, tag)
+                }
+                Ok(Authz::Unsupported) => {
+                    revalidated_hit(&me, &id, obj, auth.as_deref(), &headers).await
                 }
                 Err(e) => {
                     me.metrics.request("objects", "error");
@@ -562,6 +838,36 @@ async fn get_object(
             }
         }
         (AuthMode::Forward, None) => fill_object(&me, id, auth).await,
+    }
+}
+
+/// Forward-mode hit against an origin without batch checks: one conditional
+/// read per object, answered `304` for readable ones without reading them.
+async fn revalidated_hit(
+    me: &Arc<CacheServe>,
+    id: &ObjectId,
+    obj: EncodedObject,
+    auth: Option<&str>,
+    headers: &HeaderMap,
+) -> Response {
+    match me.revalidate(id, auth).await {
+        Ok(r) if r.status == StatusCode::NOT_MODIFIED || r.status == StatusCode::OK => {
+            let cache = r
+                .headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(CACHE_PRIVATE)
+                .to_owned();
+            object_response(me, id, obj, &cache, "revalidated", headers)
+        }
+        Ok(r) => {
+            let tag = tag_for(&r, true);
+            reply_response(me, "objects", &r, tag)
+        }
+        Err(e) => {
+            me.metrics.request("objects", "error");
+            bad_gateway(&e)
+        }
     }
 }
 
@@ -642,24 +948,106 @@ async fn get_bundle(
     res
 }
 
+fn is_public(headers: &HeaderMap) -> bool {
+    headers.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()).is_some_and(|v| {
+        let v = v.to_ascii_lowercase();
+        v.contains("public") && !v.contains("private") && !v.contains("no-store")
+    })
+}
+
+/// Forward mode: the bundle of `tree` for the caller `auth`, rebuilt from
+/// the disk cache, or `None` to forward the request.
+///
+/// The index holds the objects of a bundle the origin served `public`
+/// (outside-the-root-zone objects left out, the same for every caller).
+/// Whether *this* caller may read each of them is asked of the origin with
+/// batched `POST /o/check`s; the bundle holds exactly the objects the origin
+/// would serve this caller individually, tree first. If the caller lacks any
+/// of them the result is caller-specific and sent `private, no-store`, as
+/// the origin does. Any doubt (not indexed, an object evicted, the tree
+/// itself not readable, no batch endpoint, a refusal or error) returns
+/// `None`, and the origin decides.
+async fn rebuilt_bundle(
+    me: &Arc<CacheServe>,
+    tree: ObjectId,
+    auth: Option<&str>,
+) -> Option<Response> {
+    let ix = me.index.clone();
+    let ids = tokio::task::spawn_blocking(move || ix.read(&tree)).await.ok()??;
+    if ids.first() != Some(&tree) {
+        return None;
+    }
+    let verdicts = match me.authorize(auth, &ids, "bundles", false).await {
+        Ok(Authz::Verdicts(v)) => v,
+        _ => return None,
+    };
+    if verdicts.first() != Some(&Verdict::Allowed { private: false }) {
+        return None;
+    }
+    let keep: Vec<ObjectId> = ids
+        .iter()
+        .zip(&verdicts)
+        .filter(|(_, v)| matches!(v, Verdict::Allowed { private: false }))
+        .map(|(id, _)| *id)
+        .collect();
+    let shared = !verdicts.contains(&Verdict::Denied);
+    let objects = me.disk.get_many(&keep).await.ok()?;
+    let objects: Vec<(ObjectId, EncodedObject)> =
+        keep.into_iter().zip(objects).map(|(id, o)| Some((id, o?))).collect::<Option<_>>()?;
+    let body = tokio::task::spawn_blocking(move || {
+        ant_proto::bundle::encode(objects.iter().map(|(id, o)| (id, o.as_bytes().as_ref())))
+    })
+    .await
+    .ok()?
+    .ok()?;
+    me.metrics.request("bundles", "revalidated");
+    me.metrics.response_bytes("bundles", body.len());
+    let mut res = Response::new(Body::from(body));
+    let h = res.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(ant_proto::bundle::CONTENT_TYPE));
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(if shared { CACHE_IMMUTABLE } else { CACHE_PRIVATE_NO_STORE }),
+    );
+    h.insert(CACHE_HEADER, HeaderValue::from_static("revalidated"));
+    Some(res)
+}
+
 async fn bundle_response(me: &Arc<CacheServe>, hex: &str, headers: &HeaderMap) -> Response {
     let Ok(tree) = ObjectId::from_str(hex) else {
         return text(StatusCode::BAD_REQUEST, "malformed object id");
     };
     let path = format!("/t/{hex}");
     if me.auth == AuthMode::Forward {
-        // A bundle depends on the caller: forward, never answer from disk.
+        // A bundle depends on the caller. When the tree's public bundle is
+        // known, rebuild it from disk once the upstream has confirmed, in
+        // batches, which of its objects this caller may read; otherwise
+        // forward (never answer from disk on our own authority).
         let auth = me.credentials(headers);
+        if let Some(res) = rebuilt_bundle(me, tree, auth.as_deref()).await {
+            return res;
+        }
         return match me.upstream_get(&path, "bundles", "fetch", auth.as_deref(), None).await {
             Ok(reply) => {
-                if reply.status == StatusCode::OK
-                    && let Ok(permit) = me.ingest.try_acquire()
-                {
+                // A response every caller would get (`public`) lists the
+                // tree's objects for later rebuilds; waiting for an ingestion
+                // slot (back-pressure on the clients) keeps a cold fill from
+                // skipping most bundles. Other bundles are kept only when a
+                // slot is free.
+                let index = reply.status == StatusCode::OK && is_public(&reply.headers);
+                let permit = if reply.status != StatusCode::OK {
+                    None
+                } else if index {
+                    me.ingest.acquire().await.ok()
+                } else {
+                    me.ingest.try_acquire().ok()
+                };
+                if let Some(permit) = permit {
                     // Keep the verified objects for later revalidated reads.
                     permit.forget();
                     let (me2, body) = (me.clone(), reply.body.clone());
                     tokio::spawn(async move {
-                        if let Err(e) = me2.ingest_bundle(tree, body, false).await {
+                        if let Err(e) = me2.ingest_bundle(tree, body, index).await {
                             tracing::debug!(%tree, "bundle not kept: {e}");
                         }
                         me2.ingest.add_permits(1);

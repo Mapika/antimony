@@ -68,7 +68,7 @@ under a policy).
 **Cache tier.** `ant cache-serve` (a caching proxy for `/o/` and `/t/`) exports
 `ant_cacheserve_requests_total{route,result}`, `_response_bytes_total`,
 `_upstream_requests_total{route,kind,status}`, `_upstream_bytes_total`,
-`_inflight_fetches` and `_disk_bytes` / `_disk_budget_bytes` / `_index_bytes`
+`_authz_total{result}`, `_inflight_fetches` and `_disk_bytes` / `_disk_budget_bytes` / `_index_bytes`
 at its own `GET /metrics`; see the cache tier section of the operator guide.
 
 **Health.** `GET /healthz` is liveness (static `ok`). `GET /readyz` is
@@ -81,7 +81,7 @@ balancer checks should use `/readyz`; see the operator guide.
 | family | labels | meaning |
 |---|---|---|
 | `ant_rpc_requests_total`, `ant_rpc_duration_seconds` | `method`, `code` / `method` | gRPC calls; `code` is the snake_case status (`ok`, `not_found`, `aborted`, ...; `cancelled` if the client left early); duration runs to the end of the response (streams included) |
-| `ant_http_requests_total`, `ant_http_duration_seconds` | `route`, `status` / `route` | `objects`, `tree_bundles`, `git`, `healthz`, `readyz`, `metrics`, `other`; duration runs to the response headers |
+| `ant_http_requests_total`, `ant_http_duration_seconds` | `route`, `status` / `route` | `objects`, `object_checks`, `tree_bundles`, `git`, `healthz`, `readyz`, `metrics`, `other`; duration runs to the response headers |
 | `ant_land_batch_size` | | requests per group-commit batch |
 | `ant_land_outcomes_total` | `outcome` | `landed`, `rebased`, `conflict`, `aborted`, `denied` |
 | `ant_land_cas_retries_total` | | batches replayed after losing the ref CAS (another replica landed first) |

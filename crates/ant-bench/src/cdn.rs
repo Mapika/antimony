@@ -84,15 +84,25 @@ pub async fn spawn(origin: &str) -> Result<Cdn> {
 
 /// Start `ant_cache::CacheServe` (open mode, disk cache in `dir`) in front of
 /// `origin` on an ephemeral port.
-pub async fn spawn_tier(origin: &str, dir: &std::path::Path) -> Result<Cdn> {
+pub async fn spawn_tier(
+    origin: &str,
+    dir: &std::path::Path,
+    auth: ant_cache::AuthMode,
+    no_batch: bool,
+) -> Result<Cdn> {
     let disk = Arc::new(antd::disk::DiskObjectStore::open(dir, u64::MAX / 2)?);
     let tier = ant_cache::CacheServe::connect(ant_cache::Config {
         upstream: origin.to_owned(),
-        auth: ant_cache::AuthMode::Open,
+        auth,
         disk,
         retry: antd::retry::RetryPolicy::none(),
+        authz_ttl: ant_cache::DEFAULT_AUTHZ_TTL,
+        authz_window: ant_cache::DEFAULT_AUTHZ_WINDOW,
     })
     .await?;
+    if no_batch {
+        tier.disable_batch_checks();
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
     let t2 = tier.clone();

@@ -53,6 +53,15 @@ pub struct Args {
     /// open mode) with its own disk cache in `<cache>.tier`.
     #[arg(long, conflicts_with = "cdn")]
     pub cache_tier: bool,
+    /// With `--cache-tier`: run the tier in forward-auth mode (permission
+    /// checks against the origin) instead of open mode. Reports the origin
+    /// requests the tier made.
+    #[arg(long, requires = "cache_tier")]
+    pub cache_tier_forward: bool,
+    /// With `--cache-tier-forward`: do not use the origin's batch permission
+    /// check (`POST /o/check`), as against an older origin: the baseline.
+    #[arg(long, requires = "cache_tier_forward")]
+    pub cache_tier_no_batch: bool,
     /// After the normal phases: this many concurrent cold checkouts sharing
     /// the one disk cache (a node running many jobs), each with its own
     /// client handle, as separate processes would. Reports wall time and the
@@ -260,7 +269,19 @@ pub async fn run(a: Args) -> Result<()> {
             dir.push(".tier");
             let dir = PathBuf::from(dir);
             let _ = std::fs::remove_dir_all(&dir);
-            Some(crate::cdn::spawn_tier(origin, &dir).await?)
+            Some(
+                crate::cdn::spawn_tier(
+                    origin,
+                    &dir,
+                    if a.cache_tier_forward {
+                        ant_cache::AuthMode::Forward
+                    } else {
+                        ant_cache::AuthMode::Open
+                    },
+                    a.cache_tier_no_batch,
+                )
+                .await?,
+            )
         }
         (Some(origin), true) => Some(crate::cdn::spawn(origin).await?),
         (None, true) => {

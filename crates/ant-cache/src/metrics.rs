@@ -6,7 +6,8 @@
 //!   `bundles`; `result` is
 //!   - `hit`: served from the local disk cache (open mode),
 //!   - `revalidated`: served from the local disk cache after the upstream
-//!     confirmed this caller may read it (forward mode),
+//!     confirmed this caller may read it, now or within the permission TTL
+//!     (forward mode; bundles rebuilt from disk count here too),
 //!   - `miss`: fetched from upstream by this request,
 //!   - `joined`: waited for an upstream fetch another request had in flight,
 //!   - `passthrough`: forwarded to the upstream uncached (forward-mode bundles),
@@ -16,9 +17,13 @@
 //!   - `error`: upstream or local failure (4xx/5xx, bad data).
 //!
 //!   The hit ratio of a tier is `(hit + revalidated) / sum`.
+//! - `ant_cacheserve_authz_total{result}`: forward-mode permission lookups
+//!   (one per object per request): `cached` (an allowed decision younger than
+//!   the TTL), `checked` (asked of the upstream, batched with others),
+//!   `fallback` (the upstream has no batch endpoint: conditional GETs).
 //! - `ant_cacheserve_response_bytes_total{route}`: body bytes sent.
 //! - `ant_cacheserve_upstream_requests_total{route,kind,status}`: requests to
-//!   the upstream; `kind` is `fetch` or `revalidate`; `status` is the HTTP
+//!   the upstream; `kind` is `fetch`, `revalidate` (a conditional GET) or `check` (a batched `POST /o/check`); `status` is the HTTP
 //!   status, or `0` for a transport error.
 //! - `ant_cacheserve_upstream_bytes_total{route}`: body bytes received.
 //! - `ant_cacheserve_inflight_fetches`: upstream fetches in flight.
@@ -58,6 +63,11 @@ struct UpstreamLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct AuthzLabels {
+    result: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct BuildLabels {
     version: &'static str,
 }
@@ -69,6 +79,7 @@ pub struct Metrics {
     response_bytes: Family<RouteLabels, Counter>,
     upstream_requests: Family<UpstreamLabels, Counter>,
     upstream_bytes: Family<RouteLabels, Counter>,
+    authz: Family<AuthzLabels, Counter>,
     inflight: Gauge,
     disk_bytes: Gauge,
     disk_budget: Gauge,
@@ -101,6 +112,12 @@ impl Metrics {
             "ant_cacheserve_upstream_bytes",
             "Body bytes received from the upstream",
             upstream_bytes.clone(),
+        );
+        let authz = Family::<AuthzLabels, Counter>::default();
+        registry.register(
+            "ant_cacheserve_authz",
+            "Forward-mode read permission lookups by result",
+            authz.clone(),
         );
         let inflight = Gauge::default();
         registry.register(
@@ -136,6 +153,7 @@ impl Metrics {
             response_bytes,
             upstream_requests,
             upstream_bytes,
+            authz,
             inflight,
             disk_bytes,
             disk_budget,
@@ -145,6 +163,13 @@ impl Metrics {
 
     pub fn request(&self, route: &'static str, result: &'static str) {
         self.requests.get_or_create(&RequestLabels { route, result }).inc();
+    }
+
+    /// `n` permission lookups answered as `result`.
+    pub fn authz(&self, result: &'static str, n: usize) {
+        if n > 0 {
+            self.authz.get_or_create(&AuthzLabels { result }).inc_by(n as u64);
+        }
     }
 
     pub fn response_bytes(&self, route: &'static str, n: usize) {

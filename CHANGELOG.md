@@ -21,6 +21,19 @@ release of the 0.x series may change.
   for upstreams without a policy and is refused at startup against one.
   `ant_cacheserve_*` Prometheus metrics (hit/revalidated/miss/joined/...
   per route, upstream requests and bytes, disk gauges).
+- Batch read-permission check: `POST /o/check` (up to 4096 raw object ids in,
+  one flag byte per id out: readable / private) answers exactly what
+  `GET /o/<id>` would for the caller, sharing its authorization code, and
+  reports a hidden object like a missing one. Additive; metrics route
+  `object_checks`. `ant cache-serve --auth forward` uses it: concurrent hits
+  of one principal are batched into one request (`--authz-window-ms`, default
+  2), allowed decisions are reused for `--authz-ttl-secs` (default 30; 0 =
+  always ask; the TTL is the window in which a revoked principal can still
+  read objects the cache holds), and tree bundles seen `public` are rebuilt
+  from disk after one batched check instead of being forwarded. Against an
+  origin without the endpoint (404/405) it falls back to conditional
+  `GET /o/<id>` as before. `ant_cacheserve_authz_total{result}` metric;
+  `ant-bench checkout --cache-tier-forward [--cache-tier-no-batch]`.
 - Processes sharing a client cache directory fetch each missing object or
   tree bundle once (`flock` claim files under `<cache>/claims`, crash-safe,
   additive: the cache format version stays 1); `ANT_CACHE_DEDUP=0` disables
