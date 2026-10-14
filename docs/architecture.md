@@ -13,7 +13,11 @@ repository. Decoding is canonical-only: sorted tree entries, mode text that
 maps one-to-one to a mode, plain decimal lengths. Two different byte strings
 can therefore never decode to the same object. Commit text (names, emails,
 messages, extra headers) is raw bytes, so real-world histories round-trip byte
-for byte.
+for byte: the import copies a commit's text verbatim and replaces only the
+`tree` and `parent` ids, like git's conversion (odd signature lines such as
+`Name  <e> 1 -0000` or `+05` zones, header quirks and messages without a
+trailing newline included). Stored commits are therefore read leniently
+(`Commit::decode_lenient`); strict `decode` still gates new objects.
 
 Old histories contain non-canonical tree entry modes (`100664`, `100640`,
 zero-padded `040000`, `40755`, ...). git's SHA-256 conversion copies mode text

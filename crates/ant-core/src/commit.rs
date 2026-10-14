@@ -53,6 +53,43 @@ impl Signature {
         }
         Ok(Self { name, email, time, tz_offset_minutes: off })
     }
+
+    /// Best-effort reading of a signature line that git itself tolerates but
+    /// `decode` rejects or cannot re-encode identically (odd zones, missing
+    /// fields, no `<email>`, ...): whatever cannot be read becomes empty or
+    /// zero. For *reading* commits that are already stored (their exact bytes
+    /// are the object); never use it to admit new objects.
+    pub fn decode_lenient(s: &[u8]) -> Self {
+        if let Ok(sig) = Self::decode(s) {
+            return sig;
+        }
+        let lt = s.iter().position(|&b| b == b'<');
+        let gt = lt.and_then(|lt| s[lt..].iter().rposition(|&b| b == b'>').map(|i| lt + i));
+        let (name, email, tail) = match (lt, gt) {
+            (Some(lt), Some(gt)) => (&s[..lt], &s[lt + 1..gt], &s[gt + 1..]),
+            _ => (s, &b""[..], &b""[..]),
+        };
+        let name = name.strip_suffix(b" ").unwrap_or(name).to_vec();
+        let tail = String::from_utf8_lossy(tail);
+        let mut rest = tail.split_whitespace();
+        let time = rest.next().and_then(|t| t.parse().ok()).unwrap_or(0);
+        let tz_offset_minutes = rest.next().and_then(parse_tz).unwrap_or(0);
+        Self { name, email: email.to_vec(), time, tz_offset_minutes }
+    }
+}
+
+/// `+hhmm` / `-hhmm` as minutes (the minutes are not range checked).
+fn parse_tz(tz: &str) -> Option<i32> {
+    let (sign, digits) = match tz.as_bytes().first()? {
+        b'+' => (1, &tz[1..]),
+        b'-' => (-1, &tz[1..]),
+        _ => return None,
+    };
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (hh, mm): (i32, i32) = (digits[..2].parse().ok()?, digits[2..].parse().ok()?);
+    Some(sign * (hh * 60 + mm))
 }
 
 /// The `(key, value)` fields of a commit's header block (the body up to the
@@ -123,11 +160,27 @@ impl Commit {
     }
 
     pub fn decode(body: &[u8]) -> Result<Self> {
-        let split = body
-            .windows(2)
-            .position(|w| w == b"\n\n")
-            .ok_or_else(|| Error::Malformed("commit: missing header terminator".into()))?;
-        let (headers, message) = (&body[..split], &body[split + 2..]);
+        Self::decode_with(body, true)
+    }
+
+    /// `decode` for a commit that is already stored, whose exact bytes (not
+    /// this struct) are its identity: odd signature lines (see
+    /// `Signature::decode_lenient`), a missing message separator and missing
+    /// author/committer lines are tolerated. Imported history can contain
+    /// them and git reads it fine. A valid `tree` is still required. Never
+    /// use it to admit new objects; the result may not re-encode identically.
+    pub fn decode_lenient(body: &[u8]) -> Result<Self> {
+        Self::decode_with(body, false)
+    }
+
+    fn decode_with(body: &[u8], strict: bool) -> Result<Self> {
+        let (headers, message) = match body.windows(2).position(|w| w == b"\n\n") {
+            Some(split) => (&body[..split], &body[split + 2..]),
+            None if strict => {
+                return Err(Error::Malformed("commit: missing header terminator".into()));
+            }
+            None => (body.strip_suffix(b"\n").unwrap_or(body), &body[body.len()..]),
+        };
 
         let mut it = header_fields(headers)?.into_iter().peekable();
         let id_of = |v: &[u8]| -> Result<ObjectId> {
@@ -145,19 +198,33 @@ impl Commit {
                 parents.push(id_of(&v)?);
             }
         }
-        let author = match it.next() {
-            Some((b"author", v)) => Signature::decode(&v)?,
-            _ => return Err(Error::Malformed("commit: missing author".into())),
+        let mut signature = |key: &[u8], what: &str| -> Result<Signature> {
+            if matches!(it.peek(), Some((k, _)) if *k == key)
+                && let Some((_, v)) = it.next()
+            {
+                return if strict {
+                    Signature::decode(&v)
+                } else {
+                    Ok(Signature::decode_lenient(&v))
+                };
+            }
+            if strict {
+                return Err(Error::Malformed(format!("commit: missing {what}")));
+            }
+            Ok(Signature::decode_lenient(b""))
         };
-        let committer = match it.next() {
-            Some((b"committer", v)) => Signature::decode(&v)?,
-            _ => return Err(Error::Malformed("commit: missing committer".into())),
-        };
+        let author = signature(b"author", "author")?;
+        let committer = signature(b"committer", "committer")?;
         let extra_headers = it
             .map(|(k, v)| {
-                let k = std::str::from_utf8(k)
-                    .map_err(|_| Error::Malformed("commit: non-UTF-8 header key".into()))?;
-                Ok((k.to_string(), v))
+                let k = match std::str::from_utf8(k) {
+                    Ok(k) => k.to_string(),
+                    Err(_) if strict => {
+                        return Err(Error::Malformed("commit: non-UTF-8 header key".into()));
+                    }
+                    Err(_) => String::from_utf8_lossy(k).into_owned(),
+                };
+                Ok((k, v))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self { tree, parents, author, committer, extra_headers, message: message.to_vec() })
@@ -194,6 +261,39 @@ mod tests {
         let dec = Commit::decode(&enc).unwrap();
         assert_eq!(dec, c);
         assert_eq!(dec.encode(), enc);
+    }
+
+    #[test]
+    fn lenient_decode_reads_what_strict_rejects() {
+        let tree = ObjectId::empty_tree();
+        for (sig, name, email, time, tz) in [
+            (&b"N <e> 1 +05"[..], &b"N"[..], &b"e"[..], 1, 0),
+            (b"N  <e> 7 -0000", b"N ", b"e", 7, 0),
+            (b"<e>", b"", b"e", 0, 0),
+            (b"just words", b"just words", b"", 0, 0),
+            (b"N <e> 99999999999999999999 +0100", b"N", b"e", 0, 60),
+            (b"N <e> 5 +0575", b"N", b"e", 5, 5 * 60 + 75),
+        ] {
+            let text =
+                [format!("tree {tree}\nauthor ").as_bytes(), sig, b"\ncommitter ", sig, b"\n\nm\n"]
+                    .concat();
+            let c = Commit::decode_lenient(&text).unwrap();
+            assert_eq!(c.tree, tree);
+            assert_eq!(c.committer.name, name, "{:?}", String::from_utf8_lossy(sig));
+            assert_eq!(c.committer.email, email);
+            assert_eq!((c.committer.time, c.committer.tz_offset_minutes), (time, tz));
+            assert_eq!(c.message, b"m\n");
+        }
+        // Strict decoding (admission of new objects) still rejects them.
+        let odd = format!("tree {tree}\nauthor N <e> 1 +05\ncommitter N <e> 1 +05\n\nm\n");
+        assert!(Commit::decode(odd.as_bytes()).is_err());
+        assert!(Commit::decode_lenient(odd.as_bytes()).is_ok());
+        // No blank line, no author: lenient only. A tree is always required.
+        let bare = format!("tree {tree}\n");
+        assert!(Commit::decode(bare.as_bytes()).is_err());
+        let c = Commit::decode_lenient(bare.as_bytes()).unwrap();
+        assert!(c.message.is_empty() && c.author.name.is_empty());
+        assert!(Commit::decode_lenient(b"author a <b> 1 +0000\n\nm").is_err());
     }
 
     #[test]

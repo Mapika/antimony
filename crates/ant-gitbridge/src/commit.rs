@@ -1,85 +1,149 @@
-//! Raw commit parsing (names, emails and messages stay raw bytes).
+//! Raw commit handling. A commit is converted by copying its text verbatim and
+//! replacing only the object ids of the `tree` and `parent` lines, which is
+//! what git's own SHA-256 conversion does: names, emails, timestamps, zones,
+//! extra headers and the message are never parsed into a structure and
+//! re-encoded, because anything unusual in them would change the commit id.
 
-use ant_core::Signature;
-use ant_core::commit::header_fields;
-use anyhow::{anyhow, bail};
+use ant_core::{ObjectId, Signature, commit::header_fields};
+use anyhow::anyhow;
 
 /// A source object id (SHA-1 or SHA-256 git).
 pub(crate) type Oid = gix::ObjectId;
 
-/// A commit parsed from git's raw encoding.
+/// A commit as read from the source repository.
 pub(crate) struct RawCommit {
     pub tree: Oid,
     pub parents: Vec<Oid>,
-    pub author: Signature,
-    pub committer: Signature,
-    pub extra_headers: Vec<(String, Vec<u8>)>,
-    pub message: Vec<u8>,
+    /// Committer timestamp (ordering hint only; 0 when unreadable).
+    pub committer_time: i64,
+    /// The commit text exactly as stored in the source repository.
+    pub text: Vec<u8>,
 }
 
 pub(crate) fn parse_commit(id: gix::ObjectId, raw: &[u8]) -> anyhow::Result<RawCommit> {
     let bad = |what: &str| anyhow!("commit {id}: {what}");
-    let (head, message) = match raw.windows(2).position(|w| w == b"\n\n") {
-        Some(i) => (&raw[..i], &raw[i + 2..]),
-        None => (raw, &raw[raw.len()..]),
-    };
-
+    let head = &raw[..header_end(raw)];
     let fields = header_fields(head).map_err(|e| anyhow!("commit {id}: {e}"))?;
     let hex_id = |v: &[u8], what: &str| -> anyhow::Result<gix::ObjectId> {
         gix::ObjectId::from_hex(v).map_err(|_| bad(what))
     };
-    let mut it = fields.into_iter().peekable();
+    let mut it = fields.iter().peekable();
     let tree = match it.next() {
-        Some((b"tree", v)) => hex_id(&v, "bad tree id")?,
+        Some((b"tree", v)) => hex_id(v, "bad tree id")?,
         _ => return Err(bad("missing tree")),
     };
     let mut parents = Vec::new();
-    while matches!(it.peek(), Some((b"parent", _))) {
-        if let Some((_, v)) = it.next() {
-            parents.push(hex_id(&v, "bad parent id")?);
-        }
+    while let Some((b"parent", v)) = it.peek() {
+        parents.push(hex_id(v, "bad parent id")?);
+        it.next();
     }
-    let author = match it.next() {
-        Some((b"author", v)) => parse_signature(id, &v)?,
-        _ => return Err(bad("missing author")),
-    };
-    let committer = match it.next() {
-        Some((b"committer", v)) => parse_signature(id, &v)?,
-        _ => return Err(bad("missing committer")),
-    };
-    let extra_headers = it
-        .map(|(k, v)| {
-            let k = std::str::from_utf8(k).map_err(|_| bad("non-UTF-8 header name"))?;
-            Ok((k.to_string(), v))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(RawCommit { tree, parents, author, committer, extra_headers, message: message.to_vec() })
+    // The signature lines are only read for the committer time: whatever git
+    // tolerates there is copied through untouched.
+    let committer_time = fields
+        .iter()
+        .find(|(k, _)| *k == b"committer")
+        .map_or(0, |(_, v)| Signature::decode_lenient(v).time);
+    Ok(RawCommit { tree, parents, committer_time, text: raw.to_vec() })
 }
 
-/// `Name <email> <unix-seconds> <+hhmm>`, same rules as `Signature` decoding in
-/// ant-core, but name and email stay raw bytes.
-fn parse_signature(id: gix::ObjectId, s: &[u8]) -> anyhow::Result<Signature> {
-    let bad = || anyhow!("commit {id}: bad signature {:?}", String::from_utf8_lossy(s));
-    let lt = s.iter().position(|&b| b == b'<').ok_or_else(bad)?;
-    let gt = s.iter().rposition(|&b| b == b'>').ok_or_else(bad)?;
-    if gt < lt {
-        bail!(bad());
+/// Length of the header block: up to the first blank line, or the whole text
+/// when there is none.
+fn header_end(raw: &[u8]) -> usize {
+    raw.windows(2).position(|w| w == b"\n\n").unwrap_or(raw.len())
+}
+
+/// `raw.text` with the `tree` and `parent` ids replaced by `tree` and
+/// `parents` (antimony ids); every other byte is copied as is.
+pub(crate) fn rewrite_ids(
+    raw: &RawCommit,
+    tree: &ObjectId,
+    parents: &[ObjectId],
+) -> anyhow::Result<Vec<u8>> {
+    if parents.len() != raw.parents.len() {
+        return Err(anyhow!(
+            "commit has {} parent lines but {} converted parents",
+            raw.parents.len(),
+            parents.len()
+        ));
     }
-    let mut name_end = lt;
-    while name_end > 0 && s[name_end - 1] == b' ' {
-        name_end -= 1;
+    let text = &raw.text;
+    // The id lines are the first `1 + parents` lines; each is `key SP hex LF`
+    // (`parse_commit` accepted them, and the header block ends in a newline or
+    // at the end of the text).
+    let mut out = Vec::with_capacity(text.len() + 24 * (1 + parents.len()));
+    let mut pos = 0;
+    for (key, id) in std::iter::once(("tree", tree)).chain(parents.iter().map(|p| ("parent", p))) {
+        let line_end = text[pos..].iter().position(|&b| b == b'\n').map_or(text.len(), |i| pos + i);
+        out.extend_from_slice(format!("{key} {id}").as_bytes());
+        if line_end < text.len() {
+            out.push(b'\n');
+        }
+        pos = (line_end + 1).min(text.len());
     }
-    let name = s[..name_end].to_vec();
-    let email = s[lt + 1..gt].to_vec();
-    let tail = std::str::from_utf8(&s[gt + 1..]).map_err(|_| bad())?;
-    let mut rest = tail.split_whitespace();
-    let time: i64 = rest.next().and_then(|t| t.parse().ok()).ok_or_else(bad)?;
-    let tz = rest.next().ok_or_else(bad)?;
-    if tz.len() != 5 || !tz.is_ascii() || !matches!(&tz[..1], "+" | "-") {
-        bail!(bad());
+    out.extend_from_slice(&text[pos..]);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oid(c: char) -> gix::ObjectId {
+        gix::ObjectId::from_hex(c.to_string().repeat(40).as_bytes()).unwrap()
     }
-    let hh: i32 = tz[1..3].parse().map_err(|_| bad())?;
-    let mm: i32 = tz[3..5].parse().map_err(|_| bad())?;
-    let off = if &tz[..1] == "-" { -(hh * 60 + mm) } else { hh * 60 + mm };
-    Ok(Signature { name, email, time, tz_offset_minutes: off })
+
+    /// Rewrites with fixed antimony ids and returns the new text.
+    fn rewrite(text: &[u8], parents: usize) -> Vec<u8> {
+        let raw = parse_commit(oid('a'), text).unwrap();
+        assert_eq!(raw.parents.len(), parents);
+        let ids: Vec<_> = (0..parents).map(|i| ObjectId([i as u8 + 2; 32])).collect();
+        rewrite_ids(&raw, &ObjectId([1; 32]), &ids).unwrap()
+    }
+
+    #[test]
+    fn only_ids_change() {
+        let t = format!(
+            "tree {}\nparent {}\nparent {}\nauthor N  <e> 1 -0000\ncommitter  <>\nx\n y\n\nm \n\n",
+            "a".repeat(40),
+            "b".repeat(40),
+            "c".repeat(40)
+        );
+        let out = rewrite(t.as_bytes(), 2);
+        let want = format!(
+            "tree {}\nparent {}\nparent {}\nauthor N  <e> 1 -0000\ncommitter  <>\nx\n y\n\nm \n\n",
+            "01".repeat(32),
+            "02".repeat(32),
+            "03".repeat(32)
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), want);
+    }
+
+    #[test]
+    fn headers_only_without_trailing_newline() {
+        let t = format!("tree {}\ncommitter x", "a".repeat(40));
+        let out = rewrite(t.as_bytes(), 0);
+        assert_eq!(out, format!("tree {}\ncommitter x", "01".repeat(32)).as_bytes());
+        let t = format!("tree {}", "a".repeat(40));
+        assert_eq!(rewrite(t.as_bytes(), 0), format!("tree {}", "01".repeat(32)).as_bytes());
+    }
+
+    #[test]
+    fn committer_time_is_best_effort() {
+        let t = |sig: &str| {
+            let text = format!("tree {}\nauthor {sig}\ncommitter {sig}\n\nm", "a".repeat(40));
+            parse_commit(oid('a'), text.as_bytes()).unwrap().committer_time
+        };
+        assert_eq!(t("N <e> 1700000000 +0100"), 1700000000);
+        assert_eq!(t("N  <e>   17   +05"), 17);
+        assert_eq!(t("N <e> soon"), 0);
+        assert_eq!(t("garbage"), 0);
+    }
+
+    #[test]
+    fn broken_id_lines_are_rejected() {
+        assert!(parse_commit(oid('a'), b"author x\n\nm").is_err());
+        assert!(parse_commit(oid('a'), b"tree xyz\n\nm").is_err());
+        let t = format!("tree {}\nparent nope\n\nm", "a".repeat(40));
+        assert!(parse_commit(oid('a'), t.as_bytes()).is_err());
+    }
 }
