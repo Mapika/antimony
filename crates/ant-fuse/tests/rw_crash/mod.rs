@@ -197,8 +197,10 @@ impl Op {
         if without(before) != without(got) {
             return false;
         }
+        // A data write never changes the mode: new files are not executable.
+        let exec = matches!(before.get(path), Some(Some((_, true))));
         let content = match got.get(path) {
-            Some(Some((c, false))) => Some(c),
+            Some(Some((c, x))) if *x == exec => Some(c),
             None => None,
             _ => return false,
         };
