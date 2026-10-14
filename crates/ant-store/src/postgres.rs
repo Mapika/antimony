@@ -121,6 +121,27 @@ impl PgStore {
         self
     }
 
+    /// Store changeset blobs ahead of the commit rows that make them reachable.
+    /// They are the bulkiest part of recording commits, so large batches are
+    /// inserted by several statements at once. A crash in between leaves
+    /// unreferenced rows only; a commit never exists without its changeset.
+    async fn insert_changesets(&self, ids: &[&[u8]], data: &[Vec<u8>]) -> Result<()> {
+        const PART: usize = 256;
+        let parts = ids.chunks(PART).zip(data.chunks(PART)).map(|(ids, data)| async move {
+            sqlx::query(
+                "INSERT INTO changesets (commit_id, data) \
+                 SELECT * FROM unnest($1::bytea[], $2::bytea[]) ON CONFLICT (commit_id) DO NOTHING",
+            )
+            .bind(ids)
+            .bind(data)
+            .execute(&self.pool)
+            .await
+            .map_err(be)
+        });
+        futures::future::try_join_all(parts).await?;
+        Ok(())
+    }
+
     /// Record where objects live inside packs; first writer wins (identical content).
     pub(crate) async fn index_objects(&self, entries: &[IndexEntry]) -> Result<()> {
         if entries.is_empty() {
@@ -816,11 +837,12 @@ impl MetaStore for PgStore {
         let times: Vec<i64> = unique.iter().map(|(n, _)| n.committer_time).collect();
         let changesets: Vec<Vec<u8>> =
             unique.iter().map(|(_, c)| changeset_codec::encode(c)).collect::<Result<_>>()?;
+        self.insert_changesets(&ids, &changesets).await?;
 
         // One atomic statement (no explicit transaction round trips): insert
         // the new nodes, append them to the log in input order (parents
-        // first), insert their changesets, and return every input's seq.
-        // Already-recorded commits keep their seq and changeset.
+        // first), and return every input's seq. Already-recorded commits keep
+        // their seq and changeset (the changesets were stored just before).
         let result = sqlx::query(
             "WITH input AS ( \
                  SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::bytea[], $4::bigint[], \
@@ -833,14 +855,7 @@ impl MetaStore for PgStore {
              lg AS ( \
                  INSERT INTO log (commit_id) \
                  SELECT input.id FROM input JOIN ins ON ins.id = input.id ORDER BY input.ord \
-                 RETURNING commit_id, seq), \
-             ch AS ( \
-                 INSERT INTO changesets (commit_id, data) \
-                 SELECT input.id, cs.data \
-                 FROM input JOIN ins ON ins.id = input.id \
-                      JOIN unnest($6::bytea[]) WITH ORDINALITY AS cs(data, ord) \
-                        ON cs.ord = input.ord \
-                 ORDER BY input.ord) \
+                 RETURNING commit_id, seq) \
              SELECT commit_id, seq FROM lg \
              UNION ALL \
              SELECT commit_id, seq FROM log \
@@ -851,7 +866,6 @@ impl MetaStore for PgStore {
         .bind(&parents)
         .bind(&gens)
         .bind(&times)
-        .bind(&changesets)
         .fetch_all(&self.pool)
         .await
         .map_err(be)?;
