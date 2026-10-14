@@ -27,6 +27,8 @@ use crate::{ObjectStore, Result, StoreError};
 
 /// Maximum number of concurrent S3 requests per batch call.
 const FANOUT: usize = 64;
+/// Attempts at reading one ranged response body.
+const BODY_ATTEMPTS: u32 = 4;
 /// zstd level for stored object bodies.
 const ZSTD_LEVEL: i32 = 3;
 /// Bodies larger than this are compressed/decompressed/hashed on the blocking
@@ -145,16 +147,28 @@ impl S3ObjectStore {
 
     /// `len` bytes at `offset` of object `key`.
     pub(crate) async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes> {
-        let resp = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .range(format!("bytes={}-{}", offset, offset + len.max(1) - 1))
-            .send()
-            .await
-            .map_err(StoreError::backend)?;
-        let body = resp.body.collect().await.map_err(StoreError::backend)?.into_bytes();
+        // The SDK retries failed requests but not a body cut short mid-stream,
+        // which a busy S3 server does under many concurrent ranged reads.
+        let mut attempt = 0;
+        let body = loop {
+            let resp = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .range(format!("bytes={}-{}", offset, offset + len.max(1) - 1))
+                .send()
+                .await
+                .map_err(StoreError::backend)?;
+            match resp.body.collect().await {
+                Ok(body) => break body.into_bytes(),
+                Err(e) if attempt + 1 >= BODY_ATTEMPTS => return Err(StoreError::backend(e)),
+                Err(_) => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(20 << attempt)).await;
+                }
+            }
+        };
         if body.len() as u64 != len {
             return Err(corrupt(format!(
                 "{key}: short range read ({} of {len} bytes)",

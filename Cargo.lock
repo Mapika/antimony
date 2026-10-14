@@ -192,11 +192,13 @@ dependencies = [
  "axum",
  "bytes",
  "flate2",
+ "futures",
  "reqwest",
  "sha2 0.11.1",
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tracing",
 ]
 
 [[package]]
