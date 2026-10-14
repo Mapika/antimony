@@ -87,9 +87,27 @@ pub trait RpcResult<T> {
 
 impl<T> RpcResult<T> for std::result::Result<T, tonic::Status> {
     fn rpc(self) -> Result<T> {
-        self.map_err(|s| anyhow!("{}", s.message()))
+        self.map_err(|s| {
+            anyhow::Error::new(RpcError { code: s.code(), message: s.message().into() })
+        })
     }
 }
+
+/// A server error: displays as the bare message (the CLI output contract),
+/// while keeping the gRPC code so `main` can attach a `hint:`.
+#[derive(Debug)]
+pub struct RpcError {
+    pub code: tonic::Code,
+    pub message: String,
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RpcError {}
 
 pub fn id_from(bytes: &[u8]) -> Result<ObjectId> {
     Ok(ObjectId::from_bytes(bytes)?)

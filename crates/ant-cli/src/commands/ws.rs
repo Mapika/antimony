@@ -169,6 +169,10 @@ pub async fn land(ctx: &Ctx, ref_name: &str, commit: Option<String>) -> Result<O
             for p in c.paths {
                 writeln!(out, "{p}")?;
             }
+            eprintln!(
+                "hint: {ref_name} moved under you; start a fresh workspace at the new tip \
+                 (`ant ws new <dir> --at {ref_name}`), redo the edit there, then submit and land again"
+            );
             Ok(Outcome { stdout: out.into_bytes(), code: 2 })
         }
         None => bail!("server returned an empty land response"),
@@ -312,7 +316,7 @@ pub async fn unmount(dir: &Path) -> Result<Outcome> {
     })
     .await??;
     if !output.status.success() {
-        bail!("unmount failed: {}", String::from_utf8_lossy(&output.stderr));
+        bail!("unmount failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while tokio::fs::try_exists(state.join("ready")).await?

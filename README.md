@@ -50,28 +50,105 @@ clients are always online, history lives on the server, and nobody pushes.
 
 ## Quickstart
 
+Needs Rust, `git`, `curl`, and Postgres plus an S3-compatible store on the
+ports below (`docker compose up -d`, or `scripts/dev-services.sh start`
+without Docker). Run it from the repository root; the demo lives in
+`/tmp/ant-demo`.
+
 ```sh
-docker compose up -d                      # Postgres + S3-compatible store (SeaweedFS)
-cargo build --release                     # one binary: target/release/ant (server + client)
+docker compose up -d                       # Postgres :54329 + SeaweedFS S3 :9009
+cargo build --release                      # one binary: target/release/ant (server + client)
+export PATH=$PWD/target/release:$PATH
 
-STORE="--pg-url postgres://ant:ant@localhost:54329/ant \
-  --s3-endpoint http://localhost:9009 --s3-bucket ant --s3-access-key x --s3-secret-key x"
+# Every flag has an ANT_* environment variable; set the stores once for import and serve.
+export ANT_PG_URL=postgres://ant:ant@localhost:54329/ant
+export ANT_S3_ENDPOINT=http://localhost:9009 ANT_S3_BUCKET=ant
+export ANT_S3_ACCESS_KEY=x ANT_S3_SECRET_KEY=x     # tables and bucket are created on first use
 
-ant import /path/to/git/repo --git-ref refs/heads/main --ref main $STORE
-ant serve $STORE &                        # gRPC :7420, HTTP :7421 (--memory for a throwaway server)
+# 1. A small git repo to play with.
+rm -rf /tmp/ant-demo && mkdir -p /tmp/ant-demo/repo/src
+printf 'pub fn answer() -> u32 {\n    41\n}\n' > /tmp/ant-demo/repo/src/lib.rs
+echo '# demo' > /tmp/ant-demo/repo/README.md
+git init -q -b main /tmp/ant-demo/repo
+git -C /tmp/ant-demo/repo add -A
+git -C /tmp/ant-demo/repo -c user.name=demo -c user.email=demo@example.com commit -qm "initial import"
 
-ant ls main:src
+# 2. Import it straight into the stores, then serve it (gRPC :7420, HTTP :7421).
+ant import /tmp/ant-demo/repo              # prints: main <tip-id>
+ant serve > /tmp/ant-demo/serve.log 2>&1 &
+SERVER_PID=$!
+until curl -sf http://127.0.0.1:7421/healthz >/dev/null; do sleep 0.2; done
+
+# 3. Read without checking anything out.
+ant ls main                                # <mode> <kind> <id><TAB><name>
+ant cat main:src/lib.rs
 ant log main -n 5
-ant ws new /tmp/ws --at main --sparse src
-cd /tmp/ws && $EDITOR src/lib.rs
-ant status && ant submit -m "fix" && ant land   # exit code 2 on conflict
 
-git clone http://127.0.0.1:7421/repo.git      # humans and IDEs
+# 4. Two agents, two sparse workspaces, one file: the first lands, the second conflicts.
+ant ws new /tmp/ant-demo/a --sparse src
+ant ws new /tmp/ant-demo/b --sparse src
+echo '// from a' >> /tmp/ant-demo/a/src/lib.rs
+echo '// from b' >> /tmp/ant-demo/b/src/lib.rs
+cd /tmp/ant-demo/a && ant status && ant submit -m "a: comment" && ant land   # landed <id>
+cd /tmp/ant-demo/b && ant submit -m "b: comment"; ant land; echo "exit $?"    # conflict, src/lib.rs, exit 2
+
+# 5. History.
+ant log main --path src/lib.rs
+ant diff main~1 main                       # M<TAB>src/lib.rs
+ant blame main:src/lib.rs
+
+# 6. Humans and IDEs use plain git; Prometheus scrapes the HTTP port.
+git clone -q http://127.0.0.1:7421/repo.git /tmp/ant-demo/clone
+curl -s http://127.0.0.1:7421/metrics | grep '^ant_land_outcomes'
+
+# 7. Clean up.
+kill $SERVER_PID; cd / && rm -rf /tmp/ant-demo
+```
+
+Exit codes: `0` ok, `1` error (`error: ...` on stderr, plus `hint: ...` when
+there is an obvious fix), `2` land conflict. After a conflict, make a fresh
+workspace at the new tip, redo the edit, submit and land again.
+
+Optional: `ant ws new /tmp/lazy --lazy` mounts a writable copy-on-write
+workspace over FUSE (needs `/dev/fuse` and `fusermount3`; `ant ws unmount
+/tmp/lazy` keeps the edits), and `ant mount main /tmp/view` gives a read-only
+view.
+
+### Access control in two minutes
+
+Restart the server with a policy; `/healthz` and `/metrics` stay
+unauthenticated (use `--metrics-listen 127.0.0.1:9100` to move metrics off the
+public port).
+
+```sh
+TOKEN=$(openssl rand -hex 16)
+cat > policy.toml <<EOF
+[[principal]]
+name = "agent-1"
+token_sha256 = "$(printf %s "$TOKEN" | sha256sum | cut -d' ' -f1)"
+admin = true
+
+[[path]]
+prefix = ""
+read = ["*"]
+write = ["*"]
+
+[[ref]]
+pattern = "main"
+update = ["agent-1"]
+land = ["*"]
+EOF
+ant serve --policy policy.toml &
+ant log main -n 1                          # error: missing bearer token (+ hint)
+ANT_TOKEN=$TOKEN ant log main -n 1
+git clone http://x:$TOKEN@127.0.0.1:7421/repo.git   # the token is the Basic-auth password
 ```
 
 One binary, `ant`, is both the server and the client; the standalone
 `ant-server` binary is a thin wrapper around `ant serve`. Clients find the
 server via `ANT_SERVER` (default `http://127.0.0.1:7420`).
+`ant serve --memory` starts an empty throwaway server (`ant import` writes
+straight to the stores, so it cannot feed an in-memory server).
 `ant completions <bash|zsh|fish|...>` prints a shell completion script.
 
 ### Importing a large history

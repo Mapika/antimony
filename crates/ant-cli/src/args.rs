@@ -41,11 +41,18 @@ pub enum Command {
     /// Import a git repository straight into the stores.
     Import(ImportArgs),
     /// List a tree (or show a single blob entry): <rev>[:<path>].
-    Ls { target: String },
+    Ls {
+        /// `<rev>` or `<rev>:<path>`, e.g. `main:src`.
+        target: String,
+    },
     /// Print a blob: <rev>:<path>.
-    Cat { target: String },
+    Cat {
+        /// `<rev>:<path>`, e.g. `main:src/lib.rs`.
+        target: String,
+    },
     /// First-parent history, newest first.
     Log {
+        /// Rev to start from.
         #[arg(default_value = "main")]
         rev: String,
         /// Maximum number of commits.
@@ -56,15 +63,23 @@ pub enum Command {
         path: Option<String>,
     },
     /// Per-line attribution of a file: <rev>:<path>.
-    Blame { target: String },
+    Blame {
+        /// `<rev>:<path>`.
+        target: String,
+    },
     /// Changed paths between two revs.
-    Diff { from: String, to: String },
+    Diff {
+        /// Older rev.
+        from: String,
+        /// Newer rev.
+        to: String,
+    },
     /// Read and update refs.
     Ref {
         #[command(subcommand)]
         cmd: RefCmd,
     },
-    /// Sparse workspaces.
+    /// Create and manage workspaces (`ws new`, `ws unmount`).
     Ws {
         #[command(subcommand)]
         cmd: WsCmd,
@@ -73,18 +88,25 @@ pub enum Command {
     Status,
     /// Upload local changes as a changeset.
     Submit {
+        /// Commit message.
         #[arg(short = 'm', long)]
         message: String,
     },
     /// Land a commit onto a ref.
     Land {
+        /// Ref to land onto.
         #[arg(long = "ref", default_value = "main")]
         ref_name: String,
         /// Commit to land (default: the last submitted commit).
         commit: Option<String>,
     },
     /// Mount a read-only FUSE view of a rev.
-    Mount { rev: String, mountpoint: PathBuf },
+    Mount {
+        /// Rev to show.
+        rev: String,
+        /// Existing empty directory; the view is read-only.
+        mountpoint: PathBuf,
+    },
     /// Run the antimony server (gRPC + HTTP object endpoint).
     Serve(ant_server::serve::ServeArgs),
     /// Print a shell completion script.
@@ -143,15 +165,22 @@ pub struct ImportArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum RefCmd {
+    /// Print the commit id a ref points at.
     Get {
+        /// Ref name, e.g. `main`.
         name: String,
     },
+    /// List refs as `<id> <name>`, optionally only those under a prefix.
     List {
+        /// Only refs whose name starts with this prefix.
         #[arg(default_value = "")]
         prefix: String,
     },
+    /// Move a ref to a rev (compare-and-swap; `--create` for a new ref).
     Set {
+        /// Ref to update.
         name: String,
+        /// New target: a ref, commit id, or `~N` expression.
         rev: String,
         /// Expected current target (CAS).
         #[arg(long, conflicts_with = "create")]
@@ -165,12 +194,17 @@ pub enum RefCmd {
 #[derive(Subcommand, Debug)]
 pub enum WsCmd {
     /// Unmount a lazy workspace, keeping its edits.
-    Unmount { dir: PathBuf },
+    Unmount {
+        /// The lazy workspace directory.
+        dir: PathBuf,
+    },
     #[command(hide = true)]
     Serve { dir: PathBuf, state: PathBuf },
     /// Create a (sparse) workspace.
     New {
+        /// Directory to create the workspace in (must be empty or absent).
         dir: PathBuf,
+        /// Rev to base the workspace on.
         #[arg(long, default_value = "main")]
         at: String,
         /// Sparse pattern (repeatable). No patterns = everything.

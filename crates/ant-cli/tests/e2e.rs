@@ -28,6 +28,10 @@ impl Run {
         String::from_utf8_lossy(&self.out.stdout).into_owned()
     }
 
+    fn stderr(&self) -> String {
+        String::from_utf8_lossy(&self.out.stderr).into_owned()
+    }
+
     fn code(&self) -> Option<i32> {
         self.out.status.code()
     }
@@ -353,7 +357,10 @@ fn run_end_to_end(lazy: bool) {
 
     ctx.run(None, &["ls", "main:does/not/exist"]).expect_code(1);
     ctx.run(None, &["cat", "main:src"]).expect_code(1);
-    ctx.run(None, &["ref", "get", "no-such-ref"]).expect_code(1);
+    let r = ctx.run(None, &["ref", "get", "no-such-ref"]).expect_code(1);
+    if !r.stderr().contains("hint: list the existing refs") {
+        r.fail("missing ref should come with a hint");
+    }
 
     let cat = |path: &str| -> Vec<u8> {
         let r = ctx.run(None, &["cat", &format!("main:{path}")]).ok();
@@ -508,6 +515,9 @@ fn run_end_to_end(lazy: bool) {
         r.fail("C: stdout should start with `conflict`");
     }
     check_eq(&r, "conflict paths", lines[1..].to_vec(), strs(&["shared.txt"]));
+    if !r.stderr().contains("hint: main moved under you") {
+        r.fail("conflict should explain how to proceed on stderr");
+    }
     check_eq(
         &r,
         "main unchanged by conflict",
