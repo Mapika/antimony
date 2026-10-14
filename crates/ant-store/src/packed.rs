@@ -202,7 +202,8 @@ mod tests {
     async fn fresh() -> (PackedS3Store, S3ObjectStore) {
         let url = std::env::var("ANT_TEST_PG_URL")
             .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
-        let pg = PgStore::connect(&url, &format!("t_{}", rand::random::<u64>())).await.unwrap();
+        let pg =
+            PgStore::connect_scratch(&url, &format!("t_{}", rand::random::<u64>())).await.unwrap();
         let cfg = S3Config::for_tests(&format!("p{}", rand::random::<u64>()));
         let s3 = S3ObjectStore::connect(&cfg).await.unwrap();
         s3.ensure_bucket().await.unwrap();

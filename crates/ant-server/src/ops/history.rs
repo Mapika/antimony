@@ -923,7 +923,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.subsec_nanos())
         );
-        let pg = Arc::new(PgStore::connect(&url, &schema).await.unwrap());
+        let pg = Arc::new(PgStore::connect_scratch(&url, &schema).await.unwrap());
         let b = Backend { objects: pg.clone(), refs: pg.clone(), meta: pg.clone() };
 
         let t = Instant::now();
@@ -992,12 +992,5 @@ mod tests {
             t.elapsed(),
             fast.len()
         );
-
-        use sqlx::Connection;
-        if let Ok(mut c) = sqlx::PgConnection::connect(&url).await {
-            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA \"{schema}\" CASCADE")))
-                .execute(&mut c)
-                .await;
-        }
     }
 }
