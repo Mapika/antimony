@@ -8,6 +8,8 @@
 //! - Unknown id → 404 with `Cache-Control: no-store` (it may appear later).
 //! - Malformed id → 400.
 //! - `GET /healthz` → 200 "ok".
+//! - `GET /metrics` → 200 Prometheus/OpenMetrics text (`crate::metrics`); absent
+//!   here when `--metrics-listen` serves it on its own listener.
 //! - `GET /debug/stats` → 200 JSON of process-local cache, land queue and
 //!   catch-up sizes (for soak monitoring).
 //!
@@ -17,9 +19,13 @@
 //! outside the root zone are served `Cache-Control: private, ...`. The git
 //! export (`/repo.git/...`) takes Basic auth (401 carries
 //! `WWW-Authenticate: Basic` so git asks its credential helpers) and needs
-//! `can_read_everything`, else 403. `/healthz` and `/debug/stats` stay open.
+//! `can_read_everything`, else 403. `/healthz`, `/metrics` and `/debug/stats` stay open.
+//!
+//! Every response carries `x-request-id` (the request's own or a fresh ULID);
+//! requests are counted and timed per route (`crate::observe`).
 
 use std::str::FromStr;
+use std::sync::Arc;
 
 use ant_core::ObjectId;
 use ant_store::Backend;
@@ -30,6 +36,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
 use crate::acl::{self, Acl, AuthError};
+use crate::metrics::Metrics;
+use crate::observe::{Observer, http_observe};
 
 const CONTENT_TYPE: &str = "application/x-ant-object";
 const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
@@ -48,8 +56,21 @@ pub async fn serve_with_acl(
     acl: Acl,
     listener: tokio::net::TcpListener,
 ) -> std::io::Result<()> {
+    serve_with_metrics(backend, acl, listener, Metrics::new(), true).await
+}
+
+/// [`serve_with_acl`] recording HTTP metrics, request ids and slow-request
+/// logs (`crate::observe`) into `metrics`; `expose_metrics` serves
+/// `GET /metrics` on this listener.
+pub async fn serve_with_metrics(
+    backend: Backend,
+    acl: Acl,
+    listener: tokio::net::TcpListener,
+    metrics: Arc<Metrics>,
+    expose_metrics: bool,
+) -> std::io::Result<()> {
     use axum::serve::ListenerExt;
-    let app = app_with_acl(backend, acl);
+    let app = app_with_metrics(backend, acl, metrics, expose_metrics);
     let listener = listener.tap_io(|tcp| {
         // Avoid Nagle/delayed-ACK stalls on small responses.
         let _ = tcp.set_nodelay(true);
@@ -57,15 +78,45 @@ pub async fn serve_with_acl(
     axum::serve(listener, app).await
 }
 
+/// Serve only `GET /metrics` of `metrics` on a dedicated listener
+/// (`--metrics-listen`).
+pub async fn serve_metrics(
+    metrics: Arc<Metrics>,
+    listener: tokio::net::TcpListener,
+) -> std::io::Result<()> {
+    let app = Router::new().route("/metrics", get(scrape)).with_state(metrics);
+    axum::serve(listener, app).await
+}
+
 /// Object endpoint plus git export, enforcing `acl`.
 pub fn app_with_acl(backend: Backend, acl: Acl) -> Router {
+    app_with_metrics(backend, acl, Metrics::new(), true)
+}
+
+/// [`app_with_acl`] with the observation layer (metrics, request ids, slow
+/// logs); `expose_metrics` adds `GET /metrics`.
+pub fn app_with_metrics(
+    backend: Backend,
+    acl: Acl,
+    metrics: Arc<Metrics>,
+    expose_metrics: bool,
+) -> Router {
+    let observer = Arc::new(Observer::new(metrics.clone(), acl.clone()));
     let git = ant_gitserve::router(backend.clone());
     let git = if acl.is_open() {
         git
     } else {
         git.layer(axum::middleware::from_fn_with_state(acl.clone(), git_auth))
     };
-    router_with_acl(backend, acl).merge(git)
+    router_with_state(backend, acl, metrics, expose_metrics)
+        .merge(git)
+        .layer(axum::middleware::from_fn_with_state(observer, http_observe))
+}
+
+/// `GET /metrics`: the OpenMetrics text of the scrape.
+async fn scrape(State(metrics): State<Arc<Metrics>>) -> Response {
+    let body = metrics.render();
+    ([(header::CONTENT_TYPE, crate::metrics::CONTENT_TYPE)], body).into_response()
 }
 
 pub fn router(backend: Backend) -> Router {
@@ -74,11 +125,24 @@ pub fn router(backend: Backend) -> Router {
 
 /// The object endpoint (`/o/{hex}`, `/healthz`) enforcing `acl`.
 pub fn router_with_acl(backend: Backend, acl: Acl) -> Router {
-    Router::new()
+    router_with_state(backend, acl, Metrics::new(), true)
+}
+
+fn router_with_state(
+    backend: Backend,
+    acl: Acl,
+    metrics: Arc<Metrics>,
+    expose_metrics: bool,
+) -> Router {
+    let mut router = Router::new()
         .route("/o/{hex}", get(get_object))
         .route("/healthz", get(|| async { "ok" }))
         .route("/debug/stats", get(debug_stats))
-        .with_state(HttpState { backend, acl })
+        .with_state(HttpState { backend, acl });
+    if expose_metrics {
+        router = router.merge(Router::new().route("/metrics", get(scrape)).with_state(metrics));
+    }
+    router
 }
 
 /// `GET /debug/stats`: process-local sizes as one JSON line.

@@ -12,10 +12,35 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use ant_core::{Commit, Object, ObjectId, ObjectKind, Tree};
 use ant_store::{Backend, CommitNode, MetaStore, ObjectStore, PathChange, StoreError};
+
+/// Cache names, indexed by [`Cache`] slot.
+pub(crate) const CACHE_NAMES: [&str; 4] = ["trees", "commits", "nodes", "changesets"];
+
+/// Process-wide lookup counters per cache slot (all store instances). Plain
+/// relaxed atomics: the metrics endpoint reads them on scrape.
+static HITS: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static MISSES: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+fn count(slot: usize, hits: usize, misses: usize) {
+    if hits > 0 {
+        HITS[slot].fetch_add(hits as u64, Ordering::Relaxed);
+    }
+    if misses > 0 {
+        MISSES[slot].fetch_add(misses as u64, Ordering::Relaxed);
+    }
+}
+
+/// Cumulative `(hits, misses)` per cache, in [`CACHE_NAMES`] order.
+pub(crate) fn lookup_counters() -> [(u64, u64); 4] {
+    std::array::from_fn(|i| (HITS[i].load(Ordering::Relaxed), MISSES[i].load(Ordering::Relaxed)))
+}
 
 /// Two-generation cache: inserts go to `cur`; when `cur` exceeds its budget it
 /// becomes `prev` (dropping the old `prev`). Hits in `prev` are promoted.
@@ -63,19 +88,24 @@ impl<K: Hash + Eq, V: Clone> Generations<K, V> {
 }
 
 /// A cache keyed by `K`, safe to share between tasks.
-pub(crate) struct Cache<K, V>(Mutex<Generations<K, V>>);
+pub(crate) struct Cache<K, V> {
+    inner: Mutex<Generations<K, V>>,
+    slot: usize,
+}
 
 impl<K: Hash + Eq + Clone, V: Clone> Cache<K, V> {
-    fn new(budget: usize) -> Self {
-        Self(Mutex::new(Generations::new(budget)))
+    fn new(budget: usize, slot: usize) -> Self {
+        Self { inner: Mutex::new(Generations::new(budget)), slot }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Generations<K, V>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub(crate) fn get(&self, key: &K) -> Option<V> {
-        self.lock().get(key)
+        let found = self.lock().get(key);
+        count(self.slot, usize::from(found.is_some()), usize::from(found.is_none()));
+        found
     }
 
     /// Index-aligned lookup under one lock.
@@ -83,8 +113,13 @@ impl<K: Hash + Eq + Clone, V: Clone> Cache<K, V> {
     where
         K: 'a,
     {
-        let mut g = self.lock();
-        keys.into_iter().map(|k| g.get(k)).collect()
+        let found: Vec<Option<V>> = {
+            let mut g = self.lock();
+            keys.into_iter().map(|k| g.get(k)).collect()
+        };
+        let hits = found.iter().filter(|f| f.is_some()).count();
+        count(self.slot, hits, found.len() - hits);
+        found
     }
 
     pub(crate) fn insert(&self, key: K, value: V, weight: usize) {
@@ -172,15 +207,15 @@ fn scoped<S: ?Sized, C>(
 
 pub(crate) fn objects(store: &Arc<dyn ObjectStore>) -> Arc<ObjectCaches> {
     scoped(&OBJECTS, store, || ObjectCaches {
-        trees: Cache::new(TREE_BUDGET),
-        commits: Cache::new(COMMIT_BUDGET),
+        trees: Cache::new(TREE_BUDGET, 0),
+        commits: Cache::new(COMMIT_BUDGET, 1),
     })
 }
 
 pub(crate) fn meta(store: &Arc<dyn MetaStore>) -> Arc<MetaCaches> {
     scoped(&META, store, || MetaCaches {
-        nodes: Cache::new(NODE_BUDGET),
-        changesets: Cache::new(CHANGESET_BUDGET),
+        nodes: Cache::new(NODE_BUDGET, 2),
+        changesets: Cache::new(CHANGESET_BUDGET, 3),
     })
 }
 
@@ -213,7 +248,7 @@ pub fn cache_stats() -> (Vec<CacheStat>, usize, usize) {
         add(&mut totals[2], &c.nodes);
         add(&mut totals[3], &c.changesets);
     }
-    const NAMES: [&str; 4] = ["trees", "commits", "nodes", "changesets"];
+    const NAMES: [&str; 4] = CACHE_NAMES;
     let stats = NAMES
         .iter()
         .zip(totals)

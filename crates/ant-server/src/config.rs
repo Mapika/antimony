@@ -98,12 +98,17 @@ impl StoreArgs {
     }
 
     pub async fn backend(&self) -> anyhow::Result<Backend> {
+        Ok(self.backend_with_pg().await?.0)
+    }
+
+    /// [`Self::backend`] plus the Postgres store (for pool metrics), if any.
+    pub async fn backend_with_pg(&self) -> anyhow::Result<(Backend, Option<Arc<PgStore>>)> {
         match (self.memory, self.pg_url.as_deref()) {
             (true, None) => {
                 if self.s3_config()?.is_some() {
                     bail!("--s3-* flags require --pg-url, not --memory");
                 }
-                Ok(Backend::in_memory())
+                Ok((Backend::in_memory(), None))
             }
             (false, Some(url)) => {
                 let pg = Arc::new(
@@ -131,7 +136,7 @@ impl StoreArgs {
                         ))
                     }
                 };
-                Ok(Backend { objects, refs: pg.clone(), meta: pg })
+                Ok((Backend { objects, refs: pg.clone(), meta: pg.clone() }, Some(pg)))
             }
             (true, Some(_)) => bail!("--memory and --pg-url are mutually exclusive"),
             (false, None) => bail!("exactly one of --memory or --pg-url is required"),

@@ -21,14 +21,21 @@ bytes.workspace = true
 clap.workspace = true
 diffy.workspace = true
 futures.workspace = true
+http.workspace = true
+http-body.workspace = true
 libc.workspace = true
+pin-project-lite.workspace = true
+prometheus-client.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+ulid.workspace = true
 
 [dev-dependencies]
+prometheus-parse.workspace = true
 reqwest.workspace = true
 proptest.workspace = true
 rand.workspace = true

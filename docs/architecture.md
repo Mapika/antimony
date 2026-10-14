@@ -102,6 +102,20 @@ cache hit can never hide a missing object.
   fetch are supported, with packs delta-compressed against the previous
   version of each path.
 
+## Observability (`ant-server::metrics`, `ant-server::observe`)
+
+One `Metrics` value (a `prometheus-client` registry, no global) is created in
+`serve::run` and shared via `Arc`. Transports are observed by wrapping whole
+services, so handlers stay untouched: a tower layer around the gRPC service
+and an axum middleware around the HTTP router assign the request id (incoming
+`x-request-id` or a ULID, a tracing span field, echoed on the response),
+record `ant_rpc_*` / `ant_http_*` and log slow requests. Stores are wrapped
+once by `Metrics::instrument` (per-op timing and error counts). Landing and
+history report through `Option<Arc<Metrics>>` parameters (`land_observed`,
+`catch_up_observed`); state that lives in process-wide statics (cache sizes
+and lookup counters, land queues) is read at scrape time. See
+`operations.md` for the exposed series.
+
 ## Access control (`ant-auth`, `ant-server::acl`)
 
 A TOML policy defines principals with hashed bearer tokens, longest-prefix

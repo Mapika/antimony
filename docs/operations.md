@@ -4,7 +4,7 @@
 
 | process | role | state |
 |---|---|---|
-| `ant serve` | gRPC (`:7420`) + HTTP (`:7421`: `/o/<id>` objects, `/repo.git` git export, `/healthz`) | none; caches only |
+| `ant serve` | gRPC (`:7420`) + HTTP (`:7421`: `/o/<id>` objects, `/repo.git` git export, `/healthz`, `/metrics`) | none; caches only |
 | PostgreSQL ≥ 15 | refs, commit graph, changesets, small objects, history index | all metadata |
 | S3-compatible store | objects larger than 4 KiB (zstd) | large objects |
 | HTTP cache / CDN (optional) | caches `GET /o/<id>` (immutable; `private` for restricted zones) | disposable |
@@ -28,6 +28,50 @@ logs a warning; never expose an open-mode server.
 Run it behind TLS. Bearer tokens are secrets, and the server itself does not
 terminate TLS. Put a reverse proxy (or a gRPC-aware load balancer) in front
 of both ports.
+
+## Metrics and logs
+
+**Metrics.** `GET /metrics` on the HTTP port returns Prometheus (OpenMetrics
+text) metrics. It is unauthenticated, so either keep the HTTP port private or
+move it with `--metrics-listen 127.0.0.1:9100` (`ANT_METRICS_LISTEN`): the
+endpoint then exists only on that listener, and the HTTP port answers 404.
+
+| family | labels | meaning |
+|---|---|---|
+| `ant_rpc_requests_total`, `ant_rpc_duration_seconds` | `method`, `code` / `method` | gRPC calls; `code` is the snake_case status (`ok`, `not_found`, `aborted`, ...; `cancelled` if the client left early); duration runs to the end of the response (streams included) |
+| `ant_http_requests_total`, `ant_http_duration_seconds` | `route`, `status` / `route` | `objects`, `git`, `healthz`, `metrics`, `other`; duration runs to the response headers |
+| `ant_land_batch_size` | | requests per group-commit batch |
+| `ant_land_outcomes_total` | `outcome` | `landed`, `rebased`, `conflict`, `aborted`, `denied` |
+| `ant_land_cas_retries_total` | | batches replayed after losing the ref CAS (another replica landed first) |
+| `ant_land_queue_depth` | `ref` | land requests waiting right now |
+| `ant_store_op_duration_seconds`, `ant_store_errors_total` | `store` (`objects`, `refs`, `meta`), `op` | every store call (Postgres/S3 round trips) |
+| `ant_cache_hits_total`, `ant_cache_misses_total`, `ant_cache_bytes` | `cache` (`trees`, `commits`, `nodes`, `changesets`) | in-process caches; hits and misses count since process start |
+| `ant_history_lag_commits` | `ref` | commits the history index is behind the ref |
+| `ant_history_catch_up_seconds` | | duration of catch-ups that indexed commits |
+| `ant_build_info` | `version`, `git` | always 1 |
+| `ant_pg_pool_size`, `_idle`, `_in_use`, `_max` | | Postgres query pool (0 without Postgres) |
+
+`ref` labels are capped: the 64 most recently landed-on or indexed refs get
+their own value, all others report as `ref="other"`. Useful starting alerts:
+sustained `ant_land_queue_depth` growth, a rising share of
+`ant_land_cas_retries_total`, `ant_history_lag_commits` that does not return
+to 0, `ant_pg_pool_in_use` near `ant_pg_pool_max`, and p99
+`ant_store_op_duration_seconds{op="cas_ref"}`.
+
+**Logs.** `--log-format json|text` (`ANT_LOG_FORMAT`; default `text` on a
+terminal, `json` otherwise) writes to stderr; the level comes from `RUST_LOG`
+(default `info`). In JSON each line carries its enclosing spans, so every log
+line of a request has the request's `request_id`.
+
+**Request ids.** Every gRPC and HTTP request has an id: an incoming
+`x-request-id` (1-128 visible ASCII characters) is kept, otherwise the server
+generates a ULID. It is echoed in the `x-request-id` response header (gRPC
+initial metadata or trailers-only headers), so a client can quote it when
+reporting a problem and you can `grep` the logs for it.
+
+**Slow requests.** A request taking 1 s or more is logged at WARN as
+`slow request` with the method or route, duration and, under a policy, the
+authenticated principal.
 
 ## Importing an existing repository
 
