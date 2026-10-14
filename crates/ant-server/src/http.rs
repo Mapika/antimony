@@ -8,6 +8,8 @@
 //! - Unknown id → 404 with `Cache-Control: no-store` (it may appear later).
 //! - Malformed id → 400.
 //! - `GET /healthz` → 200 "ok".
+//! - `GET /debug/stats` → 200 JSON of process-local cache, land queue and
+//!   catch-up sizes (for soak monitoring).
 //!
 //! Access control (`crate::acl`, only with a policy): `/o/{hex}` needs
 //! `Authorization: Bearer <token>` (or Basic with the token as password),
@@ -15,7 +17,7 @@
 //! outside the root zone are served `Cache-Control: private, ...`. The git
 //! export (`/repo.git/...`) takes Basic auth (401 carries
 //! `WWW-Authenticate: Basic` so git asks its credential helpers) and needs
-//! `can_read_everything`, else 403. `/healthz` stays open.
+//! `can_read_everything`, else 403. `/healthz` and `/debug/stats` stay open.
 
 use std::str::FromStr;
 
@@ -75,7 +77,34 @@ pub fn router_with_acl(backend: Backend, acl: Acl) -> Router {
     Router::new()
         .route("/o/{hex}", get(get_object))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/debug/stats", get(debug_stats))
         .with_state(HttpState { backend, acl })
+}
+
+/// `GET /debug/stats`: process-local sizes as one JSON line.
+async fn debug_stats() -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], stats_json()).into_response()
+}
+
+/// Cache entries and weights, store registrations, land queues and running
+/// catch-ups. Built by hand: the shape is fixed and no JSON crate is needed.
+fn stats_json() -> String {
+    let (caches, objects, metas) = crate::ops::cache::cache_stats();
+    let caches: Vec<String> = caches
+        .iter()
+        .map(|c| {
+            format!(
+                r#"{{"name":"{}","entries":{},"weight_bytes":{},"budget_bytes":{}}}"#,
+                c.name, c.entries, c.weight_bytes, c.budget_bytes
+            )
+        })
+        .collect();
+    let (queues, requests) = crate::ops::land::queue_stats();
+    format!(
+        r#"{{"caches":[{}],"cache_stores":{{"objects":{objects},"meta":{metas}}},"land_queues":{{"queues":{queues},"requests":{requests}}},"catch_ups":{}}}"#,
+        caches.join(","),
+        crate::ops::history::running_catch_ups(),
+    )
 }
 
 #[derive(Clone)]
@@ -209,4 +238,18 @@ fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
         .any(|candidate| {
             candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stats_json;
+
+    #[test]
+    fn stats_json_has_expected_shape() {
+        let json = stats_json();
+        assert!(json.starts_with(r#"{"caches":[{"name":"trees""#), "{json}");
+        assert!(json.contains(r#""land_queues":{"queues":"#), "{json}");
+        assert!(json.ends_with('}'), "{json}");
+        assert!(!json.contains('\n'));
+    }
 }
