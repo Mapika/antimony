@@ -5,3 +5,9 @@
 slow-timeout = { period = "30s", terminate-after = 10 }
 fail-fast = false
 
+# The rw write benchmark (full size only with ANT_RW_BENCH=1) writes several
+# GiB and builds a crate twice; give it room.
+[[profile.default.overrides]]
+filter = 'test(rw_write_bench)'
+slow-timeout = { period = "60s", terminate-after = 30 }
+

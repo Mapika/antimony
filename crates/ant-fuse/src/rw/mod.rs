@@ -5,13 +5,62 @@
 //! `~/.cache/antimony/ws/<hash of mountpoint>/`) and holds (`state`):
 //! - `upper/`: the repo tree of every file or directory created or modified
 //!   (copy-up on first write copies the whole file from the lower layer);
-//! - `whiteouts`: newline-separated repo paths deleted from the lower layer
-//!   (a deleted directory hides everything below it);
-//! - `base`: `base_commit=<hex>\nbase_tree=<hex>\n`;
-//! - `intent`: a pending delete/rename, rolled forward after a crash;
+//! - `whiteouts`: snapshot of the repo paths deleted from the lower layer,
+//!   newline-separated (a deleted directory hides everything below it);
+//! - `base`: snapshot `base_commit=<hex>\nbase_tree=<hex>\n`;
+//! - `ops.log`: append-only journal of whiteout and base changes since the
+//!   snapshots (`journal`: checksummed records, compacted into the snapshots
+//!   at mount, at unmount and past 4 MiB);
+//! - `intent`: a pending delete/rename written by earlier versions, rolled
+//!   forward by recovery;
 //! - `lock` / `mount.lock`: the state lock and the exclusive mount marker.
 //!
-//! Every metadata file is replaced atomically (write temp + rename + fsync).
+//! Snapshots are replaced atomically (write temp + fsync + rename + fsync).
+//!
+//! # Performance model
+//!
+//! The mount is exclusive (`MountGuard`): recovery runs and base/whiteouts
+//! are loaded once at mount and kept in memory. `read`/`write`/`fsync` on an
+//! open upper file use positional I/O on the handle's own descriptor, without
+//! the overlay mutex or the state lock, on several FUSE threads. A write is
+//! acknowledged before its copy into the upper file (`overlay::Pending`), so
+//! a sequential writer's next request overlaps it; reads, attributes, flush,
+//! fsync and truncation of that inode wait for writes in flight, and
+//! overlapping writes apply in order. `status` reads upper files directly, so
+//! it sees a write once that copy completes (microseconds after the reply),
+//! and always once the file is closed or synced. Namespace operations
+//! serialize on the overlay mutex; mutations also hold the state lock so
+//! `status`/`reset` (other processes) see whole operations. `reset` on a
+//! live mount appends a journal record; the daemon notices the journal size
+//! change with one `fstat` per namespace operation and reloads. If `reset`
+//! prunes an upper file that is still open for writing, the next write,
+//! flush or fsync on it sees `nlink == 0` and publishes the file again, with
+//! its writes.
+//!
+//! # Crash semantics
+//!
+//! - **Daemon crash** (killed, panics; the kernel survives): the workspace
+//!   reflects every completed metadata operation, i.e. a prefix of them, and
+//!   the interrupted one is either applied or not (a trailing journal rename
+//!   is rolled forward; a torn journal record is dropped). File data is kept
+//!   by the kernel page cache once its file was closed (FUSE flush) or
+//!   synced; the last acknowledged writes to a file still open may be lost
+//!   or partially applied, like any unsynced data.
+//! - **System crash**: metadata changes are made durable in batches, by an
+//!   explicit `fsync`/`fsyncdir`, at unmount, and at most 100 ms later by a
+//!   background flusher; only changes acknowledged after the last such point
+//!   may be lost. Journal records and upper-directory changes are synced in
+//!   order (pending records before the next directory change and vice
+//!   versa), so what survives is a prefix of the operations. File data
+//!   written without `fsync` may be lost, as on any POSIX filesystem.
+//! - **Never torn**: no operation leaves a file whose content is neither the
+//!   old nor the new version, unless the application itself wrote it
+//!   partially. Copy-up writes a temp file, fsyncs it and renames it into
+//!   place, so a published upper file never shadows the lower file with a
+//!   partial copy. Compound operations (deleting a modified tracked file,
+//!   renaming a tracked path) journal their whiteouts first, so an
+//!   interruption leaves the upper copy, i.e. the old state, or is rolled
+//!   forward.
 //!
 //! Reads: upper wins, whiteouts hide the lower layer, everything else is the
 //! lazy read-only view (`crate::filesystem`). Supported mutations
@@ -28,10 +77,11 @@
 
 mod callbacks;
 mod changes;
+mod journal;
 mod overlay;
 mod state;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -40,15 +90,18 @@ use std::sync::Arc;
 
 use ant_core::{EntryMode, ObjectId};
 use ant_store::ObjectStore;
-use fuser::{BackgroundSession, Config, Errno, FileType, INodeNo, MountOption};
-use parking_lot::Mutex;
+use fuser::{BackgroundSession, Config, Errno, FileType, MountOption};
 
 use crate::MountOptions;
 use crate::filesystem::View;
 pub use changes::{changes, reset};
-use overlay::{Overlay, Writable};
+use overlay::Writable;
 pub use state::base;
 use state::{MountGuard, StateLock, recover, save_base, save_whiteouts};
+
+/// FUSE request threads per writable mount. Namespace operations serialize
+/// on the overlay; reads and writes of open upper files run in parallel.
+const THREADS: usize = 8;
 
 fn error(code: i32) -> io::Error {
     io::Error::from_raw_os_error(code)
@@ -127,25 +180,18 @@ pub fn mount_rw(
         save_whiteouts(&state_dir, &BTreeSet::new())?;
     }
     recover(&state_dir)?;
-    let (_, root) = base(&state_dir)?;
+    let root = journal::load(&state_dir)?.tree;
+    drop(lock);
     let mut config = Config::default();
     config.mount_options = vec![
         MountOption::RW,
         MountOption::DefaultPermissions,
         MountOption::FSName(opts.fs_name.clone()),
     ];
-    let view = Writable {
-        _mount_lock: mount_lock,
-        lower: View::new(objects, root, rt, opts),
-        dir: state_dir,
-        overlay: Mutex::new(Overlay {
-            paths: HashMap::from([(INodeNo(1), String::new())]),
-            handles: HashMap::new(),
-            directories: HashMap::new(),
-            next_handle: 1,
-        }),
-    };
-    drop(lock);
+    config.n_threads = Some(THREADS);
+    config.clone_fd = true;
+    let lower = View::new(objects, root, rt, opts);
+    let view = Writable::open(mount_lock, lower, state_dir)?;
     fuser::spawn_mount(view, mountpoint, &config)
 }
 

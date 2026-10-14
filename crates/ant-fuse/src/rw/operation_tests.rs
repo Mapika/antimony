@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
@@ -9,7 +9,6 @@ use ant_store::graph::build_tree;
 use ant_store::memory::MemoryObjectStore;
 use antd::workspace::LocalChangeKind;
 use fuser::*;
-use parking_lot::Mutex;
 
 use super::state::*;
 use super::*;
@@ -31,17 +30,12 @@ fn mutations_and_reset_without_kernel() {
     fs::create_dir(state.join("upper")).unwrap();
     save_base(state, ObjectId([1; 32]), tree).unwrap();
     save_whiteouts(state, &BTreeSet::new()).unwrap();
-    let view = Writable {
-        _mount_lock: MountGuard::take(state).unwrap(),
-        lower: View::new(objects.clone(), tree, rt.handle().clone(), MountOptions::default()),
-        dir: state.to_path_buf(),
-        overlay: Mutex::new(Overlay {
-            paths: HashMap::from([(INodeNo(1), String::new())]),
-            handles: HashMap::new(),
-            directories: HashMap::new(),
-            next_handle: 1,
-        }),
-    };
+    let view = Writable::open(
+        MountGuard::take(state).unwrap(),
+        View::new(objects.clone(), tree, rt.handle().clone(), MountOptions::default()),
+        state.to_path_buf(),
+    )
+    .unwrap();
     let root = INodeNo(1);
     view.run(|o| {
         let ino = o.inode(root, OsStr::new("file"))?;
@@ -173,4 +167,113 @@ fn reset_drops_unchanged_copies_and_splits_directory_whiteouts() {
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].path.as_str(), "dir/b");
     assert_eq!(changes[0].kind, LocalChangeKind::Deleted);
+}
+
+fn workspace(
+    rt: &tokio::runtime::Runtime,
+    files: &[(&str, &[u8])],
+) -> (Arc<MemoryObjectStore>, ObjectId, tempfile::TempDir) {
+    let objects = Arc::new(MemoryObjectStore::default());
+    let tree = rt.block_on(build_tree(objects.as_ref(), files)).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("upper")).unwrap();
+    save_base(temp.path(), ObjectId([1; 32]), tree).unwrap();
+    save_whiteouts(temp.path(), &BTreeSet::new()).unwrap();
+    (objects, tree, temp)
+}
+
+#[test]
+fn whiteouts_are_journaled_and_compacted_past_the_threshold() {
+    use super::journal::JOURNAL;
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let names = (0..300).map(|i| format!("f{i:03}")).collect::<Vec<_>>();
+    let paths = names.iter().map(|n| format!("d/{n}")).collect::<Vec<_>>();
+    let files = paths.iter().map(|p| (p.as_str(), b"x".as_slice())).collect::<Vec<_>>();
+    let (objects, tree, temp) = workspace(&rt, &files);
+    let state = temp.path();
+    let open = || {
+        Writable::open(
+            MountGuard::take(state).unwrap(),
+            View::new(objects.clone(), tree, rt.handle().clone(), MountOptions::default()),
+            state.to_path_buf(),
+        )
+        .unwrap()
+    };
+    let mut view = open();
+    view.compact_bytes = 2048;
+    let mut largest = 0;
+    for name in &names {
+        view.run_mut(|o| {
+            let d = o.inode(INodeNo(1), OsStr::new("d"))?;
+            o.remove(d, OsStr::new(name), false)
+        })
+        .unwrap();
+        largest = largest.max(fs::metadata(state.join(JOURNAL)).unwrap().len());
+        // No per-operation rewrite of the snapshot.
+        assert!(snapshot_whiteouts(state).unwrap().len() <= 300);
+    }
+    assert!(largest <= 2048 + 64, "journal grew to {largest}");
+    // Compaction happened: the snapshot holds most deletions, and snapshot
+    // plus journal hold all of them.
+    assert!(snapshot_whiteouts(state).unwrap().len() >= 200);
+    let all: BTreeSet<String> = paths.iter().cloned().collect();
+    assert_eq!(whiteouts(state).unwrap(), all);
+    let changes = rt.block_on(super::changes(objects.clone(), state)).unwrap();
+    assert_eq!(changes.len(), 300);
+    assert!(changes.iter().all(|c| c.kind == LocalChangeKind::Deleted));
+    // Survives reopening (mount-time recovery and compaction).
+    drop(view);
+    let view = open();
+    assert_eq!(fs::metadata(state.join(JOURNAL)).unwrap().len(), 0);
+    assert_eq!(snapshot_whiteouts(state).unwrap(), all);
+    view.run(|o| {
+        assert!(o.children("d")?.is_empty());
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn trailing_journal_rename_rolls_forward_once() {
+    use super::journal::{JOURNAL, Record, append_durably, parse};
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let (_objects, _tree, temp) = workspace(&rt, &[("old", b"lower")]);
+    let state = temp.path();
+    fs::write(state.join("upper/old"), b"copied up").unwrap();
+    // Crash after journaling the rename, before moving the upper copy.
+    append_durably(state, &Record::Rename { old: "old".into(), new: "new".into() }).unwrap();
+    recover(state).unwrap();
+    assert_eq!(fs::read(state.join("upper/new")).unwrap(), b"copied up");
+    assert!(!state.join("upper/old").exists());
+    assert_eq!(whiteouts(state).unwrap(), BTreeSet::from(["old".into(), "new".into()]));
+    let (records, _) = parse(&fs::read(state.join(JOURNAL)).unwrap()).unwrap();
+    assert_eq!(records.last(), Some(&Record::Done));
+    // Completed: a later upper "old" is never moved again.
+    fs::write(state.join("upper/old"), b"recreated").unwrap();
+    recover(state).unwrap();
+    assert_eq!(fs::read(state.join("upper/old")).unwrap(), b"recreated");
+    assert_eq!(fs::read(state.join("upper/new")).unwrap(), b"copied up");
+}
+
+#[test]
+fn torn_journal_tail_is_dropped_before_appending() {
+    use super::journal::{JOURNAL, Record, append_durably, parse};
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let (_objects, _tree, temp) = workspace(&rt, &[("a", b"a"), ("b", b"b")]);
+    let state = temp.path();
+    append_durably(state, &Record::Whiteout("a".into())).unwrap();
+    let good = fs::metadata(state.join(JOURNAL)).unwrap().len();
+    // A crash in the middle of the next append.
+    let torn = Record::Whiteout("b".into()).frame();
+    let mut f = fs::OpenOptions::new().append(true).open(state.join(JOURNAL)).unwrap();
+    std::io::Write::write_all(&mut f, &torn[..torn.len() - 3]).unwrap();
+    drop(f);
+    assert_eq!(whiteouts(state).unwrap(), BTreeSet::from(["a".into()]));
+    recover(state).unwrap();
+    assert_eq!(fs::metadata(state.join(JOURNAL)).unwrap().len(), good);
+    append_durably(state, &Record::Whiteout("b".into())).unwrap();
+    let (records, len) = parse(&fs::read(state.join(JOURNAL)).unwrap()).unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(len as u64, fs::metadata(state.join(JOURNAL)).unwrap().len());
+    assert_eq!(whiteouts(state).unwrap(), BTreeSet::from(["a".into(), "b".into()]));
 }
