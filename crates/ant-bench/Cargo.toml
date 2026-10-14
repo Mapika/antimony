@@ -9,6 +9,7 @@ name = "ant-bench"
 path = "src/main.rs"
 
 [dependencies]
+ant-cache.workspace = true
 ant-core.workspace = true
 ant-proto.workspace = true
 ant-store.workspace = true

@@ -42,14 +42,22 @@ struct Proxy {
 pub struct Cdn {
     pub url: String,
     pub stats: Arc<Stats>,
+    /// A real cache tier (`ant cache-serve`) instead of the toy proxy.
+    pub tier: Option<Arc<ant_cache::CacheServe>>,
 }
 
 impl Cdn {
     pub fn origin_requests(&self) -> u64 {
+        if let Some(t) = &self.tier {
+            return t.metrics().upstream_total();
+        }
         self.stats.origin_requests.load(Ordering::Relaxed)
     }
 
     pub fn hits(&self) -> u64 {
+        if self.tier.is_some() {
+            return 0;
+        }
         self.stats.hits.load(Ordering::Relaxed)
     }
 }
@@ -71,7 +79,29 @@ pub async fn spawn(origin: &str) -> Result<Cdn> {
             eprintln!("cdn: {e}");
         }
     });
-    Ok(Cdn { url, stats })
+    Ok(Cdn { url, stats, tier: None })
+}
+
+/// Start `ant_cache::CacheServe` (open mode, disk cache in `dir`) in front of
+/// `origin` on an ephemeral port.
+pub async fn spawn_tier(origin: &str, dir: &std::path::Path) -> Result<Cdn> {
+    let disk = Arc::new(antd::disk::DiskObjectStore::open(dir, u64::MAX / 2)?);
+    let tier = ant_cache::CacheServe::connect(ant_cache::Config {
+        upstream: origin.to_owned(),
+        auth: ant_cache::AuthMode::Open,
+        disk,
+        retry: antd::retry::RetryPolicy::none(),
+    })
+    .await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let t2 = tier.clone();
+    tokio::spawn(async move {
+        if let Err(e) = t2.serve(listener).await {
+            eprintln!("cache tier: {e}");
+        }
+    });
+    Ok(Cdn { url, stats: Arc::default(), tier: Some(tier) })
 }
 
 fn shareable(headers: &HeaderMap) -> bool {

@@ -11,6 +11,8 @@
 //!   --token <t>        ANT_TOKEN    bearer token (see below)
 //!   -C <dir>                        start directory for workspace discovery
 //! Object reads go through `ReadThrough(DiskObjectStore(cache), RemoteObjectStore)`.
+//! Processes sharing a cache directory fetch each missing object once (claim
+//! files under `<cache>/claims`; ANT_CACHE_DEDUP=0 turns that off).
 //!
 //! Output contract (stdout, one record per line, no decoration). Ids are
 //! 64-char lowercase hex. Errors go to stderr as `error: <message>` with exit
@@ -143,6 +145,32 @@
 //!       automatically as objects are cached (least recently used evicted
 //!       first, down to 90%); daemons (`mount`, lazy workspaces) also
 //!       enforce it periodically.
+//!   ant cache stats --tiers        the lines above, then one `<name> <n>` line per
+//!       tier counter recorded in this cache directory over its lifetime (all
+//!       processes, added when each exits): `local_hits` (objects found in
+//!       the disk cache), `waited_hits` (fetched by another process while
+//!       this one waited on its claim), `joined` (shared with a fetch in
+//!       flight in the same process), `bundle_requests`, `bundled_objects`
+//!       (objects received inside tree bundles), `fetched_requests`,
+//!       `fetched_objects` (individual upstream reads). New names may be
+//!       added at the end.
+//!   ant cache seed <rev>[:<path>] [--sparse <pattern>]...
+//!       fetches a tree into the cache without writing files, walking it as
+//!       `ws new` would (tree bundles when `--http` is set), so later
+//!       checkouts on the node are cache hits. stdout: `tree <id>`,
+//!       `files <n>` (leaves in scope), `blobs <n>` (distinct), `bundled <n>`,
+//!       `fetched <n>` (objects received by this run). A path that is not a
+//!       directory: exit 1.
+//!   ant cache-serve --upstream <http-url> [--listen <addr>] [--auth forward|open]
+//!       the cache tier (crate `ant-cache`, foreground, logs on stderr):
+//!       serves `GET /o/<id>` and `GET /t/<tree>` from the disk cache
+//!       `--cache` (required; budget `--cache-bytes`) and fills misses from
+//!       the upstream (ANT_CACHE_UPSTREAM, ANT_CACHE_LISTEN default
+//!       127.0.0.1:7422, ANT_CACHE_AUTH). `forward` (default) checks every
+//!       request with the upstream using the caller's own `Authorization`;
+//!       `open` serves everyone and is refused at startup unless the
+//!       upstream enforces no policy. Also `/healthz`, `/readyz` and
+//!       `/metrics` (`ant_cacheserve_*`); clients use it as `--http`.
 //!   ant cache gc [--to <bytes>]    evicts least-recently-used objects now: down
 //!       to 90% of the budget if the cache is over it, or, with `--to`, down
 //!       to at most that many bytes (`--to 0` empties it). Waits for another

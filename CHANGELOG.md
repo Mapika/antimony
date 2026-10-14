@@ -10,6 +10,27 @@ release of the 0.x series may change.
 
 ### Added
 
+- Cache tier (crate `ant-cache`): `ant cache-serve --cache <dir> --upstream
+  <http-url>` serves the immutable `GET /o/<id>` and `GET /t/<tree>` surface
+  from a local disk cache (client cache format, same budget, eviction and
+  `ant cache stats/gc`), filling misses from the origin or another
+  cache-serve with hash verification and in-flight dedup. `--auth forward`
+  (default) never answers on its own authority: every request is authorized
+  by the upstream with the caller's own credentials (conditional `GET` ->
+  `304`), so it cannot serve what the origin would refuse; `--auth open` is
+  for upstreams without a policy and is refused at startup against one.
+  `ant_cacheserve_*` Prometheus metrics (hit/revalidated/miss/joined/...
+  per route, upstream requests and bytes, disk gauges).
+- Processes sharing a client cache directory fetch each missing object or
+  tree bundle once (`flock` claim files under `<cache>/claims`, crash-safe,
+  additive: the cache format version stays 1); `ANT_CACHE_DEDUP=0` disables
+  it. 8 concurrent cold checkouts: 599k objects received -> 75k (the
+  distinct ones), 18.6k HTTP requests -> 2.4k.
+- `ant cache seed <rev>[:<path>] [--sparse <pattern>]...` pre-fetches a tree
+  into the cache through tree bundles, without writing files;
+  `ant cache stats --tiers` adds per-tier counters (local, waited-for-peer,
+  joined, bundled, fetched) recorded in `<cache>/gc/tiers`.
+
 - Overload protection (`ant-server` limits): per-class concurrency gates with
   a bounded queue that shed load (gRPC `UNAVAILABLE` / HTTP 503) are on by
   default, sized from `--pg-max-connections`. Per-caller token-bucket rate

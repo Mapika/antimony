@@ -519,6 +519,32 @@ mod tests {
     }
 
     #[test]
+    fn cache_tier_commands() {
+        let cli =
+            Cli::try_parse_from(["ant", "cache-serve", "--upstream", "http://o:7421"]).unwrap();
+        let Command::CacheServe(a) = cli.command else { panic!() };
+        assert_eq!(a.auth, CacheAuth::Forward);
+        assert_eq!(a.listen.port(), 7422);
+        assert!(Cli::try_parse_from(["ant", "cache-serve"]).is_err(), "--upstream is required");
+        let cli = Cli::try_parse_from(["ant", "cache-serve", "--upstream", "x", "--auth", "open"])
+            .unwrap();
+        assert!(matches!(cli.command, Command::CacheServe(a) if a.auth == CacheAuth::Open));
+        let mut cmd = command();
+        let help = cmd.find_subcommand_mut("cache-serve").unwrap().render_long_help().to_string();
+        assert!(help.contains("--cache <") && help.contains("--cache-bytes"), "{help}");
+        for flag in ["--token", "--server", "--http <", "-C <"] {
+            assert!(!help.contains(flag), "cache-serve --help mentions {flag}:\n{help}");
+        }
+        let cli = Cli::try_parse_from(["ant", "cache", "stats", "--tiers"]).unwrap();
+        assert!(matches!(cli.command, Command::Cache { cmd: CacheCmd::Stats { tiers: true } }));
+        let cli =
+            Cli::try_parse_from(["ant", "cache", "seed", "main:src", "--sparse", "a"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Cache { cmd: CacheCmd::Seed { sparse, .. } } if sparse == ["a"])
+        );
+    }
+
+    #[test]
     fn remount_and_ref_init() {
         let cli = Cli::try_parse_from(["ant", "ws", "remount"]).unwrap();
         assert!(matches!(cli.command, Command::Ws { cmd: WsCmd::Remount { dir: None } }));

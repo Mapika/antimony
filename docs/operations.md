@@ -65,6 +65,12 @@ move it with `--metrics-listen 127.0.0.1:9100` (`ANT_METRICS_LISTEN`): the
 endpoint then exists only on that listener (the HTTP port answers 404, also
 under a policy).
 
+**Cache tier.** `ant cache-serve` (a caching proxy for `/o/` and `/t/`) exports
+`ant_cacheserve_requests_total{route,result}`, `_response_bytes_total`,
+`_upstream_requests_total{route,kind,status}`, `_upstream_bytes_total`,
+`_inflight_fetches` and `_disk_bytes` / `_disk_budget_bytes` / `_index_bytes`
+at its own `GET /metrics`; see the cache tier section of the operator guide.
+
 **Health.** `GET /healthz` is liveness (static `ok`). `GET /readyz` is
 readiness: 200 `{"status":"ok","postgres":"ok","s3":"ok"}` when Postgres
 (`SELECT 1`) and S3 (`HEAD` bucket) answer within 2 s, else 503 naming the

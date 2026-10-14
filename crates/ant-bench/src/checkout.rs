@@ -49,6 +49,19 @@ pub struct Args {
     /// measure an extra `proxy` phase (empty client cache, warm proxy).
     #[arg(long)]
     pub cdn: bool,
+    /// Like `--cdn`, but the proxy is the real cache tier (`ant cache-serve`,
+    /// open mode) with its own disk cache in `<cache>.tier`.
+    #[arg(long, conflicts_with = "cdn")]
+    pub cache_tier: bool,
+    /// After the normal phases: this many concurrent cold checkouts sharing
+    /// the one disk cache (a node running many jobs), each with its own
+    /// client handle, as separate processes would. Reports wall time and the
+    /// requests/objects that reached the server.
+    #[arg(long, default_value_t = 0)]
+    pub clients: usize,
+    /// With `--clients`: turn off cross-process fetch claims.
+    #[arg(long)]
+    pub no_dedup: bool,
     #[arg(long, default_value = "main")]
     pub rev: String,
     /// Sparse pattern (repeatable); none = full checkout.
@@ -241,9 +254,18 @@ pub async fn run(a: Args) -> Result<()> {
         }
         _ => anyhow::bail!("give exactly one of --server or --synthetic-files"),
     };
-    let cdn = match (&http_url, a.cdn) {
+    let cdn = match (&http_url, a.cdn || a.cache_tier) {
+        (Some(origin), true) if a.cache_tier => {
+            let mut dir = a.cache.clone().into_os_string();
+            dir.push(".tier");
+            let dir = PathBuf::from(dir);
+            let _ = std::fs::remove_dir_all(&dir);
+            Some(crate::cdn::spawn_tier(origin, &dir).await?)
+        }
         (Some(origin), true) => Some(crate::cdn::spawn(origin).await?),
-        (None, true) => anyhow::bail!("--cdn needs an HTTP endpoint (--http or --use-http)"),
+        (None, true) => {
+            anyhow::bail!("--cdn/--cache-tier need an HTTP endpoint (--http or --use-http)")
+        }
         _ => None,
     };
     let client_http = cdn.as_ref().map(|c| c.url.clone()).or(http_url.clone());
@@ -263,6 +285,11 @@ pub async fn run(a: Args) -> Result<()> {
         "checkout: server={} http={:?} rev={} ({commit}) sparse={:?} iterations={}",
         server_url, http_url, a.rev, a.sparse, a.iterations
     );
+
+    if a.clients > 0 {
+        concurrent_clients(&a, &server_url, client_http.as_deref(), &work, commit, &sparse).await?;
+        return Ok(());
+    }
 
     let mut iters = Vec::new();
     for it in 0..a.iterations.max(1) {
@@ -411,4 +438,73 @@ async fn settle(what: &str) {
     if s > 0.5 {
         println!("  (sync {what}: {s:.1}s)");
     }
+}
+
+/// `--clients N`: N cold checkouts at once over one cache directory.
+async fn concurrent_clients(
+    a: &Args,
+    server: &str,
+    http: Option<&str>,
+    work: &Path,
+    commit: ObjectId,
+    sparse: &Sparse,
+) -> Result<()> {
+    wipe(&a.cache)?;
+    wipe(work)?;
+    settle("before clients").await;
+    let start = Instant::now();
+    let mut tasks = Vec::new();
+    for i in 0..a.clients {
+        let (server, http) = (server.to_owned(), http.map(str::to_owned));
+        let (cache, dir, sparse) = (a.cache.clone(), work.join(format!("c{i}")), sparse.clone());
+        let dedup = !a.no_dedup;
+        // One thread and runtime per client, like one process each.
+        tasks.push(std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            rt.block_on(async move {
+                let remote = RemoteObjectStore::connect(&server, http.as_deref()).await?;
+                let disk = Arc::new(DiskObjectStore::open(&cache, u64::MAX / 2)?);
+                let rt = Arc::new(
+                    ReadThrough::over_disk(disk, Arc::new(remote.clone()))
+                        .with_cross_process_dedup(dedup)
+                        .verified_upstream()
+                        .with_tree_bundles(remote.clone()),
+                );
+                let objects: Arc<dyn ObjectStore> = rt.clone();
+                let tree = objects.read_commit(&commit).await?.tree;
+                let t = Instant::now();
+                Workspace::materialize_with(
+                    objects.as_ref(),
+                    Some(rt.as_ref()),
+                    &dir,
+                    commit,
+                    tree,
+                    sparse,
+                )
+                .await?;
+                let counts = rt.tier_counts();
+                let req = remote.http_requests();
+                anyhow::Ok((t.elapsed().as_secs_f64(), counts, req.objects + req.bundles))
+            })
+        }));
+    }
+    let mut http_requests = 0;
+    let (mut received, mut waited, mut slowest) = (0u64, 0u64, 0f64);
+    for t in tasks {
+        let (secs, counts, reqs) =
+            t.join().map_err(|_| anyhow::anyhow!("client thread panicked"))??;
+        http_requests += reqs;
+        received += counts[4] + counts[6];
+        waited += counts[1];
+        slowest = slowest.max(secs);
+    }
+    let wall = start.elapsed().as_secs_f64();
+    let (files, bytes) = dir_size(&a.cache, None);
+    println!(
+        "clients {} dedup={}: wall {wall:.3}s (slowest client {slowest:.3}s) | http requests {http_requests}, objects received {received} for {files} distinct ({:.1} MiB cache), waited-for-peer hits {waited}",
+        a.clients,
+        !a.no_dedup,
+        mib(bytes)
+    );
+    Ok(())
 }

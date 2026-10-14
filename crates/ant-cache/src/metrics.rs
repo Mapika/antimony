@@ -14,6 +14,7 @@
 //!     revalidation or fetch),
 //!   - `not_found`: upstream has no such object,
 //!   - `error`: upstream or local failure (4xx/5xx, bad data).
+//!
 //!   The hit ratio of a tier is `(hit + revalidated) / sum`.
 //! - `ant_cacheserve_response_bytes_total{route}`: body bytes sent.
 //! - `ant_cacheserve_upstream_requests_total{route,kind,status}`: requests to
@@ -63,6 +64,7 @@ struct BuildLabels {
 
 pub struct Metrics {
     registry: Registry,
+    upstream_total: std::sync::atomic::AtomicU64,
     requests: Family<RequestLabels, Counter>,
     response_bytes: Family<RouteLabels, Counter>,
     upstream_requests: Family<UpstreamLabels, Counter>,
@@ -129,6 +131,7 @@ impl Metrics {
         build.get_or_create(&BuildLabels { version: env!("CARGO_PKG_VERSION") }).set(1);
         Arc::new(Self {
             registry,
+            upstream_total: Default::default(),
             requests,
             response_bytes,
             upstream_requests,
@@ -149,8 +152,14 @@ impl Metrics {
     }
 
     pub fn upstream(&self, route: &'static str, kind: &'static str, status: u16, bytes: usize) {
+        self.upstream_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.upstream_requests.get_or_create(&UpstreamLabels { route, kind, status }).inc();
         self.upstream_bytes.get_or_create(&RouteLabels { route }).inc_by(bytes as u64);
+    }
+
+    /// Requests made to the upstream so far (all routes and kinds).
+    pub fn upstream_total(&self) -> u64 {
+        self.upstream_total.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn inflight(&self, delta: i64) {

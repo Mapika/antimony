@@ -98,6 +98,7 @@ dependencies = [
 name = "ant-bench"
 version = "0.1.0"
 dependencies = [
+ "ant-cache",
  "ant-core",
  "ant-gitbridge",
  "ant-proto",

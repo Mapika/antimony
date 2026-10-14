@@ -525,10 +525,8 @@ mod tests {
     use ant_store::memory::MemoryObjectStore;
     use ant_store::{ObjectStoreExt, conformance};
 
-    use crate::claim::{Claim, Claims};
     use crate::disk::DiskObjectStore;
     use crate::test_support::CountingStore;
-    use crate::tiers::TierCounters;
 
     /// Upstream that counts how many ids it was asked for and is slow.
     fn slow_upstream() -> CountingStore {
