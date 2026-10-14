@@ -109,6 +109,20 @@ The ref compare-and-swap remains the correctness guarantee across processes.
 recorded commit nodes, changesets) that has been confirmed by the store, so a
 cache hit can never hide a missing object.
 
+### Ref events (`ops::watch`, `ant_store::feed`)
+
+Stores announce committed ref moves on an in-process feed: the in-memory
+store from `cas_ref`, Postgres after the commit, in-process and with a
+`pg_notify` sent by a notifier task in a separate non-durable transaction
+(a notify inside the move's transaction serializes all ref moves' commits,
+WAL flush included), relayed by a per-replica `LISTEN` connection. Notices are hints: per backend and watched ref,
+one hub task applies a notice only when its old tip is the hub's tip,
+skips duplicates by nonce, and otherwise re-reads the ref and emits one
+coalesced event, so `WatchRef` streams stay gapless across replicas and
+listener reconnects. Each event is built once (first-parent range walk)
+and shared through a bounded ring; a watcher that falls out of the ring
+gets one coalesced event instead of unbounded buffering.
+
 ## Read path
 
 - **Queries without a checkout:** `ResolveRev`, `ReadPath`, `Log`, `Diff`

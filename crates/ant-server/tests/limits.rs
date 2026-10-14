@@ -431,3 +431,27 @@ async fn no_limits_switch_disables_everything() {
         c.list_refs(list_refs()).await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn ref_watches_are_admitted_but_hold_no_slot() {
+    let mut cfg = LimitConfig::default();
+    cfg.max_inflight[0] = 1;
+    cfg.queue[0] = 0;
+    let s = Server::start(Acl::open(), cfg).await;
+    let mut c = s.client(None).await;
+    let watch = || pb::WatchRefRequest { name: "main".into(), from: None };
+    // Open watches leave the single read slot free...
+    let w1 = c.watch_ref(watch()).await.unwrap();
+    let w2 = c.watch_ref(watch()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(s.gauge("ant_ratelimit_inflight", "read"), 0);
+    c.list_refs(list_refs()).await.unwrap();
+    drop((w1, w2));
+    // ...but opening one is a read like any other: shed while the slot is taken.
+    let ids = big_blobs(&s, 8).await;
+    let held = c.get_objects(get_objects(&ids)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let e = c.watch_ref(watch()).await.unwrap_err();
+    assert_eq!(e.code(), Code::Unavailable, "{e:?}");
+    drop(held);
+}

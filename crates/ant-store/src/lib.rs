@@ -10,6 +10,7 @@
 
 mod changeset_codec;
 pub mod conformance;
+pub mod feed;
 pub mod graph;
 pub mod memory;
 pub mod packed;
@@ -218,6 +219,13 @@ pub trait RefStore: Send + Sync + 'static {
     async fn lock_ref(&self, name: &str) -> Result<RefLock> {
         validate_ref_name(name)?;
         Ok(RefLock::unheld())
+    }
+
+    /// Notices of the ref moves this store commits (for stores shared
+    /// between processes: every process's moves), see [`feed`]. `None`: the
+    /// store announces nothing. Wrappers must forward this.
+    fn watch_refs(&self) -> Option<tokio::sync::broadcast::Receiver<feed::RefNotice>> {
+        None
     }
 }
 

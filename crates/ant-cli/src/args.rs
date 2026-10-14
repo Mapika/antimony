@@ -355,6 +355,15 @@ pub enum RefCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Follow a ref's moves (lands, updates, force moves) as they happen,
+    /// one line per event, until interrupted.
+    Watch {
+        /// Ref to watch.
+        name: String,
+        /// First catch up from this rev to the current tip.
+        #[arg(long)]
+        from: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

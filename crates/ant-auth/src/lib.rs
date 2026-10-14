@@ -23,6 +23,7 @@
 //! pattern = "main"               # exact name, or a prefix glob like "ws/*"
 //! update = ["group:admins"]      # direct UpdateRef (create / move / delete)
 //! land = ["*"]                   # Land onto the ref
+//! read = ["group:ci"]            # WatchRef only (update/land imply it)
 //! ```
 //!
 //! Optional per-principal request-rate overrides (additive; consumed by
@@ -44,7 +45,9 @@
 //! Path rules: the rule with the longest `prefix` that the path lies under
 //! (`RepoPath::starts_with`) decides both read and write; rules do not merge.
 //! No matching rule → denied. Ref rules: the first matching rule in file
-//! order decides; none → denied.
+//! order decides; none → denied. Reading a ref's event stream (`WatchRef`)
+//! needs `read`, `update` or `land` on it ([`Policy::can_read_ref`]); other
+//! ref reads (`GetRef`, `ListRefs`, `Log`) need only a valid token.
 //!
 //! Zones: the prefix of the rule governing a path is that path's *zone*.
 //! Content-addressed objects are tagged with the zones they were written
@@ -184,6 +187,8 @@ struct RawRef {
     update: Vec<String>,
     #[serde(default)]
     land: Vec<String>,
+    #[serde(default)]
+    read: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,6 +214,7 @@ struct RefRule {
     pattern: String,
     update: Vec<String>,
     land: Vec<String>,
+    read: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -287,7 +293,7 @@ impl Policy {
         let refs = raw
             .refs
             .into_iter()
-            .map(|r| RefRule { pattern: r.pattern, update: r.update, land: r.land })
+            .map(|r| RefRule { pattern: r.pattern, update: r.update, land: r.land, read: r.read })
             .collect();
         Ok(Self { principals, rates, paths, refs })
     }
@@ -368,6 +374,14 @@ impl Policy {
 
     pub fn can_land(&self, p: &Principal, name: &str) -> bool {
         p.admin || self.ref_rule(name).is_some_and(|r| matches(&r.land, p))
+    }
+
+    /// Watch the ref's events: `read`, `update` or `land` on it.
+    pub fn can_read_ref(&self, p: &Principal, name: &str) -> bool {
+        p.admin
+            || self.ref_rule(name).is_some_and(|r| {
+                matches(&r.read, p) || matches(&r.update, p) || matches(&r.land, p)
+            })
     }
 }
 
@@ -481,6 +495,51 @@ mod tests {
         assert!(!pol.can_land(&agent, "release"));
         assert!(pol.can_update_ref(&root, "release"));
         assert!(pol.can_read(&root, &p("secrets/k")));
+    }
+
+    #[test]
+    fn reading_refs_needs_read_update_or_land() {
+        let pol = Policy::parse(&format!(
+            r#"
+            [[principal]]
+            name = "ci"
+            token_sha256 = "{}"
+            groups = ["ci"]
+
+            [[principal]]
+            name = "agent"
+            token_sha256 = "{}"
+            groups = ["agents"]
+
+            [[principal]]
+            name = "root"
+            token_sha256 = "{}"
+            admin = true
+
+            [[ref]]
+            pattern = "main"
+            land = ["group:agents"]
+            read = ["group:ci"]
+
+            [[ref]]
+            pattern = "ws/*"
+            update = ["group:agents"]
+            "#,
+            h("t-ci"),
+            h("t-agent"),
+            h("t-root")
+        ))
+        .unwrap();
+        let ci = pol.authenticate("t-ci").unwrap().clone();
+        let agent = pol.authenticate("t-agent").unwrap().clone();
+        let root = pol.authenticate("t-root").unwrap().clone();
+        assert!(pol.can_read_ref(&ci, "main"));
+        assert!(!pol.can_land(&ci, "main") && !pol.can_update_ref(&ci, "main"));
+        assert!(!pol.can_read_ref(&ci, "ws/a/x"));
+        assert!(pol.can_read_ref(&agent, "main"));
+        assert!(pol.can_read_ref(&agent, "ws/a/x"));
+        assert!(!pol.can_read_ref(&agent, "release"));
+        assert!(pol.can_read_ref(&root, "release"));
     }
 
     #[test]

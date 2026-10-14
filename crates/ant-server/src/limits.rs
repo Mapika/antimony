@@ -27,10 +27,14 @@
 //! # Classes
 //! | class | gRPC methods / HTTP routes | rate bucket |
 //! |---|---|---|
-//! | `read` | `GetObjects HasObjects GetRef ListRefs ResolveRev ReadPath Log Diff Blame MergeBase IsAncestor LogRange LandedAs`, `/o/`, `/t/`, `/repo.git` | read |
+//! | `read` | `GetObjects HasObjects GetRef ListRefs ResolveRev ReadPath Log Diff Blame MergeBase IsAncestor LogRange LandedAs WatchRef`, `/o/`, `/t/`, `/repo.git` | read |
 //! | `write` | `PutObjects UpdateRef CreateChangeset` | write |
 //! | `land` | `Land` | write |
 //! | `admin` | `/debug/stats` | admin |
+//!
+//! `WatchRef` streams are admitted (rate bucket and gate) like any read, but
+//! give their slot back once the stream has started: a watch stays open for
+//! as long as CI listens and must not hold a slot meanwhile (`long_lived`).
 //!
 //! `land` has its own concurrency gate but shares the `write` token bucket.
 //! Lands on one ref are queued and group-committed by `ops::land`; a land
@@ -118,11 +122,20 @@ impl Class {
 pub fn grpc_class(method: &str) -> Option<Class> {
     Some(match method {
         "GetObjects" | "HasObjects" | "GetRef" | "ListRefs" | "ResolveRev" | "ReadPath" | "Log"
-        | "Diff" | "Blame" | "MergeBase" | "IsAncestor" | "LogRange" | "LandedAs" => Class::Read,
+        | "Diff" | "Blame" | "MergeBase" | "IsAncestor" | "LogRange" | "LandedAs" | "WatchRef" => {
+            Class::Read
+        }
         "PutObjects" | "UpdateRef" | "CreateChangeset" => Class::Write,
         "Land" => Class::Land,
         _ => return None,
     })
+}
+
+/// Streams that stay open by design: admitted like their class, but their
+/// slot is released once the stream has started (it would otherwise be held
+/// for as long as the client watches).
+pub fn long_lived(method: &str) -> bool {
+    method == "WatchRef"
 }
 
 /// The class of an HTTP path (`None`: health, readiness, metrics, 404s).
@@ -764,12 +777,9 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let limiter = self.limiter.clone();
-        let class = req
-            .uri()
-            .path()
-            .strip_prefix("/ant.v1.Ant/")
-            .and_then(grpc_class)
-            .filter(|_| limiter.cfg.enabled);
+        let method = req.uri().path().strip_prefix("/ant.v1.Ant/");
+        let keep_slot = !method.is_some_and(long_lived);
+        let class = method.and_then(grpc_class).filter(|_| limiter.cfg.enabled);
         let Some(class) = class else {
             let fut = inner.call(req);
             return Box::pin(async move {
@@ -786,7 +796,8 @@ where
             match limiter.admit(class, auth.as_deref(), remote).await {
                 Ok(permit) => {
                     let res = inner.call(req).await?;
-                    Ok(res.map(|inner| LimitedBody { inner, permit: Some(permit) }))
+                    let permit = Some(permit).filter(|_| keep_slot);
+                    Ok(res.map(|inner| LimitedBody { inner, permit }))
                 }
                 Err(reject) => Ok(reject.status().into_http()),
             }
@@ -1007,6 +1018,7 @@ mod tests {
         assert_eq!(grpc_class("Land"), Some(Class::Land));
         assert_eq!(grpc_class("CreateChangeset"), Some(Class::Write));
         assert_eq!(grpc_class("Nope"), None);
+        assert!(long_lived("WatchRef") && !long_lived("GetObjects"));
         assert_eq!(http_class("/o/ab"), Some(Class::Read));
         assert_eq!(http_class("/t/ab"), Some(Class::Read));
         assert_eq!(http_class("/repo.git/info/refs"), Some(Class::Read));

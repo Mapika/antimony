@@ -302,6 +302,10 @@ impl RefStore for TimedRefs {
     async fn lock_ref(&self, name: &str) -> Result<RefLock> {
         timed(&self.lock, 1, self.inner.lock_ref(name)).await
     }
+
+    fn watch_refs(&self) -> Option<tokio::sync::broadcast::Receiver<ant_store::feed::RefNotice>> {
+        self.inner.watch_refs()
+    }
 }
 
 pub struct TimedMeta {

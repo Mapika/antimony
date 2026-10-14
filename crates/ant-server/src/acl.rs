@@ -60,6 +60,8 @@
 //! - Land: principal must `can_land(ref)`, and every path changed by every
 //!   replayed commit must be writable by the principal.
 //! - UpdateRef: `can_update_ref`.
+//! - WatchRef: `can_read_ref` (`read`, `update` or `land` in the ref's rule);
+//!   events carry commit ids only, like Log without a path.
 //! - PutObjects: only blobs allowed unless admin (trees/commits could smuggle
 //!   history past path checks) → permission_denied.
 //! - git export (`ant-gitserve`): requires `can_read_everything` (it cannot

@@ -49,6 +49,7 @@ Additions since 0.1.0 (all additive; an older server answers a new RPC with
 | `IsAncestor` | reachability, optionally first-parent only |
 | `LogRange` | first-parent `from..to` history with a path filter, paged (`page_token`) |
 | `LandedAs` | whether, and as which commit, a submitted commit landed on a ref |
+| `WatchRef` | server stream of a ref's moves (`RefEvent`: old/new tip, landed commits oldest first, kind `land`/`update`/`force`, `coalesced`), optional catch-up `from` a commit |
 | `DiffRequest` fields 3-6 | `path_prefixes`, `merge_base`, `patch`, `context_lines` |
 | `DiffResponse` fields 2-3, `PathChange.patch` (7), `FilePatch`, `Hunk` | merge base used, per-file unified hunks, truncation flag |
 | HTTP `GET /t/<tree-id>` | tree bundle: the tree, its blobs and whole subdirectories in one zstd-framed body (`ant_proto::bundle`, magic `ANTBNDL1`); same caching and access rules as `/o/` (see `docs/architecture.md`) |
@@ -88,6 +89,13 @@ binary's supported version is printed by `ant admin schema` as `supported <n>`.
   allowed exception). A migration that rewrites data or locks tables for long
   is called out in **Upgrading** in `docs/operations.md`.
 - Applied migrations are never edited; a fix is a new migration.
+- Ref moves are announced with `pg_notify` on the channel `ant_ref_moves`
+  (payload `v1 <nonce> <cause> <old> <new> <ref> <schema>`; see
+  `ant_store::feed`), sent right after the move commits. A payload version
+  a replica does not know is ignored. Replicas that do not announce (older
+  versions during a rolling upgrade) only delay `WatchRef` events: watchers
+  find their moves with the next announced move of the ref or within the
+  hub's 30 s resync, as coalesced events.
 - Pre-versioning data (version 0) is adopted in place and stays readable for
   all of 0.x.
 - Table and column names are an implementation detail: use the API, the

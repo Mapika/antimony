@@ -31,6 +31,16 @@ release of the 0.x series may change.
   `Log` and `Diff`. CLI: `ant merge-base`, `ant log <a>..<b> [-- <path>]`,
   `ant diff --patch [-U N] [--merge-base] <a> <b> [-- <path>...]`,
   `ant landed-as <commit> [--ref <name>]`.
+- Land event stream for post-merge CI: server-streaming RPC `WatchRef`
+  (`RefEvent`: old/new tip, every landed commit oldest first, kind
+  `land`/`update`/`force`, `coalesced`), with an optional catch-up from a
+  commit, gapless across replicas (Postgres `LISTEN/NOTIFY` on ref moves,
+  gaps filled from the ref) and bounded per-watcher buffering (slow watchers
+  get coalesced events). Needs `read`, `update` or `land` on the ref; ref
+  rules accept a new `read` list. CLI: `ant ref watch <ref> [--from <rev>]`.
+  Metrics `ant_ref_watchers`, `ant_ref_watch_events_total`,
+  `ant_ref_watch_coalesced_events_total`. Postgres replicas with watchers
+  hold one extra `LISTEN` connection.
 
 ### Changed
 

@@ -84,6 +84,8 @@ balancer checks should use `/readyz`; see the operator guide.
 | `ant_cache_hits_total`, `ant_cache_misses_total`, `ant_cache_bytes` | `cache` (`trees`, `commits`, `nodes`, `changesets`) | in-process caches; hits and misses count since process start |
 | `ant_history_lag_commits` | `ref` | commits the history index is behind the ref |
 | `ant_history_catch_up_seconds` | | duration of catch-ups that indexed commits |
+| `ant_ref_watchers` | | open `WatchRef` streams |
+| `ant_ref_watch_events_total`, `ant_ref_watch_coalesced_events_total` | | ref events sent to watchers; of those, events covering an unknown number of moves (catch-ups, gap fills, slow watchers) |
 | `ant_build_info` | `version`, `git` | always 1 |
 | `ant_pg_pool_size`, `_idle`, `_in_use`, `_max` | | Postgres query pool (0 without Postgres) |
 
