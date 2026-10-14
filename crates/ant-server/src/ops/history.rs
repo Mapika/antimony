@@ -185,6 +185,11 @@ type CatchUpKey = (usize, String);
 /// Running background catch-ups; the flag means "run once more when done".
 static CATCH_UPS: LazyLock<Mutex<HashMap<CatchUpKey, bool>>> = LazyLock::new(Default::default);
 
+/// Number of (backend, ref) catch-ups currently running in the background.
+pub(crate) fn running_catch_ups() -> usize {
+    CATCH_UPS.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
 /// Fire-and-forget `catch_up`, coalesced per (backend, ref): if one is already
 /// running it is told to run once more instead of starting a second. Errors
 /// are logged; queries fall back to changeset scans.

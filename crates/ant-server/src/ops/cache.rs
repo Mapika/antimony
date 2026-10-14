@@ -54,6 +54,12 @@ impl<K: Hash + Eq, V: Clone> Generations<K, V> {
             self.weight = 0;
         }
     }
+
+    /// `(entries, weight)` over both generations.
+    fn stats(&self) -> (usize, usize) {
+        let prev_weight: usize = self.prev.values().map(|(_, w)| *w).sum();
+        (self.cur.len() + self.prev.len(), self.weight + prev_weight)
+    }
 }
 
 /// A cache keyed by `K`, safe to share between tasks.
@@ -91,6 +97,15 @@ impl<K: Hash + Eq + Clone, V: Clone> Cache<K, V> {
             g.insert(k, v, w);
         }
     }
+
+    /// `(entries, weight)` currently held.
+    pub(crate) fn stats(&self) -> (usize, usize) {
+        self.lock().stats()
+    }
+
+    fn budget(&self) -> usize {
+        self.lock().budget
+    }
 }
 
 /// Approximate weight of a decoded tree in bytes.
@@ -123,6 +138,15 @@ pub(crate) fn changeset_weight(changes: &[PathChange]) -> usize {
 
 pub(crate) fn commit_weight(commit: &Commit) -> usize {
     256 + commit.message.len() + commit.parents.len() * 32
+}
+
+/// Totals for one named cache, summed over every live store instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheStat {
+    pub name: &'static str,
+    pub entries: usize,
+    pub weight_bytes: usize,
+    pub budget_bytes: usize,
 }
 
 type Registry<S, C> = Mutex<Vec<(Weak<S>, Arc<C>)>>;
@@ -158,6 +182,49 @@ pub(crate) fn meta(store: &Arc<dyn MetaStore>) -> Arc<MetaCaches> {
         nodes: Cache::new(NODE_BUDGET),
         changesets: Cache::new(CHANGESET_BUDGET),
     })
+}
+
+/// Clones the caches of every live registration, releasing the lock first.
+fn live<S: ?Sized, C>(registry: &Registry<S, C>) -> Vec<Arc<C>> {
+    let entries = registry.lock().unwrap_or_else(|e| e.into_inner());
+    entries.iter().filter(|(w, _)| w.strong_count() > 0).map(|(_, c)| c.clone()).collect()
+}
+
+/// Adds one cache's `(entries, weight, budget)` into `acc`.
+fn add<K: Hash + Eq + Clone, V: Clone>(acc: &mut (usize, usize, usize), cache: &Cache<K, V>) {
+    let (entries, weight) = cache.stats();
+    acc.0 += entries;
+    acc.1 += weight;
+    acc.2 += cache.budget();
+}
+
+/// Process-wide cache sizes for diagnostics: per-cache totals over the live
+/// stores (`trees`, `commits`, `nodes`, `changesets`, in that order), plus the
+/// number of live object-store and meta-store registrations.
+pub fn cache_stats() -> (Vec<CacheStat>, usize, usize) {
+    let objects = live(&OBJECTS);
+    let metas = live(&META);
+    let mut totals = [(0, 0, 0); 4];
+    for c in &objects {
+        add(&mut totals[0], &c.trees);
+        add(&mut totals[1], &c.commits);
+    }
+    for c in &metas {
+        add(&mut totals[2], &c.nodes);
+        add(&mut totals[3], &c.changesets);
+    }
+    const NAMES: [&str; 4] = ["trees", "commits", "nodes", "changesets"];
+    let stats = NAMES
+        .iter()
+        .zip(totals)
+        .map(|(name, (entries, weight_bytes, budget_bytes))| CacheStat {
+            name,
+            entries,
+            weight_bytes,
+            budget_bytes,
+        })
+        .collect();
+    (stats, objects.len(), metas.len())
 }
 
 /// Index-aligned `get_commits` through the node cache: one store round trip
@@ -275,6 +342,37 @@ mod tests {
         // The un-promoted old entries are gone; memory stays bounded.
         assert_eq!(g.get(&2), None);
         assert!(g.cur.len() + g.prev.len() <= 8);
+    }
+
+    #[test]
+    fn generations_stats_count_both_generations() {
+        let mut g = Generations::new(10);
+        for i in 0..3 {
+            g.insert(i, i, 1);
+        }
+        assert_eq!(g.stats(), (3, 3));
+
+        // Budget 3: the fourth insert retires the first four into `prev`.
+        let mut g = Generations::new(3);
+        for i in 0..4 {
+            g.insert(i, i, 1);
+        }
+        assert_eq!(g.stats(), (4, 4));
+    }
+
+    #[test]
+    fn cache_stats_reports_live_node_cache() {
+        let a: Arc<dyn MetaStore> = Arc::new(ant_store::memory::MemoryMetaStore::default());
+        let id = ObjectId([9; 32]);
+        let node = CommitNode { id, tree: id, parents: vec![], generation: 1, committer_time: 0 };
+        meta(&a).nodes.insert(id, node, NODE_WEIGHT);
+        let (stats, _, metas) = cache_stats();
+        let names: Vec<&str> = stats.iter().map(|s| s.name).collect();
+        assert_eq!(names, ["trees", "commits", "nodes", "changesets"]);
+        let nodes = stats.iter().find(|s| s.name == "nodes").expect("nodes entry");
+        assert!(nodes.entries >= 1);
+        assert!(nodes.budget_bytes >= NODE_BUDGET);
+        assert!(metas >= 1);
     }
 
     #[test]
