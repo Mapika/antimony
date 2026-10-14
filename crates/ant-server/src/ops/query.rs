@@ -13,7 +13,8 @@
 //!   (`RepoPath::starts_with`), from recorded `MetaStore` changesets (or the
 //!   history index, see `history`) — no tree diffs.
 //! - `diff`: changes between two revs' trees (`from = None` = empty tree),
-//!   via `ant_store::graph::diff_trees`.
+//!   via `ant_store::graph::diff_trees_with` over the tree cache (one
+//!   batched read of the cache misses per depth).
 
 use ant_core::{Commit, EntryMode, ObjectId, RepoPath, TreeEntry};
 use ant_store::{Backend, CommitNode, ObjectStoreExt, PathChange, StoreError, graph};
@@ -73,9 +74,9 @@ pub async fn resolve_rev(b: &Backend, rev: &str) -> OpResult<ObjectId> {
     Ok(id)
 }
 
+/// Through the node cache: recorded nodes are immutable.
 async fn node(b: &Backend, id: ObjectId) -> OpResult<CommitNode> {
-    b.meta
-        .get_commits(&[id])
+    cache::get_nodes(b, &[id])
         .await?
         .pop()
         .flatten()
@@ -208,7 +209,8 @@ pub async fn log_as(
 const LOG_SCAN_CHUNK: usize = 256;
 
 /// Serve `log --path` from the history index when `tip` is on an indexed
-/// ref's first-parent chain. Any failure falls back to the changeset scan.
+/// ref's first-parent chain (for a ref name, also when the index trails it
+/// by a short lag). Any failure falls back to the changeset scan.
 async fn indexed_path_log(
     b: &Backend,
     rev: &str,
@@ -216,12 +218,12 @@ async fn indexed_path_log(
     path: &RepoPath,
     limit: usize,
 ) -> Option<Vec<LogEntry>> {
-    if let Some(ref_name) = history::indexed_ref_for(b, rev, tip).await.ok()? {
-        let generation = node(b, tip).await.ok()?.generation;
-        return history::path_log(b, &ref_name, generation, path, limit).await.ok();
+    if let Some(log) = history::lagging_path_log(b, rev, tip, path, limit).await.ok()? {
+        return Some(log);
     }
-    // A busy ref's index trails its tip: scan just the unindexed commits.
-    history::lagging_path_log(b, rev, tip, path, limit).await.ok()?
+    let ref_name = history::indexed_ref_for(b, rev, tip).await.ok()??;
+    let generation = node(b, tip).await.ok()?.generation;
+    history::path_log(b, &ref_name, generation, path, limit).await.ok()
 }
 
 pub async fn diff(b: &Backend, from: Option<&str>, to: &str) -> OpResult<Vec<PathChange>> {
@@ -250,7 +252,9 @@ async fn diff_unfiltered(b: &Backend, from: Option<&str>, to: &str) -> OpResult<
         None => None,
     };
     let new = rev_tree(b, to).await?;
-    Ok(graph::diff_trees(b.objects.as_ref(), old, Some(new)).await?)
+    // Batched per depth and through the tree cache: a status diff spanning
+    // hundreds of lands touches hundreds of directories.
+    Ok(graph::diff_trees_with(&cache::CachedTrees(b), old, Some(new)).await?)
 }
 
 #[cfg(test)]

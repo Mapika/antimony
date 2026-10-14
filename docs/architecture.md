@@ -71,7 +71,12 @@ cache hit can never hide a missing object.
 - **Path history:** each ref has an index (`history` table) of which commits
   touched which paths along its first-parent chain. It is maintained in the
   background after lands (`ops/history.rs`, coalesced per ref) and makes
-  `log --path` and blame independent of history length.
+  `log --path` and blame independent of history length. On a busy ref the
+  index trails the tip by the commits landed since the last catch-up; a path
+  log scans only that lag and takes the rest from the index.
+- **Diff:** tree diffs walk both trees breadth first with one batched read
+  per depth, through the tree cache, so a `Diff` spanning hundreds of lands
+  costs a few round trips, not one per changed directory.
 - **Objects:** batched over gRPC (`GetObjects`), or as plain immutable HTTP
   (`GET /o/<id>`, `Cache-Control: immutable`), so any HTTP cache or CDN can
   serve as the regional cache tier.

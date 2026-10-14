@@ -584,6 +584,12 @@ impl MetaStore for PgStore {
         } else {
             let like =
                 format!("{}/%", p.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+            // Not a persistent prepared statement: Postgres switches those to
+            // a generic plan after a few runs, and a generic plan cannot turn
+            // `LIKE $5` into a `history_by_path` range scan. It walks
+            // `history_by_gen` filtering every row instead, so a narrow path
+            // costs O(history rows) (seen as ~2 s path logs in the soak). An
+            // unnamed statement is planned with the actual prefix each time.
             sqlx::query(
                 "SELECT DISTINCT generation, commit_id FROM history \
                  WHERE ref = $1 AND (path = $4 OR path LIKE $5) AND generation <= $2 \
@@ -594,6 +600,7 @@ impl MetaStore for PgStore {
             .bind(limit)
             .bind(p)
             .bind(like)
+            .persistent(false)
             .fetch_all(&self.pool)
             .await
         }

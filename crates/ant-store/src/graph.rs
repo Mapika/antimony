@@ -1,13 +1,50 @@
 //! Commit-graph primitives shared by the server, git bridge, and tests:
 //! tree diffing, commit recording, and generation-number ancestry queries.
 
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::sync::Arc;
 
-use ant_core::{Commit, EncodedObject, EntryMode, Object, ObjectId, RepoPath, Tree, TreeEntry};
+use ant_core::{
+    Commit, EncodedObject, EntryMode, Object, ObjectId, ObjectKind, RepoPath, Tree, TreeEntry,
+};
+use async_trait::async_trait;
 
 use crate::{
     Backend, ChangeKind, CommitNode, ObjectStore, ObjectStoreExt, PathChange, Result, StoreError,
 };
+
+/// Where [`diff_trees_with`] reads trees from: one index-aligned batch per
+/// call. Every [`ObjectStore`] is one (a single `get_many` per batch); the
+/// server layers its tree cache on top.
+#[async_trait]
+pub trait TreeSource: Send + Sync {
+    /// Decoded trees, index-aligned with `ids`. Missing objects are
+    /// `NotFound`; non-trees are `WrongKind`.
+    async fn read_trees(&self, ids: &[ObjectId]) -> Result<Vec<Arc<Tree>>>;
+}
+
+#[async_trait]
+impl<T: ObjectStore + ?Sized> TreeSource for T {
+    async fn read_trees(&self, ids: &[ObjectId]) -> Result<Vec<Arc<Tree>>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        ids.iter()
+            .zip(self.get_many(ids).await?)
+            .map(|(id, o)| {
+                let o = o.ok_or(StoreError::NotFound(*id))?;
+                if o.kind() != ObjectKind::Tree {
+                    return Err(StoreError::WrongKind {
+                        id: *id,
+                        expected: ObjectKind::Tree,
+                        actual: o.kind(),
+                    });
+                }
+                Ok(Arc::new(Tree::decode(o.body())?))
+            })
+            .collect()
+    }
+}
 
 /// Non-tree paths that differ between two trees (`None` = empty tree),
 /// sorted by path. Identical subtrees are skipped by id without being read.
@@ -16,48 +53,70 @@ pub async fn diff_trees(
     old: Option<ObjectId>,
     new: Option<ObjectId>,
 ) -> Result<Vec<PathChange>> {
+    diff_trees_with(objects, old, new).await
+}
+
+/// [`diff_trees`] reading trees from `source`: breadth first, with one
+/// `read_trees` batch per depth (the distinct trees of every differing
+/// directory pair at that depth), so the round trips are bounded by the
+/// depth of the changed paths, not their number.
+pub async fn diff_trees_with(
+    source: &(impl TreeSource + ?Sized),
+    old: Option<ObjectId>,
+    new: Option<ObjectId>,
+) -> Result<Vec<PathChange>> {
     let mut out = Vec::new();
-    // Explicit stack instead of async recursion.
-    let mut stack = vec![(RepoPath::root(), old, new)];
-    while let Some((dir, old, new)) = stack.pop() {
-        if old == new {
-            continue;
-        }
-        let old_t = match old {
-            Some(id) => objects.read_tree(&id).await?,
-            None => Tree::empty(),
+    let mut level = vec![(RepoPath::root(), old, new)];
+    let empty = Arc::new(Tree::empty());
+    while !level.is_empty() {
+        level.retain(|(_, o, n)| o != n);
+        let mut ids: Vec<ObjectId> =
+            level.iter().flat_map(|(_, o, n)| [*o, *n]).flatten().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let trees: HashMap<ObjectId, Arc<Tree>> =
+            ids.iter().copied().zip(source.read_trees(&ids).await?).collect();
+        let tree = |id: Option<ObjectId>| match id {
+            // `ids` covers every `Some` in `level`; the fallback is unreachable.
+            Some(id) => trees.get(&id).cloned().ok_or(StoreError::NotFound(id)),
+            None => Ok(empty.clone()),
         };
-        let new_t = match new {
-            Some(id) => objects.read_tree(&id).await?,
-            None => Tree::empty(),
-        };
-        let mut names: Vec<&str> =
-            old_t.entries().iter().chain(new_t.entries()).map(|e| e.name.as_str()).collect();
-        names.sort_unstable();
-        names.dedup();
-        for name in names {
-            let o = old_t.get(name);
-            let n = new_t.get(name);
-            if o == n {
-                continue;
+        let mut next = Vec::new();
+        for (dir, old, new) in level {
+            let (old_t, new_t) = (tree(old)?, tree(new)?);
+            // Union by name: a file and a directory of the same name sort
+            // apart in git order, so pair entries by name explicitly.
+            let mut names: BTreeMap<&str, (Option<&TreeEntry>, Option<&TreeEntry>)> =
+                BTreeMap::new();
+            for e in old_t.entries() {
+                names.entry(e.name.as_str()).or_default().0 = Some(e);
             }
-            let path = dir.join(name)?;
-            let o_tree = o.filter(|e| e.mode.is_tree()).map(|e| e.id);
-            let n_tree = n.filter(|e| e.mode.is_tree()).map(|e| e.id);
-            let o_leaf = o.filter(|e| !e.mode.is_tree()).map(|e| (e.mode, e.id));
-            let n_leaf = n.filter(|e| !e.mode.is_tree()).map(|e| (e.mode, e.id));
-            if o_tree.is_some() || n_tree.is_some() {
-                stack.push((path.clone(), o_tree, n_tree));
+            for e in new_t.entries() {
+                names.entry(e.name.as_str()).or_default().1 = Some(e);
             }
-            if o_leaf != n_leaf {
-                let kind = match (o_leaf, n_leaf) {
-                    (None, Some(_)) => ChangeKind::Added,
-                    (Some(_), None) => ChangeKind::Deleted,
-                    _ => ChangeKind::Modified,
-                };
-                out.push(PathChange { path, kind, old: o_leaf, new: n_leaf });
+            for (name, (o, n)) in names {
+                if o == n {
+                    continue;
+                }
+                let path = dir.join(name)?;
+                let o_tree = o.filter(|e| e.mode.is_tree()).map(|e| e.id);
+                let n_tree = n.filter(|e| e.mode.is_tree()).map(|e| e.id);
+                let o_leaf = o.filter(|e| !e.mode.is_tree()).map(|e| (e.mode, e.id));
+                let n_leaf = n.filter(|e| !e.mode.is_tree()).map(|e| (e.mode, e.id));
+                if o_tree.is_some() || n_tree.is_some() {
+                    next.push((path.clone(), o_tree, n_tree));
+                }
+                if o_leaf != n_leaf {
+                    let kind = match (o_leaf, n_leaf) {
+                        (None, Some(_)) => ChangeKind::Added,
+                        (Some(_), None) => ChangeKind::Deleted,
+                        _ => ChangeKind::Modified,
+                    };
+                    out.push(PathChange { path, kind, old: o_leaf, new: n_leaf });
+                }
             }
         }
+        level = next;
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
@@ -305,6 +364,86 @@ mod tests {
             lookup_path(o, t2, &RepoPath::root()).await.unwrap(),
             Some((EntryMode::Tree, t2))
         );
+    }
+
+    /// Counts `get_many` calls and the ids they asked for.
+    struct Counting {
+        inner: crate::memory::MemoryObjectStore,
+        calls: std::sync::atomic::AtomicUsize,
+        ids: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ObjectStore for Counting {
+        async fn get_many(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.calls.fetch_add(1, Relaxed);
+            self.ids.fetch_add(ids.len(), Relaxed);
+            self.inner.get_many(ids).await
+        }
+        async fn put_many(&self, objects: &[EncodedObject]) -> Result<()> {
+            self.inner.put_many(objects).await
+        }
+        async fn has_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {
+            self.inner.has_many(ids).await
+        }
+    }
+
+    /// Many changed directories cost one batched read per depth, and only
+    /// the differing trees are read (each distinct tree once).
+    #[tokio::test]
+    async fn diff_reads_one_batch_per_depth() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let o = Counting {
+            inner: Default::default(),
+            calls: Default::default(),
+            ids: Default::default(),
+        };
+        let paths: Vec<String> =
+            (0..256).map(|i| format!("agents/{:02}/{i}/f.txt", i % 16)).collect();
+        // Distinct content per file: no two agent directories share a tree.
+        let olds: Vec<Vec<u8>> = paths.iter().map(|p| format!("{p} old").into_bytes()).collect();
+        let news: Vec<Vec<u8>> = paths.iter().map(|p| format!("{p} new").into_bytes()).collect();
+        let old: Vec<(&str, &[u8])> =
+            paths.iter().zip(&olds).map(|(p, c)| (p.as_str(), c.as_slice())).collect();
+        let mut new = old.clone();
+        // 100 changed agent directories, one deleted file, one added file,
+        // and a file replaced by a directory.
+        for ((_, content), n) in new.iter_mut().zip(&news).take(100) {
+            *content = n;
+        }
+        new.retain(|(p, _)| *p != paths[200]);
+        new.push(("agents/99/x/f.txt", b"old"));
+        let old_t = build_tree(&o, &old).await.unwrap();
+        let mut with_file = old.clone();
+        with_file.push(("p", b"file"));
+        let old_t2 = build_tree(&o, &with_file).await.unwrap();
+        new.push(("p/q", b"nested"));
+        let new_t = build_tree(&o, &new).await.unwrap();
+        o.calls.store(0, Relaxed);
+
+        let d = diff_trees(&o, Some(old_t), Some(new_t)).await.unwrap();
+        // root, agents, shards, agent dirs (`p` adds one level below root).
+        assert_eq!(o.calls.load(Relaxed), 4);
+        let mut want: Vec<(String, ChangeKind)> =
+            paths[..100].iter().map(|p| (p.clone(), ChangeKind::Modified)).collect();
+        want.push((paths[200].clone(), ChangeKind::Deleted));
+        want.push(("agents/99/x/f.txt".into(), ChangeKind::Added));
+        want.push(("p/q".into(), ChangeKind::Added));
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        let got: Vec<(String, ChangeKind)> =
+            d.iter().map(|c| (c.path.as_str().to_string(), c.kind)).collect();
+        assert_eq!(got, want);
+        // Differing trees only: 2 roots, 2 `agents`, 2 × 16 shards (all
+        // touched), 2 × 100 changed agent dirs, the emptied (so removed)
+        // agent dir's old side, 1 new shard, 1 new agent dir, and `p`.
+        assert_eq!(o.ids.load(Relaxed), 2 + 2 + 32 + 200 + 1 + 1 + 1 + 1);
+
+        let d = diff_trees(&o, Some(old_t2), Some(new_t)).await.unwrap();
+        let p: Vec<_> = d.iter().filter(|c| c.path.as_str().starts_with('p')).collect();
+        assert_eq!(p.len(), 2);
+        assert_eq!((p[0].path.as_str(), p[0].kind), ("p", ChangeKind::Deleted));
+        assert_eq!((p[1].path.as_str(), p[1].kind), ("p/q", ChangeKind::Added));
     }
 
     #[tokio::test]
