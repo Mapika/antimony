@@ -21,7 +21,8 @@
 //!   must be linear and grow by exactly the number of successful lands, and
 //!   every agent file must hold its last landed content), a dead replica, an
 //!   error rate above `--max-error-rate` (conflicts are outcomes, not
-//!   errors), an RSS growth trend over the second half of the run above
+//!   errors), an RSS growth trend after `--rss-warmup` (default: the second
+//!   half of the run) above
 //!   `--max-rss-growth-mib-per-hour`, or any operation's window p99 above
 //!   `--max-p99-drift` × its first-window p99 (and above `--p99-floor-ms`).
 //! - Afterwards the schema is dropped and the run's S3 prefix deleted
@@ -55,7 +56,7 @@ const SHARDS: usize = 32;
 const FILES_PER_AGENT: usize = 4;
 const SHARED_FILES: usize = 8;
 const REF: &str = "main";
-const OPS: [&str; 7] = ["land", "create", "cat", "ls", "log", "status", "get_ref"];
+const OPS: [&str; 8] = ["land", "create", "cat", "ls", "log", "log_path", "status", "get_ref"];
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -107,6 +108,13 @@ pub struct Args {
     /// Directory for replica logs (default: the system temp dir).
     #[arg(long)]
     pub log_dir: Option<PathBuf>,
+    /// Extra environment for replica processes (KEY=VALUE, repeatable).
+    #[arg(long)]
+    pub replica_env: Vec<String>,
+    /// Seconds excluded from the RSS trend (cache warm-up); default: half
+    /// the run.
+    #[arg(long)]
+    pub rss_warmup: Option<u64>,
     /// Keep the schema and S3 data afterwards.
     #[arg(long)]
     pub keep: bool,
@@ -351,10 +359,11 @@ async fn agent(
             }
         } else if pick < 80 {
             let path = rng.random_bool(0.5).then(|| dir.clone());
+            let op = if path.is_some() { "log_path" } else { "log" };
             let t = Instant::now();
             match c.log(pb::LogRequest { rev: REF.into(), path, limit: 20 }).await {
-                Ok(_) => rec.ok("log", t),
-                Err(e) => rec.err("log", &e),
+                Ok(_) => rec.ok(op, t),
+                Err(e) => rec.err(op, &e),
             }
         } else {
             // Workspace status: where is the ref, what changed since my base.
@@ -452,7 +461,7 @@ async fn sample(replicas: &mut [Replica], pg: &mut Option<PgMonitor>) -> (Vec<Re
 fn print_header(n: usize) {
     let rss: Vec<String> = (0..n).map(|i| format!("rss{i}")).collect();
     println!(
-        "{:>6} {:>8} {:>7} {:>5} {:>5} {:>6} | {:>15} {:>8} {:>8} {:>8} {:>8} {:>8} | {} | pg(per replica/total) | cache MiB | queued",
+        "{:>6} {:>8} {:>7} {:>5} {:>5} {:>6} | {:>15} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} | {} | pg(per replica/total) | cache MiB | queued",
         "t(s)",
         "ops/s",
         "lands/s",
@@ -464,6 +473,7 @@ fn print_header(n: usize) {
         "cat99",
         "ls99",
         "log99",
+        "logp99",
         "status99",
         rss.join(" ")
     );
@@ -480,7 +490,7 @@ fn print_window(w: &WindowReport) {
     let queued: Vec<String> =
         w.replicas.iter().map(|r| r.queued.map_or("-".into(), |q| q.to_string())).collect();
     println!(
-        "{:>6.0} {:>8.1} {:>7.1} {:>5} {:>5} {:>6} | {:>6.1}/{:>7.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} | {} | {}/{} | {} | {}",
+        "{:>6.0} {:>8.1} {:>7.1} {:>5} {:>5} {:>6} | {:>6.1}/{:>7.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} | {} | {}/{} | {} | {}",
         w.end_s,
         w.ops as f64 / w.secs,
         w.landed as f64 / w.secs,
@@ -493,6 +503,7 @@ fn print_window(w: &WindowReport) {
         p99("cat"),
         p99("ls"),
         p99("log"),
+        p99("log_path"),
         p99("status"),
         rss.join(" "),
         pg.join(","),
@@ -638,7 +649,12 @@ async fn drive(
             ]);
         }
         let log = log_dir.join(format!("{schema}-r{i}.log"));
-        let env = [("RUST_LOG".to_string(), "warn".to_string())];
+        let mut env = vec![("RUST_LOG".to_string(), "warn".to_string())];
+        for kv in &args.replica_env {
+            let (k, v) =
+                kv.split_once('=').ok_or_else(|| anyhow!("--replica-env wants KEY=VALUE"))?;
+            env.push((k.to_string(), v.to_string()));
+        }
         replicas.push(Replica::spawn(i, exe, &argv, &env, &log).await?);
         println!(
             "replica {i}: pid {} grpc {} log {}",
@@ -847,18 +863,19 @@ async fn drive(
             failures.push(format!("replica {i} died"));
         }
     }
-    let half = windows.len() / 2;
+    let warmup = args.rss_warmup.unwrap_or(args.duration / 2) as f64;
     let mut rss_slopes = Vec::new();
     for i in 0..args.replicas {
-        let pts: Vec<(f64, f64)> = windows[half..]
+        let pts: Vec<(f64, f64)> = windows
             .iter()
+            .filter(|w| w.end_s > warmup)
             .filter_map(|w| w.replicas.get(i)?.rss.map(|r| (w.end_s, mib(r))))
             .collect();
         let per_hour = if pts.len() >= 3 { slope(&pts) * 3600.0 } else { 0.0 };
         rss_slopes.push(per_hour);
         if per_hour > args.max_rss_growth_mib_per_hour {
             failures.push(format!(
-                "replica {i} RSS grows {per_hour:.0} MiB/h over the second half (limit {:.0})",
+                "replica {i} RSS grows {per_hour:.0} MiB/h after {warmup:.0} s (limit {:.0})",
                 args.max_rss_growth_mib_per_hour
             ));
         }
@@ -895,7 +912,7 @@ async fn drive(
     println!("conflicts       {conflicts}");
     println!("errors          {errors} ({:.4}%), aborts {aborts}", error_rate * 100.0);
     let slopes: Vec<String> = rss_slopes.iter().map(|s| format!("{s:.0}")).collect();
-    println!("RSS trend       {} MiB/h (second half, per replica)", slopes.join(", "));
+    println!("RSS trend       {} MiB/h (after warm-up, per replica)", slopes.join(", "));
     println!("files checked   {}", expected.len());
     println!("result: {}", if pass { "PASS" } else { "FAIL" });
     for f in &failures {
