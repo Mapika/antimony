@@ -16,6 +16,7 @@ ant-gitbridge.workspace = true
 ant-server.workspace = true
 antd.workspace = true
 anyhow.workspace = true
+aws-sdk-s3.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true

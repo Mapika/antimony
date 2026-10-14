@@ -142,7 +142,12 @@ async fn connect(url: &str) -> Result<Channel> {
 fn sig() -> pb::Signature {
     let time =
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    pb::Signature { name: "soak".into(), email: "soak@example.com".into(), time, tz_offset_minutes: 0 }
+    pb::Signature {
+        name: "soak".into(),
+        email: "soak@example.com".into(),
+        time,
+        tz_offset_minutes: 0,
+    }
 }
 
 fn write_op(path: String, content: Vec<u8>) -> pb::FileOp {
@@ -529,7 +534,8 @@ pub async fn run(args: Args) -> Result<i32> {
     {
         bail!("disk is low (antimony-services DISK_LOW marker present); not starting a soak");
     }
-    let schema = args.pg_schema.clone().unwrap_or_else(|| format!("soak_{}", rand::random::<u32>()));
+    let schema =
+        args.pg_schema.clone().unwrap_or_else(|| format!("soak_{}", rand::random::<u32>()));
     if !schema.starts_with("soak_") {
         bail!("--pg-schema must start with soak_ (it is dropped afterwards)");
     }
@@ -632,7 +638,12 @@ async fn drive(
         let log = log_dir.join(format!("{schema}-r{i}.log"));
         let env = [("RUST_LOG".to_string(), "warn".to_string())];
         replicas.push(Replica::spawn(i, exe, &argv, &env, &log).await?);
-        println!("replica {i}: pid {} grpc {} log {}", replicas[i].pid, replicas[i].grpc_url, log.display());
+        println!(
+            "replica {i}: pid {} grpc {} log {}",
+            replicas[i].pid,
+            replicas[i].grpc_url,
+            log.display()
+        );
     }
     let mut pg = PgMonitor::connect(&args.pg_url).await.ok();
 
@@ -756,12 +767,16 @@ async fn drive(
         .target
         .ok_or_else(|| anyhow!("ref {REF} vanished"))?;
     let verify_start = Instant::now();
-    let store =
-        PgStore::connect_with(&args.pg_url, schema, &PgOptions { max_connections: 4, ..PgOptions::default() })
-            .await
-            .context("connecting the verifier")?;
+    let store = PgStore::connect_with(
+        &args.pg_url,
+        schema,
+        &PgOptions { max_connections: 4, ..PgOptions::default() },
+    )
+    .await
+    .context("connecting the verifier")?;
     let (growth, linear) =
-        chain_growth(&store, ObjectId::from_bytes(&final_tip)?, ObjectId::from_bytes(&seed)?).await?;
+        chain_growth(&store, ObjectId::from_bytes(&final_tip)?, ObjectId::from_bytes(&seed)?)
+            .await?;
     match growth {
         Some(g) if g >= landed && g <= landed + uncertain => {}
         Some(g) => failures.push(format!(
@@ -788,7 +803,13 @@ async fn drive(
             let mut c = admin.clone();
             let rev = final_hex.clone();
             set.spawn(async move {
-                let r = c.read_path(pb::ReadPathRequest { rev, path: path.clone(), include_content: true }).await;
+                let r = c
+                    .read_path(pb::ReadPathRequest {
+                        rev,
+                        path: path.clone(),
+                        include_content: true,
+                    })
+                    .await;
                 (path, content, r.map(|r| r.into_inner()))
             });
         }
@@ -940,7 +961,11 @@ async fn drive(
 /// Commits on the first-parent chain from `tip` down to `seed` (exclusive),
 /// and whether every one of them has exactly one parent. `None` when `seed`
 /// is not on the chain.
-async fn chain_growth(store: &PgStore, tip: ObjectId, seed: ObjectId) -> Result<(Option<u64>, bool)> {
+async fn chain_growth(
+    store: &PgStore,
+    tip: ObjectId,
+    seed: ObjectId,
+) -> Result<(Option<u64>, bool)> {
     const CHUNK: usize = 8192;
     let mut count = 0u64;
     let mut linear = true;

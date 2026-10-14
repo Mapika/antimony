@@ -14,6 +14,7 @@ mod fleet;
 mod import;
 mod json;
 mod replicas;
+mod s3clean;
 mod soak;
 mod util;
 

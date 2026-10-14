@@ -6,7 +6,6 @@
 //!   connection counts per `application_name`.
 //! - [`proc_rss_bytes`] reads a process's resident set size from `/proc`.
 
-
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::process::Stdio;
