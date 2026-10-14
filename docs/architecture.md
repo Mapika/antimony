@@ -94,6 +94,14 @@ cache hit can never hide a missing object.
   fetches content on first read; writes go to a copy-on-write upper layer. No
   root privileges or kernel overlayfs are needed, and `status` cost is
   proportional to the number of changes.
+- **Updating a workspace** (`ant ws update`): moves either kind of workspace
+  to a new base and carries local edits over, with the same 3-way rules and
+  text merge (`ant_core::merge`) the server uses when landing; overlapping
+  edits are written with conflict markers and must be marked resolved
+  (`ant ws resolve`) before `submit`. The cost follows the tree diff between
+  the two bases plus the local edits. In lazy workspaces the switch is
+  crash-atomic: merged files are staged, one journal record commits base,
+  whiteouts and edits together, and recovery rolls it forward.
 - **CLI:** `ant` covers queries, workspaces, submit/land, import, admin, and
   `ant serve` (the server is the same binary).
 

@@ -92,22 +92,34 @@ echo '// from b' >> /tmp/ant-demo/b/src/lib.rs
 cd /tmp/ant-demo/a && ant status && ant submit -m "a: comment" && ant land   # landed <id>
 cd /tmp/ant-demo/b && ant submit -m "b: comment"; ant land; echo "exit $?"    # conflict, src/lib.rs, exit 2
 
-# 5. History.
+# 5. Carry b's edit onto the new tip: both appended at the same spot, so resolve and retry.
+ant ws update; echo "exit $?"              # updated <id>, C<TAB>src/lib.rs, exit 2
+ant status                                 # C<TAB>src/lib.rs
+cat src/lib.rs                             # <<<<<<< upstream ... >>>>>>> local
+printf 'pub fn answer() -> u32 {\n    41\n}\n// from a\n// from b\n' > src/lib.rs
+ant ws resolve src/lib.rs && ant submit -m "b: comment" && ant land        # landed <id>
+
+# 6. History.
 ant log main --path src/lib.rs
 ant diff main~1 main                       # M<TAB>src/lib.rs
 ant blame main:src/lib.rs
 
-# 6. Humans and IDEs use plain git; Prometheus scrapes the HTTP port.
+# 7. Humans and IDEs use plain git; Prometheus scrapes the HTTP port.
 git clone -q http://127.0.0.1:7421/repo.git /tmp/ant-demo/clone
 curl -s http://127.0.0.1:7421/metrics | grep '^ant_land_outcomes'
 
-# 7. Clean up.
+# 8. Clean up.
 kill $SERVER_PID; cd / && rm -rf /tmp/ant-demo
 ```
 
 Exit codes: `0` ok, `1` error (`error: ...` on stderr, plus `hint: ...` when
-there is an obvious fix), `2` land conflict. After a conflict, make a fresh
-workspace at the new tip, redo the edit, submit and land again.
+there is an obvious fix), `2` land or update conflict. After a land conflict
+(or to pick up others' work) run `ant ws update`: it moves the workspace to
+the tip of the ref it was created at (or `--to <rev>`) and carries local
+edits over with the server's 3-way merge. Overlapping edits are written with
+`<<<<<<< upstream` / `>>>>>>> local` markers and shown as `C` by `ant status`;
+fix them, run `ant ws resolve <path>...`, then submit and land again.
+`ant ref set` refuses to move a ref backwards or sideways without `--force`.
 
 Optional: `ant ws new /tmp/lazy --lazy` mounts a writable copy-on-write
 workspace over FUSE (needs `/dev/fuse` and `fusermount3`; `ant ws unmount

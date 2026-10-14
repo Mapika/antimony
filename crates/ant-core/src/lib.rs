@@ -8,6 +8,7 @@
 mod commit;
 mod error;
 mod id;
+pub mod merge;
 mod object;
 mod path;
 mod tree;

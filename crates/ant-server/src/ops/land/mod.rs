@@ -10,7 +10,7 @@
 //! - ours == base → theirs is applied (write or delete);
 //! - base, ours and theirs are all regular files whose mode changed on at
 //!   most one side and whose blobs are UTF-8 → 3-way text merge
-//!   (`diffy::merge`); a clean merge writes the merged blob;
+//!   (`ant_core::merge`, shared with client workspace updates); a clean merge writes the merged blob;
 //! - anything else (modify/delete, add/add, symlinks, binary, text merge
 //!   conflicts, structural conflicts such as a directory turned into a file)
 //!   → the path conflicts.

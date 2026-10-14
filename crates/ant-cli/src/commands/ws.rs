@@ -1,4 +1,4 @@
-//! Workspace commands: ws new / status / submit / land.
+//! Workspace commands: ws new / update / resolve, status / submit / land.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -14,6 +14,47 @@ use crate::ctx::{Ctx, Outcome, RpcResult, id_from};
 use crate::discover::require_workspace;
 
 const LAST_SUBMIT: &str = ".ant/last_submit";
+/// The ref `ws update` follows by default (written by `ws new --at <ref>`).
+const TRACK: &str = "track";
+const DEFAULT_REF: &str = "main";
+
+/// `at` if it names an existing ref (so `ws update` can follow it).
+async fn tracked_ref(remote: &antd::remote::RemoteObjectStore, at: &str) -> Result<Option<String>> {
+    let r = remote.client().get_ref(pb::GetRefRequest { name: at.into() }).await.rpc()?;
+    Ok(r.into_inner().target.map(|_| at.to_string()))
+}
+
+async fn read_track(root: &Path) -> Result<String> {
+    match tokio::fs::read_to_string(root.join(".ant").join(TRACK)).await {
+        Ok(name) if !name.trim().is_empty() => Ok(name.trim().to_string()),
+        Ok(_) => Ok(DEFAULT_REF.into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DEFAULT_REF.into()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The workspace's unresolved conflicts file.
+async fn conflicts_file(root: &Path) -> Result<std::path::PathBuf> {
+    Ok(match lazy_state(root).await? {
+        Some(state) => state.join(ant_fuse::rw::CONFLICTS),
+        None => antd::workspace::conflicts_file(root),
+    })
+}
+
+async fn pending_conflicts(root: &Path) -> Result<Vec<ant_core::RepoPath>> {
+    let file = conflicts_file(root).await?;
+    tokio::task::spawn_blocking(move || antd::workspace::read_conflicts(&file)).await?
+}
+
+/// Error out while conflicts are unresolved (see `hint_for`).
+async fn require_no_conflicts(root: &Path) -> Result<()> {
+    let pending = pending_conflicts(root).await?;
+    if !pending.is_empty() {
+        let list: Vec<String> = pending.iter().map(|p| p.to_string()).collect();
+        bail!("workspace has unresolved conflicts: {}", list.join(", "));
+    }
+    Ok(())
+}
 
 pub async fn new(ctx: &Ctx, dir: &Path, at: &str, patterns: Vec<String>) -> Result<Outcome> {
     let sparse = if patterns.is_empty() { Sparse::all() } else { Sparse::new(patterns)? };
@@ -27,7 +68,11 @@ pub async fn new(ctx: &Ctx, dir: &Path, at: &str, patterns: Vec<String>) -> Resu
         .commit;
     let commit = id_from(&commit)?;
     let tree = rt.read_commit(&commit).await?.tree;
+    let track = tracked_ref(&remote, at).await?;
     Workspace::materialize(rt.as_ref(), dir, commit, tree, sparse).await?;
+    if let Some(name) = track {
+        tokio::fs::write(dir.join(".ant").join(TRACK), format!("{name}\n")).await?;
+    }
     Ok(Outcome::ok(format!("{commit}\n")))
 }
 
@@ -54,15 +99,21 @@ async fn local_changes(ctx: &Ctx) -> Result<(std::path::PathBuf, Workspace, Vec<
 }
 
 pub async fn status(ctx: &Ctx) -> Result<Outcome> {
-    let (_, _, changes) = local_changes(ctx).await?;
+    let (root, _, changes) = local_changes(ctx).await?;
+    let mut lines: std::collections::BTreeMap<String, char> =
+        changes.into_iter().map(|c| (c.path.to_string(), letter(c.kind))).collect();
+    for path in pending_conflicts(&root).await? {
+        lines.insert(path.to_string(), 'C');
+    }
     let mut out = String::new();
-    for c in changes {
-        writeln!(out, "{}\t{}", letter(c.kind), c.path)?;
+    for (path, letter) in lines {
+        writeln!(out, "{letter}\t{path}")?;
     }
     Ok(Outcome::ok(out))
 }
 
 pub async fn submit(ctx: &Ctx, message: &str) -> Result<Outcome> {
+    require_no_conflicts(&require_workspace(ctx.directory.as_deref())?).await?;
     let (root, ws, changes) = local_changes(ctx).await?;
     if changes.is_empty() {
         bail!("nothing to submit");
@@ -170,13 +221,98 @@ pub async fn land(ctx: &Ctx, ref_name: &str, commit: Option<String>) -> Result<O
                 writeln!(out, "{p}")?;
             }
             eprintln!(
-                "hint: {ref_name} moved under you; start a fresh workspace at the new tip \
-                 (`ant ws new <dir> --at {ref_name}`), redo the edit there, then submit and land again"
+                "hint: {ref_name} moved under you; run `ant ws update --to {ref_name}` to merge \
+                 your edits onto the new tip, resolve any conflicts, then submit and land again"
             );
             Ok(Outcome { stdout: out.into_bytes(), code: 2 })
         }
         None => bail!("server returned an empty land response"),
     }
+}
+
+pub async fn update(ctx: &Ctx, to: Option<String>) -> Result<Outcome> {
+    let root = require_workspace(ctx.directory.as_deref())?;
+    require_no_conflicts(&root).await?;
+    let rev = match to {
+        Some(rev) => rev,
+        None => read_track(&root).await?,
+    };
+    let old = Workspace::open(&root)?.base_commit;
+    let (read, remote) = ctx.read_through().await?;
+    let commit = id_from(
+        &remote
+            .client()
+            .resolve_rev(pb::ResolveRevRequest { rev })
+            .await
+            .rpc()?
+            .into_inner()
+            .commit,
+    )?;
+    let tree = read.read_commit(&commit).await?.tree;
+    // Reads go through to the server; local and merged blobs stay local.
+    let objects = std::sync::Arc::new(LazyObjects { read, local: ctx.disk()? });
+    let plan = match lazy_state(&root).await? {
+        Some(state) => ant_fuse::rw::update(objects, &state, commit, tree)
+            .await
+            .context("updating lazy workspace")?,
+        None => Workspace::open(&root)?.update(objects.as_ref(), commit, tree).await?,
+    };
+    if commit != old {
+        // A commit submitted from the old base is superseded by the update.
+        match tokio::fs::remove_file(root.join(LAST_SUBMIT)).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+    }
+    let mut out = format!("updated {commit}\n");
+    let conflicts: Vec<_> = plan.iter().filter(|u| u.conflict).collect();
+    for u in &conflicts {
+        writeln!(out, "C\t{}", u.path)?;
+    }
+    if conflicts.is_empty() {
+        return Ok(Outcome::ok(out));
+    }
+    eprintln!(
+        "hint: fix the listed files (text conflicts carry <<<<<<< markers; other conflicts keep \
+         your version, `ant cat {commit}:<path>` shows upstream's), then run \
+         `ant ws resolve <path>...` before submitting"
+    );
+    Ok(Outcome { stdout: out.into_bytes(), code: 2 })
+}
+
+pub async fn resolve(ctx: &Ctx, paths: Vec<String>) -> Result<Outcome> {
+    let root = require_workspace(ctx.directory.as_deref())?;
+    let pending = pending_conflicts(&root).await?;
+    let mut resolved = Vec::with_capacity(paths.len());
+    for p in paths {
+        let path = ant_core::RepoPath::new(p.trim_matches('/'))
+            .with_context(|| format!("invalid path {p:?}"))?;
+        if !pending.contains(&path) {
+            bail!("{path} is not conflicted");
+        }
+        match tokio::fs::read(root.join(path.as_str())).await {
+            Ok(data) if ant_core::merge::has_conflict_markers(&data) => {
+                bail!("{path} still contains conflict markers");
+            }
+            Ok(_) => {}
+            // Resolved by deleting it (or turning it into a directory).
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::IsADirectory => {}
+            Err(e) => return Err(e).with_context(|| format!("reading {path}")),
+        }
+        resolved.push(path);
+    }
+    match lazy_state(&root).await? {
+        Some(state) => ant_fuse::rw::resolve(&state, &resolved)?,
+        None => {
+            let left: Vec<_> = pending.into_iter().filter(|p| !resolved.contains(p)).collect();
+            let file = conflicts_file(&root).await?;
+            tokio::task::spawn_blocking(move || antd::workspace::write_conflicts(&file, &left))
+                .await??;
+        }
+    }
+    Ok(Outcome::empty())
 }
 
 async fn lazy_state(root: &Path) -> Result<Option<std::path::PathBuf>> {
@@ -209,6 +345,7 @@ pub async fn new_lazy(ctx: &Ctx, dir: &Path, at: &str) -> Result<Outcome> {
             .commit,
     )?;
     let tree = objects.read_commit(&commit).await?.tree;
+    let track = tracked_ref(&remote, at).await?;
     let cache = std::path::absolute(&ctx.cache)?;
     let d = dir.clone();
     let state = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf> {
@@ -231,6 +368,9 @@ pub async fn new_lazy(ctx: &Ctx, dir: &Path, at: &str) -> Result<Outcome> {
         std::fs::write(state.join("base"), format!("base_commit={commit}\nbase_tree={tree}\n"))?;
         std::fs::write(state.join("whiteouts"), "")?;
         std::fs::write(state.join("meta/lazy"), state.as_os_str().as_bytes())?;
+        if let Some(name) = track {
+            std::fs::write(state.join("meta").join(TRACK), format!("{name}\n"))?;
+        }
         symlink("../base", state.join("meta/workspace"))?;
         symlink(state.join("meta"), state.join("upper/.ant"))?;
         symlink(state.join("meta"), d.join(".ant"))?;

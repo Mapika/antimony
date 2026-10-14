@@ -17,9 +17,9 @@ use super::state::*;
 use super::{hidden, mode, other};
 
 pub(super) struct Upper {
-    files: BTreeMap<String, (EntryMode, ObjectId)>,
-    dirs: BTreeSet<String>,
-    blobs: Vec<EncodedObject>,
+    pub(super) files: BTreeMap<String, (EntryMode, ObjectId)>,
+    pub(super) dirs: BTreeSet<String>,
+    pub(super) blobs: Vec<EncodedObject>,
 }
 pub(super) fn scan_upper(state: &Path) -> io::Result<Upper> {
     let root = state.join("upper");

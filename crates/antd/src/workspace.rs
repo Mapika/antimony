@@ -4,7 +4,12 @@
 //! - `.ant/workspace`: `base_commit=<hex>`, `base_tree=<hex>`, and one
 //!   `sparse=<pattern>` line per pattern. Plain text, one `key=value` per line.
 //! - `.ant/index`: one tab-separated line per materialized non-tree entry
-//!   (path, mode, object id, size, mtime in ns, inode).
+//!   (path, mode, object id, size, mtime in ns, inode). After `update`, an
+//!   entry may carry an all-zero stat: the path differs locally from the new
+//!   base (it is re-hashed, or reported deleted when missing).
+//! - `.ant/conflicts`: unresolved conflicts left by `update`, one escaped
+//!   path per line (absent when there are none).
+//! - `.ant/track` (written by the CLI): the ref `ant ws update` follows.
 //!
 //! Sparse patterns (`Sparse::matches`):
 //! - Empty pattern list = everything.
@@ -47,6 +52,9 @@
 //! `diff_trees(old_base_tree, new_tree)` to the in-scope files on disk
 //! (writes, deletes, removes now-empty dirs), then rewrites the index and
 //! config.
+//!
+//! `update(objects, new_commit, new_tree)`: like `reset_to`, but carries
+//! local changes over (`crate::update::plan`) and records conflicts.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
@@ -74,6 +82,7 @@ const WRITE_CONCURRENCY: usize = 8;
 const STATE_DIR: &str = ".ant";
 const CONFIG_FILE: &str = "workspace";
 const INDEX_FILE: &str = "index";
+const CONFLICTS_FILE: &str = "conflicts";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sparse {
@@ -241,7 +250,7 @@ fn hash_disk(full: &Path, meta: &fs::Metadata) -> anyhow::Result<(EntryMode, Vec
     Ok((mode, body))
 }
 
-fn escape_path(path: &str) -> String {
+pub(crate) fn escape_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for c in path.chars() {
         match c {
@@ -253,7 +262,7 @@ fn escape_path(path: &str) -> String {
     out
 }
 
-fn unescape_path(s: &str) -> String {
+pub(crate) fn unescape_path(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -952,6 +961,152 @@ impl Workspace {
     }
 }
 
+/// Index stat that never matches a file on disk: the entry is re-hashed (and
+/// reported as modified) or, when the path is missing, reported as deleted.
+const STALE: Stat = Stat { size: 0, mtime_ns: 0, ino: 0, st_mode: 0 };
+
+/// The workspace's unresolved conflicts file (`.ant/conflicts`).
+pub fn conflicts_file(dir: &Path) -> PathBuf {
+    state_dir(dir).join(CONFLICTS_FILE)
+}
+
+/// Unresolved conflicts recorded in `file` (missing file: none).
+pub fn read_conflicts(file: &Path) -> anyhow::Result<Vec<RepoPath>> {
+    match fs::read_to_string(file) {
+        Ok(text) => crate::update::parse_conflicts(&text),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", file.display())),
+    }
+}
+
+/// Replace the conflicts in `file` atomically (an empty list removes it).
+pub fn write_conflicts(file: &Path, paths: &[RepoPath]) -> anyhow::Result<()> {
+    if paths.is_empty() {
+        return match fs::remove_file(file) {
+            Err(e) if e.kind() != ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        };
+    }
+    let text = crate::update::render_conflicts(paths.iter().map(|p| p.as_str()));
+    atomic_write(file, text.as_bytes())
+}
+
+impl Workspace {
+    /// Move the workspace to `new_tree`, carrying local edits over
+    /// ([`crate::update::plan`]). Only paths in the sparse scope, or already
+    /// on disk, are written. Afterwards `status` reports exactly the paths
+    /// that still differ from the new base (merged files as modified, kept
+    /// local deletions as deleted). Conflicted paths are recorded in
+    /// `.ant/conflicts`. Returns the plan.
+    ///
+    /// Not atomic: files are written before the new base is recorded, so an
+    /// interruption can leave upstream changes reported as local edits.
+    pub async fn update(
+        &mut self,
+        objects: &dyn ObjectStore,
+        new_commit: ObjectId,
+        new_tree: ObjectId,
+    ) -> anyhow::Result<Vec<crate::update::PathUpdate>> {
+        use crate::update::Target;
+        let local = self.status(objects).await?;
+        let changed: HashSet<&RepoPath> = local.iter().map(|c| &c.path).collect();
+        let plan = crate::update::plan(objects, self.base_tree, new_tree, &local).await?;
+        let matcher = self.sparse.compile()?;
+        let mut removals = Vec::new();
+        let mut fetch = Vec::new();
+        let mut items = Vec::new();
+        // Index decision per path: Some(None) = drop, Some(Some(id..)) = index.
+        for u in &plan {
+            let in_scope = matcher.matches(&u.path);
+            let on_disk = u.local.is_some() && (in_scope || changed.contains(&u.path));
+            match &u.target {
+                Target::Upstream if u.local != u.upstream => match u.upstream {
+                    Some((mode, id)) if in_scope || on_disk => {
+                        fetch.push((u.path.clone(), mode, id));
+                    }
+                    None if on_disk => removals.push(u.path.clone()),
+                    _ => {}
+                },
+                Target::Write { mode, data } => items.push(WriteItem {
+                    path: u.path.clone(),
+                    mode: *mode,
+                    id: hash_object(ObjectKind::Blob, data),
+                    body: Bytes::copy_from_slice(data),
+                }),
+                _ => {}
+            }
+        }
+        let d = self.dir.clone();
+        let removed = removals.clone();
+        let mut written: HashMap<String, Option<Entry>> = tokio::task::spawn_blocking(move || {
+            for p in &removed {
+                remove_leaf(&d, p)?;
+            }
+            write_items(&d, items, false).map(|w| w.into_iter().collect())
+        })
+        .await??;
+        written.extend(write_leaves(objects, &self.dir, &fetch, false).await?);
+        let d = self.dir.clone();
+        let plan_paths: Vec<_> = plan
+            .iter()
+            .map(|u| {
+                let in_scope = matcher.matches(&u.path);
+                let result = match &u.target {
+                    Target::Write { mode, data } => {
+                        Some((*mode, hash_object(ObjectKind::Blob, data)))
+                    }
+                    _ => u.result().flatten(),
+                };
+                (u.path.as_str().to_string(), in_scope, result, u.upstream)
+            })
+            .collect();
+        let index = tokio::task::spawn_blocking(move || -> anyhow::Result<Index> {
+            let mut index = read_index(&d)?;
+            for (key, in_scope, result, upstream) in plan_paths {
+                index.remove(&key);
+                let Some((mode, id)) = upstream else { continue };
+                if mode == EntryMode::Gitlink {
+                    continue;
+                }
+                let present = result.is_some();
+                if !in_scope && !present {
+                    continue;
+                }
+                let stat = if result == upstream {
+                    match written.remove(&key) {
+                        Some(Some(e)) => e.stat,
+                        Some(None) => continue,
+                        None => match fs::symlink_metadata(d.join(&key)) {
+                            Ok(m) => stat_of(&m),
+                            // Out of scope and not materialized: not indexed.
+                            Err(e) if e.kind() == ErrorKind::NotFound && !in_scope => continue,
+                            Err(e) if e.kind() == ErrorKind::NotFound => STALE,
+                            Err(e) => return Err(e.into()),
+                        },
+                    }
+                } else {
+                    STALE
+                };
+                index.insert(key, Entry { mode, id, stat });
+            }
+            Ok(index)
+        })
+        .await??;
+        let d = self.dir.clone();
+        let patterns = self.sparse.patterns.clone();
+        let conflicts: Vec<RepoPath> =
+            plan.iter().filter(|u| u.conflict).map(|u| u.path.clone()).collect();
+        tokio::task::spawn_blocking(move || {
+            save_state(&d, new_commit, new_tree, &patterns, &index)?;
+            write_conflicts(&conflicts_file(&d), &conflicts)
+        })
+        .await??;
+        self.base_commit = new_commit;
+        self.base_tree = new_tree;
+        Ok(plan)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
@@ -1189,5 +1344,105 @@ mod tests {
         // It must now be indexed, so the workspace is clean and not resent.
         assert!(ws.status(objs.as_ref()).await.unwrap().is_empty());
         assert!(!dir.join("b").exists());
+    }
+    fn summary(changes: &[LocalChange]) -> Vec<(String, LocalChangeKind)> {
+        changes.iter().map(|c| (c.path.as_str().to_string(), c.kind)).collect()
+    }
+
+    #[tokio::test]
+    async fn update_carries_local_edits_onto_new_base() {
+        use LocalChangeKind::*;
+        let objs = Arc::new(MemoryObjectStore::default());
+        let files1: &[(&str, &[u8])] = &[
+            ("both", b"1\n2\n3\n4\n5\n"),
+            ("clash", b"1\n2\n3\n"),
+            ("gone", b"g"),
+            ("keep", b"k"),
+            ("local", b"l"),
+            ("up", b"u"),
+            ("moddel", b"m"),
+        ];
+        let files2: &[(&str, &[u8])] = &[
+            ("both", b"one\n2\n3\n4\n5\n"),
+            ("clash", b"1\nup\n3\n"),
+            ("keep", b"k"),
+            ("local", b"l"),
+            ("up", b"u2"),
+            ("new/file", b"n"),
+        ];
+        let t1 = build_tree(objs.as_ref(), files1).await.unwrap();
+        let t2 = build_tree(objs.as_ref(), files2).await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ws");
+        let mut ws =
+            Workspace::materialize(objs.as_ref(), &dir, C, t1, Sparse::all()).await.unwrap();
+        std::fs::write(dir.join("both"), b"1\n2\n3\n4\nfive\n").unwrap();
+        std::fs::write(dir.join("clash"), b"1\nmine\n3\n").unwrap();
+        std::fs::write(dir.join("local"), b"l2").unwrap();
+        std::fs::write(dir.join("moddel"), b"m2").unwrap();
+        std::fs::write(dir.join("added"), b"a").unwrap();
+        std::fs::remove_file(dir.join("keep")).unwrap();
+        let plan = ws.update(objs.as_ref(), C2, t2).await.unwrap();
+        assert_eq!(ws.base_commit, C2);
+        let conflicts: Vec<&str> =
+            plan.iter().filter(|u| u.conflict).map(|u| u.path.as_str()).collect();
+        assert_eq!(conflicts, ["clash", "moddel"]);
+        assert_eq!(read_conflicts(&conflicts_file(&dir)).unwrap(), [p("clash"), p("moddel")]);
+        let read = |f: &str| std::fs::read(dir.join(f)).unwrap();
+        assert_eq!(read("both"), b"one\n2\n3\n4\nfive\n");
+        assert_eq!(
+            read("clash"),
+            b"1\n<<<<<<< upstream\nup\n||||||| base\n2\n=======\nmine\n>>>>>>> local\n3\n"
+        );
+        assert_eq!(read("up"), b"u2");
+        assert_eq!(read("new/file"), b"n");
+        assert_eq!(read("local"), b"l2");
+        assert_eq!(read("moddel"), b"m2");
+        assert!(!dir.join("gone").exists());
+        assert!(!dir.join("keep").exists());
+        let reopened = Workspace::open(&dir).unwrap();
+        assert_eq!((reopened.base_commit, reopened.base_tree), (C2, t2));
+        assert_eq!(
+            summary(&ws.status(objs.as_ref()).await.unwrap()),
+            [
+                ("added".into(), Added),
+                ("both".into(), Modified),
+                ("clash".into(), Modified),
+                ("keep".into(), Deleted),
+                ("local".into(), Modified),
+                ("moddel".into(), Added),
+            ]
+        );
+        // Nothing left to carry: a second update is a no-op.
+        let again = ws.update(objs.as_ref(), C2, t2).await.unwrap();
+        assert!(again.iter().all(|u| u.target == crate::update::Target::Local));
+        write_conflicts(&conflicts_file(&dir), &[]).unwrap();
+        assert!(read_conflicts(&conflicts_file(&dir)).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_respects_sparse_scope() {
+        let objs = Arc::new(MemoryObjectStore::default());
+        let t1 = build_tree(objs.as_ref(), &[("in/a", b"1"), ("out/b", b"2")]).await.unwrap();
+        let t2 = build_tree(
+            objs.as_ref(),
+            &[("in/a", b"3"), ("in/n", b"4"), ("out/b", b"5"), ("out/c", b"6")],
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ws");
+        let sparse = Sparse::new(vec!["in".into()]).unwrap();
+        let mut ws = Workspace::materialize(objs.as_ref(), &dir, C, t1, sparse).await.unwrap();
+        // A local file outside the scope, identical to upstream's new file.
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::write(dir.join("out/c"), b"6").unwrap();
+        let plan = ws.update(objs.as_ref(), C2, t2).await.unwrap();
+        assert!(plan.iter().all(|u| !u.conflict));
+        assert_eq!(std::fs::read(dir.join("in/a")).unwrap(), b"3");
+        assert_eq!(std::fs::read(dir.join("in/n")).unwrap(), b"4");
+        assert!(!dir.join("out/b").exists());
+        let st = ws.status(objs.as_ref()).await.unwrap();
+        assert!(st.is_empty(), "{st:?}");
     }
 }

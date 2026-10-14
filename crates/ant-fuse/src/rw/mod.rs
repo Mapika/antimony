@@ -13,6 +13,8 @@
 //!   at mount, at unmount and past 4 MiB);
 //! - `intent`: a pending delete/rename written by earlier versions, rolled
 //!   forward by recovery;
+//! - `staging/`, `conflicts`: files prepared by an in-progress [`update`]
+//!   and the unresolved conflicts it left (see `update`);
 //! - `lock` / `mount.lock`: the state lock and the exclusive mount marker.
 //!
 //! Snapshots are replaced atomically (write temp + fsync + rename + fsync).
@@ -73,13 +75,16 @@
 //! [`changes`] lists the workspace's changes (sorted, files byte-identical to
 //! the base are not changes) from the upper directory and whiteouts only,
 //! reading just the base trees on affected paths; [`reset`] moves the
-//! workspace to a new base, dropping upper entries that now match it.
+//! workspace to a new base, dropping upper entries that now match it;
+//! [`update`] moves it to a new base carrying edits over with 3-way merges,
+//! atomically across crashes (one journal record is the commit point).
 
 mod callbacks;
 mod changes;
 mod journal;
 mod overlay;
 mod state;
+mod update;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -98,6 +103,7 @@ pub use changes::{changes, reset};
 use overlay::Writable;
 pub use state::base;
 use state::{MountGuard, StateLock, recover, save_base, save_whiteouts};
+pub use update::{CONFLICTS, conflicts, resolve, update};
 
 /// FUSE request threads per writable mount. Namespace operations serialize
 /// on the overlay; reads and writes of open upper files run in parallel.

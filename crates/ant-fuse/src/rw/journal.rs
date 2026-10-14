@@ -7,6 +7,10 @@
 //! such a tail before appending. The journal is folded into the snapshots
 //! (compaction) at mount, at unmount and when it exceeds [`COMPACT_BYTES`].
 //!
+//! Record kinds: whiteout (1), rename (2), done (3), reset (4) and update
+//! (5, `ant ws update`; binaries from before it refuse a journal holding one,
+//! which only exists while an update is unfinished or not yet compacted).
+//!
 //! Frame: `len: u32 LE | crc32(len ++ payload): u32 LE | payload`, where the
 //! payload is a tag byte and the record's fields (`u32 LE` length-prefixed
 //! strings, raw 32-byte ids). An unknown tag behind a valid checksum is an
@@ -45,6 +49,7 @@ const TAG_WHITEOUT: u8 = 1;
 const TAG_RENAME: u8 = 2;
 const TAG_DONE: u8 = 3;
 const TAG_RESET: u8 = 4;
+const TAG_UPDATE: u8 = 5;
 const MAX_RECORD: usize = 1 << 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +70,22 @@ pub(super) enum Record {
         tree: ObjectId,
         whiteouts: Vec<String>,
     },
+    /// `ant ws update` (see `update`): a new base with its complete whiteout
+    /// set, staged upper files to move into place (`writes[i]` comes from
+    /// `staging/<i>`), upper files to remove and the resulting conflicts.
+    /// Completed by a following [`Record::Done`]; a trailing `Update` is
+    /// rolled forward by recovery.
+    Update(Box<UpdateRecord>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct UpdateRecord {
+    pub(super) commit: ObjectId,
+    pub(super) tree: ObjectId,
+    pub(super) whiteouts: Vec<String>,
+    pub(super) writes: Vec<String>,
+    pub(super) removes: Vec<String>,
+    pub(super) conflicts: Vec<String>,
 }
 
 const fn crc_table() -> [u32; 256] {
@@ -91,6 +112,13 @@ fn crc32(parts: &[&[u8]]) -> u32 {
         }
     }
     !c
+}
+
+fn put_paths(out: &mut Vec<u8>, paths: &[String]) {
+    out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+    for path in paths {
+        put_str(out, path);
+    }
 }
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
@@ -120,6 +148,14 @@ impl<'a> Reader<'a> {
         }
         Ok(s.to_owned())
     }
+    fn paths(&mut self) -> io::Result<Vec<String>> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n.min(1 << 16));
+        for _ in 0..n {
+            out.push(self.path()?);
+        }
+        Ok(out)
+    }
     fn id(&mut self) -> io::Result<ObjectId> {
         let b = self.take(32)?;
         let mut id = [0u8; 32];
@@ -146,9 +182,14 @@ impl Record {
                 payload.push(TAG_RESET);
                 payload.extend_from_slice(commit.as_bytes());
                 payload.extend_from_slice(tree.as_bytes());
-                payload.extend_from_slice(&(whiteouts.len() as u32).to_le_bytes());
-                for path in whiteouts {
-                    put_str(&mut payload, path);
+                put_paths(&mut payload, whiteouts);
+            }
+            Record::Update(u) => {
+                payload.push(TAG_UPDATE);
+                payload.extend_from_slice(u.commit.as_bytes());
+                payload.extend_from_slice(u.tree.as_bytes());
+                for paths in [&u.whiteouts, &u.writes, &u.removes, &u.conflicts] {
+                    put_paths(&mut payload, paths);
                 }
             }
         }
@@ -158,6 +199,15 @@ impl Record {
         frame.extend_from_slice(&crc32(&[&len, &payload]).to_le_bytes());
         frame.extend_from_slice(&payload);
         frame
+    }
+
+    /// The base this record switches to, if any.
+    pub(super) fn base(&self) -> Option<(ObjectId, ObjectId)> {
+        match self {
+            Record::Reset { commit, tree, .. } => Some((*commit, *tree)),
+            Record::Update(u) => Some((u.commit, u.tree)),
+            _ => None,
+        }
     }
 
     /// Apply the record's effect on the whiteout set.
@@ -172,6 +222,7 @@ impl Record {
             }
             Record::Done => {}
             Record::Reset { whiteouts, .. } => *deleted = whiteouts.into_iter().collect(),
+            Record::Update(u) => *deleted = u.whiteouts.into_iter().collect(),
         }
     }
 
@@ -181,16 +232,15 @@ impl Record {
             TAG_WHITEOUT => Record::Whiteout(r.path()?),
             TAG_RENAME => Record::Rename { old: r.path()?, new: r.path()? },
             TAG_DONE => Record::Done,
-            TAG_RESET => {
-                let commit = r.id()?;
-                let tree = r.id()?;
-                let n = r.u32()? as usize;
-                let mut whiteouts = Vec::with_capacity(n.min(1 << 16));
-                for _ in 0..n {
-                    whiteouts.push(r.path()?);
-                }
-                Record::Reset { commit, tree, whiteouts }
-            }
+            TAG_RESET => Record::Reset { commit: r.id()?, tree: r.id()?, whiteouts: r.paths()? },
+            TAG_UPDATE => Record::Update(Box::new(UpdateRecord {
+                commit: r.id()?,
+                tree: r.id()?,
+                whiteouts: r.paths()?,
+                writes: r.paths()?,
+                removes: r.paths()?,
+                conflicts: r.paths()?,
+            })),
             tag => return Err(other(format!("unsupported journal record kind {tag}"))),
         };
         if !r.0.is_empty() {
@@ -246,8 +296,8 @@ pub(super) fn load(state: &Path) -> io::Result<Persisted> {
     let mut deleted = snapshot_whiteouts(state)?;
     let (records, len) = parse(&read_journal(state)?)?;
     for record in records {
-        if let Record::Reset { commit: c, tree: t, .. } = &record {
-            (commit, tree) = (*c, *t);
+        if let Some(base) = record.base() {
+            (commit, tree) = base;
         }
         record.apply(&mut deleted);
     }
@@ -483,6 +533,15 @@ mod tests {
                 whiteouts: vec!["x".into(), "y/z".into()],
             },
             Record::Whiteout("über".into()),
+            Record::Update(Box::new(UpdateRecord {
+                commit: ObjectId([7; 32]),
+                tree: ObjectId([8; 32]),
+                whiteouts: vec!["w".into()],
+                writes: vec!["a/merged".into(), "b".into()],
+                removes: vec![],
+                conflicts: vec!["b".into()],
+            })),
+            Record::Done,
         ]
     }
 

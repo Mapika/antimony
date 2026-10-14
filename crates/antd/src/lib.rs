@@ -9,4 +9,5 @@
 pub mod disk;
 pub mod readthrough;
 pub mod remote;
+pub mod update;
 pub mod workspace;

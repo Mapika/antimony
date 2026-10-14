@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use ant_auth::Policy;
+use ant_core::merge::{self, EntryMerge, TextMerge};
 use ant_core::{EncodedObject, EntryMode, Object, ObjectId, ObjectKind, RepoPath, Tree, TreeEntry};
 use ant_store::{Backend, ChangeKind, CommitNode, PathChange, StoreError};
 
@@ -277,23 +278,18 @@ impl BatchState {
             let base = entry(&base_dirs, &change.path);
             let ours = entry(&dirs, &change.path);
             let theirs = change.new;
-            if ours == theirs {
-                continue;
-            }
-            if ours == base {
-                edits.insert(change.path.clone(), theirs);
-                continue;
-            }
-            if let (Some(base), Some(ours), Some(theirs)) = (base, ours, theirs)
-                && [base.0, ours.0, theirs.0]
-                    .into_iter()
-                    .all(|m| matches!(m, EntryMode::File | EntryMode::Executable))
-                && (ours.0 == base.0 || theirs.0 == base.0)
-            {
-                blob_ids.extend([base.1, ours.1, theirs.1]);
-                merges.push((change.path.clone(), base, ours, theirs));
-            } else {
-                conflicts.insert(change.path.clone());
+            match merge::entries(base, ours, theirs) {
+                EntryMerge::Same | EntryMerge::Ours => {}
+                EntryMerge::Theirs => {
+                    edits.insert(change.path.clone(), theirs);
+                }
+                EntryMerge::Text { mode, base, ours, theirs } => {
+                    blob_ids.extend([base, ours, theirs]);
+                    merges.push((change.path.clone(), mode, [base, ours, theirs]));
+                }
+                EntryMerge::Conflict => {
+                    conflicts.insert(change.path.clone());
+                }
             }
         }
         let mut blobs = BTreeMap::new();
@@ -324,14 +320,12 @@ impl BatchState {
         let mut objects = Vec::new();
         // (path, id) of every new blob/tree, for zone tagging.
         let mut written = Vec::new();
-        for (path, base, ours, theirs) in merges {
-            let texts = [base.1, ours.1, theirs.1]
-                .map(|id| blobs.get(&id).and_then(|blob| std::str::from_utf8(blob.body()).ok()));
-            if let [Some(base_text), Some(ours_text), Some(theirs_text)] = texts
-                && let Ok(merged) = diffy::merge(base_text, ours_text, theirs_text)
+        for (path, mode, ids) in merges {
+            let bodies = ids.map(|id| blobs.get(&id).map(|blob| blob.body()));
+            if let [Some(base), Some(ours), Some(theirs)] = bodies
+                && let TextMerge::Clean(merged) = merge::text(base, ours, theirs)
             {
-                let object = EncodedObject::new(ObjectKind::Blob, merged.as_bytes());
-                let mode = if ours.0 == base.0 { theirs.0 } else { ours.0 };
+                let object = EncodedObject::new(ObjectKind::Blob, &merged);
                 written.push((path.clone(), object.id()));
                 edits.insert(path, Some((mode, object.id())));
                 objects.push(object);

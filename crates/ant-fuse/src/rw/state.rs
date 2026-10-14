@@ -153,7 +153,9 @@ pub(super) fn recover(state: &Path) -> io::Result<()> {
     recover_intent(state)?;
     let data = read_journal(state)?;
     if data.is_empty() {
-        return Ok(());
+        // An update that never journaled its record left at most staged
+        // files: the workspace is still at the old base.
+        return super::update::discard_staging(state);
     }
     let (records, len) = parse(&data)?;
     if len < data.len() {
@@ -163,17 +165,21 @@ pub(super) fn recover(state: &Path) -> io::Result<()> {
     }
     // `reset` journals the new base before rewriting the `base` snapshot
     // (which `ant` reads directly); finish an interrupted rewrite.
-    let last_base = records.iter().rev().find_map(|r| match r {
-        Record::Reset { commit, tree, .. } => Some((*commit, *tree)),
-        _ => None,
-    });
+    let last_base = records.iter().rev().find_map(Record::base);
     if let Some((commit, tree)) = last_base
         && base(state)? != (commit, tree)
     {
         save_base(state, commit, tree)?;
     }
-    // Records are appended in operation order and a rename is followed by
-    // `Done` before anything else, so only the last record can be unfinished.
+    // Records are appended in operation order and a rename or update is
+    // followed by `Done` before anything else, so only the last record can
+    // be unfinished.
+    if let Some(Record::Update(update)) = records.last() {
+        super::update::roll_forward(state, update)?;
+        append_durably(state, &Record::Done)?;
+        return Ok(());
+    }
+    super::update::discard_staging(state)?;
     if let Some(Record::Rename { old, new }) = records.last() {
         let old = state.join("upper").join(old);
         if metadata(&old)?.is_some() {

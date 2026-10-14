@@ -29,19 +29,41 @@
 //!   ant diff <from-rev> <to-rev>   `A|M|D\t<path>`
 //!   ant ref get <name>             `<id>` (missing: exit 1)
 //!   ant ref list [<prefix>]        `<id> <name>`
-//!   ant ref set <name> <rev> [--expect <id>|--create]   CAS update; mismatch: exit 1
-//!   ant ws new <dir> [--at <rev>] [--sparse <pattern>]...
-//!       rev default `main`. stdout: `<commit-id>`
-//!   ant status                     `A|M|D\t<path>` (sorted)
+//!   ant ref set <name> <rev> [--expect <id>|--create] [--force]
+//!       CAS update; mismatch: exit 1. A move to a commit that does not
+//!       descend from the current (or `--expect`ed) target is refused
+//!       (exit 1) unless `--force`. stdout: `<id>`
+//!   ant ws new <dir> [--at <rev>] [--sparse <pattern>]... [--lazy]
+//!       rev default `main`. stdout: `<commit-id>`. If <rev> is a ref name the
+//!       workspace tracks it (`ws update` default).
+//!   ant ws update [--to <rev>]
+//!       Moves the workspace to <rev> (default: the tracked ref, else
+//!       `main`), carrying local edits over: paths changed on one side take
+//!       that side; text files changed on both get the server's 3-way land
+//!       merge. Overlapping edits are written with `<<<<<<< upstream`,
+//!       `||||||| base`, `=======`, `>>>>>>> local` markers; other
+//!       both-sides conflicts keep the local version. Conflicts are recorded
+//!       in the workspace. stdout: `updated <commit-id>`, then `C\t<path>` per
+//!       conflicted path (sorted); with conflicts exit 2 and a `hint:` on
+//!       stderr. Refused (exit 1) while conflicts are unresolved. Drops
+//!       `.ant/last_submit` when the base changes. Lazy workspaces switch
+//!       base and edits atomically (crash-safe); sparse ones only write paths
+//!       in their patterns.
+//!   ant ws resolve <path>...       marks conflicted paths resolved; refused
+//!       (exit 1) for a path that is not conflicted or still has a line
+//!       starting with `<<<<<<< ` or `>>>>>>> `. stdout: empty.
+//!   ant status                     `A|M|D|C\t<path>` (sorted); `C` = unresolved
+//!       conflict from `ws update` (replaces the path's A/M/D line)
 //!   ant submit -m <msg>            uploads changed blobs (PutObjects), then
 //!       CreateChangeset with base = workspace base commit and blob_id ops.
 //!       Records the id in `.ant/last_submit`. stdout: `<commit-id>`.
-//!       Nothing to submit: exit 1.
+//!       Nothing to submit, or unresolved conflicts: exit 1.
 //!   ant land [--ref main] [<commit>]   default commit = `.ant/last_submit`.
 //!       Landed: stdout `landed <new-tip-id>` (+ ` rebased` if rebased), then
 //!       resets the workspace to the new tip. Conflict: stdout `conflict`
 //!       followed by one path per line, exit code 2.
-//!       stderr then carries a `hint: ...` line on how to proceed.
+//!       stderr then carries a `hint: ...` line on how to proceed
+//!       (`ant ws update`, resolve, submit and land again).
 //!   ant mount <rev> <mountpoint>   read-only FUSE view, foreground until SIGINT/SIGTERM
 //!   ant admin reindex-acl <rev> --policy <file> [--full] [--history] <store flags>
 //!       Zone-tag objects for access control straight in the stores (after
@@ -52,7 +74,7 @@
 //! (servers running with `--policy`). `ant import --policy <file>` (or
 //! ANT_POLICY) zone-tags the imported history.
 //!
-//! Workspace commands (status/submit/land) find the workspace by walking up
+//! Workspace commands (status/submit/land/ws update/ws resolve) find the workspace by walking up
 //! from the current directory to the first dir containing `.ant/workspace`;
 //! `-C <dir>` overrides the starting directory.
 //!
@@ -99,6 +121,14 @@ fn hint_for(e: &anyhow::Error) -> Option<&'static str> {
         Some("list the existing refs with `ant ref list`")
     } else if first.starts_with("not inside an ant workspace") {
         Some("create one with `ant ws new <dir>`, or point at one with -C <dir>")
+    } else if first.starts_with("workspace has unresolved conflicts") {
+        Some("fix the files `ant status` marks C, then run `ant ws resolve <path>...`")
+    } else if first.ends_with("still contains conflict markers") {
+        Some("edit out the <<<<<<< ... >>>>>>> sections, then run `ant ws resolve` again")
+    } else if first.ends_with(" is not conflicted") {
+        Some("`ant status` lists the conflicted paths as `C<TAB><path>`")
+    } else if first.starts_with("non-fast-forward update of ref ") {
+        Some("pass --force to move it anyway; commits only the old target reaches leave the ref")
     } else {
         None
     }
@@ -155,6 +185,10 @@ mod tests {
         assert!(h(anyhow::anyhow!("ref x not found")).contains("ant ref list"));
         assert!(h(anyhow::anyhow!("not inside an ant workspace (no .ant)")).contains("ws new"));
         assert!(hint_for(&anyhow::anyhow!("something else")).is_none());
+        assert!(h(anyhow::anyhow!("workspace has unresolved conflicts: a")).contains("ws resolve"));
+        assert!(h(anyhow::anyhow!("a still contains conflict markers")).contains("ws resolve"));
+        assert!(h(anyhow::anyhow!("a is not conflicted")).contains("ant status"));
+        assert!(h(anyhow::anyhow!("non-fast-forward update of ref main: x")).contains("--force"));
     }
 
     #[test]
