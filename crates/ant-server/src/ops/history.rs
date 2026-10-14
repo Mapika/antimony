@@ -112,12 +112,22 @@ pub async fn is_first_parent_ancestor(
     if ancestor == descendant {
         return Ok(true);
     }
-    let Some(target) = b.meta.get_commits(&[ancestor]).await?.pop().flatten() else {
+    let [Some(target), Some(desc)] =
+        <[_; 2]>::try_from(b.meta.get_commits(&[ancestor, descendant]).await?)
+            .unwrap_or([None, None])
+    else {
         return Ok(false);
     };
+    // Generations strictly decrease along a chain: a newer `ancestor` (the
+    // common case of a tip ahead of a lagging watermark) needs no walk, and
+    // otherwise the walk is at most the generation gap long.
+    if desc.generation <= target.generation {
+        return Ok(false);
+    }
+    let gap = usize::try_from(desc.generation - target.generation).unwrap_or(usize::MAX);
     let mut from = descendant;
     loop {
-        let chunk = b.meta.first_parent_chain(from, Some(ancestor), CHUNK).await?;
+        let chunk = b.meta.first_parent_chain(from, Some(ancestor), CHUNK.min(gap)).await?;
         let Some(last) = chunk.last() else { return Ok(false) };
         match last.parents.first() {
             Some(p) if *p == ancestor => return Ok(true),
@@ -693,6 +703,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(path_log(&b, "main", u64::MAX, &a, 0).await.unwrap().len(), before.len());
+    }
+
+    #[tokio::test]
+    async fn first_parent_ancestry() {
+        let b = Backend::in_memory();
+        let c0 = commit(&b, None, vec![write("f", "0")]).await.unwrap();
+        land(&b, "main", c0).await.unwrap();
+        let mut chain = vec![c0];
+        for i in 1..6 {
+            chain.push(landed(&b, chain[i - 1], vec![write("f", &i.to_string())]).await);
+        }
+        let side = commit(&b, Some(chain[2]), vec![write("g", "x")]).await.unwrap();
+        for (i, a) in chain.iter().enumerate() {
+            for (j, d) in chain.iter().enumerate() {
+                assert_eq!(is_first_parent_ancestor(&b, *a, *d).await.unwrap(), i <= j, "{i} {j}");
+            }
+        }
+        assert!(is_first_parent_ancestor(&b, chain[2], side).await.unwrap());
+        assert!(!is_first_parent_ancestor(&b, chain[3], side).await.unwrap());
+        assert!(!is_first_parent_ancestor(&b, side, chain[5]).await.unwrap());
+        let unknown = ObjectId([9; 32]);
+        assert!(!is_first_parent_ancestor(&b, unknown, chain[5]).await.unwrap());
+        assert!(!is_first_parent_ancestor(&b, chain[0], unknown).await.unwrap());
     }
 
     /// A watermark trailing the tip (normal on a busy ref) still uses the
