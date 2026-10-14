@@ -12,6 +12,7 @@ mod checkout;
 mod fleet;
 mod import;
 mod json;
+mod replicas;
 mod util;
 
 use clap::{Parser, Subcommand};
@@ -32,6 +33,9 @@ enum Cmd {
     Fleet(fleet::Args),
     /// Time sparse workspace materialization cold and warm.
     Checkout(checkout::Args),
+    /// Run a server (same as `ant serve`); used by `soak` to spawn replicas.
+    #[command(hide = true)]
+    Serve(ant_server::serve::ServeArgs),
 }
 
 #[tokio::main]
@@ -56,5 +60,6 @@ async fn run() -> anyhow::Result<i32> {
         Cmd::Import(args) => import::run(args).await.map(|()| 0),
         Cmd::Fleet(args) => fleet::run(args).await,
         Cmd::Checkout(args) => checkout::run(args).await.map(|()| 0),
+        Cmd::Serve(args) => ant_server::serve::run(args).await.map(|()| 0),
     }
 }

@@ -100,6 +100,7 @@ dependencies = [
  "bytes",
  "clap",
  "rand 0.9.5",
+ "reqwest",
  "sqlx",
  "tokio",
  "tonic",
