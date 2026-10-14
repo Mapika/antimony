@@ -1,5 +1,8 @@
 # Running antimony
 
+For running a fleet in production (sizing, alerts, failure runbook), see the
+[operator guide](operator-guide.md).
+
 ## Components
 
 | process | role | state |
