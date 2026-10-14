@@ -1,8 +1,8 @@
 //! Property tests for the object codecs: decoders never panic on hostile
 //! input, and encode/decode roundtrip for every valid value.
 //!
-//! Tests carrying `#[ignore = "BUG: ..."]` document real defects found by
-//! these properties; each has a minimized plain regression test next to it.
+//! The `regression_*` tests are minimized cases of defects these properties
+//! once found (all fixed); they pin the fixes.
 
 use ant_core::{
     Commit, EncodedObject, EntryMode, Object, ObjectId, ObjectKind, Signature, Tree, TreeEntry,

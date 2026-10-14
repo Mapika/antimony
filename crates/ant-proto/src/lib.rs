@@ -32,6 +32,12 @@ pub fn entry_mode(mode: v1::EntryMode) -> Option<ant_core::EntryMode> {
     })
 }
 
+/// The core mode of a protobuf mode field's raw value; `None` for unknown
+/// values and `ENTRY_MODE_UNSPECIFIED`.
+pub fn entry_mode_from_i32(mode: i32) -> Option<ant_core::EntryMode> {
+    v1::EntryMode::try_from(mode).ok().and_then(entry_mode)
+}
+
 impl From<&ant_core::Signature> for v1::Signature {
     fn from(s: &ant_core::Signature) -> Self {
         v1::Signature {
@@ -51,5 +57,26 @@ impl From<v1::Signature> for ant_core::Signature {
             time: s.time,
             tz_offset_minutes: s.tz_offset_minutes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_modes_round_trip_and_reject_unknown_values() {
+        for mode in [
+            ant_core::EntryMode::File,
+            ant_core::EntryMode::Executable,
+            ant_core::EntryMode::Symlink,
+            ant_core::EntryMode::Tree,
+            ant_core::EntryMode::Gitlink,
+        ] {
+            assert_eq!(entry_mode_from_i32(v1::EntryMode::from(mode) as i32), Some(mode));
+        }
+        assert_eq!(entry_mode_from_i32(v1::EntryMode::Unspecified as i32), None);
+        assert_eq!(entry_mode_from_i32(-1), None);
+        assert_eq!(entry_mode_from_i32(1000), None);
     }
 }
