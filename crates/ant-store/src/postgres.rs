@@ -21,7 +21,8 @@
 //! - `get_many`/`has_many` are one round trip each (`WHERE id = ANY($1)`).
 //! - Pool: `sqlx::postgres::PgPoolOptions` (default 64 connections; with
 //!   fewer, 64 concurrent agents queue on it), with `search_path` set to
-//!   the schema on every connection (`after_connect`). [`PgStore::connect_with`]
+//!   the schema on every connection (`after_connect`) and JIT compilation
+//!   off (`SESSION_SETTINGS`). [`PgStore::connect_with`]
 //!   sets the limits ([`PgOptions`]) so several server processes fit under
 //!   the database's `max_connections`.
 //! - `lock_ref`: a session-level `pg_advisory_lock` on a hash of
@@ -213,6 +214,23 @@ fn quote_ident(name: &str) -> String {
 
 fn be(e: impl std::error::Error + Send + Sync + 'static) -> StoreError {
     StoreError::backend(e)
+}
+
+/// Session settings of every store connection (sent in the startup packet:
+/// no extra round trip).
+///
+/// - `jit = off`: the store's statements are index lookups and bounded
+///   graph walks that run in about a millisecond, but the planner cannot
+///   size recursive walks (`ancestors_above` is estimated at over a million
+///   cost units whatever its limit), which crosses `jit_above_cost` and the
+///   inline/optimize thresholds. On a server built with LLVM (e.g. the
+///   official Docker image) every such call then compiled the query first:
+///   about 80 ms per call instead of 0.5 ms.
+const SESSION_SETTINGS: [(&str, &str); 1] = [("jit", "off")];
+
+/// Connect options for the store's pools: `url` plus [`SESSION_SETTINGS`].
+fn connect_options(url: &str) -> Result<sqlx::postgres::PgConnectOptions> {
+    Ok(url.parse::<sqlx::postgres::PgConnectOptions>().map_err(be)?.options(SESSION_SETTINGS))
 }
 
 fn change_kind_from_code(c: i16) -> Result<ChangeKind> {
@@ -540,8 +558,7 @@ impl PgStore {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(std::time::Duration::from_secs(30))
-            .connect_lazy(url)
-            .map_err(be)?;
+            .connect_lazy_with(connect_options(url)?);
         Ok(Self {
             feed: notify::PgFeed::new(url, schema, pool.clone()),
             pool,
@@ -575,7 +592,7 @@ impl PgStore {
                     Ok(())
                 })
             })
-            .connect(url)
+            .connect_with(connect_options(url)?)
             .await
             .map_err(be)?;
 
@@ -584,7 +601,7 @@ impl PgStore {
         let lock_timeout = format!("SET lock_timeout = {}", options.lock_timeout.as_millis());
         let locks = (options.lock_connections > 0)
             .then(|| {
-                sqlx::postgres::PgPoolOptions::new()
+                let pool = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(options.lock_connections)
                     .min_connections(0)
                     .idle_timeout(Some(std::time::Duration::from_secs(60)))
@@ -598,8 +615,8 @@ impl PgStore {
                             Ok(())
                         })
                     })
-                    .connect_lazy(url)
-                    .map_err(be)
+                    .connect_lazy_with(connect_options(url)?);
+                Ok::<_, StoreError>(pool)
             })
             .transpose()?;
 
@@ -1706,6 +1723,51 @@ mod tests {
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_ancestors_above_conforms() {
         conformance::ancestors_above(Arc::new(fresh().await)).await;
+    }
+
+    /// Every store connection runs with JIT compilation off: on servers
+    /// built with LLVM, the over-estimated recursive walks (`ancestors_above`)
+    /// otherwise compile each query first, ~80 ms per call instead of
+    /// ~0.5 ms (it made the Postgres ancestry property test time out in CI).
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_store_sessions_do_not_jit() {
+        let s = fresh().await;
+        let show = "SHOW jit";
+        let jit: String = sqlx::query_scalar(show).fetch_one(&s.pool).await.unwrap();
+        assert_eq!(jit, "off");
+        let locks = s.locks.as_ref().expect("lock pool");
+        let jit: String = sqlx::query_scalar(show).fetch_one(locks).await.unwrap();
+        assert_eq!(jit, "off");
+        // Whatever the server's JIT support: the walk's plan carries no JIT.
+        let [a, b] = [1u8, 2].map(|i| ObjectId([i; 32]));
+        let node = |id, parents: Vec<ObjectId>, generation| CommitNode {
+            id,
+            tree: ObjectId([0; 32]),
+            parents,
+            generation,
+            committer_time: 0,
+        };
+        s.put_commit(node(a, vec![], 1), vec![]).await.unwrap();
+        s.put_commit(node(b, vec![a], 2), vec![]).await.unwrap();
+        let mut tx = s.pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL jit_above_cost = 0").execute(&mut *tx).await.unwrap();
+        let plan: Vec<String> = sqlx::query_scalar(
+            "EXPLAIN (ANALYZE, VERBOSE) \
+             WITH RECURSIVE walk(id, parents) AS ( \
+                 SELECT id, parents FROM commits WHERE id = $1 \
+                 UNION \
+                 SELECT c.id, c.parents FROM walk w \
+                   JOIN commits c ON c.id = substring(w.parents from 1 for 32)) \
+             SELECT count(*) FROM walk",
+        )
+        .bind(b.as_bytes().as_slice())
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+        assert!(!plan.iter().any(|l| l.starts_with("JIT")), "{plan:#?}");
+        assert_eq!(s.ancestors_above(&[b], 0, 10).await.unwrap().len(), 2);
     }
 
     /// Concurrent batches sharing objects in opposite orders used to deadlock
