@@ -13,6 +13,7 @@ mod fleet;
 mod import;
 mod json;
 mod replicas;
+mod s3clean;
 mod util;
 
 use clap::{Parser, Subcommand};

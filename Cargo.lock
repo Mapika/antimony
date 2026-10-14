@@ -97,6 +97,7 @@ dependencies = [
  "antd",
  "anyhow",
  "async-trait",
+ "aws-sdk-s3",
  "bytes",
  "clap",
  "rand 0.9.5",
