@@ -194,9 +194,12 @@ async fn indexed_path_log(
     path: &RepoPath,
     limit: usize,
 ) -> Option<Vec<LogEntry>> {
-    let ref_name = history::indexed_ref_for(b, rev, tip).await.ok()??;
-    let generation = node(b, tip).await.ok()?.generation;
-    history::path_log(b, &ref_name, generation, path, limit).await.ok()
+    if let Some(ref_name) = history::indexed_ref_for(b, rev, tip).await.ok()? {
+        let generation = node(b, tip).await.ok()?.generation;
+        return history::path_log(b, &ref_name, generation, path, limit).await.ok();
+    }
+    // A busy ref's index trails its tip: scan just the unindexed commits.
+    history::lagging_path_log(b, rev, tip, path, limit).await.ok()?
 }
 
 pub async fn diff(b: &Backend, from: Option<&str>, to: &str) -> OpResult<Vec<PathChange>> {

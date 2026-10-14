@@ -269,8 +269,9 @@ async fn agent(
         if pick < 35 {
             let mut ops = Vec::new();
             let mut written = Vec::new();
-            for _ in 0..rng.random_range(1..=2) {
-                let path = format!("{dir}/f{}.txt", rng.random_range(0..FILES_PER_AGENT));
+            let first = rng.random_range(0..FILES_PER_AGENT);
+            for k in 0..rng.random_range(1..=2) {
+                let path = format!("{dir}/f{}.txt", (first + k) % FILES_PER_AGENT);
                 let content = format!("agent={i} seq={seq}\n").into_bytes();
                 ops.push(write_op(path.clone(), content.clone()));
                 written.push((path, content));
