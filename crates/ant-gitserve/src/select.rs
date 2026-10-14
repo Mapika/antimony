@@ -6,10 +6,11 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
 };
 
-use ant_core::{EntryMode, ObjectId, ObjectKind};
+use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind};
 use ant_store::{Backend, CommitNode};
 use anyhow::{Result, anyhow, bail, ensure};
 
+/// Ids per store call when reading commit metadata and checking `have`s.
 pub const BATCH: usize = 512;
 /// Trees per read, and reads in flight, while planning.
 const TREE_BATCH: usize = 256;
@@ -21,7 +22,8 @@ const ROOT_PATH: u64 = 1;
 
 /// One object of the pack plan: its id, a fingerprint of the path it was
 /// first reached at, and the uncompressed size when planning read the body
-/// (trees; 0 for commits and blobs, which planning never reads).
+/// (trees and directly wanted blobs; 0 for commits and blobs reached through
+/// trees, which planning never reads).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Planned {
     pub id: ObjectId,
@@ -181,7 +183,7 @@ impl Walk {
     fn visit(
         &mut self,
         batch: Vec<(ObjectId, u64)>,
-        objects: Vec<Option<ant_core::EncodedObject>>,
+        objects: Vec<Option<EncodedObject>>,
     ) -> Result<()> {
         ensure!(objects.len() == batch.len(), "incomplete tree batch");
         for ((id, path), object) in batch.into_iter().zip(objects) {
@@ -217,7 +219,7 @@ impl Walk {
 /// Aborts a spawned read when planning stops early (error or disconnect).
 struct Read(tokio::task::JoinHandle<Result<TreeBatch>>);
 
-type TreeBatch = (Vec<(ObjectId, u64)>, Vec<Option<ant_core::EncodedObject>>);
+type TreeBatch = (Vec<(ObjectId, u64)>, Vec<Option<EncodedObject>>);
 
 impl Drop for Read {
     fn drop(&mut self) {
@@ -270,6 +272,14 @@ async fn trees(
     }
     Ok(walk.ordered)
 }
+
+/// Plan the pack for `fetch`: walk the commits from the wants (level by
+/// level, `BATCH` at a time, up to `depth` for shallow fetches, recording the
+/// new shallow and unshallow boundaries), then every tree and blob (unless
+/// `blob:none`) reachable from their root trees and not from the client's
+/// `have`s, so the client receives exactly what it lacks. Objects come out
+/// grouped by path fingerprint, largest first within a path, for the delta
+/// search.
 pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
     let mut known = Known::default();
     known.add(b, &fetch.haves).await?;

@@ -53,6 +53,11 @@ const WINDOW: usize = 10;
 const WINDOW_BYTES: usize = 16 << 20;
 /// zlib level of every entry (git's default `core.compression`).
 const LEVEL: u32 = 6;
+/// Pack entry types (git's `object_type`).
+const OBJ_COMMIT: u8 = 1;
+const OBJ_TREE: u8 = 2;
+const OBJ_BLOB: u8 = 3;
+const OBJ_OFS_DELTA: u8 = 6;
 
 struct PackWriter {
     tx: Sender<Chunk>,
@@ -248,14 +253,14 @@ fn encode_segment(work: Work) -> io::Result<Segment> {
         let (kind, size, base, depth) = match &best {
             Some((delta, base, depth)) => {
                 encoder.write_all(delta)?;
-                (6, delta.len(), Some(*base), *depth)
+                (OBJ_OFS_DELTA, delta.len(), Some(*base), *depth)
             }
             None => {
                 encoder.write_all(object.body())?;
                 let kind = match object.kind() {
-                    ObjectKind::Commit => 1,
-                    ObjectKind::Tree => 2,
-                    ObjectKind::Blob => 3,
+                    ObjectKind::Commit => OBJ_COMMIT,
+                    ObjectKind::Tree => OBJ_TREE,
+                    ObjectKind::Blob => OBJ_BLOB,
                 };
                 (kind, object.body().len(), None, 0)
             }

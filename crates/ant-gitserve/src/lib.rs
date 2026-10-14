@@ -80,7 +80,10 @@ async fn upload(State(backend): State<Backend>, headers: HeaderMap, body: Bytes)
     match request.command {
         "ls-refs" => match refs(&backend, &request.args).await {
             Ok(body) => response(body, false),
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            Err(error) => {
+                tracing::warn!(error = format!("{error:#}"), "git ls-refs failed");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
         },
         "fetch" => {
             let fetch = match Fetch::parse(&request.args) {
@@ -90,7 +93,7 @@ async fn upload(State(backend): State<Backend>, headers: HeaderMap, body: Bytes)
             match fetch_response(backend, fetch).await {
                 Ok(response) => response,
                 Err(error) => {
-                    tracing::warn!(error = format!("{error:?}"), "git fetch failed");
+                    tracing::warn!(error = format!("{error:#}"), "git fetch failed");
                     StatusCode::INTERNAL_SERVER_ERROR.into_response()
                 }
             }
@@ -185,7 +188,7 @@ async fn fetch_response(b: Backend, fetch: Fetch) -> Result<Response> {
                 "git pack sent"
             ),
             Err(error) => {
-                tracing::warn!(%error, "git pack failed");
+                tracing::warn!(error = format!("{error:#}"), "git pack failed");
                 let _ = tx.send(Err(std::io::Error::other(error.to_string()))).await;
             }
         }
