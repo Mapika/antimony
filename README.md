@@ -215,13 +215,12 @@ process. `--pg-lock-timeout` (default `10s`) bounds the wait for a ref lock. `an
 
 ## Status
 
-Early prototype, built in the open with AI agents. Working end to end against
-real Postgres + S3 (see `crates/ant-cli/tests/e2e.rs`), with property-based
-tests for codecs, changeset construction and concurrent landing.
-
-Also implemented: indexed path history and blame, and writable lazy
-workspaces (`ant ws new --lazy`, FUSE copy-on-write). In progress: scale
-benchmarks (`ant-bench`: fleet load generator, large-repo import, checkout).
+Pre-1.0 (v0.1), built in the open with AI agents. Every capability above is
+covered end to end against real Postgres + S3 and FUSE, with property tests
+for codecs, changeset construction, landing (single and multi-replica) and
+garbage collection. Measured performance is in `docs/scorecard/`; open work
+and known limitations are in `ROADMAP.md` and `CHANGELOG.md`; compatibility
+guarantees are in `docs/compatibility.md`.
 
 ## Access control and threat model
 

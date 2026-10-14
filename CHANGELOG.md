@@ -188,8 +188,6 @@ scorecard before relying on those landing numbers.
   work). Workspaces of principals who cannot read everything must be sparse
   around restricted paths, and principals sharing a cache directory share
   what it holds.
-- **Submit after cache eviction.** A staged blob evicted from the client cache
-  before `ant submit` is not yet re-read from the workspace (queued fix).
 
 [Unreleased]: https://github.com/Mapika/antimony/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/Mapika/antimony/releases/tag/v0.1.0
