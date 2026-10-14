@@ -1,61 +1,94 @@
-//! Import existing git repositories (SHA-1 or SHA-256) into antimony.
+//! Import existing git repositories (SHA-1) into antimony.
 //!
-//! - [`import`] opens the repo with `gix`. For each `(git_ref, ant_ref)` in
-//!   `opts.refs` it converts every commit reachable from the git ref that is
-//!   not yet imported, parents first (topological order).
+//! - Open the repo with `gix`. For each `(git_ref, ant_ref)` in
+//!   `opts.refs`, collect all commits reachable from the git ref that are
+//!   not yet imported, and convert them parents-first (topological order).
 //! - Conversion rewrites object ids to SHA-256 git objects
 //!   (`ant_core::{Tree, Commit}`) while preserving everything else byte for
 //!   byte: tree entry names/modes, commit author/committer/time zones,
 //!   extra headers (e.g. `encoding`, `mergetag`, `gpgsig`) and messages
 //!   (raw bytes: names and messages need not be UTF-8). The result equals
 //!   what `git fast-export | git fast-import` into a
-//!   `--object-format=sha256` repo produces for unsigned commits (the tests
-//!   check every commit id).
-//! - SHA-1→SHA-256 ids of trees and blobs are memoized within a run
-//!   (identical subtrees are converted once). The commit mapping persists in
-//!   `MetaStore` derived data, kind `"git-import/commit/v1"`, key = source
-//!   commit id bytes, value = 32-byte antimony id — this makes re-imports
-//!   incremental (already-imported commits are skipped without reading
-//!   their trees).
-//! - Objects are written in batches (`opts.batch_objects` per `put_many`,
-//!   several batches in flight); each batch's commits are recorded (generation and
-//!   changeset computed by the producer from its own conversion state, no
-//!   tree re-reads) with one `put_commits` once the batch's objects and
-//!   those of all earlier batches are stored.
-//! - Finally each `ant_ref` points at the converted tip via `cas_ref`
+//!   `--object-format=sha256` repo produces for unsigned commits (the test
+//!   checks every commit id).
+//! - The commit mapping is persisted in `MetaStore` derived data, kind
+//!   `"git-import/commit/v1"`, key = source commit id bytes, value = 32-byte
+//!   antimony id — this makes re-imports incremental (already-imported
+//!   commits are skipped without reading their trees).
+//! - Finally each `ant_ref` is pointed at the converted tip via `cas_ref`
 //!   (expected = current value; it's an import tool, not concurrent).
-//! - gix is synchronous: git reading runs inside `spawn_blocking`, streaming
-//!   converted objects to the async writer through a bounded channel, so
-//!   memory stays bounded on big repos.
-//! - Non-UTF-8 tree entry names → error naming the path and commit. Commit
-//!   text is carried as raw bytes.
-//! - Stats count objects actually written (not skipped). When no
-//!   previously imported commit is found the target is assumed empty and the
-//!   existence check is skipped (re-puts are idempotent), so stats then count
-//!   every converted object.
+//! - Stats count objects actually written (not skipped). When no previously
+//!   imported commit is found the target is assumed empty and the existence
+//!   check is skipped (re-puts are idempotent), so stats then count every
+//!   converted object.
+//!
+//! # Pipeline
+//!
+//! ```text
+//!  discover ──► N prep workers ──(in order)──► converter ──► writer ──► store
+//!  (graph)      read/diff/parse/hash           memo, trees    batched    objects,
+//!                                              commits        put_many   commits
+//! ```
+//!
+//! 1. `graph`: walks the history once (commit headers only, read in parallel),
+//!    asks the store which commits are already imported, and orders the rest
+//!    parents-first. The graph is a handful of flat arrays (about 100 bytes per
+//!    commit).
+//! 2. `prep`: workers (each with its own git handle) take chunks of that order
+//!    and do everything that needs only source objects: parse the commit, diff
+//!    its tree against its parents' trees, read and hash the blobs it
+//!    introduces and parse the changed trees. Nothing is shared between
+//!    workers, so this scales with cores.
+//! 3. `convert`: one thread consumes the prepared commits in order, maps source
+//!    ids to antimony ids through a bounded memo (`memo`), encodes and hashes
+//!    the rewritten trees and the commit, and computes generations and
+//!    changesets from the workers' diffs (no tree re-reads).
+//! 4. The async writer stores each batch's objects concurrently (bounded by
+//!    bytes in flight) and records commits strictly in order, only after the
+//!    objects of their batch and all earlier ones are stored.
+//!
+//! Memory is flat in the length of the history: the memo is a fixed-size cache
+//! (a miss just converts the object again, with identical output), the caches
+//! are byte-bounded, and in-flight data is bounded by bytes. The only per-commit
+//! state is the graph and the commit-id table. Mapped pack pages are released
+//! periodically (`rss`).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+mod commit;
+mod convert;
+mod graph;
+mod memo;
+mod prep;
+mod read;
+mod rss;
+mod tree;
+
 use std::path::Path;
 use std::sync::Arc;
 
-use ant_core::{
-    Commit, EncodedObject, EntryMode, ObjectId, ObjectKind, RepoPath, Signature, Tree, TreeEntry,
-};
-use ant_store::{Backend, CasOutcome, ChangeKind, CommitNode, PathChange};
+use ant_core::ObjectId;
+use ant_store::{Backend, CasOutcome, CommitNode, PathChange};
 use anyhow::{Context as _, anyhow, bail};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
-/// Derived-data kind mapping a source commit id to its antimony commit id.
-const COMMIT_KIND: &str = "git-import/commit/v1";
+use crate::convert::{Converter, Sink};
+use crate::graph::{COMMIT_KIND, discover};
+use crate::memo::Memo;
+use crate::prep::Pipeline;
+use crate::read::Reader;
 
-/// Batches of objects stored concurrently (commits are still recorded in order).
-const BATCHES_IN_FLIGHT: usize = 4;
-/// Rotate the parsed-tree cache after this many entries per generation.
-const TREE_CACHE_ENTRIES: usize = 400_000;
-/// Commits per incremental pre-check query: starts small, doubles up to the cap.
-const PRECHECK_START: usize = 64;
-const PRECHECK_MAX: usize = 8192;
+/// Bytes of object batches stored concurrently (commits are still recorded in order).
+const INFLIGHT_BYTES: usize = 128 << 20;
+/// Batches queued between the object writers and the in-order commit recorder.
+const RECORD_QUEUE: usize = 64;
+/// Commits recorded per `put_commits`: batches are merged up to this size.
+const RECORD_COMMITS: usize = 1500;
+/// Resident file-backed memory above which mapped packs are released.
+const PACK_RSS_LIMIT: usize = 96 << 20;
+/// Delta-base cache per git handle (one per worker thread).
+const DELTA_CACHE_BYTES: usize = 16 << 20;
+/// Largest memo, in objects (56 bytes each).
+const MEMO_MAX_ENTRIES: usize = 1 << 21;
 
 #[derive(Debug, Clone)]
 pub struct ImportOptions {
@@ -77,35 +110,67 @@ pub struct ImportStats {
     pub blobs: u64,
 }
 
+/// Knobs for benchmarking and tests; the defaults suit production. Environment:
+/// `ANT_IMPORT_WORKERS`, `ANT_IMPORT_MEMO_ENTRIES`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Tuning {
+    pub workers: Option<usize>,
+    pub memo_entries: Option<usize>,
+}
+
+impl Tuning {
+    fn from_env() -> Self {
+        let get = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok());
+        Self { workers: get("ANT_IMPORT_WORKERS"), memo_entries: get("ANT_IMPORT_MEMO_ENTRIES") }
+    }
+
+    fn workers(&self) -> usize {
+        self.workers.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(4, |n| n.get())
+                .saturating_sub(2)
+                .clamp(2, 8)
+        })
+    }
+}
+
 /// A converted commit ready to be recorded.
-struct NewCommit {
-    node: CommitNode,
-    changes: Vec<PathChange>,
+pub(crate) struct NewCommit {
+    pub node: CommitNode,
+    pub changes: Vec<PathChange>,
     /// Source commit id (key of the derived mapping).
-    git: gix::ObjectId,
+    pub git: gix::ObjectId,
 }
 
 /// Producer → writer messages. Objects always precede the commits that
 /// reference them, so the writer can store a batch and then record its
 /// commits parents-first.
-enum Msg {
+pub(crate) enum Msg {
     Batch {
-        objects: Vec<EncodedObject>,
+        objects: Vec<ant_core::EncodedObject>,
+        bytes: usize,
         commits: Vec<NewCommit>,
         /// Ask the store which objects exist (needed for exact stats on
         /// incremental imports); skipped on fresh imports.
         check_present: bool,
     },
-    Tip {
-        ant_ref: String,
-        id: ObjectId,
-    },
+    /// Point `ant_ref` at `id` once everything before is recorded, then ack.
+    Tip { ant_ref: String, id: ObjectId, ack: std::sync::mpsc::SyncSender<()> },
 }
 
 pub async fn import(
     repo: &Path,
     backend: &Backend,
     opts: &ImportOptions,
+) -> anyhow::Result<ImportStats> {
+    import_tuned(repo, backend, opts, Tuning::from_env()).await
+}
+
+pub(crate) async fn import_tuned(
+    repo: &Path,
+    backend: &Backend,
+    opts: &ImportOptions,
+    tuning: Tuning,
 ) -> anyhow::Result<ImportStats> {
     let batch_objects = opts.batch_objects.max(1);
     let (tx, rx) = mpsc::channel::<Msg>(4);
@@ -115,7 +180,7 @@ pub async fn import(
         let refs = opts.refs.clone();
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            produce(&repo, backend, handle, &refs, batch_objects, tx)
+            produce(&repo, backend, handle, &refs, batch_objects, tx, &tuning)
         })
     };
     let mut stats = ImportStats::default();
@@ -137,28 +202,94 @@ struct Counts {
     blobs: u64,
 }
 
-type InFlight = VecDeque<(JoinHandle<anyhow::Result<Counts>>, Vec<NewCommit>)>;
+enum Item {
+    Batch(JoinHandle<anyhow::Result<Counts>>, Vec<NewCommit>),
+    Tip { ant_ref: String, id: ObjectId, ack: std::sync::mpsc::SyncSender<()> },
+}
 
 async fn write(
     backend: &Backend,
     mut rx: mpsc::Receiver<Msg>,
     stats: &mut ImportStats,
 ) -> anyhow::Result<()> {
-    let mut inflight: InFlight = VecDeque::new();
+    let (rec_tx, rec_rx) = mpsc::channel::<Item>(RECORD_QUEUE);
+    let recorder = tokio::spawn(record(backend.clone(), rec_rx));
+    let budget = Arc::new(Semaphore::new(INFLIGHT_BYTES >> 20));
     while let Some(msg) = rx.recv().await {
-        match msg {
-            Msg::Batch { objects, commits, check_present } => {
+        let item = match msg {
+            Msg::Batch { objects, bytes, commits, check_present } => {
+                let mb = ((bytes >> 20) + 1).min(INFLIGHT_BYTES >> 20) as u32;
+                let permit = budget.clone().acquire_many_owned(mb).await?;
                 let b = backend.clone();
-                let task =
-                    tokio::spawn(async move { store_objects(&b, objects, check_present).await });
-                inflight.push_back((task, commits));
-                while inflight.len() > BATCHES_IN_FLIGHT {
-                    finish_batch(backend, &mut inflight, stats).await?;
+                let task = tokio::spawn(async move {
+                    let _permit = permit;
+                    store_objects(&b, objects, check_present).await
+                });
+                Item::Batch(task, commits)
+            }
+            Msg::Tip { ant_ref, id, ack } => Item::Tip { ant_ref, id, ack },
+        };
+        if rec_tx.send(item).await.is_err() {
+            break; // the recorder stopped; its error is reported below
+        }
+    }
+    drop(rec_tx);
+    *stats = recorder.await.context("commit recorder")??;
+    Ok(())
+}
+
+/// Record commits in order: wait for each batch's objects, merge small
+/// batches, and keep the derived mapping one step behind so it overlaps the
+/// next commit write. A mapping is only written after its commits.
+async fn record(backend: Backend, mut rx: mpsc::Receiver<Item>) -> anyhow::Result<ImportStats> {
+    let mut stats = ImportStats::default();
+    let mut pending: Vec<NewCommit> = Vec::new();
+    let mut mapping_task: Option<JoinHandle<anyhow::Result<()>>> = None;
+
+    async fn flush(
+        backend: &Backend,
+        pending: &mut Vec<NewCommit>,
+        mapping_task: &mut Option<JoinHandle<anyhow::Result<()>>>,
+        stats: &mut ImportStats,
+    ) -> anyhow::Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut mapping = Vec::with_capacity(pending.len());
+        let mut records = Vec::with_capacity(pending.len());
+        for c in pending.drain(..) {
+            mapping.push((c.git.as_slice().to_vec(), c.node.id.as_bytes().to_vec().into()));
+            records.push((c.node, c.changes));
+        }
+        stats.commits += records.len() as u64;
+        backend.meta.put_commits(records).await?;
+        if let Some(prev) = mapping_task.take() {
+            prev.await.context("mapping writer")??;
+        }
+        let meta = backend.meta.clone();
+        *mapping_task = Some(tokio::spawn(async move {
+            // After the commits: a mapping must never point at an unrecorded commit.
+            meta.put_derived_many(COMMIT_KIND, mapping).await?;
+            Ok(())
+        }));
+        Ok(())
+    }
+
+    while let Some(item) = rx.recv().await {
+        match item {
+            Item::Batch(task, commits) => {
+                let counts = task.await.context("object writer task")??;
+                stats.trees += counts.trees;
+                stats.blobs += counts.blobs;
+                pending.extend(commits);
+                if pending.len() >= RECORD_COMMITS {
+                    flush(&backend, &mut pending, &mut mapping_task, &mut stats).await?;
                 }
             }
-            Msg::Tip { ant_ref, id } => {
-                while !inflight.is_empty() {
-                    finish_batch(backend, &mut inflight, stats).await?;
+            Item::Tip { ant_ref, id, ack } => {
+                flush(&backend, &mut pending, &mut mapping_task, &mut stats).await?;
+                if let Some(prev) = mapping_task.take() {
+                    prev.await.context("mapping writer")??;
                 }
                 let expected = backend.refs.get_ref(&ant_ref).await?;
                 match backend.refs.cas_ref(&ant_ref, expected, Some(id)).await? {
@@ -167,57 +298,30 @@ async fn write(
                         bail!("ref {ant_ref} changed during import (now {actual:?})")
                     }
                 }
+                let _ = ack.send(());
             }
         }
     }
-    while !inflight.is_empty() {
-        finish_batch(backend, &mut inflight, stats).await?;
+    flush(&backend, &mut pending, &mut mapping_task, &mut stats).await?;
+    if let Some(prev) = mapping_task.take() {
+        prev.await.context("mapping writer")??;
     }
-    Ok(())
-}
-
-/// Wait for the oldest batch's objects, then record its commits. Batches
-/// complete strictly in order, so a commit is only recorded once everything it
-/// can reference is stored.
-async fn finish_batch(
-    backend: &Backend,
-    inflight: &mut InFlight,
-    stats: &mut ImportStats,
-) -> anyhow::Result<()> {
-    let Some((task, commits)) = inflight.pop_front() else {
-        return Ok(());
-    };
-    let counts = task.await.context("object writer task")??;
-    stats.trees += counts.trees;
-    stats.blobs += counts.blobs;
-    if commits.is_empty() {
-        return Ok(());
-    }
-    let mut mapping = Vec::with_capacity(commits.len());
-    let mut records = Vec::with_capacity(commits.len());
-    for c in commits {
-        mapping.push((c.git.as_slice().to_vec(), c.node.id.as_bytes().to_vec().into()));
-        records.push((c.node, c.changes));
-    }
-    stats.commits += records.len() as u64;
-    backend.meta.put_commits(records).await?;
-    // After the commits: a mapping must never point at an unrecorded commit.
-    backend.meta.put_derived_many(COMMIT_KIND, mapping).await?;
-    Ok(())
+    Ok(stats)
 }
 
 /// Store the objects the target does not already hold; only those are counted.
 async fn store_objects(
     backend: &Backend,
-    objects: Vec<EncodedObject>,
+    objects: Vec<ant_core::EncodedObject>,
     check_present: bool,
 ) -> anyhow::Result<Counts> {
+    use ant_core::ObjectKind;
     let mut counts = Counts::default();
     if objects.is_empty() {
         return Ok(counts);
     }
-    let missing = if check_present {
-        let ids: Vec<ObjectId> = objects.iter().map(EncodedObject::id).collect();
+    let missing: Vec<_> = if check_present {
+        let ids: Vec<ObjectId> = objects.iter().map(|o| o.id()).collect();
         let present = backend.objects.has_many(&ids).await?;
         objects.into_iter().zip(present).filter_map(|(o, p)| (!p).then_some(o)).collect()
     } else {
@@ -247,520 +351,96 @@ fn produce(
     refs: &[(String, String)],
     batch_objects: usize,
     tx: mpsc::Sender<Msg>,
+    tuning: &Tuning,
 ) -> anyhow::Result<()> {
-    let repo = gix::open(repo_path)
+    // Every thread has its own handle, each with a delta-base cache that
+    // defaults to ~100 MiB: bound it so memory does not scale with threads.
+    let options = gix::open::Options::default()
+        .config_overrides([format!("gitoxide.core.deltaBaseCacheLimit={DELTA_CACHE_BYTES}")]);
+    let repo = gix::open_opts(repo_path, options)
         .with_context(|| format!("opening git repo {}", repo_path.display()))?;
-    let mut p = Producer {
-        repo,
-        backend,
-        handle,
-        tx,
-        batch_objects,
-        objects: Vec::new(),
-        commits: Vec::new(),
-        memo: HashMap::new(),
-        infos: HashMap::new(),
-        trees: TreeCache::default(),
-        incremental: false,
-        current: None,
-        empty: Arc::new(Vec::new()),
-    };
+    if repo.object_hash() != gix::hash::Kind::Sha1 {
+        bail!("only SHA-1 source repositories are supported");
+    }
+    let sync = repo.into_sync();
+    rss::limit_arenas();
+    let workers = tuning.workers();
+    let progress = std::env::var_os("ANT_IMPORT_STATS").is_some();
+    let mut sink = Some(Sink::new(tx, batch_objects));
+    let mut memo: Option<Memo> = None;
     for (git_ref, ant_ref) in refs {
-        let tip = p.resolve(git_ref)?;
-        p.discover(tip)?;
-        p.walk(tip)?;
-        let id = p.known_commit(tip).ok_or_else(|| anyhow!("{git_ref} was not converted"))?;
-        p.send_batch()?;
-        p.send(Msg::Tip { ant_ref: ant_ref.clone(), id })?;
-    }
-    p.send_batch()
-}
-
-/// One parsed tree entry (names already checked to be UTF-8).
-struct RawEntry {
-    mode: EntryMode,
-    name: String,
-    child: gix::ObjectId,
-}
-
-type Entries = Arc<Vec<RawEntry>>;
-
-/// Two-generation cache of parsed source trees, bounded by entry count.
-#[derive(Default)]
-struct TreeCache {
-    hot: HashMap<gix::ObjectId, Entries>,
-    cold: HashMap<gix::ObjectId, Entries>,
-    hot_entries: usize,
-}
-
-impl TreeCache {
-    fn get(&mut self, id: &gix::ObjectId) -> Option<Entries> {
-        if let Some(e) = self.hot.get(id) {
-            return Some(e.clone());
-        }
-        let e = self.cold.remove(id)?;
-        self.insert(*id, e.clone());
-        Some(e)
-    }
-
-    fn insert(&mut self, id: gix::ObjectId, entries: Entries) {
-        if self.hot_entries >= TREE_CACHE_ENTRIES {
-            self.cold = std::mem::take(&mut self.hot);
-            self.hot_entries = 0;
-        }
-        self.hot_entries += entries.len() + 1;
-        self.hot.insert(id, entries);
-    }
-}
-
-/// What the producer remembers about a converted (or known) commit.
-#[derive(Clone, Copy)]
-struct CommitInfo {
-    /// Source root tree.
-    git_tree: gix::ObjectId,
-    generation: u64,
-}
-
-struct Producer {
-    repo: gix::Repository,
-    backend: Backend,
-    handle: tokio::runtime::Handle,
-    tx: mpsc::Sender<Msg>,
-    batch_objects: usize,
-    /// Converted objects not yet sent to the writer.
-    objects: Vec<EncodedObject>,
-    /// Converted commits not yet sent to the writer (parents-first order).
-    commits: Vec<NewCommit>,
-    /// SHA-1 (source) → SHA-256 (antimony) for trees, blobs and commits
-    /// converted during this run, plus commits found already imported.
-    memo: HashMap<gix::ObjectId, ObjectId>,
-    /// Source commit → tree and generation, for first-parent changesets.
-    infos: HashMap<gix::ObjectId, CommitInfo>,
-    trees: TreeCache,
-    /// A previously imported commit was found: the target is not empty.
-    incremental: bool,
-    /// Commit being converted (for error messages).
-    current: Option<gix::ObjectId>,
-    empty: Entries,
-}
-
-/// A commit parsed from git's raw encoding.
-struct RawCommit {
-    tree: gix::ObjectId,
-    parents: Vec<gix::ObjectId>,
-    author: Signature,
-    committer: Signature,
-    extra_headers: Vec<(String, Vec<u8>)>,
-    message: Vec<u8>,
-}
-
-enum Frame {
-    Enter(gix::ObjectId),
-    /// Only the id: the commit is re-read when its turn comes, so the DFS
-    /// stack never holds the parsed metadata of many commits at once.
-    Exit(gix::ObjectId),
-}
-
-impl Producer {
-    fn resolve(&self, name: &str) -> anyhow::Result<gix::ObjectId> {
-        let mut reference =
-            self.repo.find_reference(name).with_context(|| format!("resolving {name}"))?;
-        Ok(reference.peel_to_id()?.detach())
-    }
-
-    fn read(&self, id: gix::ObjectId) -> anyhow::Result<Vec<u8>> {
-        Ok(self.repo.find_object(id).with_context(|| format!("reading object {id}"))?.detach().data)
-    }
-
-    /// Antimony id of an already converted commit (this run, or found by
-    /// [`Self::discover`] from an earlier import).
-    fn known_commit(&self, id: gix::ObjectId) -> Option<ObjectId> {
-        self.memo.get(&id).copied()
-    }
-
-    /// Find the commits reachable from `tip` that earlier imports already
-    /// converted, and put them in `memo`. Reads ahead in batches (commits are
-    /// checked with one `get_derived_many` per chunk, not one lookup each);
-    /// everything below a known commit is known too and is never expanded.
-    fn discover(&mut self, tip: gix::ObjectId) -> anyhow::Result<()> {
-        let mut seen = HashSet::from([tip]);
-        let mut queue = VecDeque::from([tip]);
-        let mut chunk = PRECHECK_START;
-        while !queue.is_empty() {
-            let mut batch = Vec::with_capacity(chunk.min(queue.len()));
-            while batch.len() < chunk {
-                match queue.pop_front() {
-                    Some(id) if !self.memo.contains_key(&id) => batch.push(id),
-                    Some(_) => {}
-                    None => break,
-                }
+        let tip = resolve(&sync.to_thread_local(), git_ref)?;
+        let graph = discover(&sync, &backend, &handle, tip, workers)?;
+        let mut s = sink.take().ok_or_else(|| anyhow!("import sink lost"))?;
+        s.incremental |= !graph.known.is_empty();
+        let m = memo.take().unwrap_or_else(|| {
+            let want = tuning
+                .memo_entries
+                .unwrap_or_else(|| (graph.order.len() * 12).clamp(1 << 14, MEMO_MAX_ENTRIES));
+            Memo::with_capacity(want)
+        });
+        let mut conv = Converter::new(&graph, Reader::new(sync.to_thread_local()), m, s);
+        let pipeline = Pipeline::new(&graph, workers);
+        let result = std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| pipeline.work(&sync));
             }
-            let keys: Vec<&[u8]> = batch.iter().map(|id| id.as_slice()).collect();
-            let found =
-                self.handle.block_on(self.backend.meta.get_derived_many(COMMIT_KIND, &keys))?;
-            for (id, value) in batch.into_iter().zip(found) {
-                match value {
-                    Some(bytes) => {
-                        self.memo.insert(id, ObjectId::from_bytes(&bytes)?);
-                        self.incremental = true;
+            let r = (|| {
+                let mut chunks = 0usize;
+                while let Some(chunk) = pipeline.next() {
+                    for prep in chunk? {
+                        conv.convert(prep)?;
                     }
-                    None => {
-                        for p in parse_commit(id, &self.read(id)?)?.parents {
-                            if seen.insert(p) {
-                                queue.push_back(p);
-                            }
-                        }
+                    chunks += 1;
+                    if progress && chunks.is_multiple_of(2000) {
+                        eprintln!(
+                            "import: commits={} memo hits={} misses={} fallback trees={} blobs={} ids={}",
+                            conv.stats.commits,
+                            conv.memo.hits,
+                            conv.memo.misses,
+                            conv.stats.fallback_trees,
+                            conv.stats.fallback_blobs,
+                            conv.stats.fallback_ids
+                        );
+                    }
+                    if chunks.is_multiple_of(4) {
+                        rss::trim_mapped_packs(PACK_RSS_LIMIT);
+                        rss::release_heap();
                     }
                 }
-            }
-            chunk = (chunk * 2).min(PRECHECK_MAX);
-        }
-        Ok(())
+                Ok::<(), anyhow::Error>(())
+            })();
+            pipeline.stop();
+            r
+        });
+        result?;
+        conv.sink().flush()?;
+        let id = conv.commit_id(0).ok_or_else(|| anyhow!("{git_ref} was not converted"))?;
+        tracing::info!(
+            git_ref,
+            commits = conv.stats.commits,
+            memo_hits = conv.memo.hits,
+            memo_misses = conv.memo.misses,
+            fallback_trees = conv.stats.fallback_trees,
+            fallback_blobs = conv.stats.fallback_blobs,
+            fallback_ids = conv.stats.fallback_ids,
+            "converted"
+        );
+        let (m, s) = conv.into_parts();
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        s.send(Msg::Tip { ant_ref: ant_ref.clone(), id, ack: ack_tx })?;
+        // Wait until this ref's commits are recorded: the next ref's discovery
+        // asks the store which commits already exist.
+        ack_rx.recv().map_err(|_| anyhow!("import writer stopped"))?;
+        memo = Some(m);
+        sink = Some(s);
     }
-
-    fn send(&self, msg: Msg) -> anyhow::Result<()> {
-        self.tx.blocking_send(msg).map_err(|_| anyhow!("import writer stopped"))
-    }
-
-    fn send_batch(&mut self) -> anyhow::Result<()> {
-        if self.objects.is_empty() && self.commits.is_empty() {
-            return Ok(());
-        }
-        let objects = std::mem::take(&mut self.objects);
-        let commits = std::mem::take(&mut self.commits);
-        self.send(Msg::Batch { objects, commits, check_present: self.incremental })
-    }
-
-    fn push_object(&mut self, obj: EncodedObject) -> anyhow::Result<()> {
-        self.objects.push(obj);
-        if self.objects.len() >= self.batch_objects {
-            self.send_batch()?;
-        }
-        Ok(())
-    }
-
-    /// Post-order walk from `tip` that converts parents before children and
-    /// stops at commits that were already imported.
-    fn walk(&mut self, tip: gix::ObjectId) -> anyhow::Result<()> {
-        let mut visited = HashSet::new();
-        let mut stack = vec![Frame::Enter(tip)];
-        while let Some(frame) = stack.pop() {
-            match frame {
-                Frame::Enter(id) => {
-                    if !visited.insert(id) || self.memo.contains_key(&id) {
-                        continue;
-                    }
-                    let raw = parse_commit(id, &self.read(id)?)?;
-                    stack.push(Frame::Exit(id));
-                    for p in raw.parents.into_iter().rev() {
-                        stack.push(Frame::Enter(p));
-                    }
-                }
-                Frame::Exit(id) => self.convert_commit(id)?,
-            }
-        }
-        Ok(())
-    }
-
-    /// Root tree and generation of an already converted parent commit.
-    fn parent_info(&mut self, id: gix::ObjectId) -> anyhow::Result<CommitInfo> {
-        if let Some(i) = self.infos.get(&id) {
-            return Ok(*i);
-        }
-        // Imported by an earlier run: ask the store (once per boundary commit).
-        let ant = self.known_commit(id).ok_or_else(|| anyhow!("parent {id} was not converted"))?;
-        let node = self
-            .handle
-            .block_on(self.backend.meta.get_commits(&[ant]))?
-            .pop()
-            .flatten()
-            .ok_or_else(|| anyhow!("imported commit {ant} (source {id}) is not recorded"))?;
-        let git_tree = parse_commit(id, &self.read(id)?)?.tree;
-        let info = CommitInfo { git_tree, generation: node.generation };
-        self.infos.insert(id, info);
-        Ok(info)
-    }
-
-    fn convert_commit(&mut self, id: gix::ObjectId) -> anyhow::Result<()> {
-        self.current = Some(id);
-        let raw = parse_commit(id, &self.read(id)?)?;
-        let tree = self.convert_tree(raw.tree, "")?;
-        let mut parents = Vec::with_capacity(raw.parents.len());
-        let mut generation = 0;
-        let mut first = None;
-        for (i, p) in raw.parents.iter().enumerate() {
-            let a = self
-                .known_commit(*p)
-                .ok_or_else(|| anyhow!("parent {p} of {id} was not converted"))?;
-            let info = self.parent_info(*p)?;
-            generation = generation.max(info.generation);
-            if i == 0 {
-                first = Some(info.git_tree);
-            }
-            parents.push(a);
-        }
-        let changes = self.changes(first, raw.tree)?;
-        let committer_time = raw.committer.time;
-        let commit = Commit {
-            tree,
-            parents: parents.clone(),
-            author: raw.author,
-            committer: raw.committer,
-            extra_headers: raw.extra_headers,
-            message: raw.message,
-        };
-        let obj = EncodedObject::new(ObjectKind::Commit, &commit.encode());
-        let ant = obj.id();
-        self.memo.insert(id, ant);
-        self.infos.insert(id, CommitInfo { git_tree: raw.tree, generation: generation + 1 });
-        let node =
-            CommitNode { id: ant, tree, parents, generation: generation + 1, committer_time };
-        self.commits.push(NewCommit { node, changes, git: id });
-        self.push_object(obj)
-    }
-
-    /// Parsed entries of source tree `id` (cached). `path` is the directory,
-    /// only used in error messages.
-    fn tree_entries(&mut self, id: gix::ObjectId, path: &str) -> anyhow::Result<Entries> {
-        if let Some(e) = self.trees.get(&id) {
-            return Ok(e);
-        }
-        let raw = self.read(id)?;
-        let hash_len = self.repo.object_hash().len_in_bytes();
-        let mut entries = Vec::new();
-        let mut rest = &raw[..];
-        while !rest.is_empty() {
-            let malformed = || anyhow!("malformed tree {id}");
-            let sp = rest.iter().position(|&b| b == b' ').ok_or_else(malformed)?;
-            let nul = sp + 1 + rest[sp + 1..].iter().position(|&b| b == 0).ok_or_else(malformed)?;
-            let oid_end = nul + 1 + hash_len;
-            if rest.len() < oid_end {
-                bail!("malformed tree {id}");
-            }
-            let name = match std::str::from_utf8(&rest[sp + 1..nul]) {
-                Ok(n) => n.to_string(),
-                Err(_) => {
-                    let commit = self.current.map_or_else(|| "?".to_string(), |c| c.to_string());
-                    bail!(
-                        "non-UTF-8 file name {:?} in directory {:?} (tree {id}, commit {commit}): \
-                         antimony tree entry names must be UTF-8",
-                        String::from_utf8_lossy(&rest[sp + 1..nul]),
-                        if path.is_empty() { "/" } else { path },
-                    );
-                }
-            };
-            let mode = EntryMode::from_octal_lenient(&rest[..sp])?;
-            let child = gix::ObjectId::from_bytes_or_panic(&rest[nul + 1..oid_end]);
-            entries.push(RawEntry { mode, name, child });
-            rest = &rest[oid_end..];
-        }
-        let entries = Arc::new(entries);
-        self.trees.insert(id, entries.clone());
-        Ok(entries)
-    }
-
-    fn convert_tree(&mut self, id: gix::ObjectId, path: &str) -> anyhow::Result<ObjectId> {
-        if let Some(a) = self.memo.get(&id) {
-            return Ok(*a);
-        }
-        let raw = self.tree_entries(id, path)?;
-        let mut entries = Vec::with_capacity(raw.len());
-        for e in raw.iter() {
-            let child_id = match e.mode {
-                EntryMode::Tree => {
-                    let sub =
-                        if path.is_empty() { e.name.clone() } else { format!("{path}/{}", e.name) };
-                    self.convert_tree(e.child, &sub)?
-                }
-                _ => self.leaf_id(e.mode, e.child)?,
-            };
-            entries.push(TreeEntry { mode: e.mode, name: e.name.clone(), id: child_id });
-        }
-        let tree = Tree::new(entries)?;
-        let obj = EncodedObject::new(ObjectKind::Tree, &tree.encode());
-        let ant = obj.id();
-        self.memo.insert(id, ant);
-        self.push_object(obj)?;
-        Ok(ant)
-    }
-
-    /// Antimony id of a non-tree entry.
-    fn leaf_id(&mut self, mode: EntryMode, child: gix::ObjectId) -> anyhow::Result<ObjectId> {
-        match mode {
-            // Submodule pointer: carried through, never fetched. The foreign
-            // commit id is zero-padded to 32 bytes (lossless for SHA-1/256).
-            EntryMode::Gitlink => {
-                let mut raw = [0u8; 32];
-                let n = child.as_bytes().len().min(32);
-                raw[..n].copy_from_slice(&child.as_bytes()[..n]);
-                Ok(ObjectId(raw))
-            }
-            _ => self.convert_blob(child),
-        }
-    }
-
-    fn convert_blob(&mut self, id: gix::ObjectId) -> anyhow::Result<ObjectId> {
-        if let Some(a) = self.memo.get(&id) {
-            return Ok(*a);
-        }
-        let data = self.read(id)?;
-        let obj = EncodedObject::new(ObjectKind::Blob, &data);
-        let ant = obj.id();
-        self.memo.insert(id, ant);
-        self.push_object(obj)?;
-        Ok(ant)
-    }
-
-    /// Non-tree paths that differ between two source trees (`old` = `None`
-    /// for root commits), sorted by path: the same result as
-    /// `ant_store::graph::diff_trees` on the converted trees, computed from the
-    /// producer's own state. Identical subtrees (equal source ids) are skipped
-    /// unread, and nothing is fetched from the store.
-    fn changes(
-        &mut self,
-        old: Option<gix::ObjectId>,
-        new: gix::ObjectId,
-    ) -> anyhow::Result<Vec<PathChange>> {
-        let mut out = Vec::new();
-        let mut stack = vec![(RepoPath::root(), old, Some(new))];
-        while let Some((dir, old, new)) = stack.pop() {
-            if old == new {
-                continue;
-            }
-            let old_e = match old {
-                Some(id) => self.tree_entries(id, dir.as_str())?,
-                None => self.empty.clone(),
-            };
-            let new_e = match new {
-                Some(id) => self.tree_entries(id, dir.as_str())?,
-                None => self.empty.clone(),
-            };
-            let old_m: HashMap<&str, &RawEntry> =
-                old_e.iter().map(|e| (e.name.as_str(), e)).collect();
-            let new_m: HashMap<&str, &RawEntry> =
-                new_e.iter().map(|e| (e.name.as_str(), e)).collect();
-            let mut names: Vec<&str> = old_m.keys().chain(new_m.keys()).copied().collect();
-            names.sort_unstable();
-            names.dedup();
-            for name in names {
-                let o = old_m.get(name).copied();
-                let n = new_m.get(name).copied();
-                if o.map(|e| (e.mode, e.child)) == n.map(|e| (e.mode, e.child)) {
-                    continue;
-                }
-                let path = dir.join(name)?;
-                let o_tree = o.filter(|e| e.mode.is_tree()).map(|e| e.child);
-                let n_tree = n.filter(|e| e.mode.is_tree()).map(|e| e.child);
-                let o_leaf = o.filter(|e| !e.mode.is_tree()).map(|e| (e.mode, e.child));
-                let n_leaf = n.filter(|e| !e.mode.is_tree()).map(|e| (e.mode, e.child));
-                if o_tree.is_some() || n_tree.is_some() {
-                    stack.push((path.clone(), o_tree, n_tree));
-                }
-                if o_leaf != n_leaf {
-                    let kind = match (o_leaf, n_leaf) {
-                        (None, Some(_)) => ChangeKind::Added,
-                        (Some(_), None) => ChangeKind::Deleted,
-                        _ => ChangeKind::Modified,
-                    };
-                    let old = o_leaf
-                        .map(|(m, c)| Ok::<_, anyhow::Error>((m, self.leaf_id(m, c)?)))
-                        .transpose()?;
-                    let new = n_leaf
-                        .map(|(m, c)| Ok::<_, anyhow::Error>((m, self.leaf_id(m, c)?)))
-                        .transpose()?;
-                    out.push(PathChange { path, kind, old, new });
-                }
-            }
-        }
-        out.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(out)
-    }
+    Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Raw git commit parsing
-// ---------------------------------------------------------------------------
-
-fn parse_commit(id: gix::ObjectId, raw: &[u8]) -> anyhow::Result<RawCommit> {
-    let bad = |what: &str| anyhow!("commit {id}: {what}");
-    let (head, message) = match raw.windows(2).position(|w| w == b"\n\n") {
-        Some(i) => (&raw[..i], &raw[i + 2..]),
-        None => (raw, &raw[raw.len()..]),
-    };
-
-    // Fold continuation lines into the previous header, as ant-core does.
-    let mut fields: Vec<(&[u8], Vec<u8>)> = Vec::new();
-    for line in head.split(|&b| b == b'\n') {
-        if let Some(cont) = line.strip_prefix(b" ") {
-            let last = fields.last_mut().ok_or_else(|| bad("orphan continuation line"))?;
-            last.1.push(b'\n');
-            last.1.extend_from_slice(cont);
-        } else {
-            let (k, v) = match line.iter().position(|&b| b == b' ') {
-                Some(i) => (&line[..i], &line[i + 1..]),
-                None => (line, &b""[..]),
-            };
-            fields.push((k, v.to_vec()));
-        }
-    }
-
-    let hex_id = |v: &[u8], what: &str| -> anyhow::Result<gix::ObjectId> {
-        gix::ObjectId::from_hex(v).map_err(|_| bad(what))
-    };
-    let mut it = fields.into_iter().peekable();
-    let tree = match it.next() {
-        Some((b"tree", v)) => hex_id(&v, "bad tree id")?,
-        _ => return Err(bad("missing tree")),
-    };
-    let mut parents = Vec::new();
-    while matches!(it.peek(), Some((b"parent", _))) {
-        if let Some((_, v)) = it.next() {
-            parents.push(hex_id(&v, "bad parent id")?);
-        }
-    }
-    let author = match it.next() {
-        Some((b"author", v)) => parse_signature(id, &v)?,
-        _ => return Err(bad("missing author")),
-    };
-    let committer = match it.next() {
-        Some((b"committer", v)) => parse_signature(id, &v)?,
-        _ => return Err(bad("missing committer")),
-    };
-    let extra_headers = it
-        .map(|(k, v)| {
-            let k = std::str::from_utf8(k).map_err(|_| bad("non-UTF-8 header name"))?;
-            Ok((k.to_string(), v))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(RawCommit { tree, parents, author, committer, extra_headers, message: message.to_vec() })
-}
-
-/// `Name <email> <unix-seconds> <+hhmm>`, same rules as `Signature` decoding in
-/// ant-core, but name and email stay raw bytes.
-fn parse_signature(id: gix::ObjectId, s: &[u8]) -> anyhow::Result<Signature> {
-    let bad = || anyhow!("commit {id}: bad signature {:?}", String::from_utf8_lossy(s));
-    let lt = s.iter().position(|&b| b == b'<').ok_or_else(bad)?;
-    let gt = s.iter().rposition(|&b| b == b'>').ok_or_else(bad)?;
-    if gt < lt {
-        bail!(bad());
-    }
-    let mut name_end = lt;
-    while name_end > 0 && s[name_end - 1] == b' ' {
-        name_end -= 1;
-    }
-    let name = s[..name_end].to_vec();
-    let email = s[lt + 1..gt].to_vec();
-    let tail = std::str::from_utf8(&s[gt + 1..]).map_err(|_| bad())?;
-    let mut rest = tail.split_whitespace();
-    let time: i64 = rest.next().and_then(|t| t.parse().ok()).ok_or_else(bad)?;
-    let tz = rest.next().ok_or_else(bad)?;
-    if tz.len() != 5 || !tz.is_ascii() || !matches!(&tz[..1], "+" | "-") {
-        bail!(bad());
-    }
-    let hh: i32 = tz[1..3].parse().map_err(|_| bad())?;
-    let mm: i32 = tz[3..5].parse().map_err(|_| bad())?;
-    let off = if &tz[..1] == "-" { -(hh * 60 + mm) } else { hh * 60 + mm };
-    Ok(Signature { name, email, time, tz_offset_minutes: off })
+fn resolve(repo: &gix::Repository, name: &str) -> anyhow::Result<gix::ObjectId> {
+    let mut reference = repo.find_reference(name).with_context(|| format!("resolving {name}"))?;
+    Ok(reference.peel_to_id()?.detach())
 }
 
 #[cfg(test)]
@@ -1014,6 +694,142 @@ mod tests {
                 parent_gens.iter().map(|p| p.as_ref().unwrap().generation).max().unwrap_or(0);
             assert_eq!(node.generation, parent_gen + 1);
             assert_eq!(node.committer_time, c.committer.time);
+        }
+    }
+
+    /// Deterministic pseudo-random history with branches, merges, renames, mode
+    /// flips, file <-> directory flips and reverts.
+    fn make_random_repo(root: &Path, commits: usize) -> PathBuf {
+        let r = root.join("rand");
+        std::fs::create_dir(&r).unwrap();
+        git(&r, &["init", "-q", "-b", "main"]);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let dirs = ["", "a/", "a/b/", "c/", "c/d/e/", "x-y/"];
+        let mut on_side = false;
+        let mut n_side = 0;
+        for i in 0..commits {
+            let ops = 1 + next(3);
+            for _ in 0..ops {
+                let dir = dirs[next(dirs.len() as u64) as usize];
+                let name = format!("{dir}f{}", next(6));
+                let path = r.join(&name);
+                match next(8) {
+                    0..=2 => {
+                        if path.is_dir() {
+                            continue;
+                        }
+                        std::fs::create_dir_all(path.parent().unwrap()).ok();
+                        // few distinct contents: repeated blobs and reverts
+                        std::fs::write(&path, format!("content {}\n", next(5))).unwrap();
+                    }
+                    3 => {
+                        if path.is_file() {
+                            std::fs::remove_file(&path).unwrap();
+                        }
+                    }
+                    4 => {
+                        if path.is_file() {
+                            let to = r.join(format!("{dir}g{}", next(3)));
+                            if !to.exists() {
+                                std::fs::rename(&path, &to).unwrap();
+                            }
+                        }
+                    }
+                    5 => {
+                        if path.is_file() {
+                            let mode = if next(2) == 0 { 0o755 } else { 0o644 };
+                            std::fs::set_permissions(
+                                &path,
+                                std::os::unix::fs::PermissionsExt::from_mode(mode),
+                            )
+                            .unwrap();
+                        }
+                    }
+                    6 => {
+                        if path.is_file() {
+                            std::fs::remove_file(&path).unwrap();
+                            std::fs::create_dir_all(&path).unwrap();
+                            std::fs::write(path.join("inner"), "inner\n").unwrap();
+                        }
+                    }
+                    _ => {
+                        if path.is_dir() {
+                            std::fs::remove_dir_all(&path).unwrap();
+                            std::fs::write(&path, "was a dir\n").unwrap();
+                        }
+                    }
+                }
+            }
+            git(&r, &["add", "-A"]);
+            git(&r, &["commit", "-q", "--allow-empty", "-m", &format!("c{i}")]);
+            if !on_side && next(6) == 0 {
+                git(&r, &["checkout", "-qb", &format!("s{n_side}")]);
+                on_side = true;
+            } else if on_side && next(3) == 0 {
+                let side = format!("s{n_side}");
+                n_side += 1;
+                git(&r, &["checkout", "-q", "main"]);
+                let merged = Command::new("git")
+                    .args(["merge", "-q", "--no-edit", "-X", "theirs", &side])
+                    .current_dir(&r)
+                    .env("GIT_AUTHOR_NAME", "Ada")
+                    .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+                    .env("GIT_COMMITTER_NAME", "Bob")
+                    .env("GIT_COMMITTER_EMAIL", "bob@example.com")
+                    .output()
+                    .unwrap();
+                if !merged.status.success() {
+                    git(&r, &["merge", "--abort"]);
+                }
+                on_side = false;
+            }
+        }
+        if on_side {
+            git(&r, &["checkout", "-q", "main"]);
+        }
+        r
+    }
+
+    /// Whatever the worker count and however small (so evicting) the memo is,
+    /// the import produces the same tip, and every recorded changeset equals a
+    /// re-read tree diff.
+    #[tokio::test]
+    async fn random_history_is_independent_of_tuning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = make_random_repo(tmp.path(), 120);
+        let mut first_tip = None;
+        for (workers, memo_entries) in [(1, Some(1024)), (4, None), (3, Some(1024))] {
+            let b = Backend::in_memory();
+            let tuning = Tuning { workers: Some(workers), memo_entries };
+            let mut opts = ImportOptions::single("refs/heads/main", "main");
+            opts.batch_objects = 7;
+            let stats = import_tuned(&src, &b, &opts, tuning).await.unwrap();
+            assert!(stats.commits > 100);
+            let tip = b.refs.get_ref("main").await.unwrap().unwrap();
+            assert_eq!(
+                *first_tip.get_or_insert(tip),
+                tip,
+                "workers={workers} memo={memo_entries:?}"
+            );
+            let log = b.meta.tail(0, 1000).await.unwrap();
+            assert_eq!(log.len() as u64, stats.commits);
+            for (_, id) in &log {
+                let c = b.objects.read_commit(id).await.unwrap();
+                let first = match c.parents.first() {
+                    Some(p) => Some(b.objects.read_commit(p).await.unwrap().tree),
+                    None => None,
+                };
+                let want = ant_store::graph::diff_trees(b.objects.as_ref(), first, Some(c.tree))
+                    .await
+                    .unwrap();
+                assert_eq!(b.meta.get_changeset(id).await.unwrap().unwrap(), want, "{id}");
+            }
         }
     }
 }
