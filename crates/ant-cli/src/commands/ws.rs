@@ -158,11 +158,21 @@ pub async fn submit(ctx: &Ctx, message: &str) -> Result<Outcome> {
     }
     let disk = ctx.disk()?;
 
-    // Upload the changed blobs (they were stored locally by status()).
+    // Upload the changed blobs. The status scan stored them in the local
+    // cache, but the cache may have evicted some since (tiny budget, `ant
+    // cache gc`); those are re-read from the workspace and hash-checked.
     let ids: Vec<ObjectId> = changes.iter().filter_map(|c| c.new.map(|(_, id)| id)).collect();
     let mut blobs: Vec<EncodedObject> = Vec::with_capacity(ids.len());
-    for (id, obj) in ids.iter().zip(disk.get_many(&ids).await?) {
-        blobs.push(obj.ok_or_else(|| anyhow!("local blob {id} missing from cache"))?);
+    let source = match lazy_state(&root).await? {
+        Some(state) => state.join("upper"),
+        None => root.clone(),
+    };
+    let cached = disk.get_many(&ids).await?;
+    for (change, obj) in changes.iter().filter(|c| c.new.is_some()).zip(cached) {
+        blobs.push(match obj {
+            Some(obj) => obj,
+            None => restage_blob(&source, change).await?,
+        });
     }
     let remote = ctx.remote().await?;
     remote.put_many(&blobs).await.context("uploading blobs")?;
@@ -196,6 +206,30 @@ pub async fn submit(ctx: &Ctx, message: &str) -> Result<Outcome> {
     let commit = id_from(&r.commit)?;
     tokio::fs::write(root.join(LAST_SUBMIT), format!("{commit}\n")).await?;
     Ok(Outcome::ok(format!("{commit}\n")))
+}
+
+/// Re-read the content of `change` from the workspace file under `source`
+/// (the working tree, or a lazy workspace's upper layer) after the cache lost
+/// its staged blob. The content is used only if it still hashes to the id the
+/// scan computed; otherwise the file changed in between and submit fails
+/// rather than upload something other than what was reported.
+async fn restage_blob(source: &Path, change: &LocalChange) -> Result<EncodedObject> {
+    let Some((_, id)) = change.new else {
+        bail!("{} has no new content", change.path);
+    };
+    let file = source.join(change.path.as_str());
+    let body = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+        let meta = std::fs::symlink_metadata(&file)?;
+        antd::files::read_body(&file, &meta)
+    })
+    .await?
+    .with_context(|| format!("reading {} to restore its evicted blob {id}", change.path))?;
+    let blob = EncodedObject::new(ant_core::ObjectKind::Blob, &body);
+    if blob.id() != id {
+        print_hint("the file changed while submitting; run `ant status`, then `ant submit` again");
+        bail!("{} changed after it was scanned (blob {id} is gone from the cache)", change.path);
+    }
+    Ok(blob)
 }
 
 pub async fn land(ctx: &Ctx, ref_name: &str, commit: Option<String>) -> Result<Outcome> {
@@ -526,5 +560,41 @@ impl ObjectStore for LazyObjects {
     }
     async fn has_many(&self, ids: &[ObjectId]) -> ant_store::Result<Vec<bool>> {
         self.read.has_many(ids).await
+    }
+}
+
+#[cfg(test)]
+mod restage_tests {
+    use super::*;
+    use ant_core::{ObjectKind, RepoPath};
+
+    fn change(path: &str, content: &[u8]) -> LocalChange {
+        let id = EncodedObject::new(ObjectKind::Blob, content).id();
+        LocalChange {
+            path: RepoPath::new(path).expect("path"),
+            kind: LocalChangeKind::Modified,
+            new: Some((ant_core::EntryMode::File, id)),
+        }
+    }
+
+    #[tokio::test]
+    async fn restage_reads_matching_file() {
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir_all(dir.path().join("d")).expect("mkdir");
+        std::fs::write(dir.path().join("d/f"), b"hello").expect("write");
+        let c = change("d/f", b"hello");
+        let blob = restage_blob(dir.path(), &c).await.expect("restage");
+        assert_eq!(Some(blob.id()), c.new.map(|(_, id)| id));
+    }
+
+    #[tokio::test]
+    async fn restage_refuses_changed_or_missing_file() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let c = change("f", b"hello");
+        std::fs::write(dir.path().join("f"), b"changed").expect("write");
+        let err = restage_blob(dir.path(), &c).await.expect_err("changed");
+        assert!(err.to_string().contains("changed after it was scanned"), "{err}");
+        std::fs::remove_file(dir.path().join("f")).expect("rm");
+        assert!(restage_blob(dir.path(), &c).await.is_err());
     }
 }
