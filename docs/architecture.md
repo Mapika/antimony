@@ -28,8 +28,19 @@ implementations:
 `TieredObjectStore` sends objects ≤ 4 KiB (encoded) to Postgres and larger ones
 to S3, so the many tiny trees and files avoid S3's per-request latency. Batch
 writes are key-ordered so concurrent writers never deadlock. There are no
-packfiles and no repository maintenance: objects are written once and never
-rewritten.
+packfiles: objects are written once and never rewritten.
+
+**Garbage collection** (`ant admin gc`, `ant_store::postgres::gc`) deletes
+data unreachable from refs, the history index, landed-as and import
+mappings, and everything written within a grace period (rows carry their
+write time). It runs beside live servers: unreachable rows are first
+*condemned* (readers report them missing), then, after a wait longer than
+any server's cache lifetime and operation, marked again from everything
+written meanwhile, and only then deleted. Storing an object that already
+exists refreshes an old write time, and the delete re-checks it under the
+row lock, so a writer's deduplicated `put_many` never loses its objects.
+S3 packs get random ids and are deleted once no index row points into
+them.
 
 ## Write path (`ant-server::ops`)
 

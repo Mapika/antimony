@@ -142,9 +142,9 @@ place and stays readable.
 
 ```sh
 ant admin schema --pg-url ... --pg-schema ant            # inspect
-# version 3
-# supported 4
-# pending 4 storage_tuning
+# version 4
+# supported 5
+# pending 5 gc
 ant admin schema --migrate --pg-url ... --pg-schema ant  # apply now
 ```
 
@@ -154,6 +154,7 @@ ant admin schema --migrate --pg-url ... --pg-schema ant  # apply now
 | 2 | `object_index` | index of large objects bundled into S3 packs |
 | 3 | `changesets` | one compressed changeset row per commit |
 | 4 | `storage_tuning` | out-of-line storage and insert-only autovacuum settings |
+| 5 | `gc` | write times (`written_at`, BRIN-indexed) on objects, packed-object index rows, commits and changesets; garbage-collection state (`gc_condemned`, `gc_live`, `gc_state`) |
 
 To control when migrations run, start servers with `--no-migrate`
 (`ANT_NO_MIGRATE=1`) and run `ant admin schema --migrate` yourself; a
@@ -170,7 +171,12 @@ a migrated schema. In a rolling upgrade, start one new server first (it
 migrates); servers of the previous release that are already running keep
 working while you replace them unless the release notes say a migration
 needs all servers stopped first. Take a Postgres backup before upgrading:
-there are no down-migrations.
+there are no down-migrations. Migration 5 gives every existing row the
+migration time as its write time, so garbage collection cannot delete
+anything written before the upgrade until one grace period after it; run
+`ant admin gc` only once every server runs a release with schema version 5
+or later (older servers neither hide condemned data nor refresh write
+times).
 
 **Clients.** The disk cache (`<cache>/format`), sparse workspaces
 (`format=` in `.ant/workspace`) and lazy workspace state directories

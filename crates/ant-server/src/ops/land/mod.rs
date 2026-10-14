@@ -75,7 +75,7 @@ pub const MAX_STACK: usize = 256;
 
 /// Derived-data kind mapping a commit id to the id it was landed as after a
 /// server-side rebase. Makes retries of a land idempotent.
-const LANDED_AS: &str = "land/landed-as/v1";
+pub(crate) const LANDED_AS: &str = "land/landed-as/v1";
 
 pub async fn rebase(
     b: &Backend,

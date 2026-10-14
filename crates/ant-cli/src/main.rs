@@ -88,6 +88,18 @@
 //!       schema), `supported <n>` (this binary's version) and
 //!       `pending <version> <name>` per migration still to apply. A schema
 //!       newer than supported: exit 1 with a `hint:` to upgrade.
+//!   ant admin gc [--dry-run] [--grace 7d] [--quiesce 30m] [--max-batches N] [--abort] <store flags>
+//!       Garbage collection (Postgres stores; packs too with `--s3-*`).
+//!       Progress on stderr (`gc: ...`). stdout: first line `dry-run`, `done`
+//!       or `stopped` (resumable: run again), plus ` resumed` when it
+//!       continued an interrupted run; then `cutoff <time>`, `live <n>`,
+//!       `condemned <n>`, `objects <count> <bytes>`,
+//!       `large-objects <count> <bytes>`, `commits <n>`,
+//!       `changesets <count> <bytes>`; except for dry runs `legacy-changes
+//!       <n>`, `derived <n>`, `kept <n>`; with S3 `packs <count> <bytes>` and
+//!       `packs-kept <count> <bytes> <dead-bytes> <dead-percent>%`. Dry runs
+//!       report what a run would delete. `--abort`: `aborted` or
+//!       `nothing to abort`. A grace period under 1d: exit 1.
 //!
 //! Store flags (`ant import`, `ant serve`, `ant admin`) include
 //! `--no-migrate` (ANT_NO_MIGRATE): by default the Postgres schema is

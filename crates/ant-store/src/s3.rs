@@ -60,6 +60,15 @@ impl S3Config {
     }
 }
 
+/// A stored pack ([`S3ObjectStore::list_packs`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PackInfo {
+    pub id: [u8; 16],
+    pub size: u64,
+    /// Last modification, Unix seconds (S3 clock).
+    pub modified: f64,
+}
+
 #[derive(Clone)]
 pub struct S3ObjectStore {
     client: aws_sdk_s3::Client,
@@ -125,12 +134,85 @@ impl S3ObjectStore {
 
     /// Key of pack `pack` (see [`crate::packed`]).
     pub(crate) fn pack_key(&self, pack: &[u8; 16]) -> String {
-        let hex = hex_string(pack);
+        format!("{}{}", self.packs_prefix(), hex_string(pack))
+    }
+
+    /// Prefix of every pack key.
+    fn packs_prefix(&self) -> String {
         if self.prefix.is_empty() {
-            format!("packs/{hex}")
+            "packs/".to_owned()
         } else {
-            format!("{}/packs/{hex}", self.prefix.trim_end_matches('/'))
+            format!("{}/packs/", self.prefix.trim_end_matches('/'))
         }
+    }
+
+    /// One page (up to 1000) of the stored packs, and the token of the next
+    /// page. Keys under the packs prefix that are not pack ids are skipped.
+    pub(crate) async fn list_packs(
+        &self,
+        token: Option<String>,
+    ) -> Result<(Vec<PackInfo>, Option<String>)> {
+        let prefix = self.packs_prefix();
+        let resp = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&prefix)
+            .set_continuation_token(token)
+            .send()
+            .await
+            .map_err(StoreError::backend)?;
+        let mut packs = Vec::new();
+        for o in resp.contents() {
+            let Some(hex) = o.key().and_then(|k| k.strip_prefix(prefix.as_str())) else {
+                continue;
+            };
+            let mut id = [0u8; 16];
+            if hex.len() != 32 || hex::decode_to_slice(hex, &mut id).is_err() {
+                continue;
+            }
+            let modified = o.last_modified().map_or(0.0, |t| t.as_secs_f64());
+            packs.push(PackInfo { id, size: o.size().unwrap_or(0).max(0) as u64, modified });
+        }
+        let next = if resp.is_truncated() == Some(true) {
+            resp.next_continuation_token().map(str::to_owned)
+        } else {
+            None
+        };
+        Ok((packs, next))
+    }
+
+    /// Delete packs (one request per 1000).
+    pub(crate) async fn delete_packs(&self, packs: &[[u8; 16]]) -> Result<()> {
+        use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+        for chunk in packs.chunks(1000) {
+            let objects = chunk
+                .iter()
+                .map(|p| ObjectIdentifier::builder().key(self.pack_key(p)).build())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(StoreError::backend)?;
+            let delete = Delete::builder()
+                .set_objects(Some(objects))
+                .quiet(true)
+                .build()
+                .map_err(StoreError::backend)?;
+            let resp = self
+                .client
+                .delete_objects()
+                .bucket(&self.bucket)
+                .delete(delete)
+                .send()
+                .await
+                .map_err(StoreError::backend)?;
+            if let Some(e) = resp.errors().first() {
+                return Err(corrupt(format!(
+                    "deleting pack {}: {}",
+                    e.key().unwrap_or("?"),
+                    e.message().unwrap_or("error")
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn put_raw(&self, key: String, body: Vec<u8>) -> Result<()> {
