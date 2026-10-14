@@ -34,12 +34,15 @@
 //!    `commits`, everything else through the object store) and their
 //!    children inserted. Ids written since the mark began are marked again
 //!    right before step 2.
-//! 2. **Condemn.** Every row written before the cutoff whose id is not
-//!    marked is inserted into `gc_condemned`, one id-range chunk per
-//!    statement. From that moment readers treat condemned ids as missing
-//!    (`get_many`, `has_many`, the packed-object index, `get_commits`,
-//!    `get_changesets`, `first_parent_chain`): no operation that starts
-//!    later can read a condemned object and build on it.
+//! 2. **Condemn.** Every id not marked whose rows were all written before
+//!    the cutoff is inserted into `gc_condemned`, one id-range chunk per
+//!    statement; its object and index rows are locked and re-checked while
+//!    doing so (see *Re-storing*). From that moment readers treat condemned
+//!    ids as missing (`get_many`, `has_many`, the packed-object index,
+//!    `get_commits`, `get_changesets`, `first_parent_chain`), object and
+//!    index rows only while they are older than the cutoff, i.e. exactly
+//!    those the sweep would delete: no operation that starts later can read
+//!    a condemned object and build on it.
 //! 3. **Quiesce.** Wait [`GcOptions::quiesce`] (default 30 minutes): longer
 //!    than the servers' cache lifetime (`ant-server` caches immutable data
 //!    for at most 10 minutes per entry) plus the longest operation. After
@@ -75,25 +78,47 @@
 //!   after the mark began are marked in step 4, which removes their closure
 //!   from K. Objects written after step 4 come from operations that started
 //!   after step 2 (step 3 outlasts every operation), which reference only
-//!   objects they read (never condemned ones: those read as missing) or
-//!   their children, or objects they write themselves; by induction their
-//!   closure avoids K.
+//!   objects they read (never condemned ones the sweep could delete: those
+//!   read as missing; a condemned id whose row was written since the
+//!   cutoff is never deleted by this run and, written after the mark
+//!   began, is marked with its closure in step 4) or their children, or
+//!   objects they write themselves; by induction their closure avoids K.
 //! - *Re-storing.* Writers deduplicate (`ON CONFLICT DO NOTHING`), so an
 //!   object about to be deleted may be "stored" again by a writer that then
 //!   refers to it. Storing an existing object therefore refreshes a write
-//!   time older than [`FRESHEN_AFTER`] (and takes the id back from
-//!   `gc_condemned`); objects not refreshed were written less than
-//!   [`FRESHEN_AFTER`] ago (the insert statement itself reads which existing
-//!   rows are that young, so the common case costs no extra statement; a
-//!   young row is condemned only transiently, while a run races another
-//!   writer's refresh, and that writer, the condemn step's clean-up or the
-//!   re-mark takes it back). Either way the row is younger than any run's
-//!   cutoff (grace > [`FRESHEN_AFTER`]). The sweep deletes a row only if its
-//!   write time is older than the cutoff *at delete time* (the predicate is
+//!   time older than [`FRESHEN_AFTER`] and takes the id back from
+//!   `gc_condemned`, both in one transaction; objects not refreshed were
+//!   written less than [`FRESHEN_AFTER`] ago (the insert statement itself
+//!   reads which existing rows are that young, so the common case costs no
+//!   extra statement). Either way the row is younger than any run's cutoff
+//!   (grace > [`FRESHEN_AFTER`]). The sweep deletes a row only if its write
+//!   time is older than the cutoff *at delete time* (the predicate is
 //!   re-evaluated under the row lock, so refresh and delete serialize), and
 //!   a writer whose refresh finds the row gone inserts it again. So
 //!   `put_many` returning means the objects exist and outlive any run that
 //!   could delete them.
+//! - *Read your writes.* Once `put_many` (or `index_objects`, which backs
+//!   the packed store) returns, every read finds the objects until a later
+//!   run collects them legitimately. Two independent reasons:
+//!   1. Readers hide a condemned object or index row only while its write
+//!      time is older than the run's cutoff (`gc_state.cutoff`), and the
+//!      row a returned `put_many` leaves is younger than that.
+//!   2. No id with a row younger than the cutoff stays condemned once the
+//!      write that made the row young has committed. A condemn chunk locks
+//!      the object and index rows it condemns (`FOR SHARE SKIP LOCKED`, in
+//!      the condemning statement), which re-evaluates "written before the
+//!      cutoff" on the row's current version, and condemns an id only if
+//!      every such row of it passed. A refresh (`FOR UPDATE`) either locks
+//!      the row first, and the chunk skips it (refresh in flight, or
+//!      committed: the re-check fails), or waits for the chunk to commit;
+//!      the take-back that follows in the writer's transaction, a separate
+//!      statement and so a later snapshot, then removes the id. Refresh and
+//!      take-back commit together, so another writer whose insert finds the
+//!      row young (and skips both) cannot see it still condemned. The one
+//!      exception is an id condemned for an old commit record or changeset
+//!      while its object row did not exist yet (a changeset retried long
+//!      after its objects write failed): reason 1 covers its reads, and the
+//!      clean-up at the end of the condemn step takes it back.
 //! - *Blind ref moves.* `cas_ref` does not check that its target exists
 //!   (open mode, admins). Each sweep batch takes the collector's fence
 //!   exclusively, which waits for ref moves in flight (they hold it shared
@@ -399,16 +424,16 @@ impl PgStore {
     /// younger than [`FRESHEN_AFTER`]): for the other ids (they existed with
     /// an old write time, or were inserted concurrently after the snapshot),
     /// refresh a write time older than [`FRESHEN_AFTER`] and take them back
-    /// from `gc_condemned`. Returns the ids that no longer exist (a
-    /// collection deleted them after the insert saw them): store those again.
+    /// from `gc_condemned`, in one transaction. Returns the ids that no
+    /// longer exist (a collection deleted them after the insert saw them):
+    /// store those again.
     ///
     /// Young existing rows need neither step: no run deletes them (their
-    /// write time is after any run's cutoff, and only grows), and if one is
-    /// condemned at all it is transiently, by a run racing another writer's
-    /// refresh, which that writer, the condemn step's clean-up or the re-mark
-    /// takes back (see the module docs). The common case of storing objects
-    /// that were just written (a land rebuilding trees a changeset wrote)
-    /// therefore costs no statement beyond the insert.
+    /// write time is after any run's cutoff, and only grows), readers never
+    /// hide them, and none is condemned once the write that made it young
+    /// has committed (module docs, *Read your writes*). The common case of
+    /// storing objects that were just written (a land rebuilding trees a
+    /// changeset wrote) therefore costs no statement beyond the insert.
     ///
     /// Rows are locked in id order and a collection never waits for a
     /// writer's row lock (`SKIP LOCKED`), so this cannot deadlock with it.
@@ -455,19 +480,32 @@ impl PgStore {
                    AND written_at >= now() - make_interval(secs => $2)"
             }
         };
-        let query = sqlx::query(sql).bind(&existing).bind(secs(FRESHEN_AFTER));
-        let present = self.write(query, self.objects_deferred()).await?;
+        // Refresh and take-back commit together, so no reader ever sees the
+        // refreshed row still condemned. The take-back is a statement of its
+        // own (READ COMMITTED: a snapshot taken after the refresh's lock
+        // waits): a condemn chunk that locked a row first made the refresh
+        // wait for it to commit, and the take-back sees its ids; one that
+        // locks later sees the refresh and skips the row (`condemn_chunk!`).
+        let mut tx = self.begin_write(self.objects_deferred()).await?;
+        self.count_write();
+        let present = sqlx::query(sql)
+            .bind(&existing)
+            .bind(secs(FRESHEN_AFTER))
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(be)?;
         let present: HashSet<Vec<u8>> = present
             .iter()
             .map(|r| r.try_get::<Vec<u8>, _>("id"))
             .collect::<std::result::Result<_, _>>()
             .map_err(be)?;
-        // Taken back only now, in a statement that starts after the refresh
-        // committed: a condemn step that missed the refresh (its snapshot
-        // was older) has either committed already, and this sees its rows,
-        // or its own clean-up sees the refresh (`Run::condemn`).
-        let unc = sqlx::query("DELETE FROM gc_condemned WHERE id = ANY($1)").bind(&existing);
-        self.write(unc, self.objects_deferred()).await?;
+        self.count_write();
+        sqlx::query("DELETE FROM gc_condemned WHERE id = ANY($1)")
+            .bind(&existing)
+            .execute(&mut *tx)
+            .await
+            .map_err(be)?;
+        tx.commit().await.map_err(be)?;
         Ok(existing.into_iter().filter(|id| !present.contains(*id)).map(<[u8]>::to_vec).collect())
     }
 
@@ -785,38 +823,7 @@ impl Run<'_> {
     /// Condemn (dry run: count) every row written before the cutoff that is
     /// not marked, one id range at a time.
     async fn condemn(&mut self) -> Result<()> {
-        let stmt = "WITH cand AS ( \
-                 SELECT id, 'o'::text AS src, octet_length(data)::bigint AS bytes \
-                   FROM objects o WHERE id >= $1 AND ($2::bytea IS NULL OR id < $2) \
-                    AND written_at < to_timestamp($3) \
-                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = o.id) \
-                 UNION ALL \
-                 SELECT id, 'i', len::bigint FROM object_index x \
-                  WHERE id >= $1 AND ($2::bytea IS NULL OR id < $2) \
-                    AND written_at < to_timestamp($3) \
-                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = x.id) \
-                 UNION ALL \
-                 SELECT id, 'c', 0::bigint FROM commits c \
-                  WHERE id >= $1 AND ($2::bytea IS NULL OR id < $2) \
-                    AND written_at < to_timestamp($3) \
-                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = c.id) \
-                 UNION ALL \
-                 SELECT commit_id, 's', octet_length(data)::bigint FROM changesets s \
-                  WHERE commit_id >= $1 AND ($2::bytea IS NULL OR commit_id < $2) \
-                    AND written_at < to_timestamp($3) \
-                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = s.commit_id)), \
-             ids AS (SELECT DISTINCT id FROM cand), \
-             ins AS (INSERT INTO gc_condemned (id) SELECT id FROM ids WHERE $4 \
-                     ON CONFLICT (id) DO NOTHING) \
-             SELECT (SELECT count(*) FROM ids), \
-                    count(*) FILTER (WHERE src = 'o'), \
-                    coalesce(sum(bytes) FILTER (WHERE src = 'o'), 0)::bigint, \
-                    count(*) FILTER (WHERE src = 'i'), \
-                    coalesce(sum(bytes) FILTER (WHERE src = 'i'), 0)::bigint, \
-                    count(*) FILTER (WHERE src = 'c'), \
-                    count(*) FILTER (WHERE src = 's'), \
-                    coalesce(sum(bytes) FILTER (WHERE src = 's'), 0)::bigint \
-             FROM cand";
+        let stmt = if self.opts.dry_run { CONDEMN_COUNT } else { CONDEMN_CHUNK };
         let step = 256 / CONDEMN_CHUNKS;
         let mut totals = [0u64; 8];
         for chunk in 0..CONDEMN_CHUNKS {
@@ -837,9 +844,14 @@ impl Run<'_> {
         let [ids, objects, object_bytes, index, index_bytes, commits, changesets, changeset_bytes] =
             totals;
         if !self.opts.dry_run {
-            // Objects stored again while a chunk was condemned (their refresh
-            // committed after its snapshot) are taken back here, or by the
-            // writer (`PgStore::refresh_existing`).
+            // Defence in depth: ids with an object or index row written since
+            // the cutoff are not condemned (`condemn_chunk!` re-checks
+            // under row locks, and writers take refreshed ids back in the
+            // refresh's transaction), except when the row did not exist yet
+            // for a chunk that condemned the id for an old commit record or
+            // changeset (a retried changeset whose first objects write
+            // failed). Readers do not hide such rows meanwhile (they hide
+            // only rows older than the cutoff).
             let back = sqlx::query(
                 "DELETE FROM gc_condemned g WHERE \
                  EXISTS (SELECT 1 FROM objects o WHERE o.id = g.id \
@@ -865,7 +877,80 @@ impl Run<'_> {
         }
         Ok(())
     }
+}
 
+/// One chunk of the condemn step. `$1`..`$2` (null: open end): id range;
+/// `$3`: cutoff (Unix seconds); `$4`: insert into `gc_condemned`. Returns
+/// the number of ids condemned, then counts and bytes per table of their
+/// rows.
+///
+/// In a real run the old object and index rows are locked (`FOR SHARE`)
+/// and an id is condemned only if every object and index row it has is
+/// among them. Locking re-evaluates the predicate against the row's current
+/// version (READ COMMITTED re-check), so a row refreshed after this
+/// statement's snapshot is skipped, and a row whose refresh has not
+/// committed yet is skipped too (`SKIP LOCKED`: the collector never waits
+/// for a writer). A writer that refreshes a row after this statement locked
+/// it waits until the chunk commits, and its take-back, which runs after the
+/// refresh in the writer's transaction, then sees the condemned id
+/// (`PgStore::refresh_existing`). Commit records and changesets are not
+/// refreshed by writers and are not locked.
+macro_rules! condemn_chunk {
+    ($lock_o:literal, $lock_x:literal) => {
+        concat!(
+            "WITH co AS (SELECT id, octet_length(data)::bigint AS bytes FROM objects o \
+                  WHERE id >= $1 AND ($2::bytea IS NULL OR id < $2) \
+                    AND written_at < to_timestamp($3) \
+                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = o.id) ",
+            $lock_o,
+            "), \
+             cx AS (SELECT id, len::bigint AS bytes FROM object_index x \
+                  WHERE id >= $1 AND ($2::bytea IS NULL OR id < $2) \
+                    AND written_at < to_timestamp($3) \
+                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = x.id) ",
+            $lock_x,
+            "), \
+             cand AS ( \
+                 SELECT id, 'o'::text AS src, bytes FROM co \
+                 UNION ALL \
+                 SELECT id, 'i', bytes FROM cx \
+                 UNION ALL \
+                 SELECT id, 'c', 0::bigint FROM commits c \
+                  WHERE id >= $1 AND ($2::bytea IS NULL OR id < $2) \
+                    AND written_at < to_timestamp($3) \
+                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = c.id) \
+                 UNION ALL \
+                 SELECT commit_id, 's', octet_length(data)::bigint FROM changesets s \
+                  WHERE commit_id >= $1 AND ($2::bytea IS NULL OR commit_id < $2) \
+                    AND written_at < to_timestamp($3) \
+                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = s.commit_id)), \
+             ids AS (SELECT DISTINCT id FROM cand d \
+                  WHERE NOT EXISTS (SELECT 1 FROM objects o WHERE o.id = d.id \
+                                    AND NOT EXISTS (SELECT 1 FROM co WHERE co.id = o.id)) \
+                    AND NOT EXISTS (SELECT 1 FROM object_index x WHERE x.id = d.id \
+                                    AND NOT EXISTS (SELECT 1 FROM cx WHERE cx.id = x.id))), \
+             ins AS (INSERT INTO gc_condemned (id) SELECT id FROM ids WHERE $4 \
+                     ON CONFLICT (id) DO NOTHING) \
+             SELECT (SELECT count(*) FROM ids), \
+                    count(*) FILTER (WHERE src = 'o'), \
+                    coalesce(sum(bytes) FILTER (WHERE src = 'o'), 0)::bigint, \
+                    count(*) FILTER (WHERE src = 'i'), \
+                    coalesce(sum(bytes) FILTER (WHERE src = 'i'), 0)::bigint, \
+                    count(*) FILTER (WHERE src = 'c'), \
+                    count(*) FILTER (WHERE src = 's'), \
+                    coalesce(sum(bytes) FILTER (WHERE src = 's'), 0)::bigint \
+             FROM cand WHERE id IN (SELECT id FROM ids)"
+        )
+    };
+}
+
+/// [`condemn_chunk!`] of a real run.
+const CONDEMN_CHUNK: &str =
+    condemn_chunk!("FOR SHARE OF o SKIP LOCKED", "FOR SHARE OF x SKIP LOCKED");
+/// [`condemn_chunk!`] of a dry run: counts only, takes no locks.
+const CONDEMN_COUNT: &str = condemn_chunk!("", "");
+
+impl Run<'_> {
     // -- the phases -------------------------------------------------------
 
     async fn dry(&mut self) -> Result<()> {
@@ -1488,6 +1573,151 @@ pub(super) mod tests {
         let before = count(&s, &versions).await;
         s.put(EncodedObject::new(ObjectKind::Blob, b"x")).await.unwrap();
         assert_eq!(count(&s, &versions).await, before);
+    }
+
+    /// The cutoff of a run with the default grace period starting now.
+    async fn default_cutoff(s: &PgStore) -> f64 {
+        sqlx::query_scalar("SELECT extract(epoch FROM now())::float8 - $1")
+            .bind(secs(DEFAULT_GRACE))
+            .fetch_one(&s.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Run the condemn statement over the whole id range in `tx`.
+    async fn condemn_all(tx: &mut sqlx::PgConnection, cutoff: f64) {
+        sqlx::query(CONDEMN_CHUNK)
+            .bind(vec![0u8])
+            .bind(None::<Vec<u8>>)
+            .bind(cutoff)
+            .bind(true)
+            .fetch_one(tx)
+            .await
+            .unwrap();
+    }
+
+    async fn condemned(s: &PgStore, id: &ObjectId) -> bool {
+        count(s, &format!("SELECT count(*) FROM gc_condemned WHERE id = {}", lit(id))).await > 0
+    }
+
+    /// Read-your-writes against a condemn step in flight: an old object is
+    /// stored again while a condemn chunk that selected it has not committed
+    /// yet. Whichever way the two interleave, once `put` returns the object
+    /// reads back (formerly the chunk committed after the writer's refresh
+    /// and take-back, and the object read as missing until the end of the
+    /// condemn step).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_storing_again_during_a_condemn_chunk_reads_back() {
+        let s = scratch().await;
+        let blob = EncodedObject::new(ObjectKind::Blob, b"aged");
+        let id = blob.id();
+        s.put(blob.clone()).await.unwrap();
+        age(&s, 30).await;
+        let cutoff = default_cutoff(&s).await;
+        // The chunk has selected (and, now, locked) the row; it is held open.
+        let mut chunk = s.pool.begin().await.unwrap();
+        condemn_all(&mut chunk, cutoff).await;
+        let mut writer = tokio::spawn({
+            let s = s.clone();
+            async move { s.put(blob).await }
+        });
+        // Let the writer get as far as it can before the chunk commits: its
+        // refresh waits for the chunk's row lock.
+        let early = tokio::time::timeout(Duration::from_millis(500), &mut writer).await;
+        chunk.commit().await.unwrap();
+        assert!(early.is_err(), "the writer finished while the chunk condemning it was open");
+        writer.await.unwrap().unwrap();
+        assert!(s.get(&id).await.unwrap().is_some(), "stored, then read as missing");
+        assert!(!condemned(&s, &id).await);
+        let young = "SELECT count(*) FROM objects WHERE written_at > now() - interval '1 minute'";
+        assert_eq!(count(&s, young).await, 1);
+    }
+
+    /// A condemn chunk running while a writer's refresh of a row is not
+    /// committed yet leaves that row alone: it never condemns a row a writer
+    /// is about to report stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_condemn_skips_rows_being_refreshed() {
+        let s = scratch().await;
+        let (busy, idle) = (b"busy".as_slice(), b"idle".as_slice());
+        let (busy, idle) = (
+            EncodedObject::new(ObjectKind::Blob, busy),
+            EncodedObject::new(ObjectKind::Blob, idle),
+        );
+        s.put_many(&[busy.clone(), idle.clone()]).await.unwrap();
+        age(&s, 30).await;
+        let cutoff = default_cutoff(&s).await;
+        // A writer's refresh, not committed yet (as `refresh_existing`).
+        let mut w = s.pool.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE objects SET written_at = now() WHERE id = {}",
+            lit(&busy.id())
+        )))
+        .execute(&mut *w)
+        .await
+        .unwrap();
+        let mut c = s.pool.acquire().await.unwrap();
+        // The collector never waits for a writer.
+        tokio::time::timeout(Duration::from_secs(10), condemn_all(&mut c, cutoff)).await.unwrap();
+        assert!(!condemned(&s, &busy.id()).await, "a row being refreshed was condemned");
+        assert!(condemned(&s, &idle.id()).await);
+        w.commit().await.unwrap();
+        assert!(s.get(&busy.id()).await.unwrap().is_some());
+        assert!(s.get(&idle.id()).await.unwrap().is_none());
+    }
+
+    /// An id is condemned only when every row it has is old: a commit
+    /// object stored again keeps its (old) commit record readable.
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_condemn_needs_every_row_of_an_id_old() {
+        let s = scratch().await;
+        let (c, _, _) = commit(&s, None, "f", b"x").await;
+        let (g, _, _) = commit(&s, None, "g", b"y").await;
+        age(&s, 30).await;
+        let object = s.get(&c).await.unwrap().unwrap();
+        s.put(object).await.unwrap();
+        let cutoff = default_cutoff(&s).await;
+        let mut conn = s.pool.acquire().await.unwrap();
+        condemn_all(&mut conn, cutoff).await;
+        assert!(!condemned(&s, &c).await);
+        assert!(s.get_commits(&[c]).await.unwrap()[0].is_some());
+        assert!(condemned(&s, &g).await);
+        assert!(s.get_commits(&[g]).await.unwrap()[0].is_none());
+    }
+
+    /// Readers hide a condemned id only where the sweep would delete it: rows
+    /// written before the run's cutoff. A row written since (stored again,
+    /// or new) reads back even while its id is condemned.
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_condemned_ids_hide_only_rows_older_than_the_cutoff() {
+        let s = scratch().await;
+        let index = |id: ObjectId| vec![IndexEntry { id, pack: [7; 16], off: 0, len: 1 }];
+        let (old, new) = (
+            EncodedObject::new(ObjectKind::Blob, b"old"),
+            EncodedObject::new(ObjectKind::Blob, b"new"),
+        );
+        s.put(old.clone()).await.unwrap();
+        s.index_objects(&index(old.id())).await.unwrap();
+        age(&s, 30).await;
+        s.put(new.clone()).await.unwrap();
+        s.index_objects(&index(new.id())).await.unwrap();
+        sql(
+            &s,
+            "INSERT INTO gc_state (phase, started_at, cutoff, grace_secs, quiesce_secs) \
+             VALUES ('quiesce', now(), now() - interval '7 days', 0, 0)",
+        )
+        .await;
+        for id in [old.id(), new.id()] {
+            sql(&s, &format!("INSERT INTO gc_condemned VALUES ({})", lit(&id))).await;
+        }
+        assert_eq!(s.has_many(&[old.id(), new.id()]).await.unwrap(), vec![false, true]);
+        assert!(s.get(&new.id()).await.unwrap().is_some());
+        let found = s.lookup_index(&[old.id(), new.id()]).await.unwrap();
+        assert!(!found.contains_key(&old.id()) && found.contains_key(&new.id()));
     }
 
     /// An object deleted between the insert that saw it and the refresh is
