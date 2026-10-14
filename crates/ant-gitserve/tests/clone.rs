@@ -1,20 +1,17 @@
 mod support;
-use ant_core::{Commit, EncodedObject, EntryMode, ObjectId, ObjectKind, Signature, TreeEntry};
+use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, TreeEntry};
 use ant_store::{
     Backend, ObjectStoreExt,
     graph::{build_tree, write_commit, write_tree},
 };
 use std::{collections::HashSet, path::Path, time::Duration};
+use support::{commit_of, git_command, pack_bytes, packed_objects};
 use tempfile::TempDir;
 
 async fn git_result(dir: &Path, args: &[&str]) -> std::process::Output {
     tokio::time::timeout(
         Duration::from_secs(30),
-        tokio::process::Command::new("git")
-            .current_dir(dir)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
+        git_command(dir)
             .args(["-c", "protocol.version=2", "-c", "fetch.unpackLimit=1"])
             .args(args)
             .output(),
@@ -30,6 +27,17 @@ async fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(result.stdout).unwrap().trim().to_string()
 }
 
+/// Serve `b`'s git export on an ephemeral port: the clone URL and the server
+/// task (abort it to stop).
+async fn serve(b: Backend) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, ant_gitserve::router(b)).await.unwrap();
+    });
+    (url, task)
+}
+
 async fn commit(b: &Backend, parents: Vec<ObjectId>, version: u8) -> ObjectId {
     let nested = build_tree(b.objects.as_ref(), &[("deep/file", b"nested\n")]).await.unwrap();
     let mut entries = vec![TreeEntry { mode: EntryMode::Tree, name: "dir".into(), id: nested }];
@@ -42,25 +50,14 @@ async fn commit(b: &Backend, parents: Vec<ObjectId>, version: u8) -> ObjectId {
         entries.push(TreeEntry { mode, name: name.into(), id });
     }
     let tree = write_tree(b.objects.as_ref(), entries).await.unwrap();
-    let sig = Signature {
-        name: "Test".into(),
-        email: "test@example.com".into(),
-        time: i64::from(version),
-        tz_offset_minutes: 0,
-    };
-    write_commit(
-        b,
-        &Commit {
-            tree,
-            parents,
-            author: sig.clone(),
-            committer: sig,
-            extra_headers: vec![],
-            message: format!("version {version}\n").into_bytes(),
-        },
-    )
-    .await
-    .unwrap()
+    let commit = commit_of(
+        tree,
+        parents,
+        ("Test", "test@example.com"),
+        i64::from(version),
+        format!("version {version}\n"),
+    );
+    write_commit(b, &commit).await.unwrap()
 }
 
 struct Fixture {
@@ -86,12 +83,7 @@ impl Fixture {
         }
         b.refs.cas_ref("main", None, Some(ids[2])).await.unwrap();
         b.refs.cas_ref("topic", None, Some(ids[1])).await.unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
-        let app = ant_gitserve::router(b.clone());
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let (url, task) = serve(b.clone()).await;
         Self { b, ids, url, task, temp: tempfile::tempdir().unwrap() }
     }
 
@@ -184,17 +176,7 @@ async fn incremental_fetch_sends_exactly_new_objects() {
     assert_eq!(new.difference(&old).count(), 3); // commit, root tree, changed blob
     // Inspect every pack, including duplicates: counting the object database
     // alone would miss the server resending old objects in a second pack.
-    let mut packed = Vec::new();
-    for entry in std::fs::read_dir(dir.join(".git/objects/pack")).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|ext| ext == "idx") {
-            let listing = git(&dir, &["verify-pack", "-v", path.to_str().unwrap()]).await;
-            packed.extend(listing.lines().filter_map(|line| {
-                let id = line.split_whitespace().next()?;
-                (id.len() == 64).then(|| id.to_owned())
-            }));
-        }
-    }
+    let packed = packed_objects(&dir.join(".git/objects/pack")).await;
     assert_eq!(packed.len(), new.len(), "incremental pack repeated objects");
     git(&dir, &["fsck", "--full"]).await;
 }
@@ -208,54 +190,18 @@ async fn partial_clone_lazy_fetch_of_many_blobs() {
         .map(|i| (format!("d{}/f{i:03}.txt", i % 7), format!("content {i}\n").into_bytes()))
         .collect();
     let refs: Vec<(&str, &[u8])> = files.iter().map(|(p, c)| (p.as_str(), c.as_slice())).collect();
-    let tree = ant_store::graph::build_tree(b.objects.as_ref(), &refs).await.unwrap();
-    let sig = ant_core::Signature {
-        name: "t".into(),
-        email: "t@t".into(),
-        time: 1,
-        tz_offset_minutes: 0,
-    };
-    let c = ant_store::graph::write_commit(
-        &b,
-        &ant_core::Commit {
-            tree,
-            parents: vec![],
-            author: sig.clone(),
-            committer: sig,
-            extra_headers: vec![],
-            message: "many\n".into(),
-        },
-    )
-    .await
-    .unwrap();
+    let tree = build_tree(b.objects.as_ref(), &refs).await.unwrap();
+    let c =
+        write_commit(&b, &commit_of(tree, vec![], ("t", "t@t"), 1, "many\n".into())).await.unwrap();
     b.refs.cas_ref("main", None, Some(c)).await.unwrap();
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, ant_gitserve::router(b)).await });
+    let (url, _task) = serve(b).await;
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["clone", "-q", "--filter=blob:none", &url, "p"]).await;
     let dir = tmp.path().join("p");
     for (path, content) in &files {
         assert_eq!(&std::fs::read(dir.join(path)).unwrap(), content, "{path}");
     }
-}
-
-fn pack_bytes(dir: &Path) -> u64 {
-    std::fs::read_dir(dir.join(".git/objects/pack"))
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|e| e == "pack"))
-        .map(|p| std::fs::metadata(p).unwrap().len())
-        .sum()
-}
-
-fn rss_kib() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .unwrap_or_default()
-        .lines()
-        .find_map(|line| line.strip_prefix("VmRSS:")?.split_whitespace().next()?.parse().ok())
-        .unwrap_or(0)
 }
 
 /// Merge-heavy history over real HTTP: blobless clone with a lazy checkout,
@@ -265,15 +211,11 @@ async fn merged_history_blobless_clone_and_checkout() {
     let b = Backend::in_memory();
     let tip = support::merge_history(&b, 300).await;
     b.refs.cas_ref("main", None, Some(tip)).await.unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
-    let task = tokio::spawn(async move {
-        axum::serve(listener, ant_gitserve::router(b)).await.unwrap();
-    });
+    let (url, task) = serve(b).await;
     let temp = tempfile::tempdir().unwrap();
     git(temp.path(), &["clone", "--filter=blob:none", "--no-checkout", &url, "merged"]).await;
     let dir = temp.path().join("merged");
-    let packed = pack_bytes(&dir);
+    let packed = pack_bytes(&dir.join(".git/objects/pack"));
     git(&dir, &["checkout", "main"]).await;
     git(&dir, &["fsck", "--full"]).await;
     assert_eq!(git(&dir, &["rev-parse", "HEAD"]).await, tip.to_string());
@@ -290,36 +232,19 @@ async fn merged_history_blobless_clone_and_checkout() {
 /// separately so fixture storage is not confused with pack working memory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_blobless_history_is_delta_compressed() {
-    use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicU64, Ordering},
-        },
-        time::Instant,
-    };
+    use std::{sync::atomic::Ordering, time::Instant};
     const REVISIONS: usize = 2000;
     let (b, undeltified) = support::history(REVISIONS, 2000).await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
-    let task = tokio::spawn(async move {
-        axum::serve(listener, ant_gitserve::router(b)).await.unwrap();
-    });
+    let (url, task) = serve(b).await;
     let temp = tempfile::tempdir().unwrap();
-    let before = rss_kib();
-    let peak = Arc::new(AtomicU64::new(before));
-    let monitor_peak = peak.clone();
-    let monitor = tokio::spawn(async move {
-        loop {
-            monitor_peak.fetch_max(rss_kib(), Ordering::Relaxed);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    });
+    let before = support::rss_kib();
+    let (peak, monitor) = support::watch_peak_rss(before);
     let start = Instant::now();
     git(temp.path(), &["clone", "--filter=blob:none", "--no-checkout", &url, "large"]).await;
     let elapsed = start.elapsed();
     monitor.abort();
     let dir = temp.path().join("large");
-    let packed = pack_bytes(&dir);
+    let packed = pack_bytes(&dir.join(".git/objects/pack"));
     eprintln!(
         "synthetic {REVISIONS} x 2000: undeltified={undeltified} pack={packed} clone={elapsed:?} RSS before={before} KiB peak={} KiB",
         peak.load(Ordering::Relaxed)
@@ -338,23 +263,11 @@ async fn delta_chains_path_type_changes_and_incremental_fetch() {
     let dir = f.clone_into("chains", &["--no-checkout"]).await;
     git(&dir, &["fsck", "--full"]).await;
     let old = objects(&dir).await;
-    let mut tree_deltas = 0;
-    let mut blob_deltas = 0;
-    let mut max_depth = 0;
-    for entry in std::fs::read_dir(dir.join(".git/objects/pack")).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|e| e == "idx") {
-            for line in git(&dir, &["verify-pack", "-v", path.to_str().unwrap()]).await.lines() {
-                let fields: Vec<_> = line.split_whitespace().collect();
-                if fields.len() == 7 && fields[0].len() == 64 {
-                    max_depth = max_depth.max(fields[5].parse::<usize>().unwrap());
-                    tree_deltas += usize::from(fields[1] == "tree");
-                    blob_deltas += usize::from(fields[1] == "blob");
-                }
-            }
-        }
-    }
-    assert!(tree_deltas > 50 && blob_deltas > 50);
+    let pack_dir = dir.join(".git/objects/pack");
+    let packed = packed_objects(&pack_dir).await;
+    let deltas = |kind: &str| packed.iter().filter(|(k, d)| k == kind && d.is_some()).count();
+    let max_depth = packed.iter().filter_map(|(_, d)| *d).max().unwrap_or(0);
+    assert!(deltas("tree") > 50 && deltas("blob") > 50);
     assert!((2..=50).contains(&max_depth));
     let next = support::revisions(&f.b, Some(tip), 125..135).await;
     f.b.refs.cas_ref("main", Some(tip), Some(next)).await.unwrap();
@@ -362,16 +275,6 @@ async fn delta_chains_path_type_changes_and_incremental_fetch() {
     git(&dir, &["fsck", "--full"]).await;
     let new = objects(&dir).await;
     assert_eq!(new.difference(&old).count(), 30);
-    let mut packed_count = 0;
-    for entry in std::fs::read_dir(dir.join(".git/objects/pack")).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|e| e == "idx") {
-            packed_count += git(&dir, &["verify-pack", "-v", path.to_str().unwrap()])
-                .await
-                .lines()
-                .filter(|line| line.split_whitespace().next().is_some_and(|id| id.len() == 64))
-                .count();
-        }
-    }
+    let packed_count = packed_objects(&pack_dir).await.len();
     assert_eq!(packed_count, new.len(), "incremental pack repeated known objects");
 }

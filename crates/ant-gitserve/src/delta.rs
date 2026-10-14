@@ -219,8 +219,11 @@ mod tests {
             let mut target = b"inserted prefix".to_vec();
             target.extend_from_slice(&base[32..32 + count]);
             target.extend_from_slice(b"tail");
-            if count >= 127 {
-                assert_eq!(apply(&base, &encode(&base, &target).unwrap()), target);
+            // Short copies may not be worth a delta; any delta made must apply.
+            let delta = encode(&base, &target);
+            assert!(count < 127 || delta.is_some(), "no delta for {count} copied bytes");
+            if let Some(delta) = delta {
+                assert_eq!(apply(&base, &delta), target);
             }
         }
         let mut instructions = Vec::new();
