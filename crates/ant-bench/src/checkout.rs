@@ -2,7 +2,12 @@
 //! and warm (cache populated), plus `status` on the unchanged workspace.
 //!
 //! Object traffic is counted at two layers: what the workspace asks of the
-//! read-through store (`ws.*`) and what actually reaches the server (`net.*`).
+//! read-through store (`ws.*`) and what actually reaches the server (`net.*`;
+//! tree bundles bypass it), plus HTTP requests by kind (`/o/` objects, `/t/`
+//! bundles). With `--cdn` an in-process shared cache (`crate::cdn`) sits in
+//! front of the HTTP endpoint and each iteration adds a `proxy` phase: an
+//! empty client cache against a warm proxy (requests reaching the origin are
+//! counted).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,6 +42,13 @@ pub struct Args {
     /// With --synthetic-files, fetch over the in-process HTTP endpoint, not gRPC.
     #[arg(long)]
     pub use_http: bool,
+    /// Fetch per object over HTTP, without tree bundles (`GET /t/`).
+    #[arg(long)]
+    pub no_tree_bundles: bool,
+    /// Put an in-process caching proxy in front of the HTTP endpoint and
+    /// measure an extra `proxy` phase (empty client cache, warm proxy).
+    #[arg(long)]
+    pub cdn: bool,
     #[arg(long, default_value = "main")]
     pub rev: String,
     /// Sparse pattern (repeatable); none = full checkout.
@@ -65,6 +77,7 @@ pub struct Args {
 
 struct Iter {
     cold: Phase,
+    proxy: Option<Phase>,
     warm: Phase,
     status1: f64,
     status2: f64,
@@ -84,11 +97,16 @@ struct Phase {
     net_objects: u64,
     net_bytes: u64,
     net_secs: f64,
+    http_objects: u64,
+    http_bundles: u64,
+    /// Requests the caching proxy forwarded to the origin (`--cdn`).
+    origin_requests: u64,
 }
 
 async fn materialize(
     a: &Args,
     remote: &RemoteObjectStore,
+    cdn: Option<&crate::cdn::Cdn>,
     work: &Path,
     commit: ObjectId,
     sparse: Sparse,
@@ -99,13 +117,30 @@ async fn materialize(
             .context("opening cache")?,
     );
     let net = Arc::new(TimedObjects::new(Arc::new(remote.clone()), &metrics, "net"));
-    let read_through = Arc::new(ReadThrough::over_disk(disk, net).verified_upstream());
-    let rt: Arc<dyn ObjectStore> = Arc::new(TimedObjects::new(read_through, &metrics, "ws"));
+    let mut read_through = ReadThrough::over_disk(disk, net).verified_upstream();
+    if !a.no_tree_bundles {
+        read_through = read_through.with_tree_bundles(remote.clone());
+    }
+    let read_through = Arc::new(read_through);
+    let rt: Arc<dyn ObjectStore> =
+        Arc::new(TimedObjects::new(read_through.clone(), &metrics, "ws"));
     let tree = rt.read_commit(&commit).await?.tree;
+    let http0 = remote.http_requests();
+    let origin0 = cdn.map_or(0, |c| c.origin_requests());
     let cpu0 = cpu_total();
     let start = Instant::now();
-    let ws = Workspace::materialize(rt.as_ref(), work, commit, tree, sparse).await?;
+    let ws = Workspace::materialize_with(
+        rt.as_ref(),
+        Some(read_through.as_ref()),
+        work,
+        commit,
+        tree,
+        sparse,
+    )
+    .await?;
     let secs = start.elapsed().as_secs_f64();
+    let http = remote.http_requests();
+    let origin_requests = cdn.map_or(0, |c| c.origin_requests()) - origin0;
     let cpu = cpu_total() - cpu0;
     let w = work.to_path_buf();
     let (files, bytes) = tokio::task::spawn_blocking(move || dir_size(&w, Some(".ant"))).await?;
@@ -122,6 +157,9 @@ async fn materialize(
             net_objects: nc.items(),
             net_bytes: nc.bytes(),
             net_secs: nc.secs(),
+            http_objects: http.objects - http0.objects,
+            http_bundles: http.bundles - http0.bundles,
+            origin_requests,
         },
         ws,
         rt,
@@ -142,11 +180,15 @@ fn phase_json(p: &Phase) -> J {
         .with("net_objects", p.net_objects)
         .with("net_bytes", p.net_bytes)
         .with("net_secs_sum", p.net_secs)
+        .with("http_object_requests", p.http_objects)
+        .with("http_bundle_requests", p.http_bundles)
+        .with("origin_requests", p.origin_requests)
 }
 
 fn iter_json(i: &Iter) -> J {
     J::obj()
         .with("cold", phase_json(&i.cold))
+        .with("proxy", i.proxy.as_ref().map_or(J::Null, phase_json))
         .with("warm", phase_json(&i.warm))
         .with("status_first_s", i.status1)
         .with("status_second_s", i.status2)
@@ -157,7 +199,7 @@ fn iter_json(i: &Iter) -> J {
 
 fn print_phase(name: &str, p: &Phase) {
     println!(
-        "  {name:<5} {:>8.3}s  {:>8} files  {:>9.1} MiB  {:>9.0} files/s  {:>8.1} MiB/s  cpu {:.2}s | ws: {} get_many/{} obj | net: {} calls/{} obj/{:.1} MiB, call-time sum {:.2}s",
+        "  {name:<5} {:>8.3}s  {:>8} files  {:>9.1} MiB  {:>9.0} files/s  {:>8.1} MiB/s  cpu {:.2}s | ws: {} get_many/{} obj | net: {} calls/{} obj/{:.1} MiB, call-time sum {:.2}s | http: {} /o/ + {} /t/ requests, {} reached origin",
         p.secs,
         p.files,
         mib(p.bytes),
@@ -169,7 +211,10 @@ fn print_phase(name: &str, p: &Phase) {
         p.net_calls,
         p.net_objects,
         mib(p.net_bytes),
-        p.net_secs
+        p.net_secs,
+        p.http_objects,
+        p.http_bundles,
+        p.origin_requests
     );
 }
 
@@ -196,7 +241,13 @@ pub async fn run(a: Args) -> Result<()> {
         }
         _ => anyhow::bail!("give exactly one of --server or --synthetic-files"),
     };
-    let remote = RemoteObjectStore::connect(&server_url, http_url.as_deref()).await?;
+    let cdn = match (&http_url, a.cdn) {
+        (Some(origin), true) => Some(crate::cdn::spawn(origin).await?),
+        (None, true) => anyhow::bail!("--cdn needs an HTTP endpoint (--http or --use-http)"),
+        _ => None,
+    };
+    let client_http = cdn.as_ref().map(|c| c.url.clone()).or(http_url.clone());
+    let remote = RemoteObjectStore::connect(&server_url, client_http.as_deref()).await?;
     let t = Instant::now();
     let commit = remote
         .client()
@@ -219,8 +270,20 @@ pub async fn run(a: Args) -> Result<()> {
         wipe(&a.cache)?;
         wipe(&work)?;
         settle("before cold").await;
-        let (cold, _ws, _) = materialize(&a, &remote, &work, commit, sparse.clone()).await?;
+        let (cold, _ws, _) =
+            materialize(&a, &remote, cdn.as_ref(), &work, commit, sparse.clone()).await?;
         let (cache_files, cache_bytes) = dir_size(&a.cache, None);
+
+        // Proxy: empty client cache, warm shared cache in front of the origin.
+        let proxy = match &cdn {
+            Some(cdn) => {
+                wipe(&a.cache)?;
+                wipe(&work)?;
+                settle("before proxy").await;
+                Some(materialize(&a, &remote, Some(cdn), &work, commit, sparse.clone()).await?.0)
+            }
+            None => None,
+        };
 
         // Warm: cache kept, fresh workspace directory.
         wipe(&work)?;
@@ -228,7 +291,8 @@ pub async fn run(a: Args) -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(a.warm_delay_secs)).await;
         }
         settle("before warm").await;
-        let (warm, ws, rt) = materialize(&a, &remote, &work, commit, sparse.clone()).await?;
+        let (warm, ws, rt) =
+            materialize(&a, &remote, cdn.as_ref(), &work, commit, sparse.clone()).await?;
 
         // status on the unchanged workspace (twice: first may touch more state).
         let t = Instant::now();
@@ -239,6 +303,9 @@ pub async fn run(a: Args) -> Result<()> {
         let status2 = t.elapsed().as_secs_f64();
         println!("iteration {}", it + 1);
         print_phase("cold", &cold);
+        if let Some(p) = &proxy {
+            print_phase("proxy", p);
+        }
         print_phase("warm", &warm);
         println!(
             "  status {status1:.3}s then {status2:.3}s ({} / {} changes reported on an unchanged tree); cache after cold: {cache_files} files, {:.1} MiB",
@@ -248,6 +315,7 @@ pub async fn run(a: Args) -> Result<()> {
         );
         iters.push(Iter {
             cold,
+            proxy,
             warm,
             status1,
             status2,
@@ -257,6 +325,9 @@ pub async fn run(a: Args) -> Result<()> {
         });
     }
 
+    if let Some(c) = &cdn {
+        println!("cdn: {} hits, {} origin requests in total", c.hits(), c.origin_requests());
+    }
     let n = iters.len() as f64;
     let mean = |f: &dyn Fn(&Iter) -> f64| iters.iter().map(f).sum::<f64>() / n;
     let series = |f: &dyn Fn(&Iter) -> f64| iters.iter().map(f).collect::<Vec<f64>>();

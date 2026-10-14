@@ -35,7 +35,7 @@ capacity plan.
 | Load balancer | 1 | Must speak gRPC (HTTP/2) on 7420 and plain HTTP on 7421. Any replica can serve any request; no stickiness needed. |
 | PostgreSQL | 1 | The single source of truth for refs and metadata. Run it with whatever HA you normally use; antimony has no opinion beyond "one primary". |
 | S3-compatible store | 1 | Bucket is created on first start. Holds only objects larger than `--inline-threshold` (default 4096 bytes). |
-| HTTP cache / CDN | optional | Put it in front of `GET /o/<id>` only. Responses are `Cache-Control: public, max-age=31536000, immutable` with an `ETag`. Objects in restricted zones are served `private` (a shared cache must not store them) and unknown ids get `no-store`. Pass the CDN base URL to clients via `ANT_HTTP`. |
+| HTTP cache / CDN | optional | Put it in front of `GET /o/<id>` and `GET /t/<tree-id>` only (cache key: the path; forward `Authorization`). Responses are `Cache-Control: public, max-age=31536000, immutable` (`/o/` also with an `ETag`). Objects in restricted zones are served `private`, bundles that depend on the caller `private, no-store` (a shared cache must not store either), and unknown ids get `no-store`. Pass the CDN base URL to clients via `ANT_HTTP`; checkouts then cost about one `/t/` request per 8 MiB of small files instead of one request per file. |
 
 **Replicas and coordination.** Replicas share nothing except Postgres and S3.
 Lands on one ref are group-committed per process (up to 64 requests per
@@ -427,6 +427,104 @@ else reports as `ref="other"`), and ref locks are one per ref being landed
 on, so avoid designs that need thousands of hot refs at once. Prefer deleting
 finished scratch refs.
 
+### Rate limits and load shedding
+
+Thousands of agents retry with backoff; one runaway principal, or a thundering
+herd after an outage, must not saturate the Postgres pool and starve the rest.
+The server therefore applies two independent protections to every gRPC method
+and to `/o/`, `/t/`, `/repo.git` and `/debug/stats` (never to `/healthz`,
+`/readyz`, `/metrics`):
+
+1. **Per-caller token buckets** (requests/s plus burst) per rate class: a
+   principal under a policy, otherwise the client IP (open mode, unknown
+   tokens). An empty bucket is answered with gRPC `RESOURCE_EXHAUSTED` /
+   HTTP `429`.
+2. **Concurrency gates** per class with a bounded queue. A request holds a
+   slot until its response ends; with no slot free it waits in the queue for
+   at most `--shed-wait`, and is shed with gRPC `UNAVAILABLE` / HTTP `503`
+   when the queue is full or the wait runs out.
+
+Both answer *before the handler runs* and carry a retry hint: gRPC trailer
+metadata `retry-after-ms`, HTTP `Retry-After` (seconds) plus `retry-after-ms`.
+`ant` and `antd` retry exactly the responses that carry the hint, sleeping the
+hint (or 50 ms x 2^n, whichever is longer) scaled by a random 1.0-1.5 factor,
+at most 8 times and 30 s in total, then surface the error (`error: rate limit
+exceeded ...` plus a `hint:`). Because nothing ran, retrying is safe for
+`Land`, `CreateChangeset` and `UpdateRef` as well; a bare `UNAVAILABLE` from a
+dropped connection has no hint and is not retried by the client (a custom
+harness should treat it like `aborted`).
+
+| class | methods / routes | rate bucket | default concurrency (P = `--pg-max-connections`) |
+|---|---|---|---|
+| `read` | `GetObjects HasObjects GetRef ListRefs ResolveRev ReadPath Log Diff Blame MergeBase IsAncestor LogRange LandedAs`, `/o/`, `/t/`, `/repo.git` | read | 4P |
+| `write` | `PutObjects UpdateRef CreateChangeset` | write | 2P |
+| `land` | `Land` | write | 16P |
+| `admin` | `/debug/stats` | admin | 8 |
+
+The queue of each gate holds as many waiters as it has slots. `land` is wide on
+purpose: lands on one ref are queued and group-committed by the server, and a
+waiting land holds no Postgres connection, so the gate never limits batching
+(the 16-agent in-memory fleet and a 96-agent concurrent-land test batch the
+same with and without limits); it only caps how many land requests a replica
+accepts at once. Rates are **opt-in** and unlimited by default for everyone:
+a token is often shared by a whole team or pool of agents, so a default per
+principal would throttle real fleets. Enable them with the flags below (they
+apply to every caller, open-mode IPs included) or per principal in the policy,
+sized to the agents per token (agents x requests/s each, with headroom):
+
+| flag (env) | default | meaning |
+|---|---|---|
+| `--rate-read` (`ANT_RATE_READ`) | off | `<rps>[:<burst>]` or `off`; applies to every principal and to open-mode IPs |
+| `--rate-write` (`ANT_RATE_WRITE`) | off | changesets, lands, ref updates, uploads |
+| `--rate-admin` (`ANT_RATE_ADMIN`) | off | |
+| `--max-inflight-{read,write,land,admin}` (`ANT_MAX_INFLIGHT_*`) | 4P, 2P, 16P, 8 | `0` = unlimited; queue length = the same number |
+| `--shed-wait` (`ANT_SHED_WAIT`) | `2s` | longest queue wait before shedding |
+| `--no-limits` (`ANT_NO_LIMITS`) | off | disable both mechanisms |
+
+Burst defaults to twice the rate. Override a principal in the policy
+(additive; `rps = 0` means unlimited, omitted classes keep the default):
+
+```toml
+[[principal]]
+name = "ci-bridge"
+token_sha256 = "..."
+[principal.limits]
+read  = { rps = 5000, burst = 10000 }
+write = { rps = 0 }
+```
+
+Sizing: a replica's `read` + `write` slots should not exceed what the pool can
+serve (`P` connections x the number of replicas must stay under Postgres'
+`max_connections`, section 2); most reads are served from caches, which is why
+`read` is 4P. The limits and the token buckets are per replica, so with
+several replicas behind one balancer a principal's real ceiling is
+`replicas x rps`. A streaming `GetObjects` keeps its slot until the client has
+read the whole stream, so a stalled client occupies one `read` slot (not more)
+until its connection drops.
+
+Measured (dev machine, 2 replicas x 300 agents, Postgres + S3, 120 s, plus 32
+hostile read loops from a second address ignoring every retry hint; agents'
+overall p99 in ms, `ant-bench soak --hostile 32`):
+
+| run | cat | create | get_ref | land | hostile served |
+|---|---|---|---|---|---|
+| no hostile caller | 5.8 | 12.0 | 1.2 | 72 | - |
+| hostile, `--no-limits` | 24.6 | 25.6 | 9.0 | 102 | 15,300/s |
+| hostile, `--rate-read 1500:3000` | 14.3 | 13.1 | 4.6 | 180 | 3,000/s |
+
+Limits cap the hostile caller at its budget and halve the read-side damage, but
+the flood (167,000 rejected requests/s here, on the same machine as the
+servers) still costs CPU, which is why the land tail is not better than
+without limits in this run: rejecting is cheap, not free. In production put
+a network-level limiter in front for floods of that size. The in-memory fleet
+(16 agents) lands 322k/243k (before, noisy) vs 328k/331k (after) in 20 s.
+
+Metrics: `ant_ratelimit_rejected_total{class,reason}` (`rate`, `queue_full`,
+`queue_timeout`), `ant_ratelimit_inflight{class}`,
+`ant_ratelimit_queued{class}`, `ant_ratelimit_inflight_limit{class}`.
+Rejections also appear as `resource_exhausted` / `unavailable` in
+`ant_rpc_requests_total` and 429/503 in `ant_http_requests_total`.
+
 ## 5. Observability
 
 ### What to scrape
@@ -512,6 +610,13 @@ sum by (method, code) (rate(ant_rpc_requests_total{code=~"internal|unavailable|u
 
 # 13. Replica down
 up{job="antimony"} == 0
+
+# 14. A principal (or an unthrottled herd) is being rate limited: sustained 429s
+sum by (class) (rate(ant_ratelimit_rejected_total{reason="rate"}[5m])) > 1       # for 10m
+
+# 15. Load shedding: the replica is overloaded (queue full / queue timeouts), or slot holders are stuck
+sum by (instance, class) (rate(ant_ratelimit_rejected_total{reason=~"queue_full|queue_timeout"}[5m])) > 0   # for 2m
+max by (instance, class) (ant_ratelimit_inflight / clamp_min(ant_ratelimit_inflight_limit, 1)) > 0.9        # for 5m
 ```
 
 Do not alert on `denied` unless you expect none (it counts policy refusals on
@@ -556,7 +661,7 @@ template variable on every panel):
 7. Postgres pool: in use vs max, idle
 8. History lag per ref
 9. Cache hit ratio and `ant_cache_bytes` by cache
-10. HTTP `/o` request rate and p99 (CDN miss traffic)
+10. HTTP `/o` and `/t` (`route="tree_bundles"`) request rate and p99 (CDN miss traffic)
 11. Process RSS and CPU (from node/process exporter)
 
 A compact importable Grafana dashboard (Grafana 10+, Prometheus datasource
@@ -614,6 +719,7 @@ ever points at lost objects, and a land that was acknowledged is durable.
 | **S3 full or quota exceeded** | as S3 outage, only for `put_many` | Large-object writes fail; reads fine. | Raise the quota. |
 | **Replica disk full** | log write errors | A replica keeps no data on disk besides logs; only logging suffers. | Rotate logs. Nothing else. |
 | **History index lag** | `ant_history_lag_commits{ref="..."}` does not return to 0; `history catch-up failed` warnings | `log --path` and `blame` still return correct results: a path log scans only the unindexed tail (up to a bounded number of commits) and takes the rest from the index; with a very large lag they get slower. Everything else is unaffected. | The index catches up after every successful land or `UpdateRef`, in the background, coalesced per ref; read the warning text for the store error behind it (usually Postgres trouble). Fixing the cause and landing once more (or waiting for traffic) re-runs it. If the ref was moved non-fast-forward, the index rebuilds from scratch on the next catch-up, which takes time proportional to history. |
+| **Overload or a runaway principal** | alert 14 or 15; `ant_ratelimit_rejected_total` rising; clients fail with `rate limit exceeded` / `server overloaded` once their retries run out | Rejected requests never ran, so nothing is half done; rate-limited callers slow down, everyone else keeps its latency. Shedding (`queue_full` / `queue_timeout`) means a class is at its concurrency limit: either real overload (also high `ant_pg_pool_in_use / ant_pg_pool_max`, rising store latency) or slots pinned by stalled streaming clients (`ant_ratelimit_inflight` at the limit while RPC throughput is low). | Find the principal: the slow-request log names it, and `reason="rate"` rejections point at a bucket. Raise its `[principal.limits]` if the traffic is legitimate, otherwise fix the harness (`ant` and `antd` already honour `retry-after-ms`; a client that still floods ignores it). For genuine overload add replicas or raise `--pg-max-connections` (watch Postgres `max_connections`). Do not raise `--max-inflight-*` beyond what the pool serves just to hide shedding. `--no-limits` is the emergency switch. |
 | **Stuck ref lock** | `ant_store_op_duration_seconds{store="refs",op="lock_ref"}` p99 near 10 s; WARN `ref lock unavailable; landing with CAS only`; queue depth up on a ref | A hung lock holder (stalled replica, half-open connection) blocks other replicas for up to the 10 s lock timeout; then they fall back to CAS-only landing, which stays correct but gets contended. | Find the holder: `SELECT pid, state, application_name, client_addr, query_start FROM pg_stat_activity WHERE pid IN (SELECT pid FROM pg_locks WHERE locktype='advisory' AND granted)`; if its replica is dead or unresponsive, restart that replica or `SELECT pg_terminate_backend(<pid>)` (the lock is released when the session ends; the holder's batch aborts and is retried). Add `application_name=antimony-<host>` to `--pg-url` to make holders identifiable. Locks are per (schema, ref), so unrelated refs are never affected. |
 | **Client cache corruption** | an agent reports decode or hash errors reading objects, or odd missing-file errors | The cache is content-addressed and disposable. A corrupt file (bad compression or framing) is deleted and refetched on its own, and fetched objects are hash-verified. | If problems persist, delete `<cache>/objects` (default `~/.cache/antimony/objects`); it refills on demand. **Do not delete the whole cache directory:** lazy-workspace state (edits) lives under `<cache>/ws/` (see below). Workspace metadata is in each workspace's `.ant/`. |
 | **FUSE daemon crash (lazy workspace)** | accessing the mount gives `Transport endpoint is not connected`; `ant -C <dir> status` says `error: lazy workspace mount <dir> is dead` with a `hint:` naming `ant ws remount` | The workspace's edits are **not lost**: they live in the state directory outside the mount (`<cache>/ws/<hash of mountpoint>/`: upper layer, whiteouts, journal). Metadata operations are journaled and recovery rolls an interrupted one forward or drops it; data of files that were still open or unsynced at the moment of the crash may be missing or partial, as with any POSIX crash. | `ant ws remount <dir>`: it detaches the dead mount (`fusermount3 -u -z`), restarts the daemon on the same state (recovery runs) and prints the base commit. Verified by an end-to-end test that SIGKILLs the daemon: uncommitted edits were intact after remounting. Then continue with `status`/`submit`/`land`. A host reboot has the same fix. |
@@ -672,9 +778,13 @@ exists in the services directory.
    in section 4.
 5. `--log-format json`, logs shipped, Prometheus scraping each replica, alerts
    from section 5.
-6. Harness: retries on `aborted`/`unavailable`, `ws update` + `ws resolve`
+6. Rate limits: off by default; set per-principal rates sized to the agents
+   per token (section 4, "Rate limits and load shedding"), especially for
+   bridge/CI principals, and alert on 14 and 15. Concurrency gates are on.
+7. Harness: retries on `aborted`/`unavailable` (`ant`/`antd` already honour
+   the server's `retry-after-ms`), `ws update` + `ws resolve`
    loop on exit code 2, backoff with jitter, sparse workspaces by default, one
    shared `ANT_CACHE` per host.
-7. Smoke test: `ant-bench soak` at the intended scale (it drops its own
+8. Smoke test: `ant-bench soak` at the intended scale (it drops its own
    `soak_*` schema and S3 prefix afterwards unless `--keep`); `ant-bench fleet`
    for a single-process load check.

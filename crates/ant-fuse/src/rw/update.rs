@@ -108,7 +108,7 @@ pub(super) async fn update_with(
         }
         // The plan reads the local versions of changed files by id, which
         // `local_changes` stores.
-        let Local { tree: old_tree, deleted, upper, changes: local } =
+        let Local { tree: old_tree, deleted, upper, changes: local, .. } =
             local_changes(&state, objects.as_ref(), &rt)?;
         let plan = rt
             .block_on(antd::update::plan(objects.as_ref(), old_tree, tree, &local))
@@ -331,7 +331,7 @@ mod tests {
     /// Read the workspace like the overlay does, from the state directory.
     fn view(rt: &tokio::runtime::Runtime, objects: &MemoryObjectStore, state: &Path) -> View {
         let Persisted { tree, deleted, .. } = load(state).unwrap();
-        let upper = scan_upper(state).unwrap();
+        let upper = scan_upper(state, None).unwrap();
         let lower = rt.block_on(leaves(objects, tree));
         let mut out = View::new();
         for (path, (mode, id)) in &lower {

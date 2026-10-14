@@ -91,6 +91,12 @@ impl Matcher {
         self.prefixes.iter().any(|p| under(s, p)) || self.globs.iter().any(|g| g.is_match(s))
     }
 
+    /// Does every path under directory `dir` match? (Glob patterns are not
+    /// analysed: only "everything" and prefix patterns count.)
+    pub(super) fn covers_all_under(&self, dir: &RepoPath) -> bool {
+        self.all || self.prefixes.iter().any(|p| under(dir.as_str(), p))
+    }
+
     pub(super) fn may_contain_under(&self, dir: &RepoPath) -> bool {
         if self.all || dir.is_root() || !self.globs.is_empty() {
             return true;

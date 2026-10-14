@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -133,6 +133,17 @@ pub struct Args {
     pub seed: u64,
     #[arg(long)]
     pub json: Option<PathBuf>,
+    /// Hostile client tasks: read in a tight loop (`GetRef`, `Log`,
+    /// `ReadPath`, no think time, never backing off), spread over the
+    /// replicas, from `--hostile-addr` so an open-mode server sees a caller
+    /// distinct from the agents. Their requests are not part of the agents'
+    /// latency statistics. Pair with `--replica-env ANT_NO_LIMITS=1` or
+    /// `--replica-env ANT_RATE_READ=<rps>` for the with/without comparison.
+    #[arg(long, default_value_t = 0)]
+    pub hostile: usize,
+    /// Source address of the hostile connections (any 127.0.0.0/8 address).
+    #[arg(long, default_value = "127.0.0.2")]
+    pub hostile_addr: std::net::IpAddr,
 }
 
 fn agent_dir(i: usize) -> String {
@@ -157,6 +168,9 @@ struct Window {
 #[derive(Default)]
 struct Recorder {
     window: Mutex<Window>,
+    /// Every successful operation's latency of the whole run (for the
+    /// overall percentiles in the summary).
+    all: Mutex<BTreeMap<&'static str, Vec<u64>>>,
     stop: AtomicBool,
 }
 
@@ -171,6 +185,13 @@ impl Recorder {
             w.ops += 1;
             w.lat.entry(op).or_default().push(micros);
         });
+        self.all.lock().unwrap_or_else(|e| e.into_inner()).entry(op).or_default().push(micros);
+    }
+
+    /// Overall latency of every operation in the run.
+    fn overall(&self) -> BTreeMap<&'static str, Lat> {
+        let all = self.all.lock().unwrap_or_else(|e| e.into_inner());
+        all.iter().map(|(op, v)| (*op, Lat::from_micros(v.clone()))).collect()
     }
 
     fn err(&self, op: &'static str, e: &tonic::Status) {
@@ -188,6 +209,45 @@ impl Recorder {
 
     fn take(&self) -> Window {
         self.with(std::mem::take)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hostile client
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct HostileStats {
+    sent: AtomicU64,
+    ok: AtomicU64,
+    /// `RESOURCE_EXHAUSTED` (rate limited).
+    limited: AtomicU64,
+    /// `UNAVAILABLE` (load shed).
+    shed: AtomicU64,
+    other: AtomicU64,
+}
+
+/// Reads as fast as the server answers, ignoring retry hints.
+async fn hostile(mut c: Client, stats: Arc<HostileStats>, rec: Arc<Recorder>, seed: u64, i: usize) {
+    let mut rng = agent_rng(seed, 1_000_000 + i);
+    while !rec.stop.load(Ordering::Relaxed) {
+        stats.sent.fetch_add(1, Ordering::Relaxed);
+        let result = match rng.random_range(0..3) {
+            0 => c.get_ref(pb::GetRefRequest { name: REF.into() }).await.map(|_| ()),
+            1 => c.log(pb::LogRequest { rev: REF.into(), path: None, limit: 20 }).await.map(|_| ()),
+            _ => {
+                let path = format!("agents/{:02}", rng.random_range(0..SHARDS));
+                let req = pb::ReadPathRequest { rev: REF.into(), path, include_content: false };
+                c.read_path(req).await.map(|_| ())
+            }
+        };
+        let counter = match result {
+            Ok(()) => &stats.ok,
+            Err(e) if e.code() == tonic::Code::ResourceExhausted => &stats.limited,
+            Err(e) if e.code() == tonic::Code::Unavailable => &stats.shed,
+            Err(_) => &stats.other,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -368,7 +428,8 @@ impl Agent {
         };
         let Some(tip) = tip else { return };
         let t = Instant::now();
-        let req = pb::DiffRequest { from_rev: hex(&self.base), to_rev: hex(&tip) };
+        let req =
+            pb::DiffRequest { from_rev: hex(&self.base), to_rev: hex(&tip), ..Default::default() };
         match self.c.diff(req).await {
             Ok(_) => {
                 self.rec.ok("status", t);
@@ -644,6 +705,9 @@ struct Outcome {
     rss_slopes: Vec<f64>,
     windows: Vec<WindowReport>,
     failures: Vec<String>,
+    /// Whole-run latency per operation of the (non-hostile) agents.
+    overall: BTreeMap<&'static str, Lat>,
+    hostile: Option<Arc<HostileStats>>,
 }
 
 async fn drive(args: &Args, plan: &Plan) -> Result<i32> {
@@ -671,8 +735,32 @@ async fn drive(args: &Args, plan: &Plan) -> Result<i32> {
         })
         .collect();
 
+    // ---- hostile callers (optional) ----
+    let hostile_stats = (args.hostile > 0).then(|| Arc::new(HostileStats::default()));
+    let mut hostile_handles = Vec::new();
+    if let Some(stats) = &hostile_stats {
+        for i in 0..args.hostile {
+            let url = &replicas[i % args.replicas].grpc_url;
+            let ch = Channel::from_shared(url.clone())?
+                .local_address(Some(args.hostile_addr))
+                .connect()
+                .await
+                .with_context(|| format!("connecting hostile client from {}", args.hostile_addr))?;
+            hostile_handles.push(tokio::spawn(hostile(
+                client(ch),
+                stats.clone(),
+                rec.clone(),
+                args.seed,
+                i,
+            )));
+        }
+    }
+
     let windows = run_windows(args, &rec, start, &mut replicas, &mut pg).await;
     rec.stop.store(true, Ordering::Relaxed);
+    for h in hostile_handles {
+        let _ = h.await;
+    }
     let mut outs = Vec::new();
     let mut failures = Vec::new();
     for (i, h) in handles.into_iter().enumerate() {
@@ -705,7 +793,17 @@ async fn drive(args: &Args, plan: &Plan) -> Result<i32> {
     for r in replicas {
         r.shutdown().await;
     }
-    let outcome = Outcome { wall, verify_s, growth, files_checked, rss_slopes, windows, failures };
+    let outcome = Outcome {
+        wall,
+        verify_s,
+        growth,
+        files_checked,
+        rss_slopes,
+        windows,
+        failures,
+        overall: rec.overall(),
+        hostile: hostile_stats,
+    };
     report(args, plan, &tot, &outcome)
 }
 
@@ -1033,6 +1131,27 @@ fn report(args: &Args, plan: &Plan, tot: &Totals, o: &Outcome) -> Result<i32> {
     let slopes: Vec<String> = o.rss_slopes.iter().map(|s| format!("{s:.0}")).collect();
     println!("RSS trend       {} MiB/h (after warm-up, per replica)", slopes.join(", "));
     println!("files checked   {}", o.files_checked);
+    println!("overall latency (agents, ms)    n      p50      p95      p99      max");
+    for (op, l) in &o.overall {
+        println!(
+            "  {op:<28}{:>6} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
+            l.n, l.p50_ms, l.p95_ms, l.p99_ms, l.max_ms
+        );
+    }
+    if let Some(h) = &o.hostile {
+        let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        println!(
+            "hostile         {} tasks from {}: sent {} ({:.0}/s), served {}, rate-limited {}, shed {}, other errors {}",
+            args.hostile,
+            args.hostile_addr,
+            get(&h.sent),
+            get(&h.sent) as f64 / wall,
+            get(&h.ok),
+            get(&h.limited),
+            get(&h.shed),
+            get(&h.other)
+        );
+    }
     println!("result: {}", if pass { "PASS" } else { "FAIL" });
     for f in &o.failures {
         println!("  - {f}");
@@ -1056,6 +1175,28 @@ fn report(args: &Args, plan: &Plan, tot: &Totals, o: &Outcome) -> Result<i32> {
         .with("aborts", tot.aborts)
         .with("error_rate", tot.error_rate)
         .with("rss_growth_mib_per_hour", J::Arr(o.rss_slopes.iter().map(|&s| J::from(s)).collect()))
+        .with(
+            "overall_latency",
+            J::Arr(
+                o.overall
+                    .iter()
+                    .map(|(op, l)| J::obj().with("op", *op).with("latency", l.json()))
+                    .collect(),
+            ),
+        )
+        .with(
+            "hostile",
+            o.hostile.as_ref().map(|h| {
+                let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+                J::obj()
+                    .with("tasks", args.hostile)
+                    .with("sent", get(&h.sent))
+                    .with("served", get(&h.ok))
+                    .with("rate_limited", get(&h.limited))
+                    .with("shed", get(&h.shed))
+                    .with("other_errors", get(&h.other))
+            }),
+        )
         .with("windows", J::Arr(o.windows.iter().map(window_json).collect()))
         .with("pass", pass)
         .with("failures", J::Arr(o.failures.iter().map(|f| J::from(f.as_str())).collect()));

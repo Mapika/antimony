@@ -276,7 +276,7 @@ async fn log_paths(c: &mut Client, rev: &str, path: Option<&str>) -> Vec<ObjectI
 }
 
 async fn diff_paths(c: &mut Client, from: &str, to: &str) -> Vec<String> {
-    c.diff(pb::DiffRequest { from_rev: from.into(), to_rev: to.into() })
+    c.diff(pb::DiffRequest { from_rev: from.into(), to_rev: to.into(), ..Default::default() })
         .await
         .unwrap()
         .into_inner()
@@ -348,12 +348,40 @@ async fn unauthenticated_and_unknown_tokens() {
             c.log(pb::LogRequest { rev: "main".into(), path: None, limit: 0 }).await.unwrap_err();
         assert_eq!(e.code(), Code::Unauthenticated);
         let e = c
-            .diff(pb::DiffRequest { from_rev: String::new(), to_rev: "main".into() })
+            .diff(pb::DiffRequest {
+                from_rev: String::new(),
+                to_rev: "main".into(),
+                ..Default::default()
+            })
             .await
             .unwrap_err();
         assert_eq!(e.code(), Code::Unauthenticated);
         let e = c
             .blame(pb::BlameRequest { rev: "main".into(), path: "README".into() })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::Unauthenticated);
+        let e = c
+            .merge_base(pb::MergeBaseRequest { a: "main".into(), b: "main".into() })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::Unauthenticated);
+        let e = c
+            .is_ancestor(pb::IsAncestorRequest {
+                ancestor: "main".into(),
+                descendant: "main".into(),
+                first_parent_only: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::Unauthenticated);
+        let e = c
+            .log_range(pb::LogRangeRequest { to: "main".into(), ..Default::default() })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::Unauthenticated);
+        let e = c
+            .landed_as(pb::LandedAsRequest { commit: tip.to_hex(), ref_name: String::new() })
             .await
             .unwrap_err();
         assert_eq!(e.code(), Code::Unauthenticated);
@@ -529,6 +557,217 @@ async fn read_path_log_diff_blame_filtering() {
         w.blame(pb::BlameRequest { rev: "main".into(), path: "secrets/key".into() }).await.unwrap();
     assert_eq!(lines.into_inner().lines[0].commit, c2.0.to_vec());
     r.blame(pb::BlameRequest { rev: "main".into(), path: "src/a.rs".into() }).await.unwrap();
+}
+
+async fn range_ids(c: &mut Client, from: &str, to: &str, path: Option<&str>) -> Vec<ObjectId> {
+    let (mut out, mut token) = (Vec::new(), String::new());
+    loop {
+        let r = c
+            .log_range(pb::LogRangeRequest {
+                from_exclusive: from.into(),
+                to: to.into(),
+                path: path.map(Into::into),
+                limit: 1,
+                page_token: token,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        out.extend(r.commits.iter().map(|e| ObjectId::from_bytes(&e.id).unwrap()));
+        if r.next_page_token.is_empty() {
+            return out;
+        }
+        token = r.next_page_token;
+    }
+}
+
+/// Paths and patch text of a `Diff` with the given options.
+async fn diff_patch(
+    c: &mut Client,
+    from: &str,
+    to: &str,
+    prefixes: &[&str],
+    merge_base: bool,
+) -> (Vec<String>, String) {
+    let r = c
+        .diff(pb::DiffRequest {
+            from_rev: from.into(),
+            to_rev: to.into(),
+            path_prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+            merge_base,
+            patch: true,
+            context_lines: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let paths = r.changes.iter().map(|c| c.path.clone()).collect();
+    let text = r
+        .changes
+        .iter()
+        .flat_map(|c| c.patch.iter().flat_map(|p| &p.hunks).flat_map(|h| &h.lines))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    (paths, text)
+}
+
+/// The graph queries see the whole history (commits are not path
+/// restricted, as with `Log`); path-filtered ranges count only readable
+/// changes; diffs with prefixes, merge bases and patches never list or
+/// read restricted files; unknown commits are missing for everyone.
+#[tokio::test]
+async fn graph_queries_ranges_and_patches_filtering() {
+    let (s, c1) = seeded().await;
+    let mut r = s.client(Some(READER));
+    let mut w = s.client(Some(WRITER));
+    let c2 =
+        changeset(&mut w, Some(c1), vec![write_file("secrets/key", "rotated\n")]).await.unwrap();
+    let c2 = landed_tip(&mut w, "main", c2).await;
+    let c3 =
+        changeset(&mut r, Some(c2), vec![write_file("src/a.rs", "pub fn b() {}\n")]).await.unwrap();
+    let c3 = landed_tip(&mut r, "main", c3).await;
+    // A reader's branch off c1, touching src/ only.
+    let f = changeset(&mut r, Some(c1), vec![write_file("src/f.rs", "f\n")]).await.unwrap();
+    let fh = f.to_hex();
+
+    for c in [&mut r, &mut w] {
+        let mb = c
+            .merge_base(pb::MergeBaseRequest { a: "main".into(), b: fh.clone() })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(mb.commit, Some(c1.0.to_vec()));
+        let anc = c
+            .is_ancestor(pb::IsAncestorRequest {
+                ancestor: c2.to_hex(),
+                descendant: "main".into(),
+                first_parent_only: true,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(anc.is_ancestor);
+        let landed = c
+            .landed_as(pb::LandedAsRequest { commit: c3.to_hex(), ref_name: "main".into() })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(landed.landed);
+        assert_eq!(landed.landed_commit, c3.0.to_vec());
+        // Unknown commits: not found, whoever asks.
+        let ghost = ObjectId([7; 32]).to_hex();
+        let e = c
+            .merge_base(pb::MergeBaseRequest { a: ghost.clone(), b: "main".into() })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::NotFound);
+        let e = c
+            .is_ancestor(pb::IsAncestorRequest {
+                ancestor: ghost.clone(),
+                descendant: "main".into(),
+                first_parent_only: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::NotFound);
+        let e = c
+            .landed_as(pb::LandedAsRequest { commit: ghost.clone(), ref_name: String::new() })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::NotFound);
+        let e = c
+            .log_range(pb::LogRangeRequest {
+                from_exclusive: ghost.clone(),
+                to: "main".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::NotFound);
+    }
+
+    // LogRange: the whole range is visible; a path counts readable changes
+    // only, by scan and through the index.
+    let c1h = c1.to_hex();
+    for indexed in [false, true] {
+        if indexed {
+            ant_server::ops::history::catch_up(&s.backend, "main").await.unwrap();
+        }
+        assert_eq!(range_ids(&mut r, &c1h, "main", None).await, [c3, c2]);
+        assert_eq!(range_ids(&mut r, &c1h, "main", Some("secrets")).await, Vec::<ObjectId>::new());
+        assert_eq!(range_ids(&mut r, &c1h, "main", Some("secrets/key")).await, []);
+        assert_eq!(range_ids(&mut r, &c1h, "main", Some("")).await, [c3]);
+        assert_eq!(range_ids(&mut w, &c1h, "main", Some("secrets")).await, [c2]);
+        assert_eq!(range_ids(&mut w, &c1h, "main", Some("")).await, [c3, c2]);
+        assert_eq!(range_ids(&mut r, "", "main", Some("secrets")).await, []);
+        assert_eq!(range_ids(&mut w, "", "main", Some("secrets")).await, [c2, c1]);
+    }
+
+    // Diff with patches: restricted files are neither listed nor diffed.
+    let (paths, text) = diff_patch(&mut r, "", "main", &[], false).await;
+    assert_eq!(paths, ["README", "src/a.rs"]);
+    assert!(!text.contains("TOPSECRET") && !text.contains("rotated"), "{text}");
+    let (paths, text) = diff_patch(&mut w, "", "main", &[], false).await;
+    assert_eq!(paths.len(), 4);
+    assert!(text.contains("+rotated"), "{text}");
+    // Prefixes: the restricted subtree is empty for the reader.
+    assert_eq!(diff_patch(&mut r, "", "main", &["secrets"], false).await.0, Vec::<String>::new());
+    assert_eq!(
+        diff_patch(&mut r, "", "main", &["secrets/key"], false).await.0,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        diff_patch(&mut w, "", "main", &["secrets", "src"], false).await.0,
+        ["secrets/dir/x", "secrets/key", "src/a.rs"]
+    );
+    // Merge-base diffs: main...f is f's own change; f...main hides secrets.
+    assert_eq!(diff_patch(&mut r, "main", &fh, &[], true).await.0, ["src/f.rs"]);
+    let (paths, text) = diff_patch(&mut r, &fh, "main", &[], true).await;
+    assert_eq!(paths, ["src/a.rs"]);
+    assert!(!text.contains("rotated"), "{text}");
+    assert_eq!(diff_patch(&mut w, &fh, "main", &[], true).await.0, ["secrets/key", "src/a.rs"]);
+}
+
+/// The ops-level API applies the same filters (`log_range_as`, `diff_with`).
+#[tokio::test]
+async fn ops_level_ranges_and_patches() {
+    let (s, c1) = seeded().await;
+    let reader = access(READER);
+    let writer = access(WRITER);
+    let b = &s.backend;
+    let secrets = p("secrets");
+    let page = ant_server::ops::ancestry::log_range_as(
+        b,
+        Some(&reader),
+        None,
+        "main",
+        Some(&secrets),
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(page.entries.is_empty());
+    let page = ant_server::ops::ancestry::log_range_as(
+        b,
+        Some(&writer),
+        None,
+        "main",
+        Some(&secrets),
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.entries.iter().map(|e| e.id).collect::<Vec<_>>(), [c1]);
+    let opts =
+        query::DiffOptions { prefixes: vec![secrets.clone()], merge_base: false, patch: Some(3) };
+    let d = query::diff_with(b, Some(&reader), None, "main", &opts).await.unwrap();
+    assert!(d.changes.is_empty() && d.patches.unwrap().is_empty());
+    let d = query::diff_with(b, Some(&writer), None, "main", &opts).await.unwrap();
+    assert_eq!(d.changes.len(), 2);
+    assert!(d.patches.unwrap().iter().flatten().any(|p| p.hunks[0].lines[0] == "+TOPSECRET"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,4 +1420,220 @@ async fn ops_level_checks() {
     assert!(matches!(e, OpError::PermissionDenied(_)));
     let ok = land::land_as(&b, Some(&writer), "main", sneaky).await.unwrap();
     assert!(matches!(ok, LandOutcome::Landed { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// tree bundles (`GET /t/{id}`)
+// ---------------------------------------------------------------------------
+
+struct BundleResponse {
+    status: u16,
+    cache: String,
+    ids: Vec<ObjectId>,
+    body: Bytes,
+}
+
+async fn get_bundle(s: &Server, tree: &ObjectId, token: Option<&str>) -> BundleResponse {
+    let mut req = s.http.get(format!("{}/t/{}", s.http_base, tree.to_hex()));
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status().as_u16();
+    let cache = resp
+        .headers()
+        .get("cache-control")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    let body = resp.bytes().await.unwrap();
+    let ids = if status == 200 {
+        let frames = ant_proto::bundle::decode(&body, 64 << 20).unwrap();
+        for (id, data) in &frames {
+            EncodedObject::from_bytes(data.clone()).unwrap().verify(id).unwrap();
+        }
+        frames.into_iter().map(|(id, _)| id).collect()
+    } else {
+        Vec::new()
+    };
+    BundleResponse { status, cache, ids, body }
+}
+
+/// The safety invariants of bundles for every (tree, caller) pair: a
+/// response a shared cache may store (`public`) holds no object outside the
+/// root zone and is byte-identical for every caller that gets one; every
+/// other 200 is `private, no-store` and holds only objects the caller can
+/// read by id.
+async fn check_bundle_invariants(s: &Server, policy: &Policy, trees: &[ObjectId], tokens: &[&str]) {
+    let acl = Acl::new(policy.clone());
+    for tree in trees {
+        let mut public: Option<Bytes> = None;
+        for token in tokens {
+            let r = get_bundle(s, tree, Some(token)).await;
+            if r.status != 200 {
+                assert_eq!(r.status, 404, "{tree} for {token}");
+                continue;
+            }
+            assert_eq!(r.ids.first(), Some(tree));
+            if r.cache.starts_with("public") {
+                let private = acl::private_many(&s.backend, policy, &r.ids).await.unwrap();
+                assert!(!private.contains(&true), "private object in a public bundle of {tree}");
+                match &public {
+                    Some(b) => {
+                        assert_eq!(b, &r.body, "public bundle of {tree} differs for {token}")
+                    }
+                    None => public = Some(r.body.clone()),
+                }
+            } else {
+                assert_eq!(r.cache, "private, no-store", "{tree} for {token}");
+                let a = acl.authenticate(Some(token)).unwrap().unwrap();
+                let readable =
+                    acl::readable(&s.backend, &a.policy, &a.principal, &r.ids).await.unwrap();
+                assert!(readable.iter().all(|r| *r), "unreadable object for {token} in {tree}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn tree_bundles_never_share_restricted_objects() {
+    let (s, _) = seeded().await;
+    let mut w = s.client(Some(WRITER));
+    let root = path_id(&mut w, "main", "").await;
+    let src = path_id(&mut w, "main", "src").await;
+    let secrets = path_id(&mut w, "main", "secrets").await;
+    let secrets_dir = path_id(&mut w, "main", "secrets/dir").await;
+    let key = path_id(&mut w, "main", "secrets/key").await;
+    let nested = path_id(&mut w, "main", "secrets/dir/x").await;
+    let restricted = [secrets, secrets_dir, key, nested];
+
+    // The root bundle is shared: the same public bytes for everyone, with
+    // the public files but nothing from secrets/ (not even for the writer,
+    // who may read it: shared caches serve it to anyone).
+    let reader = get_bundle(&s, &root, Some(READER)).await;
+    let writer = get_bundle(&s, &root, Some(WRITER)).await;
+    let admin = get_bundle(&s, &root, Some(ADMIN)).await;
+    for r in [&reader, &writer, &admin] {
+        assert_eq!(r.status, 200);
+        assert_eq!(r.cache, "public, max-age=31536000, immutable");
+        assert_eq!(r.body, reader.body);
+        for id in restricted {
+            assert!(!r.ids.contains(&id), "restricted {id} in the root bundle");
+        }
+        for id in [root, src, blob_id("pub fn a() {}\n"), blob_id("readme\n")] {
+            assert!(r.ids.contains(&id), "{id} missing from the root bundle");
+        }
+    }
+
+    // The restricted directory: 404 like a missing tree for the reader;
+    // a caller-specific, never-stored bundle for the writer.
+    let r = get_bundle(&s, &secrets, Some(READER)).await;
+    assert_eq!(r.status, 404);
+    assert_eq!(r.cache, "no-store");
+    let r = get_bundle(&s, &secrets, Some(WRITER)).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.cache, "private, no-store");
+    for id in restricted {
+        assert!(r.ids.contains(&id), "{id} missing from the writer's secrets bundle");
+    }
+
+    // Authentication as for `/o/`.
+    assert_eq!(get_bundle(&s, &root, None).await.status, 401);
+    assert_eq!(get_bundle(&s, &root, Some("t-unknown")).await.status, 401);
+
+    let policy = Policy::parse(&policy_text()).unwrap();
+    let trees = [root, src, secrets, secrets_dir];
+    check_bundle_invariants(&s, &policy, &trees, &[READER, WRITER, ADMIN]).await;
+}
+
+/// A policy whose root zone is not readable by everyone: `outsider` reads
+/// only `docs/`, `insider` reads everything.
+fn closed_policy() -> Policy {
+    Policy::parse(&format!(
+        r#"
+        [[principal]]
+        name = "outsider"
+        token_sha256 = "{}"
+
+        [[principal]]
+        name = "insider"
+        token_sha256 = "{}"
+        groups = ["staff"]
+
+        [[path]]
+        prefix = ""
+        read = ["group:staff"]
+        write = ["group:staff"]
+
+        [[path]]
+        prefix = "docs"
+        read = ["*"]
+        write = ["group:staff"]
+        "#,
+        hex(hash_token("t-outsider")),
+        hex(hash_token("t-insider")),
+    ))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn tree_bundles_when_the_root_zone_is_restricted() {
+    let policy = closed_policy();
+    let s = Server::start(Acl::new(policy.clone())).await;
+    let b = &s.backend;
+    let tree = |entries: Vec<(&str, EntryMode, ObjectId)>| {
+        let es = entries.into_iter().map(|(n, mode, id)| TreeEntry { mode, name: n.into(), id });
+        Object::Tree(Tree::new(es.collect()).unwrap()).encode()
+    };
+    let blob = |s: &str| EncodedObject::new(ObjectKind::Blob, s.as_bytes());
+
+    // docs/guide (docs zone only); src/main (root zone, untagged).
+    let guide = blob("guide\n");
+    let docs = tree(vec![("guide", EntryMode::File, guide.id())]);
+    let main_rs = blob("fn main() {}\n");
+    let src = tree(vec![("main", EntryMode::File, main_rs.id())]);
+    let root = tree(vec![("docs", EntryMode::Tree, docs.id()), ("src", EntryMode::Tree, src.id())]);
+    acl::tag_written(b, &policy, &[(p("docs"), docs.id()), (p("docs/guide"), guide.id())])
+        .await
+        .unwrap();
+    b.objects
+        .put_many(&[guide.clone(), docs.clone(), main_rs.clone(), src.clone(), root.clone()])
+        .await
+        .unwrap();
+    // `shared` is stored untagged (public), then also placed under docs/,
+    // so it carries the root and the docs tag: the outsider can read the
+    // tree, but not its untagged blob.
+    let hidden = blob("staff only\n");
+    let shared = tree(vec![("f", EntryMode::File, hidden.id())]);
+    b.objects.put_many(&[hidden.clone(), shared.clone()]).await.unwrap();
+    acl::tag_written(b, &policy, &[(p("docs/shared"), shared.id())]).await.unwrap();
+
+    // The root tree: unreadable for the outsider; a public bundle without
+    // docs/ (outside the root zone) for the insider.
+    assert_eq!(get_bundle(&s, &root.id(), Some("t-outsider")).await.status, 404);
+    let r = get_bundle(&s, &root.id(), Some("t-insider")).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.cache, "public, max-age=31536000, immutable");
+    assert_eq!(r.ids, [root.id(), src.id(), main_rs.id()]);
+
+    // docs/ lies outside the root zone: caller-specific, never stored.
+    for token in ["t-outsider", "t-insider"] {
+        let r = get_bundle(&s, &docs.id(), Some(token)).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(r.cache, "private, no-store");
+        assert_eq!(r.ids, [docs.id(), guide.id()]);
+    }
+
+    // shared/ is public, but the outsider cannot read its blob: the
+    // outsider's response leaves it out and is caller-specific; the
+    // insider's is the shared one.
+    let r = get_bundle(&s, &shared.id(), Some("t-outsider")).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.cache, "private, no-store");
+    assert_eq!(r.ids, [shared.id()]);
+    let r = get_bundle(&s, &shared.id(), Some("t-insider")).await;
+    assert_eq!(r.cache, "public, max-age=31536000, immutable");
+    assert_eq!(r.ids, [shared.id(), hidden.id()]);
+
+    let trees = [root.id(), docs.id(), src.id(), shared.id()];
+    check_bundle_invariants(&s, &policy, &trees, &["t-outsider", "t-insider"]).await;
 }

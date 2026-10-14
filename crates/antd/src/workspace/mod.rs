@@ -27,7 +27,11 @@
 //! `materialize`:
 //! - `dir` must not exist or be empty (else `AlreadyExists` io error).
 //! - Walks the tree breadth-first, fetching each level's subtrees with one
-//!   `get_many` call. Skips subtrees that cannot contain a match
+//!   `get_many` call. With a [`DirFetch`] (`materialize_with`; the CLI
+//!   passes its read-through store, which uses HTTP tree bundles when
+//!   `--http` is set), trees of directories wholly inside the sparse scope
+//!   are fetched with `DirFetch::get_dirs` instead, which may bring their
+//!   blobs and subdirectories into the cache in the same round trip. Skips subtrees that cannot contain a match
 //!   (`Sparse::may_contain_under(dir_path)`: true if any prefix pattern
 //!   starts with or is under that dir, or any glob pattern exists — globs are
 //!   not pruned).
@@ -51,7 +55,12 @@
 //!   indexing) and is always re-hashed.
 //! - Indexed paths missing on disk → `Deleted`.
 //! - Unindexed files anywhere (even outside the sparse patterns) → `Added`
-//!   (it's the agent's new file — never ignore it).
+//!   (it's the agent's new file), unless an ignore rule hides them
+//!   ([`crate::ignore`]: `.gitignore` files at any depth plus `.ant/ignore`).
+//!   Indexed (tracked) files are always compared, ignored or not. An ignored
+//!   directory is not entered unless it contains indexed files (so a huge
+//!   `target/` costs one `readdir` of its parent), and its untracked
+//!   contents are reported only by `status_with_ignored`.
 //! - Empty directories are ignored. Output sorted by path.
 //! - New/modified blob contents are stored into `objects` (so `submit` can
 //!   upload them by id) — `LocalChange.new` carries their ids.
@@ -78,10 +87,12 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ant_core::EncodedObject;
 use ant_core::{EntryMode, ObjectId, ObjectKind, RepoPath, hash_object};
 use ant_store::ObjectStore;
 use ant_store::graph::diff_trees;
 use anyhow::{Context, anyhow, bail};
+use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::par::par_map;
@@ -100,6 +111,8 @@ const STATE_DIR: &str = ".ant";
 const CONFIG_FILE: &str = "workspace";
 const INDEX_FILE: &str = "index";
 const CONFLICTS_FILE: &str = "conflicts";
+/// `.ant/ignore`: optional workspace-local ignore patterns (user-written).
+const IGNORE_FILE: &str = "ignore";
 /// Version of the `.ant/` state layout, the `format=` line of
 /// `.ant/workspace` (absent in workspaces created before it: version 1).
 pub const WORKSPACE_FORMAT: u64 = 1;
@@ -119,6 +132,15 @@ pub struct LocalChange {
     pub new: Option<(EntryMode, ObjectId)>,
 }
 
+/// Tree reads for a walk that goes on to read the trees' blobs and subtrees
+/// (a full or prefix-sparse checkout of those directories).
+#[async_trait]
+pub trait DirFetch: Send + Sync {
+    /// Like `ObjectStore::get_many(trees)` (same results, input order), but
+    /// may also make the directories' contents local in the same round trip.
+    async fn get_dirs(&self, trees: &[ObjectId]) -> ant_store::Result<Vec<Option<EncodedObject>>>;
+}
+
 #[derive(Debug)]
 pub struct Workspace {
     dir: PathBuf,
@@ -135,6 +157,20 @@ impl Workspace {
         base_tree: ObjectId,
         sparse: Sparse,
     ) -> anyhow::Result<Self> {
+        Self::materialize_with(objects, None, dir, base_commit, base_tree, sparse).await
+    }
+
+    /// [`materialize`](Self::materialize), reading the trees of directories
+    /// wholly inside the sparse scope through `dirs` (e.g. HTTP tree
+    /// bundles) when given.
+    pub async fn materialize_with(
+        objects: &dyn ObjectStore,
+        dirs: Option<&dyn DirFetch>,
+        dir: &Path,
+        base_commit: ObjectId,
+        base_tree: ObjectId,
+        sparse: Sparse,
+    ) -> anyhow::Result<Self> {
         let matcher = sparse.compile()?;
 
         // Breadth-first walk: one get_many per level for the subtrees we need;
@@ -143,8 +179,7 @@ impl Workspace {
         let mut leaves: Vec<(RepoPath, EntryMode, ObjectId)> = Vec::new();
         let mut frontier = vec![(RepoPath::root(), base_tree)];
         while !frontier.is_empty() {
-            let ids: Vec<ObjectId> = frontier.iter().map(|(_, id)| *id).collect();
-            let level = objects.get_many(&ids).await?;
+            let level = fetch_level(objects, dirs, &matcher, &frontier).await?;
             let m = matcher.clone();
             let expanded = tokio::task::spawn_blocking(move || {
                 let work: Vec<_> = frontier.into_iter().zip(level).collect();
@@ -215,15 +250,24 @@ impl Workspace {
     }
 
     pub async fn status(&self, objects: &dyn ObjectStore) -> anyhow::Result<Vec<LocalChange>> {
+        Ok(self.status_with_ignored(objects).await?.0)
+    }
+
+    /// [`status`](Self::status) plus the untracked paths the ignore rules
+    /// hide (sorted; ignored directories end in `/`).
+    pub async fn status_with_ignored(
+        &self,
+        objects: &dyn ObjectStore,
+    ) -> anyhow::Result<(Vec<LocalChange>, Vec<String>)> {
         let dir = self.dir.clone();
-        let (changes, blobs) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let found = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let index = read_index(&dir)?;
             let mtime = index_mtime(&dir)?;
             scan(&dir, &index, mtime)
         })
         .await??;
-        put_blobs(objects, &blobs).await?;
-        Ok(changes)
+        put_blobs(objects, &found.blobs).await?;
+        Ok((found.changes, found.ignored))
     }
 
     pub async fn reset_to(
@@ -448,6 +492,32 @@ impl Workspace {
         self.base_tree = tree;
         Ok(())
     }
+}
+
+/// The trees of one walk level, in `frontier` order: directories wholly in
+/// scope through `dirs` (when given), the rest with one `get_many`.
+async fn fetch_level(
+    objects: &dyn ObjectStore,
+    dirs: Option<&dyn DirFetch>,
+    matcher: &sparse::Matcher,
+    frontier: &[(RepoPath, ObjectId)],
+) -> anyhow::Result<Vec<Option<EncodedObject>>> {
+    let whole: Vec<bool> = match dirs {
+        Some(_) => frontier.iter().map(|(p, _)| matcher.covers_all_under(p)).collect(),
+        None => vec![false; frontier.len()],
+    };
+    let pick = |want: bool| -> Vec<ObjectId> {
+        frontier.iter().zip(&whole).filter(|(_, w)| **w == want).map(|((_, id), _)| *id).collect()
+    };
+    let (by_dir, by_id) = (pick(true), pick(false));
+    let mut by_dir = match dirs {
+        Some(d) if !by_dir.is_empty() => d.get_dirs(&by_dir).await?,
+        _ => Vec::new(),
+    }
+    .into_iter();
+    let mut by_id =
+        if by_id.is_empty() { Vec::new() } else { objects.get_many(&by_id).await? }.into_iter();
+    Ok(whole.iter().map(|w| if *w { by_dir.next() } else { by_id.next() }.flatten()).collect())
 }
 
 /// The workspace's unresolved conflicts file (`.ant/conflicts`).

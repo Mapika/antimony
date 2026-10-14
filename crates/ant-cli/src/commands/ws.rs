@@ -107,7 +107,7 @@ pub async fn new(ctx: &Ctx, dir: &Path, at: &str, patterns: Vec<String>) -> Resu
     let commit = resolve_commit(&mut remote.client(), at).await?;
     let tree = rt.read_commit(&commit).await?.tree;
     let track = tracked_ref(&remote, at).await?;
-    Workspace::materialize(rt.as_ref(), dir, commit, tree, sparse).await?;
+    Workspace::materialize_with(rt.as_ref(), Some(rt.as_ref()), dir, commit, tree, sparse).await?;
     if let Some(name) = track {
         tokio::fs::write(dir.join(".ant").join(TRACK), format!("{name}\n")).await?;
     }
@@ -122,26 +122,33 @@ fn letter(k: LocalChangeKind) -> char {
     }
 }
 
-async fn local_changes(ctx: &Ctx) -> Result<(PathBuf, Workspace, Vec<LocalChange>)> {
+/// The workspace root, its config, local changes and the untracked paths the
+/// ignore rules hide (sorted; directories end in `/`).
+async fn local_changes(ctx: &Ctx) -> Result<(PathBuf, Workspace, Vec<LocalChange>, Vec<String>)> {
     let root = require_workspace(ctx.directory.as_deref())?;
     let ws = Workspace::open(&root)?;
     let disk = ctx.disk()?;
-    let changes = if let Some(state) = lazy_state(&root).await? {
+    let (changes, ignored) = if let Some(state) = lazy_state(&root).await? {
         let (read, _) = ctx.read_through().await?;
         let objects = Arc::new(LazyObjects { read, local: disk });
-        ant_fuse::rw::changes(objects, &state).await?
+        ant_fuse::rw::changes_with_ignored(objects, &state).await?
     } else {
-        ws.status(disk.as_ref()).await?
+        ws.status_with_ignored(disk.as_ref()).await?
     };
-    Ok((root, ws, changes))
+    Ok((root, ws, changes, ignored))
 }
 
-pub async fn status(ctx: &Ctx) -> Result<Outcome> {
-    let (root, _, changes) = local_changes(ctx).await?;
+pub async fn status(ctx: &Ctx, show_ignored: bool) -> Result<Outcome> {
+    let (root, _, changes, ignored) = local_changes(ctx).await?;
     let mut lines: std::collections::BTreeMap<String, char> =
         changes.into_iter().map(|c| (c.path.to_string(), letter(c.kind))).collect();
     for path in pending_conflicts(&root).await? {
         lines.insert(path.to_string(), 'C');
+    }
+    if show_ignored {
+        for path in ignored {
+            lines.entry(path).or_insert('!');
+        }
     }
     let mut out = String::new();
     for (path, letter) in lines {
@@ -152,7 +159,7 @@ pub async fn status(ctx: &Ctx) -> Result<Outcome> {
 
 pub async fn submit(ctx: &Ctx, message: &str) -> Result<Outcome> {
     require_no_conflicts(&require_workspace(ctx.directory.as_deref())?).await?;
-    let (root, ws, changes) = local_changes(ctx).await?;
+    let (root, ws, changes, _) = local_changes(ctx).await?;
     if changes.is_empty() {
         bail!("nothing to submit");
     }

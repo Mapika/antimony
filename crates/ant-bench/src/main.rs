@@ -10,6 +10,7 @@
 //! JSON object with all metrics. Exit code: 0 on success, 1 when `fleet` or
 //! `soak` invariants fail, 2 on an error (`error: ...` on stderr).
 
+mod cdn;
 mod checkout;
 mod fleet;
 mod import;

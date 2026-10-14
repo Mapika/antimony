@@ -83,7 +83,11 @@
 //!   refers to it. Storing an existing object therefore refreshes a write
 //!   time older than [`FRESHEN_AFTER`] (and takes the id back from
 //!   `gc_condemned`); objects not refreshed were written less than
-//!   [`FRESHEN_AFTER`] ago. Either way the row is younger than any run's
+//!   [`FRESHEN_AFTER`] ago (the insert statement itself reads which existing
+//!   rows are that young, so the common case costs no extra statement; a
+//!   young row is condemned only transiently, while a run races another
+//!   writer's refresh, and that writer, the condemn step's clean-up or the
+//!   re-mark takes it back). Either way the row is younger than any run's
 //!   cutoff (grace > [`FRESHEN_AFTER`]). The sweep deletes a row only if its
 //!   write time is older than the cutoff *at delete time* (the predicate is
 //!   re-evaluated under the row lock, so refresh and delete serialize), and
@@ -390,11 +394,21 @@ fn commit_children(body: &[u8], out: &mut Vec<(ObjectId, i16)>) -> Result<()> {
 }
 
 impl PgStore {
-    /// After `INSERT ... ON CONFLICT DO NOTHING RETURNING id` of `ids` into
-    /// `table`: for the ids that were not inserted (they existed), refresh a
-    /// write time older than [`FRESHEN_AFTER`] and take them back from
-    /// `gc_condemned`. Returns the ids that no longer exist (a collection
-    /// deleted them after the insert saw them): store those again.
+    /// After the insert of `ids` into `table` (`settled`: the ids it
+    /// inserted, plus those its snapshot already held with a write time
+    /// younger than [`FRESHEN_AFTER`]): for the other ids (they existed with
+    /// an old write time, or were inserted concurrently after the snapshot),
+    /// refresh a write time older than [`FRESHEN_AFTER`] and take them back
+    /// from `gc_condemned`. Returns the ids that no longer exist (a
+    /// collection deleted them after the insert saw them): store those again.
+    ///
+    /// Young existing rows need neither step: no run deletes them (their
+    /// write time is after any run's cutoff, and only grows), and if one is
+    /// condemned at all it is transiently, by a run racing another writer's
+    /// refresh, which that writer, the condemn step's clean-up or the re-mark
+    /// takes back (see the module docs). The common case of storing objects
+    /// that were just written (a land rebuilding trees a changeset wrote)
+    /// therefore costs no statement beyond the insert.
     ///
     /// Rows are locked in id order and a collection never waits for a
     /// writer's row lock (`SKIP LOCKED`), so this cannot deadlock with it.
@@ -402,18 +416,18 @@ impl PgStore {
         &self,
         table: Table,
         ids: &[&[u8]],
-        inserted: &[PgRow],
+        settled: &[PgRow],
     ) -> Result<HashSet<Vec<u8>>> {
-        if inserted.len() >= ids.len() {
+        if settled.len() >= ids.len() {
             return Ok(HashSet::new());
         }
-        let inserted: HashSet<Vec<u8>> = inserted
+        let settled: HashSet<Vec<u8>> = settled
             .iter()
             .map(|r| r.try_get::<Vec<u8>, _>("id"))
             .collect::<std::result::Result<_, _>>()
             .map_err(be)?;
         let existing: Vec<&[u8]> =
-            ids.iter().copied().filter(|id| !inserted.contains(*id)).collect();
+            ids.iter().copied().filter(|id| !settled.contains(*id)).collect();
         if existing.is_empty() {
             return Ok(HashSet::new());
         }
@@ -1253,11 +1267,28 @@ enum Batch {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    use crate::postgres::IndexEntry;
     use crate::{CasOutcome, CommitNode, MetaStore, ObjectStoreExt, RefStore};
     use ant_core::{Commit, EncodedObject, EntryMode, Object, Signature, Tree, TreeEntry};
+    use std::cell::Cell;
     use std::sync::Arc;
+
+    tokio::task_local! {
+        /// Write statements (`PgStore::write`) issued by the current task.
+        pub(in crate::postgres) static WRITES: Cell<u64>;
+    }
+
+    /// `fut`'s result and the number of write statements it issued.
+    async fn writes<F: Future>(fut: F) -> (F::Output, u64) {
+        WRITES
+            .scope(Cell::new(0), async {
+                let out = fut.await;
+                (out, WRITES.with(Cell::get))
+            })
+            .await
+    }
 
     fn url() -> String {
         std::env::var("ANT_TEST_PG_URL")
@@ -1374,6 +1405,60 @@ mod tests {
         // Nothing left: a second run deletes nothing.
         let again = run(&s, &opts()).await;
         assert_eq!((again.objects, again.commits, again.condemned), (0, 0, 0));
+    }
+
+    /// Regression guard (landing throughput): storing objects that exist
+    /// with a young write time, as a land does with the trees its
+    /// changesets wrote, is one statement, like storing new ones; only old
+    /// rows cost the refresh and the take-back from `gc_condemned`.
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_storing_young_objects_again_is_one_statement() {
+        let s = scratch().await;
+        let blob = |b: &[u8]| EncodedObject::new(ObjectKind::Blob, b);
+        let (a, b, c) = (blob(b"a"), blob(b"b"), blob(b"c"));
+        let index = |ids: &[ObjectId]| -> Vec<IndexEntry> {
+            ids.iter()
+                .enumerate()
+                .map(|(i, id)| IndexEntry { id: *id, pack: [7; 16], off: i as u64, len: 1 })
+                .collect()
+        };
+
+        let (r, n) = writes(s.put_many(&[a.clone(), b.clone()])).await;
+        r.unwrap();
+        assert_eq!(n, 1, "new objects");
+        let (r, n) = writes(s.put_many(&[a.clone(), b.clone()])).await;
+        r.unwrap();
+        assert_eq!(n, 1, "young existing objects");
+        let (r, n) = writes(s.put_many(&[a.clone(), c.clone()])).await;
+        r.unwrap();
+        assert_eq!(n, 1, "young existing and new objects");
+        let (r, n) = writes(s.index_objects(&index(&[a.id(), b.id()]))).await;
+        r.unwrap();
+        assert_eq!(n, 1, "new index rows");
+        let (r, n) = writes(s.index_objects(&index(&[a.id(), b.id(), c.id()]))).await;
+        r.unwrap();
+        assert_eq!(n, 1, "young existing and new index rows");
+
+        // Old rows (one of them condemned) are refreshed and taken back.
+        sql(&s, "UPDATE objects SET written_at = now() - interval '2 hours'").await;
+        sql(&s, "UPDATE object_index SET written_at = now() - interval '2 hours'").await;
+        sql(&s, &format!("INSERT INTO gc_condemned VALUES ({})", lit(&a.id()))).await;
+        let (r, n) = writes(s.put_many(&[a.clone(), b.clone()])).await;
+        r.unwrap();
+        assert_eq!(n, 3, "insert, refresh, take back");
+        let young = "SELECT count(*) FROM objects WHERE written_at > now() - interval '1 minute'";
+        assert_eq!(count(&s, young).await, 2);
+        assert_eq!(count(&s, "SELECT count(*) FROM gc_condemned").await, 0);
+        let (r, n) = writes(s.index_objects(&index(&[a.id(), c.id()]))).await;
+        r.unwrap();
+        assert_eq!(n, 3, "index: insert, refresh, take back");
+        let young =
+            "SELECT count(*) FROM object_index WHERE written_at > now() - interval '1 minute'";
+        assert_eq!(count(&s, young).await, 2);
+        // Index rows keep pointing where they were first written.
+        let off = format!("SELECT off FROM object_index WHERE id = {}", lit(&c.id()));
+        assert_eq!(count(&s, &off).await, 2);
     }
 
     #[tokio::test]

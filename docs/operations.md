@@ -7,10 +7,10 @@ For running a fleet in production (sizing, alerts, failure runbook), see the
 
 | process | role | state |
 |---|---|---|
-| `ant serve` | gRPC (`:7420`) + HTTP (`:7421`: `/o/<id>` objects, `/repo.git` git export, `/healthz`, `/readyz`, `/metrics`) | none; caches only |
+| `ant serve` | gRPC (`:7420`) + HTTP (`:7421`: `/o/<id>` objects, `/t/<tree-id>` tree bundles, `/repo.git` git export, `/healthz`, `/readyz`, `/metrics`) | none; caches only |
 | PostgreSQL ≥ 15 | refs, commit graph, changesets, small objects, history index | all metadata |
 | S3-compatible store | objects larger than 4 KiB (zstd) | large objects |
-| HTTP cache / CDN (optional) | caches `GET /o/<id>` (immutable; `private` for restricted zones) | disposable |
+| HTTP cache / CDN (optional) | caches `GET /o/<id>` and `GET /t/<tree-id>` (immutable; `private` for restricted zones, `private, no-store` for caller-specific bundles) | disposable |
 
 ## Starting a server
 
@@ -52,7 +52,7 @@ balancer checks should use `/readyz`; see the operator guide.
 | family | labels | meaning |
 |---|---|---|
 | `ant_rpc_requests_total`, `ant_rpc_duration_seconds` | `method`, `code` / `method` | gRPC calls; `code` is the snake_case status (`ok`, `not_found`, `aborted`, ...; `cancelled` if the client left early); duration runs to the end of the response (streams included) |
-| `ant_http_requests_total`, `ant_http_duration_seconds` | `route`, `status` / `route` | `objects`, `git`, `healthz`, `readyz`, `metrics`, `other`; duration runs to the response headers |
+| `ant_http_requests_total`, `ant_http_duration_seconds` | `route`, `status` / `route` | `objects`, `tree_bundles`, `git`, `healthz`, `readyz`, `metrics`, `other`; duration runs to the response headers |
 | `ant_land_batch_size` | | requests per group-commit batch |
 | `ant_land_outcomes_total` | `outcome` | `landed`, `rebased`, `conflict`, `aborted`, `denied` |
 | `ant_land_cas_retries_total` | | batches replayed after losing the ref CAS (another replica landed first) |

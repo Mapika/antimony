@@ -102,6 +102,9 @@ ant ws resolve src/lib.rs && ant submit -m "b: comment" && ant land        # lan
 # 6. History.
 ant log main --path src/lib.rs
 ant diff main~1 main                       # M<TAB>src/lib.rs
+ant diff --patch main~1 main               # unified diff, computed by the server
+ant log main~2..main -- src                # a range, first parents
+ant landed-as <submitted-id>               # <landed-id> main [rebased]
 ant blame main:src/lib.rs
 
 # 7. Humans and IDEs use plain git; Prometheus scrapes the HTTP port.
@@ -234,14 +237,18 @@ auth password (any user name) for `git clone`. Missing or unknown tokens get
 
 **What is protected**
 
-- *File content under unreadable paths*: `ReadPath`, `Blame`, `Diff` and
-  `Log --path` behave as if those paths did not exist.
+- *File content under unreadable paths*: `ReadPath`, `Blame`, `Diff`
+  (including patches and path prefixes) and `Log` / `LogRange` with a path
+  behave as if those paths did not exist.
 - *Objects by id*: every blob and tree written under a restricted path rule
   (a *zone*) is tagged with that zone, so `GetObjects`, `HasObjects` and
   `GET /o/<id>` report it exactly like a missing object (same code, body and
   headers). Content is readable by id if *any* place it is stored is
   readable: the same bytes at a public path are not secret. Objects outside
-  the root zone are served with `Cache-Control: private`.
+  the root zone are served with `Cache-Control: private`. Tree bundles
+  (`GET /t/<tree-id>`) never carry such objects in a `public` response, and
+  bundles that depend on the caller are `private, no-store`
+  (`docs/architecture.md`).
 - *Read by copy*: `CreateChangeset` may reference a blob by id only if the
   caller can read it or uploaded it; otherwise it is "not found". Fresh
   uploads stay hidden from everyone until a changeset places them.

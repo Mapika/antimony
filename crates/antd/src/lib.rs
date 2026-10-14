@@ -15,9 +15,11 @@
 
 pub mod disk;
 pub mod files;
+pub mod ignore;
 mod par;
 pub mod readthrough;
 pub mod remote;
+pub mod retry;
 pub mod update;
 pub mod walk;
 pub mod workspace;

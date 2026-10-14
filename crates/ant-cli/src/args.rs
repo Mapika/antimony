@@ -88,9 +88,10 @@ pub enum Command {
         /// `<rev>:<path>`, e.g. `main:src/lib.rs`.
         target: String,
     },
-    /// First-parent history, newest first.
+    /// First-parent history, newest first: of a rev, or of a range `<a>..<b>`
+    /// (commits of `<b>` not reachable from `<a>`).
     Log {
-        /// Rev to start from.
+        /// Rev to start from, or `<a>..<b>`.
         #[arg(default_value = "main")]
         rev: String,
         /// Maximum number of commits.
@@ -99,18 +100,48 @@ pub enum Command {
         /// Only commits touching this path.
         #[arg(long)]
         path: Option<String>,
+        /// Only commits touching this path (same as --path).
+        #[arg(last = true, value_name = "PATH")]
+        paths: Vec<String>,
     },
     /// Per-line attribution of a file: <rev>:<path>.
     Blame {
         /// `<rev>:<path>`.
         target: String,
     },
-    /// Changed paths between two revs.
+    /// Changed paths between two revs, or (`--patch`) their line diffs.
     Diff {
         /// Older rev.
         from: String,
         /// Newer rev.
         to: String,
+        /// Print a unified diff (computed by the server) instead of paths.
+        #[arg(long)]
+        patch: bool,
+        /// Diff from the merge base of the two revs (like `a...b`).
+        #[arg(long)]
+        merge_base: bool,
+        /// Context lines around changes (with --patch).
+        #[arg(short = 'U', long = "unified", value_name = "N", requires = "patch")]
+        context: Option<u32>,
+        /// Only changes at or under these paths.
+        #[arg(last = true, value_name = "PATH")]
+        paths: Vec<String>,
+    },
+    /// Best common ancestor of two revs.
+    MergeBase {
+        /// A rev.
+        a: String,
+        /// Another rev.
+        b: String,
+    },
+    /// Whether (and as which commit) a commit was landed onto a ref.
+    LandedAs {
+        /// The commit that was landed (as submitted).
+        commit: String,
+        /// Ref to look in (default: every ref, in name order, at most 64).
+        #[arg(long = "ref")]
+        ref_name: Option<String>,
     },
     /// Read and update refs.
     Ref {
@@ -123,7 +154,11 @@ pub enum Command {
         cmd: WsCmd,
     },
     /// Show local changes in the workspace.
-    Status,
+    Status {
+        /// Also list untracked paths hidden by .gitignore / .ant/ignore, marked `!`.
+        #[arg(long)]
+        ignored: bool,
+    },
     /// Upload local changes as a changeset.
     Submit {
         /// Commit message.

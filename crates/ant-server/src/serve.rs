@@ -11,6 +11,10 @@
 //!                          json otherwise; level via `RUST_LOG`
 //!   --policy <file>        (ANT_POLICY) access-control policy (`ant_auth`);
 //!                          without it the server runs in OPEN mode
+//!   rate limits / load shedding (`crate::limits`): `--no-limits`,
+//!   `--rate-{read,write,admin} <rps[:burst]|off>`,
+//!   `--max-inflight-{read,write,land,admin} <n>`, `--shed-wait <dur>`
+//!   (env `ANT_NO_LIMITS`, `ANT_RATE_*`, `ANT_MAX_INFLIGHT_*`, `ANT_SHED_WAIT`)
 //!   plus the store flags of [`StoreArgs`] (`--memory` | `--pg-url` ...).
 
 use std::io::IsTerminal;
@@ -25,6 +29,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::acl::Acl;
 use crate::config::StoreArgs;
+use crate::limits::{LimitArgs, LimitConfig, Limiter};
 use crate::metrics::Metrics;
 use crate::{http, rpc};
 
@@ -62,6 +67,9 @@ pub struct ServeArgs {
     /// request is allowed.
     #[arg(long, env = "ANT_POLICY")]
     pub policy: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub limits: LimitArgs,
 
     #[command(flatten)]
     pub store: StoreArgs,
@@ -127,11 +135,28 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         "ant-server listening"
     );
 
-    let grpc_fut = rpc::serve_with_metrics(backend.clone(), acl.clone(), grpc, metrics.clone());
+    let limit_cfg = args.limits.config(args.store.pg_max_connections());
+    if limit_cfg.enabled {
+        tracing::info!(
+            max_inflight = ?limit_cfg.max_inflight,
+            shed_wait_ms = limit_cfg.shed_wait.as_millis() as u64,
+            "rate limits and load shedding enabled (read, write, land, admin)"
+        );
+    } else {
+        tracing::warn!("--no-limits: rate limiting and load shedding are off");
+    }
+    let limiter = Limiter::new(limit_cfg, acl.clone(), metrics.clone());
+    let grpc_fut = rpc::serve_with_limiter(
+        backend.clone(),
+        acl.clone(),
+        grpc,
+        metrics.clone(),
+        limiter.clone(),
+    );
     let expose = metrics_listener.is_none();
     let http_metrics = metrics.clone();
     let http_fut = async move {
-        http::serve_with_metrics(backend, acl, http_listener, http_metrics, expose)
+        http::serve_with_limiter(backend, acl, http_listener, http_metrics, expose, limiter)
             .await
             .context("HTTP server failed")
     };
@@ -186,16 +211,45 @@ pub async fn spawn_local_with_metrics(
     spawn_local_inner(backend, acl, metrics).await
 }
 
+/// [`spawn_local_with_metrics`] with explicit rate-limit and load-shedding
+/// settings (`crate::limits`; the defaults otherwise).
+pub async fn spawn_local_with_limits(
+    backend: Backend,
+    acl: Acl,
+    metrics: Arc<Metrics>,
+    limits: LimitConfig,
+) -> std::io::Result<LocalServer> {
+    let backend = metrics.instrument(&backend);
+    let limiter = Limiter::new(limits, acl.clone(), metrics.clone());
+    spawn_local_with_limiter(backend, acl, metrics, limiter).await
+}
+
 async fn spawn_local_inner(
     backend: Backend,
     acl: Acl,
     metrics: Arc<Metrics>,
 ) -> std::io::Result<LocalServer> {
+    let limiter = Limiter::new(LimitConfig::default(), acl.clone(), metrics.clone());
+    spawn_local_with_limiter(backend, acl, metrics, limiter).await
+}
+
+async fn spawn_local_with_limiter(
+    backend: Backend,
+    acl: Acl,
+    metrics: Arc<Metrics>,
+    limiter: Arc<Limiter>,
+) -> std::io::Result<LocalServer> {
     let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addrs = LocalServer { grpc: grpc.local_addr()?, http: http_listener.local_addr()? };
-    tokio::spawn(rpc::serve_with_metrics(backend.clone(), acl.clone(), grpc, metrics.clone()));
-    tokio::spawn(http::serve_with_metrics(backend, acl, http_listener, metrics, true));
+    tokio::spawn(rpc::serve_with_limiter(
+        backend.clone(),
+        acl.clone(),
+        grpc,
+        metrics.clone(),
+        limiter.clone(),
+    ));
+    tokio::spawn(http::serve_with_limiter(backend, acl, http_listener, metrics, true, limiter));
     Ok(addrs)
 }
 
