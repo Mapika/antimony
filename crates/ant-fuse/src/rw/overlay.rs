@@ -111,9 +111,6 @@ impl Pending {
         }
         s.error.take().map_or(Ok(()), Err)
     }
-    pub(super) fn fail(&self, e: io::Error) {
-        self.state.lock().error.get_or_insert(e);
-    }
 }
 
 pub(super) struct Writable {
@@ -267,10 +264,10 @@ impl Writable {
     }
 
     /// Writes to an open upper file normally touch only the file. `reset`
-    /// may prune an upper file equal to the base while it is open; the
-    /// writes then land in the unlinked inode. Detected after each write
-    /// (and on flush/fsync/truncate) by `nlink == 0`, the file is published
-    /// again at its path, with everything written to it.
+    /// may prune an upper file equal to the base while it is open; writes
+    /// then land in the unlinked inode. Detected before each write (and on
+    /// flush/fsync/truncate) by `nlink == 0`, the file is published again at
+    /// its path, with everything written to it.
     pub(super) fn check_attached(
         &self,
         ino: INodeNo,

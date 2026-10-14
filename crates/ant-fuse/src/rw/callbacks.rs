@@ -5,7 +5,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -194,12 +194,25 @@ impl Filesystem for Writable {
         if let Err(e) = pending.begin(offset, data.len()) {
             return reply.error(e.into());
         }
+        // `reset` pruned the file while open: write synchronously and publish
+        // the file again before replying (`check_attached`). A prune racing
+        // an acknowledged write is caught by the next write, flush or fsync.
+        if handle.writable
+            && !handle.detached.load(std::sync::atomic::Ordering::Relaxed)
+            && f.metadata().is_ok_and(|m| m.nlink() == 0)
+        {
+            let result = f.write_all_at(data, offset);
+            pending.end(offset, data.len(), Ok(()));
+            match result.and_then(|()| self.check_attached(ino, fh, &handle, Some((offset, data))))
+            {
+                Ok(()) => reply.written(data.len() as u32),
+                Err(e) => reply.error(e.into()),
+            }
+            return;
+        }
         reply.written(data.len() as u32);
         let result = f.write_all_at(data, offset);
         pending.end(offset, data.len(), result);
-        if let Err(e) = self.check_attached(ino, fh, &handle, Some((offset, data))) {
-            pending.fail(e);
-        }
     }
     fn release(
         &self,
