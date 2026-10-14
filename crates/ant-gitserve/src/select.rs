@@ -2,11 +2,10 @@
 //! include/exclude blobs without downloading their bodies during planning.
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    hash::{DefaultHasher, Hash, Hasher},
+    collections::{BTreeMap, HashSet, VecDeque},
 };
 
-use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind};
+use ant_core::{EntryMode, ObjectId, ObjectKind};
 use ant_store::{Backend, CommitNode};
 use anyhow::{Result, anyhow, bail, ensure};
 
@@ -15,22 +14,6 @@ pub const BATCH: usize = 512;
 /// Trees per read, and reads in flight, while planning.
 const TREE_BATCH: usize = 256;
 const TREE_READS: usize = 8;
-/// Path fingerprint of commits and directly wanted objects (sorted first).
-const NO_PATH: u64 = 0;
-/// Path fingerprint of root trees (children hash their names into it).
-const ROOT_PATH: u64 = 1;
-
-/// One object of the pack plan: its id, a fingerprint of the path it was
-/// first reached at, and the uncompressed size when planning read the body
-/// (trees and directly wanted blobs; 0 for commits and blobs reached through
-/// trees, which planning never reads).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Planned {
-    pub id: ObjectId,
-    pub path: u64,
-    pub size: u32,
-    pub blob: bool,
-}
 
 #[derive(Default)]
 pub struct Fetch {
@@ -75,17 +58,22 @@ impl Fetch {
     }
 }
 
+/// What a fetch sends, before any tree is read: the export walk
+/// (`walk.rs`) expands `roots` once, skipping `excluded` objects.
+#[derive(Clone, Default)]
 pub struct Selection {
-    pub objects: Vec<Planned>,
+    /// Selected commits, sent first.
+    pub commits: Vec<ObjectId>,
+    /// Wanted ids without commit metadata: blobs are sent as they are (even
+    /// under `blob:none`), trees are walked like `roots`.
+    pub direct: Vec<ObjectId>,
+    /// Root trees of the selected commits (repeats allowed).
+    pub roots: Vec<ObjectId>,
+    /// Objects the client has (reachable from its `have`s).
+    pub excluded: HashSet<ObjectId>,
+    pub no_blobs: bool,
     pub shallow: Vec<ObjectId>,
     pub unshallow: Vec<ObjectId>,
-}
-
-#[cfg(test)]
-impl Selection {
-    pub fn ids(&self) -> Vec<ObjectId> {
-        self.objects.iter().map(|p| p.id).collect()
-    }
 }
 
 /// Lazily paint have ancestry in generation order. To test a candidate at
@@ -148,7 +136,9 @@ impl Known {
 }
 
 /// Entries of a canonical tree body without allocating names: (mode, name, id).
-fn entries(mut body: &[u8]) -> impl Iterator<Item = Result<(EntryMode, &[u8], ObjectId)>> {
+pub(crate) fn entries(
+    mut body: &[u8],
+) -> impl Iterator<Item = Result<(EntryMode, &[u8], ObjectId)>> {
     std::iter::from_fn(move || {
         if body.is_empty() {
             return None;
@@ -170,121 +160,68 @@ fn entries(mut body: &[u8]) -> impl Iterator<Item = Result<(EntryMode, &[u8], Ob
     })
 }
 
-/// Breadth-first tree walk state; moved to the blocking pool per batch.
-struct Walk {
-    excluded: HashSet<ObjectId>,
-    found: HashSet<ObjectId>,
-    ordered: Vec<Planned>,
-    queue: VecDeque<(ObjectId, u64)>,
-    no_blobs: bool,
-}
-
-impl Walk {
-    fn visit(
-        &mut self,
-        batch: Vec<(ObjectId, u64)>,
-        objects: Vec<Option<EncodedObject>>,
-    ) -> Result<()> {
-        ensure!(objects.len() == batch.len(), "incomplete tree batch");
-        for ((id, path), object) in batch.into_iter().zip(objects) {
-            let object = object.ok_or_else(|| anyhow!("missing tree {id}"))?;
-            ensure!(object.kind() == ObjectKind::Tree, "expected tree {id}");
-            let size = u32::try_from(object.body().len()).unwrap_or(u32::MAX);
-            self.ordered.push(Planned { id, path, size, blob: false });
-            for entry in entries(object.body()) {
-                let (mode, name, id) = entry?;
-                if !(mode.is_tree() || mode.is_blob() && !self.no_blobs) {
-                    continue;
-                }
-                // Mark on enqueue, not dequeue: shared subtrees must not
-                // accumulate millions of duplicate pending references.
-                if self.excluded.contains(&id) || !self.found.insert(id) {
-                    continue;
-                }
-                let mut hash = DefaultHasher::new();
-                path.hash(&mut hash);
-                name.hash(&mut hash);
-                let path = hash.finish();
-                if mode.is_tree() {
-                    self.queue.push_back((id, path));
-                } else {
-                    self.ordered.push(Planned { id, path, size: 0, blob: true });
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Aborts a spawned read when planning stops early (error or disconnect).
-struct Read(tokio::task::JoinHandle<Result<TreeBatch>>);
-
-type TreeBatch = (Vec<(ObjectId, u64)>, Vec<Option<EncodedObject>>);
-
-impl Drop for Read {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// Expand each distinct tree once, recording compact path fingerprints rather
-/// than allocating full paths for millions of historical objects. Collisions
-/// only affect compression: the encoder checks kinds and encodes actual bytes.
-/// Store reads are pipelined: `TREE_READS` batches stay in flight while the
-/// previous one is parsed on the blocking pool.
-async fn trees(
-    b: &Backend,
-    roots: Vec<ObjectId>,
-    excluded: HashSet<ObjectId>,
-    no_blobs: bool,
-) -> Result<Vec<Planned>> {
-    let mut walk = Walk {
-        excluded,
-        found: HashSet::new(),
-        ordered: Vec::new(),
-        queue: VecDeque::new(),
-        no_blobs,
-    };
-    for id in roots {
-        if !walk.excluded.contains(&id) && walk.found.insert(id) {
-            walk.queue.push_back((id, ROOT_PATH));
-        }
-    }
+/// Every tree (and blob, unless `no_blobs`) reachable from `roots`: the
+/// objects a client already has. Ids only; nothing is retained per object but
+/// the set. Store reads are pipelined: `TREE_READS` batches stay in flight
+/// while the previous one is parsed on the blocking pool.
+async fn reachable(b: &Backend, roots: Vec<ObjectId>, no_blobs: bool) -> Result<HashSet<ObjectId>> {
+    let mut found: HashSet<ObjectId> = HashSet::new();
+    let mut queue: VecDeque<ObjectId> = roots.into_iter().filter(|id| found.insert(*id)).collect();
     let mut reads = VecDeque::new();
     loop {
-        while reads.len() < TREE_READS && !walk.queue.is_empty() {
-            let batch: Vec<_> = walk.queue.drain(..walk.queue.len().min(TREE_BATCH)).collect();
+        while reads.len() < TREE_READS && !queue.is_empty() {
+            let batch: Vec<_> = queue.drain(..queue.len().min(TREE_BATCH)).collect();
             let b = b.clone();
             reads.push_back(Read(tokio::spawn(async move {
-                let ids: Vec<_> = batch.iter().map(|(id, _)| *id).collect();
-                let objects = b.objects.get_many(&ids).await?;
+                let objects = b.objects.get_many(&batch).await?;
                 Ok((batch, objects))
             })));
         }
         let Some(mut read) = reads.pop_front() else { break };
         let (batch, objects) = (&mut read.0).await??;
         // Parsing large trees is CPU work, too. Do not stall HTTP executors.
-        walk = tokio::task::spawn_blocking(move || -> Result<Walk> {
-            walk.visit(batch, objects)?;
-            Ok(walk)
+        (found, queue) = tokio::task::spawn_blocking(move || -> Result<_> {
+            ensure!(objects.len() == batch.len(), "incomplete tree batch");
+            for (id, object) in batch.into_iter().zip(objects) {
+                let object = object.ok_or_else(|| anyhow!("missing tree {id}"))?;
+                ensure!(object.kind() == ObjectKind::Tree, "expected tree {id}");
+                for entry in entries(object.body()) {
+                    let (mode, _, id) = entry?;
+                    let wanted = mode.is_tree() || mode.is_blob() && !no_blobs;
+                    if wanted && found.insert(id) && mode.is_tree() {
+                        queue.push_back(id);
+                    }
+                }
+            }
+            Ok((found, queue))
         })
         .await??;
     }
-    Ok(walk.ordered)
+    Ok(found)
+}
+
+/// Aborts a spawned read when the walk stops early (error or disconnect).
+pub(crate) struct Read<T>(pub tokio::task::JoinHandle<Result<T>>);
+
+impl<T> Drop for Read<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Plan the pack for `fetch`: walk the commits from the wants (level by
 /// level, `BATCH` at a time, up to `depth` for shallow fetches, recording the
-/// new shallow and unshallow boundaries), then every tree and blob (unless
-/// `blob:none`) reachable from their root trees and not from the client's
-/// `have`s, so the client receives exactly what it lacks. Objects come out
-/// grouped by path fingerprint, largest first within a path, for the delta
-/// search.
+/// new shallow and unshallow boundaries) and collect everything the client
+/// already has (reachable from its `have`s), so that the export walk
+/// (`walk.rs`) sends exactly what it lacks: the selected commits, the direct
+/// wants, and every tree and blob (unless `blob:none`) reachable from the
+/// selected root trees and not excluded. No object body but the client's
+/// trees is read here.
 pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
     let mut known = Known::default();
     known.add(b, &fetch.haves).await?;
-    let mut selected = HashSet::new();
-    let mut direct_blobs = HashMap::new();
+    let mut commits = Vec::new();
+    let mut direct = Vec::new();
     let mut roots = Vec::new();
     let mut shallow = Vec::new();
     let mut unshallow = Vec::new();
@@ -298,12 +235,13 @@ pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
             if let Some(generation) = metadata.iter().flatten().map(|node| node.generation).min() {
                 known.advance_to(b, generation, &fetch.shallow).await?;
             }
-            let mut direct = Vec::new();
             for (id, node) in chunk.iter().zip(metadata) {
                 if !seen.insert(*id) {
                     continue;
                 }
                 let Some(node) = node else {
+                    // A blob or tree (or an unknown id): classified by the
+                    // export walk, which reads it anyway.
                     direct.push(*id);
                     continue;
                 };
@@ -311,8 +249,8 @@ pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
                 {
                     continue;
                 }
-                selected.insert(*id);
-                roots.push(node.tree);
+                commits.push(*id);
+                roots.push((Reverse(node.generation), node.tree));
                 if fetch.depth.is_some_and(|depth| level >= depth) {
                     if !node.parents.is_empty() {
                         shallow.push(*id);
@@ -326,61 +264,25 @@ pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
                     next.extend(node.parents);
                 }
             }
-            if !direct.is_empty() {
-                for (id, object) in direct.iter().zip(b.objects.get_many(&direct).await?) {
-                    let object = object.ok_or_else(|| anyhow!("unknown want {id}"))?;
-                    match object.kind() {
-                        ObjectKind::Blob => {
-                            selected.insert(*id);
-                            let size = u32::try_from(object.body().len()).unwrap_or(u32::MAX);
-                            direct_blobs.insert(*id, size);
-                        }
-                        ObjectKind::Tree => roots.push(*id),
-                        ObjectKind::Commit => bail!("commit {id} has no graph metadata"),
-                    }
-                }
-            }
         }
         frontier = next;
         level += 1;
     }
     drop(seen);
-    let mut entries: Vec<_> = selected
-        .iter()
-        .map(|id| match direct_blobs.get(id) {
-            Some(size) => Planned { id: *id, path: NO_PATH, size: *size, blob: true },
-            None => Planned { id: *id, path: NO_PATH, size: 0, blob: false },
-        })
-        .collect();
-    drop(direct_blobs);
-    if !roots.is_empty() {
+    let mut excluded = HashSet::new();
+    if !roots.is_empty() || !direct.is_empty() {
         // Exact subtraction includes historical trees, including restored files.
         known.advance_to(b, 0, &fetch.shallow).await?;
         let known_roots = std::mem::take(&mut known.roots);
         drop(known);
-        let known_objects = trees(b, known_roots, HashSet::new(), fetch.no_blobs)
-            .await?
-            .into_iter()
-            .map(|planned| planned.id)
-            .collect();
-        entries.extend(
-            trees(b, roots, known_objects, fetch.no_blobs)
-                .await?
-                .into_iter()
-                .filter(|planned| !selected.contains(&planned.id)),
-        );
+        excluded = reachable(b, known_roots, fetch.no_blobs).await?;
     }
-    drop(selected);
-    // Group by path, largest first within a path (as git's own packer does):
-    // deltas then mostly delete from a bigger, usually newer base, and chains
-    // fan out instead of growing one step per revision. The stable sort keeps
-    // traversal order (newest first) among equal sizes.
-    let objects = tokio::task::spawn_blocking(move || {
-        entries.sort_by_key(|planned| (planned.path, Reverse(planned.size)));
-        entries
-    })
-    .await?;
-    Ok(Selection { objects, shallow, unshallow })
+    // Newest first by generation rather than by distance from the wants:
+    // consecutive root trees are then close in history, which keeps the
+    // export walk's runs of versions small (see `walk.rs`).
+    roots.sort_by_key(|(generation, _)| *generation);
+    let roots = roots.into_iter().map(|(_, tree)| tree).collect();
+    Ok(Selection { commits, direct, roots, excluded, no_blobs: fetch.no_blobs, shallow, unshallow })
 }
 
 #[cfg(test)]
@@ -391,6 +293,11 @@ mod tests {
         ObjectStoreExt,
         graph::{build_tree, write_commit},
     };
+
+    /// Everything the export walk sends for `fetch`, in pack order.
+    async fn ids(b: &Backend, fetch: Fetch) -> Vec<ObjectId> {
+        crate::walk::ids(b, select(b, &fetch).await.unwrap()).await.unwrap()
+    }
 
     async fn commit(b: &Backend, parents: Vec<ObjectId>, content: &[u8], time: i64) -> ObjectId {
         let tree = build_tree(b.objects.as_ref(), &[("file", content)]).await.unwrap();
@@ -428,22 +335,16 @@ mod tests {
         assert!(known.ids.contains(&left));
         assert!(!known.ids.contains(&root), "walk must stop at the generation floor");
         assert!(!known.ids.contains(&right), "equal generation is not equal ancestry");
-        let selection = select(
-            &b,
-            &Fetch { wants: vec![right], haves: vec![tip], done: true, ..Fetch::default() },
-        )
-        .await
-        .unwrap();
-        assert_eq!(selection.ids().len(), 3);
-        assert!(selection.ids().contains(&right));
-        assert!(!selection.ids().contains(&root));
-        let empty = select(
-            &b,
-            &Fetch { wants: vec![left], haves: vec![tip], done: true, ..Fetch::default() },
-        )
-        .await
-        .unwrap();
-        assert!(empty.objects.is_empty());
+        let selection =
+            ids(&b, Fetch { wants: vec![right], haves: vec![tip], done: true, ..Fetch::default() })
+                .await;
+        assert_eq!(selection.len(), 3);
+        assert!(selection.contains(&right));
+        assert!(!selection.contains(&root));
+        let empty =
+            ids(&b, Fetch { wants: vec![left], haves: vec![tip], done: true, ..Fetch::default() })
+                .await;
+        assert!(empty.is_empty());
     }
 
     #[tokio::test]
@@ -452,21 +353,19 @@ mod tests {
         let root = commit(&b, vec![], b"old", 1).await;
         let middle = commit(&b, vec![root], b"new", 2).await;
         let tip = commit(&b, vec![middle], b"old", 3).await;
-        let selection = select(
+        let selection = ids(
             &b,
-            &Fetch { wants: vec![tip], haves: vec![middle], done: true, ..Fetch::default() },
+            Fetch { wants: vec![tip], haves: vec![middle], done: true, ..Fetch::default() },
         )
-        .await
-        .unwrap();
-        assert_eq!(selection.ids(), [tip], "old tree and blob already belong to the client");
+        .await;
+        assert_eq!(selection, [tip], "old tree and blob already belong to the client");
         let blob = b.objects.put(EncodedObject::new(ObjectKind::Blob, b"lazy")).await.unwrap();
-        let selection = select(
+        let selection = ids(
             &b,
-            &Fetch { wants: vec![blob, blob], no_blobs: true, done: true, ..Fetch::default() },
+            Fetch { wants: vec![blob, blob], no_blobs: true, done: true, ..Fetch::default() },
         )
-        .await
-        .unwrap();
-        assert_eq!(selection.ids(), [blob], "explicit wants override blob filtering");
+        .await;
+        assert_eq!(selection, [blob], "explicit wants override blob filtering");
     }
 
     #[tokio::test]
@@ -474,9 +373,9 @@ mod tests {
         let b = Backend::in_memory();
         let root = commit(&b, vec![], b"old", 1).await;
         let tip = commit(&b, vec![root], b"new", 2).await;
-        let selection = select(
+        let selection = ids(
             &b,
-            &Fetch {
+            Fetch {
                 wants: vec![root],
                 haves: vec![tip],
                 shallow: [tip].into(),
@@ -484,10 +383,9 @@ mod tests {
                 ..Fetch::default()
             },
         )
-        .await
-        .unwrap();
-        assert_eq!(selection.ids().len(), 3);
-        assert!(selection.ids().contains(&root));
+        .await;
+        assert_eq!(selection.len(), 3);
+        assert!(selection.contains(&root));
     }
 
     #[test]
@@ -503,12 +401,11 @@ mod tests {
         let tip = commit(&b, vec![], b"body", 1).await;
         let blob = EncodedObject::new(ObjectKind::Blob, b"body").id();
         let selection =
-            select(&b, &Fetch { wants: vec![tip, blob], done: true, ..Default::default() })
-                .await
-                .unwrap();
-        assert_eq!(selection.ids().len(), 3);
-        assert_eq!(selection.ids().iter().filter(|id| **id == blob).count(), 1);
-        assert_eq!(selection.objects.iter().filter(|p| p.blob).count(), 1);
+            ids(&b, Fetch { wants: vec![tip, blob], done: true, ..Default::default() }).await;
+        assert_eq!(selection.len(), 3);
+        assert_eq!(selection.iter().filter(|id| **id == blob).count(), 1);
+        let kinds = b.objects.get_many(&selection).await.unwrap();
+        assert_eq!(kinds.iter().flatten().filter(|o| o.kind() == ObjectKind::Blob).count(), 1);
     }
 
     #[test]

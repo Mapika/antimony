@@ -146,6 +146,19 @@ async fn partial_clone_fetches_blobs_on_checkout() {
     assert_files(&checked_out);
 }
 
+/// A pack that fails while it is built (here: a want the store does not
+/// have) reaches git as a remote error, not as a truncated pack.
+#[tokio::test]
+async fn failed_pack_is_reported_to_git() {
+    let f = Fixture::new().await;
+    let dir = f.clone_into("clone", &[]).await;
+    let missing = EncodedObject::new(ObjectKind::Blob, b"never stored").id().to_string();
+    let result = git_result(&dir, &["fetch", "origin", &missing]).await;
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains(&format!("unknown want {missing}")), "{stderr}");
+}
+
 #[tokio::test]
 async fn shallow_clone() {
     let f = Fixture::new().await;

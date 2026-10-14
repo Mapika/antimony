@@ -10,6 +10,7 @@ mod delta;
 mod pack;
 mod protocol;
 mod select;
+mod walk;
 
 use std::collections::HashMap;
 
@@ -162,14 +163,14 @@ async fn fetch_response(b: Backend, fetch: Fetch) -> Result<Response> {
         return Ok(response(prefix, false));
     }
     let started = std::time::Instant::now();
-    let selection = select::select(&b, &fetch).await?;
+    let mut selection = select::select(&b, &fetch).await?;
     let planned = started.elapsed();
     if fetch.depth.is_some() {
         prefix.extend(packet(b"shallow-info\n"));
-        for id in selection.shallow {
+        for id in std::mem::take(&mut selection.shallow) {
             prefix.extend(packet(format!("shallow {id}\n").as_bytes()));
         }
-        for id in selection.unshallow {
+        for id in std::mem::take(&mut selection.unshallow) {
             prefix.extend(packet(format!("unshallow {id}\n").as_bytes()));
         }
         prefix.extend_from_slice(b"0001");
@@ -178,7 +179,7 @@ async fn fetch_response(b: Backend, fetch: Fetch) -> Result<Response> {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tx.send(Ok(prefix.into())).await?;
     tokio::spawn(async move {
-        match pack::send_planned(b, selection.objects, fetch.ofs_delta, tx.clone()).await {
+        match pack::send(b, selection, fetch.ofs_delta, tx.clone()).await {
             Ok(stats) => tracing::info!(
                 objects = stats.objects,
                 deltas = stats.deltas,
@@ -189,7 +190,14 @@ async fn fetch_response(b: Backend, fetch: Fetch) -> Result<Response> {
             ),
             Err(error) => {
                 tracing::warn!(error = format!("{error:#}"), "git pack failed");
-                let _ = tx.send(Err(std::io::Error::other(error.to_string()))).await;
+                // Sideband 3 (git prints "remote error: ..." and fails), then
+                // the body ends without a pack trailer or flush packet. An
+                // aborted body would hide the message from the client.
+                let mut message = vec![3];
+                let text = format!("{error:#}");
+                message.extend_from_slice(&text.as_bytes()[..text.len().min(1000)]);
+                message.push(b'\n');
+                let _ = tx.send(Ok(packet(&message).into())).await;
             }
         }
     });
