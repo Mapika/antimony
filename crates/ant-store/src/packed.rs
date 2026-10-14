@@ -4,10 +4,23 @@
 //! spends far more on a request than on a few kilobytes of body (measured on a
 //! local SeaweedFS: 12 KB objects at under 1k PUT/s, 8 MB objects at 1 GB/s).
 //! [`PackedS3Store`] therefore writes each `put_many` batch as a handful of
-//! *packs* (concatenated, individually zstd-compressed objects) and records
-//! `id -> (pack, offset, length)` in the Postgres `object_index` table. A read
-//! is one index lookup plus one ranged `GET` per object.
+//! *packs* (concatenated compressed records, see [`frame`]) and records
+//! `id -> (pack, offset, length)` of each object's record in the Postgres
+//! `object_index` table. A read is one index lookup plus one ranged `GET`
+//! per record (nearby records share one).
 //!
+//! - Compression: objects of one batch that look alike (versions of one file
+//!   or directory: [`frame::similarity_key`]) are compressed together as one
+//!   multi-object frame of at most [`FRAME_RAW`] uncompressed bytes, so a
+//!   history import stores each version as little more than its difference
+//!   to its neighbours. Objects with no look-alike in the batch are stored
+//!   alone, in the record format of earlier versions.
+//! - Reads decode a whole frame (bounded work, no delta chains) and keep
+//!   recently decoded frames ([`FRAME_CACHE_BYTES`]): walks that read the
+//!   versions of a directory one commit at a time decode each frame once.
+//!   The cache holds immutable record contents only; which ids exist is
+//!   always asked of the index first, so it never shows a deleted or
+//!   condemned object.
 //! - Order of writes: packs first, index rows after. An index row never points
 //!   at a missing pack; a crash in between leaves an unreferenced pack.
 //! - Pack ids are random (earlier versions hashed the content), so a pack is
@@ -21,16 +34,22 @@
 //! - An object stored twice (concurrent writers) occupies space in two packs;
 //!   the index keeps the first. Packs are never rewritten here.
 
-use std::{collections::HashSet, sync::Arc};
+mod frame;
 
-use ant_core::{EncodedObject, ObjectId};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use ant_core::{EncodedObject, ObjectId, ObjectKind};
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, stream};
+use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 
 use crate::postgres::{IndexEntry, PgStore};
 use crate::s3::S3ObjectStore;
-use crate::{BLOCKING_THRESHOLD, ObjectStore, Result, StoreError, ZSTD_LEVEL};
+use crate::{BLOCKING_THRESHOLD, ObjectStore, Result, StoreError};
+
+pub use frame::FRAME_RAW;
 
 /// Target size of one pack, after compression.
 const PACK_BYTES: usize = 24 * 1024 * 1024;
@@ -41,6 +60,16 @@ const FANOUT: usize = 32;
 const COALESCE_GAP: u64 = 256 * 1024;
 /// ...as long as the whole range stays below this many bytes.
 const COALESCE_SPAN: u64 = 2 * 1024 * 1024;
+/// Uncompressed bytes of decoded frames kept per store (shared by clones).
+pub const FRAME_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Uncompressed bytes of frames being decoded at once, per store: a ranged
+/// read of a few MiB can hold dozens of frames of up to `FRAME_RAW` each, so
+/// `READ_BUDGET` alone does not bound decoding memory.
+const DECODE_BUDGET: usize = 64 * 1024 * 1024;
+const DECODE_UNIT: usize = 64 * 1024;
+const DECODE_PERMITS: usize = DECODE_BUDGET / DECODE_UNIT;
+/// Uncompressed bytes of records compressed per blocking task.
+const ENCODE_TASK_BYTES: usize = 1024 * 1024;
 
 /// Bytes of ranged reads in flight per store, across all callers. Bounds
 /// memory, and S3 servers throttle beyond some in-flight volume (SeaweedFS
@@ -53,7 +82,7 @@ const READ_UNIT: u64 = 4096;
 const READ_PERMITS: usize = (READ_BUDGET / READ_UNIT) as usize;
 
 /// One ranged GET: `entries` (sorted by offset, all in `pack`) lie within
-/// `start..end`.
+/// `start..end`. Members of one frame share an offset.
 #[derive(Debug)]
 struct Run {
     pack: [u8; 16],
@@ -84,40 +113,139 @@ fn coalesce(mut entries: Vec<IndexEntry>) -> Vec<Run> {
     runs
 }
 
+/// Recently decoded frames by `(pack, offset)`, bounded by bytes.
+struct FrameCache {
+    frames: lru::LruCache<([u8; 16], u64), Arc<frame::Frame>>,
+    bytes: usize,
+    limit: usize,
+}
+
+impl FrameCache {
+    fn new(limit: usize) -> Self {
+        Self { frames: lru::LruCache::unbounded(), bytes: 0, limit }
+    }
+
+    fn get(&mut self, key: &([u8; 16], u64)) -> Option<Arc<frame::Frame>> {
+        self.frames.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: ([u8; 16], u64), f: Arc<frame::Frame>) {
+        if f.weight() > self.limit {
+            return;
+        }
+        self.bytes += f.weight();
+        if let Some(old) = self.frames.put(key, f) {
+            self.bytes -= old.weight();
+        }
+        while self.bytes > self.limit {
+            match self.frames.pop_lru() {
+                Some((_, old)) => self.bytes -= old.weight(),
+                None => break,
+            }
+        }
+    }
+}
+
+/// The object `e.id` out of a decoded frame; the index naming a frame that
+/// lacks it is corruption.
+fn member(f: &frame::Frame, e: &IndexEntry) -> Result<EncodedObject> {
+    f.get(&e.id).unwrap_or_else(|| {
+        Err(frame::corrupt(format!(
+            "object {} is not in the frame at {} of pack {}",
+            e.id,
+            e.off,
+            hex::encode(e.pack)
+        )))
+    })
+}
+
 #[derive(Clone)]
 pub struct PackedS3Store {
     index: PgStore,
     s3: S3ObjectStore,
     /// Range bytes being downloaded, in `READ_UNIT`s (see `READ_BUDGET`).
     reading: Arc<Semaphore>,
+    /// Uncompressed frame bytes being decoded, in `DECODE_UNIT`s.
+    decoding: Arc<Semaphore>,
+    frames: Arc<Mutex<FrameCache>>,
+    /// Uncompressed bytes per frame written ([`FRAME_RAW`]; 0: every object
+    /// alone, the format older versions read).
+    frame_raw: usize,
 }
 
 impl PackedS3Store {
     /// `index` holds the `object_index` table; `s3` receives the packs and is
     /// also consulted for objects stored one per key.
     pub fn new(index: PgStore, s3: S3ObjectStore) -> Self {
-        Self { index, s3, reading: Arc::new(Semaphore::new(READ_PERMITS)) }
+        Self {
+            index,
+            s3,
+            reading: Arc::new(Semaphore::new(READ_PERMITS)),
+            decoding: Arc::new(Semaphore::new(DECODE_PERMITS)),
+            frames: Arc::new(Mutex::new(FrameCache::new(FRAME_CACHE_BYTES))),
+            frame_raw: FRAME_RAW,
+        }
     }
 
-    /// Read one run with a single ranged GET and decode its objects.
+    /// Write frames of at most `bytes` uncompressed bytes; 0 stores every
+    /// object alone, in the record format of versions before 0.1.5.
+    pub fn with_frame_bytes(mut self, bytes: usize) -> Self {
+        self.frame_raw = bytes.min(frame::MAX_FRAME_RAW);
+        self
+    }
+
+    /// Read one run with a single ranged GET and decode its records.
     async fn get_run(&self, run: Run) -> Result<Vec<(ObjectId, EncodedObject)>> {
         let len = run.end - run.start;
         let units = len.max(READ_MIN_COST).div_ceil(READ_UNIT).clamp(1, READ_PERMITS as u64) as u32;
         let permit = self.reading.acquire_many(units).await.map_err(StoreError::backend)?;
         let body = self.s3.get_range(&self.s3.pack_key(&run.pack), run.start, len).await?;
         drop(permit);
-        let decode = move || -> Result<Vec<(ObjectId, EncodedObject)>> {
-            run.entries
-                .iter()
-                .map(|e| {
-                    let at = (e.off - run.start) as usize;
-                    let object =
-                        S3ObjectStore::decode_object(e.id, &body[at..at + e.len as usize])?;
-                    Ok((e.id, object))
-                })
-                .collect()
+        // Every frame's uncompressed size: decoding memory, and CPU work.
+        let raw = run
+            .entries
+            .chunk_by(|a, b| a.off == b.off)
+            .map(|group| {
+                let at = (group[0].off - run.start) as usize;
+                frame::frame_raw_len(&body[at..at + group[0].len as usize]).unwrap_or(0)
+            })
+            .sum::<usize>();
+        let work = len as usize + raw;
+        let decoding = if raw == 0 {
+            None
+        } else {
+            let units = raw.div_ceil(DECODE_UNIT).clamp(1, DECODE_PERMITS) as u32;
+            Some(
+                self.decoding
+                    .clone()
+                    .acquire_many_owned(units)
+                    .await
+                    .map_err(StoreError::backend)?,
+            )
         };
-        if (run.end - run.start) as usize > BLOCKING_THRESHOLD {
+        let cache = self.frames.clone();
+        let decode = move || -> Result<Vec<(ObjectId, EncodedObject)>> {
+            let _decoding = decoding;
+            let mut out = Vec::with_capacity(run.entries.len());
+            for group in run.entries.chunk_by(|a, b| a.off == b.off) {
+                let first = &group[0];
+                let at = (first.off - run.start) as usize;
+                let record = &body[at..at + first.len as usize];
+                if frame::is_frame(record) {
+                    let f = Arc::new(frame::decode_frame(record)?);
+                    for e in group {
+                        out.push((e.id, member(&f, e)?));
+                    }
+                    cache.lock().insert((run.pack, first.off), f);
+                } else {
+                    for e in group {
+                        out.push((e.id, frame::decode_single(e.id, record)?));
+                    }
+                }
+            }
+            Ok(out)
+        };
+        if work > BLOCKING_THRESHOLD {
             tokio::task::spawn_blocking(decode).await.map_err(StoreError::backend)?
         } else {
             decode()
@@ -125,11 +253,36 @@ impl PackedS3Store {
     }
 }
 
-/// One pack under construction.
+/// One pack under construction: its body and `(id, offset, length, share)`
+/// per object.
 #[derive(Default)]
 struct Pack {
     body: Vec<u8>,
-    entries: Vec<(ObjectId, u64, u32)>,
+    entries: Vec<(ObjectId, u64, u32, Option<u32>)>,
+}
+
+/// One encoded record: its members' ids with their uncompressed lengths,
+/// and the record bytes.
+type Encoded = (Vec<(ObjectId, usize)>, Vec<u8>);
+
+/// Compress `records` (indices into `objects`) on the blocking pool.
+fn encode_task(
+    objects: Arc<Vec<(ObjectId, u64, EncodedObject)>>,
+    records: Vec<Vec<usize>>,
+) -> tokio::task::JoinHandle<Result<Vec<Encoded>>> {
+    tokio::task::spawn_blocking(move || {
+        records
+            .into_iter()
+            .map(|record| {
+                let members: Vec<&EncodedObject> = record.iter().map(|&i| &objects[i].2).collect();
+                let ids: Vec<ObjectId> = record.iter().map(|&i| objects[i].0).collect();
+                let bytes = frame::encode(&members, &ids)?;
+                let sizes =
+                    record.iter().map(|&i| (objects[i].0, objects[i].2.as_bytes().len())).collect();
+                Ok((sizes, bytes))
+            })
+            .collect()
+    })
 }
 
 #[async_trait]
@@ -145,13 +298,38 @@ impl ObjectStore for PackedS3Store {
             .filter(|id| wanted.insert(**id))
             .filter_map(|id| index.get(id).copied())
             .collect();
-        let fetched: Vec<Vec<(ObjectId, EncodedObject)>> = stream::iter(coalesce(found))
+        // Members of frames decoded recently need no S3 read.
+        let mut cached: Vec<(IndexEntry, Arc<frame::Frame>)> = Vec::new();
+        let mut fetch: Vec<IndexEntry> = Vec::with_capacity(found.len());
+        {
+            let mut cache = self.frames.lock();
+            for e in found {
+                match cache.get(&(e.pack, e.off)) {
+                    Some(f) => cached.push((e, f)),
+                    None => fetch.push(e),
+                }
+            }
+        }
+        let mut got: HashMap<ObjectId, EncodedObject> = HashMap::with_capacity(wanted.len());
+        if !cached.is_empty() {
+            // Copying out and hashing the members.
+            let work: usize = cached.iter().map(|(e, f)| f.member_len(&e.id)).sum();
+            let extract = move || -> Result<Vec<(ObjectId, EncodedObject)>> {
+                cached.iter().map(|(e, f)| Ok((e.id, member(f, e)?))).collect()
+            };
+            let objects = if work > BLOCKING_THRESHOLD {
+                tokio::task::spawn_blocking(extract).await.map_err(StoreError::backend)??
+            } else {
+                extract()?
+            };
+            got.extend(objects);
+        }
+        let fetched: Vec<Vec<(ObjectId, EncodedObject)>> = stream::iter(coalesce(fetch))
             .map(|run| self.get_run(run))
             .buffer_unordered(FANOUT)
             .try_collect()
             .await?;
-        let mut got: std::collections::HashMap<ObjectId, EncodedObject> =
-            fetched.into_iter().flatten().collect();
+        got.extend(fetched.into_iter().flatten());
         // Objects stored one per key (before packs existed).
         let mut legacy_ids: Vec<ObjectId> =
             wanted.iter().filter(|id| !got.contains_key(id)).copied().collect();
@@ -173,32 +351,66 @@ impl ObjectStore for PackedS3Store {
         if objects.is_empty() {
             return Ok(());
         }
-        // Hash and compress in parallel on the blocking pool.
+        // Hash and key in parallel on the blocking pool.
         let tasks = crate::compress_chunks(objects).into_iter().map(|chunk| {
-            tokio::task::spawn_blocking(move || -> Result<Vec<(ObjectId, Vec<u8>)>> {
+            tokio::task::spawn_blocking(move || {
                 chunk
                     .into_iter()
-                    .map(|o| {
-                        let z = zstd::stream::encode_all(&o.as_bytes()[..], ZSTD_LEVEL)
-                            .map_err(StoreError::backend)?;
-                        Ok((o.id(), z))
-                    })
-                    .collect()
+                    .map(|o| (o.id(), frame::similarity_key(&o), o))
+                    .collect::<Vec<_>>()
             })
         });
         let mut seen: HashSet<ObjectId> = HashSet::with_capacity(objects.len());
+        let mut unique: Vec<(ObjectId, u64, EncodedObject)> = Vec::with_capacity(objects.len());
+        for part in futures::future::try_join_all(tasks).await.map_err(StoreError::backend)? {
+            unique.extend(part.into_iter().filter(|(id, _, _)| seen.insert(*id)));
+        }
+        let records: Vec<Vec<usize>> = if self.frame_raw == 0 {
+            (0..unique.len()).map(|i| vec![i]).collect()
+        } else {
+            let shape: Vec<(ObjectKind, u64, usize)> =
+                unique.iter().map(|(_, key, o)| (o.kind(), *key, o.as_bytes().len())).collect();
+            frame::plan(&shape, self.frame_raw)
+        };
+
+        // Compress records in parallel, about ENCODE_TASK_BYTES per task.
+        let unique = Arc::new(unique);
+        let mut tasks = Vec::new();
+        let mut batch: Vec<Vec<usize>> = Vec::new();
+        let mut batch_bytes = 0usize;
+        for record in records {
+            batch_bytes += record.iter().map(|&i| unique[i].2.as_bytes().len()).sum::<usize>();
+            batch.push(record);
+            if batch_bytes >= ENCODE_TASK_BYTES {
+                tasks.push(encode_task(unique.clone(), std::mem::take(&mut batch)));
+                batch_bytes = 0;
+            }
+        }
+        if !batch.is_empty() {
+            tasks.push(encode_task(unique.clone(), batch));
+        }
         let mut packs: Vec<Pack> = Vec::new();
         let mut cur = Pack::default();
         for part in futures::future::try_join_all(tasks).await.map_err(StoreError::backend)? {
-            for (id, z) in part? {
-                if !seen.insert(id) {
-                    continue;
-                }
-                if cur.body.len() + z.len() > PACK_BYTES && !cur.body.is_empty() {
+            for (members, bytes) in part? {
+                if cur.body.len() + bytes.len() > PACK_BYTES && !cur.body.is_empty() {
                     packs.push(std::mem::take(&mut cur));
                 }
-                cur.entries.push((id, cur.body.len() as u64, z.len() as u32));
-                cur.body.extend_from_slice(&z);
+                let off = cur.body.len() as u64;
+                let len = u32::try_from(bytes.len()).map_err(|_| {
+                    StoreError::InvalidArgument(format!("pack record of {} bytes", bytes.len()))
+                })?;
+                if let [(id, _)] = members.as_slice() {
+                    cur.entries.push((*id, off, len, None));
+                } else {
+                    // Each member's share of the frame, by uncompressed size.
+                    let raw = members.iter().map(|(_, n)| *n as u64).sum::<u64>().max(1);
+                    for (id, n) in &members {
+                        let share = (u64::from(len) * *n as u64).div_ceil(raw).clamp(1, len.into());
+                        cur.entries.push((*id, off, len, Some(share as u32)));
+                    }
+                }
+                cur.body.extend_from_slice(&bytes);
             }
         }
         if !cur.body.is_empty() {
@@ -211,11 +423,12 @@ impl ObjectStore for PackedS3Store {
             .into_iter()
             .map(|p| {
                 let pack: [u8; 16] = rand::random();
-                entries.extend(p.entries.into_iter().map(|(id, off, len)| IndexEntry {
+                entries.extend(p.entries.into_iter().map(|(id, off, len, share)| IndexEntry {
                     id,
                     pack,
                     off,
                     len,
+                    share,
                 }));
                 (self.s3.pack_key(&pack), p.body)
             })
@@ -271,6 +484,7 @@ mod tests {
             pack: [pack; 16],
             off,
             len,
+            share: None,
         };
         let far = COALESCE_GAP + 1;
         let mut entries = vec![
@@ -369,7 +583,7 @@ mod tests {
             pack: [1; 16],
             start: 0,
             end: len,
-            entries: vec![IndexEntry { id, pack: [1; 16], off: 0, len: len as u32 }],
+            entries: vec![IndexEntry { id, pack: [1; 16], off: 0, len: len as u32, share: None }],
         }
     }
 
@@ -407,5 +621,201 @@ mod tests {
         let (store, _) = fake_backed(vec![crate::s3_fake::Act::Ok], 2).await;
         let body = store.s3.get_range("x", 0, 100).await.unwrap();
         assert_eq!(body.len(), 100);
+    }
+
+    /// Versions of a file (one line edited per version) and of a directory
+    /// (one entry added per version), as an import writes them.
+    fn history(versions: usize) -> Vec<EncodedObject> {
+        let mut out = Vec::new();
+        for v in 0..versions {
+            let mut text = String::new();
+            for line in 0..400 {
+                let word = if line == v % 400 { format!("edit {v}") } else { "same".into() };
+                text.push_str(&format!("{line:4}: a line of source code, {word}\n"));
+            }
+            out.push(EncodedObject::new(ObjectKind::Blob, text.as_bytes()));
+            let mut tree = Vec::new();
+            for e in 0..(100 + v) {
+                tree.extend_from_slice(format!("100644 file{e:05}.c\0").as_bytes());
+                let entry = format!("{e}/{}", e % 7 == v % 7);
+                tree.extend_from_slice(
+                    EncodedObject::new(ObjectKind::Blob, entry.as_bytes()).id().as_bytes(),
+                );
+            }
+            out.push(EncodedObject::new(ObjectKind::Tree, &tree));
+        }
+        out
+    }
+
+    /// Bytes of the records the index points at.
+    async fn stored_bytes(store: &PackedS3Store, ids: &[ObjectId]) -> u64 {
+        let index = store.index.lookup_index(ids).await.unwrap();
+        let records: HashSet<([u8; 16], u64, u32)> =
+            index.values().map(|e| (e.pack, e.off, e.len)).collect();
+        records.iter().map(|r| u64::from(r.2)).sum()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres and s3: docker compose up -d"]
+    async fn frames_conform_and_so_does_the_old_record_format() {
+        conformance::object_store(Arc::new(fresh().await.0.with_frame_bytes(0))).await;
+        conformance::object_store(Arc::new(fresh().await.0.with_frame_bytes(4096))).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres and s3: docker compose up -d"]
+    async fn versions_written_together_are_stored_compactly_and_read_back_any_way() {
+        let (store, s3) = fresh().await;
+        let objects = history(60);
+        let ids: Vec<ObjectId> = objects.iter().map(EncodedObject::id).collect();
+        store.put_many(&objects).await.unwrap();
+        let (single, _) = fresh().await;
+        let single = single.with_frame_bytes(0);
+        single.put_many(&objects).await.unwrap();
+        let (framed, alone) = (stored_bytes(&store, &ids).await, stored_bytes(&single, &ids).await);
+        assert!(framed * 8 < alone, "frames {framed} bytes, objects alone {alone}");
+
+        // All at once, from a store with nothing cached.
+        let reader = PackedS3Store::new(store.index.clone(), s3.clone());
+        let got = reader.get_many(&ids).await.unwrap();
+        assert!(got.iter().zip(&objects).all(|(g, o)| g.as_ref() == Some(o)));
+        // One at a time and in odd subsets, each from a cold store too.
+        for (i, id) in ids.iter().enumerate().step_by(7) {
+            let cold = PackedS3Store::new(store.index.clone(), s3.clone());
+            assert_eq!(cold.get(id).await.unwrap().as_ref(), Some(&objects[i]));
+            assert_eq!(reader.get(id).await.unwrap().as_ref(), Some(&objects[i]));
+        }
+        let subset: Vec<ObjectId> = ids.iter().rev().step_by(3).copied().collect();
+        let got = reader.get_many(&subset).await.unwrap();
+        for (id, g) in subset.iter().zip(got) {
+            assert_eq!(g.map(|o| o.id()), Some(*id));
+        }
+        // Duplicates and absent ids among frame members.
+        let absent = EncodedObject::new(ObjectKind::Blob, b"absent").id();
+        let got = reader.get_many(&[ids[3], absent, ids[3]]).await.unwrap();
+        assert_eq!(got, vec![Some(objects[3].clone()), None, Some(objects[3].clone())]);
+        assert_eq!(reader.has_many(&[ids[5], absent]).await.unwrap(), vec![true, false]);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres and s3: docker compose up -d"]
+    async fn decoded_frames_are_reused_without_reading_s3() {
+        let (store, s3) = fresh().await;
+        let objects = history(20);
+        let ids: Vec<ObjectId> = objects.iter().map(EncodedObject::id).collect();
+        store.put_many(&objects).await.unwrap();
+        let reader = PackedS3Store::new(store.index.clone(), s3.clone());
+        assert_eq!(reader.get(&ids[0]).await.unwrap().as_ref(), Some(&objects[0]));
+        // Remove the packs: members of the frame decoded above are still
+        // served (the cache holds immutable record contents; the index still
+        // names them), and a store without the cache fails.
+        let index = store.index.lookup_index(&ids).await.unwrap();
+        let packs: HashSet<[u8; 16]> = index.values().map(|e| e.pack).collect();
+        s3.delete_packs(&packs.into_iter().collect::<Vec<_>>()).await.unwrap();
+        let first = index[&ids[0]];
+        let mates: Vec<usize> = (0..ids.len())
+            .filter(|&i| index[&ids[i]].pack == first.pack && index[&ids[i]].off == first.off)
+            .collect();
+        assert!(mates.len() > 1, "the first object shares a frame");
+        for &i in &mates {
+            assert_eq!(reader.get(&ids[i]).await.unwrap().as_ref(), Some(&objects[i]));
+        }
+        let cold = PackedS3Store::new(store.index.clone(), s3.clone());
+        assert!(cold.get(&ids[0]).await.is_err());
+    }
+
+    #[test]
+    fn the_frame_cache_stays_within_its_budget() {
+        let objects = history(8);
+        let ids: Vec<ObjectId> = objects.iter().map(EncodedObject::id).collect();
+        let refs: Vec<&EncodedObject> = objects.iter().collect();
+        let f = Arc::new(frame::decode_frame(&frame::encode(&refs, &ids).unwrap()).unwrap());
+        let w = f.weight();
+        let mut cache = FrameCache::new(3 * w);
+        for off in 0..10u64 {
+            cache.insert(([1; 16], off), f.clone());
+            assert!(cache.bytes <= 3 * w);
+        }
+        assert_eq!(cache.frames.len(), 3);
+        assert!(cache.get(&([1; 16], 9)).is_some());
+        assert!(cache.get(&([1; 16], 0)).is_none());
+        // Re-inserting a key does not count it twice; a frame larger than
+        // the whole budget is not kept.
+        cache.insert(([1; 16], 9), f.clone());
+        assert_eq!(cache.bytes, 3 * w);
+        let mut tiny = FrameCache::new(w - 1);
+        tiny.insert(([1; 16], 0), f);
+        assert_eq!((tiny.bytes, tiny.frames.len()), (0, 0));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres and s3: docker compose up -d"]
+    async fn old_single_records_and_frames_mix_in_one_read() {
+        let (store, s3) = fresh().await;
+        let old = store.clone().with_frame_bytes(0);
+        let a = history(10);
+        let b = history(30).split_off(20);
+        old.put_many(&a).await.unwrap();
+        store.put_many(&b).await.unwrap();
+        // One object stored one per key (before packs existed).
+        let legacy = EncodedObject::new(ObjectKind::Blob, b"stored before packs");
+        s3.put_many(std::slice::from_ref(&legacy)).await.unwrap();
+        let all: Vec<EncodedObject> = a.iter().chain(&b).chain([&legacy]).cloned().collect();
+        let ids: Vec<ObjectId> = all.iter().map(EncodedObject::id).collect();
+        for reader in [old, store.clone(), PackedS3Store::new(store.index.clone(), s3.clone())] {
+            let got = reader.get_many(&ids).await.unwrap();
+            assert!(got.iter().zip(&all).all(|(g, o)| g.as_ref() == Some(o)));
+        }
+        let index = store.index.lookup_index(&ids).await.unwrap();
+        assert_eq!(index.len(), ids.len() - 1);
+        let shared = |o: &EncodedObject| {
+            let e = index[&o.id()];
+            index.values().filter(|x| (x.pack, x.off) == (e.pack, e.off)).count()
+        };
+        assert!(a.iter().all(|o| shared(o) == 1), "written alone");
+        assert!(b.iter().any(|o| shared(o) > 1), "written in frames");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres and s3: docker compose up -d"]
+    async fn corrupt_packs_are_read_errors_not_panics() {
+        let (store, s3) = fresh().await;
+        let objects = history(8);
+        let ids: Vec<ObjectId> = objects.iter().map(EncodedObject::id).collect();
+        store.put_many(&objects).await.unwrap();
+        let index = store.index.lookup_index(&ids).await.unwrap();
+        let pack = index[&ids[0]].pack;
+        assert!(index.values().all(|e| e.pack == pack), "one pack");
+        let key = s3.pack_key(&pack);
+        let size = index.values().map(|e| e.off + u64::from(e.len)).max().unwrap();
+        let good = s3.get_range(&key, 0, size).await.unwrap().to_vec();
+        let damaged = |f: &dyn Fn(&mut Vec<u8>)| {
+            let mut b = good.clone();
+            f(&mut b);
+            b
+        };
+        let cases = [
+            damaged(&|b| b.iter_mut().for_each(|x| *x = 0xAA)),
+            damaged(&|b| b.iter_mut().skip(40).step_by(97).for_each(|x| *x ^= 0x10)),
+            damaged(&|b| {
+                // Frame headers claiming absurd sizes.
+                for e in index.values() {
+                    let at = e.off as usize;
+                    if b[at..].starts_with(b"AFR1") {
+                        b[at + 8..at + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+                    }
+                }
+            }),
+        ];
+        for body in cases {
+            s3.put_raw(key.clone(), body).await.unwrap();
+            let cold = PackedS3Store::new(store.index.clone(), s3.clone());
+            let r = cold.get_many(&ids).await;
+            assert!(matches!(r, Err(StoreError::Backend(_))), "{r:?}");
+        }
+        s3.put_raw(key, good).await.unwrap();
+        let cold = PackedS3Store::new(store.index.clone(), s3.clone());
+        let got = cold.get_many(&ids).await.unwrap();
+        assert!(got.iter().zip(&objects).all(|(g, o)| g.as_ref() == Some(o)));
     }
 }

@@ -1,4 +1,5 @@
-//! Cleanup helper for soak runs: deletes everything a run wrote to S3.
+//! S3 helpers for benchmarks: delete everything a soak run wrote, and add up
+//! what an import stored.
 //!
 //! The client uses the store's SDK configuration (`S3Config::sdk_config`:
 //! static credentials, region, endpoint, path-style addressing) with the
@@ -53,6 +54,41 @@ pub async fn delete_prefix(cfg: &S3Config) -> Result<u64> {
         }
     }
     Ok(deleted)
+}
+
+/// Number and total size of the objects under `cfg.prefix` (a missing bucket
+/// is empty).
+pub async fn prefix_size(cfg: &S3Config) -> Result<(u64, u64)> {
+    let client = aws_sdk_s3::Client::from_conf(cfg.sdk_config().build());
+    let prefix = match cfg.prefix.trim_end_matches('/') {
+        "" => String::new(),
+        p => format!("{p}/"),
+    };
+    let (mut count, mut bytes) = (0u64, 0u64);
+    let mut token: Option<String> = None;
+    loop {
+        let mut req = client.list_objects_v2().bucket(&cfg.bucket).prefix(&prefix);
+        if let Some(t) = token.take() {
+            req = req.continuation_token(t);
+        }
+        let page = match req.send().await {
+            Ok(p) => p,
+            Err(e) if e.code() == Some("NoSuchBucket") => return Ok((0, 0)),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("listing objects in bucket {} prefix {prefix:?}", cfg.bucket)
+                });
+            }
+        };
+        for o in page.contents() {
+            count += 1;
+            bytes += o.size().unwrap_or(0).max(0) as u64;
+        }
+        match page.next_continuation_token() {
+            Some(t) if page.is_truncated().unwrap_or(false) => token = Some(t.to_owned()),
+            _ => return Ok((count, bytes)),
+        }
+    }
 }
 
 async fn delete_batch(client: &aws_sdk_s3::Client, bucket: &str, keys: &[String]) -> Result<u64> {

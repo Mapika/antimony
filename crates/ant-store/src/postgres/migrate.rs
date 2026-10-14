@@ -30,7 +30,7 @@ use super::{be, quote_ident};
 use crate::{Result, StoreError};
 
 /// The schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// One schema migration.
 pub struct Migration {
@@ -76,6 +76,13 @@ pub static MIGRATIONS: [Migration; SCHEMA_VERSION as usize] = [
         description: "write times of objects, packed-object index rows, commits and changesets; \
                       garbage-collection state (condemned ids, mark working set, run state)",
         ddl: gc,
+    },
+    Migration {
+        version: 6,
+        name: "pack_frames",
+        description: "S3 packs may hold multi-object frames (unreadable by versions before \
+                      0.1.5); objects in a frame record their share of its bytes",
+        ddl: pack_frames,
     },
 ];
 
@@ -251,6 +258,18 @@ fn gc(qs: &str, _ql: &str) -> Vec<String> {
         ),
     ]);
     stmts
+}
+
+/// Multi-object frames in S3 packs (`crate::packed`). Packs written from
+/// this version on may hold records older binaries cannot decode, which is
+/// why it is a migration at all: binaries that support only version 5 refuse
+/// the schema instead of failing reads. `share` is the part of a frame's
+/// compressed bytes attributed to one member (its uncompressed share of the
+/// frame), for the garbage collector's byte counts; NULL (every row written
+/// before, and objects stored alone) means the whole record (`len`). Adding
+/// a nullable column does not rewrite the table.
+fn pack_frames(qs: &str, _ql: &str) -> Vec<String> {
+    vec![format!("ALTER TABLE {qs}.object_index ADD COLUMN IF NOT EXISTS share integer")]
 }
 
 /// Version state of one schema ([`super::PgStore::schema_status`]).

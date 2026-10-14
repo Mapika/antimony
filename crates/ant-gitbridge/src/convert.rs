@@ -22,7 +22,7 @@ use crate::tree::{Parsed, TreeCache, parse_tree};
 use crate::{Msg, NewCommit};
 
 /// Cut a batch of objects at this many bytes even if `batch_objects` is not reached.
-const BATCH_BYTES: usize = 16 << 20;
+const BATCH_BYTES: usize = 64 << 20;
 /// Parsed-tree cache for the fallback path (bytes per generation).
 const FALLBACK_TREE_CACHE: usize = 32 << 20;
 

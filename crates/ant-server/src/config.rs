@@ -120,6 +120,12 @@ pub struct StoreArgs {
     /// larger ones go to S3 (only with --s3-*).
     #[arg(long, env = "ANT_INLINE_THRESHOLD", default_value_t = DEFAULT_INLINE_THRESHOLD)]
     inline_threshold: usize,
+
+    /// Compress similar large objects together in multi-object frames of S3
+    /// packs (`false`: store each object alone, the format servers before
+    /// 0.1.5 read; for the window of a rolling upgrade).
+    #[arg(long, env = "ANT_PACK_FRAMES", default_value_t = true, action = clap::ArgAction::Set)]
+    pack_frames: bool,
 }
 
 impl StoreArgs {
@@ -211,7 +217,10 @@ impl StoreArgs {
                         s3.ensure_bucket().await.context("ensuring S3 bucket")?;
                         // Large objects are bundled into S3 packs indexed in Postgres.
                         s3_probe = Some(s3.clone());
-                        let packed = PackedS3Store::new(pg.as_ref().clone(), s3);
+                        let mut packed = PackedS3Store::new(pg.as_ref().clone(), s3);
+                        if !self.pack_frames {
+                            packed = packed.with_frame_bytes(0);
+                        }
                         Arc::new(TieredObjectStore::new(
                             pg.clone(),
                             Arc::new(packed),

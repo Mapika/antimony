@@ -496,6 +496,88 @@ async fn gc_deletes_dead_packs_and_reports_dead_bytes() {
     assert_eq!(again.packs_kept as i64, packs_after);
 }
 
+/// Versions of one file uploaded together share a multi-object frame. When
+/// most of them are collected, the ones still referenced stay readable from
+/// the same frame (no member depends on another's index row), the pack stays,
+/// and the collected members' shares are reported as dead bytes.
+#[tokio::test]
+#[ignore = "needs postgres and s3: docker compose up -d"]
+async fn gc_keeps_live_members_of_a_frame_whose_other_members_die() {
+    let (r, s3, _guard) = repo_s3().await;
+    let b = &r.b;
+    let (tip, _) = history(b, 2).await;
+    let body = |v: usize| {
+        let mut s = String::new();
+        for line in 0..200 {
+            let edit = if line == v { format!("edited in version {v}") } else { "kept".into() };
+            s.push_str(&format!("line {line} of a long file, {edit}\n"));
+        }
+        s.into_bytes()
+    };
+    let versions: Vec<EncodedObject> =
+        (0..12).map(|v| EncodedObject::new(ObjectKind::Blob, &body(v))).collect();
+    b.objects.put_many(&versions).await.unwrap();
+    let lits: Vec<String> =
+        versions.iter().map(|v| format!("'\\x{}'::bytea", v.id().to_hex())).collect();
+    let frames = count(
+        &r.schema,
+        &format!(
+            "SELECT count(*) FROM (SELECT DISTINCT pack, off FROM object_index \
+             WHERE share IS NOT NULL AND id IN ({})) f",
+            lits.join(", ")
+        ),
+    )
+    .await;
+    assert_eq!(frames, 1, "the versions share one frame");
+    // The first and the last version are used; the others are not.
+    let keep = [versions[0].id(), versions[11].id()];
+    let ops = keep
+        .iter()
+        .enumerate()
+        .map(|(i, id)| FileOp::Write {
+            path: RepoPath::new(format!("v/{i}")).unwrap(),
+            mode: EntryMode::File,
+            content: WriteContent::Blob(*id),
+        })
+        .collect();
+    let req = ChangesetRequest {
+        base: Some(tip),
+        ops,
+        author: sig(),
+        committer: None,
+        message: "versions".into(),
+    };
+    let c = create_changeset(b, req).await.unwrap();
+    land_tip(b, "main", c).await;
+
+    let before = readback(b).await;
+    age(&r.schema, 30).await;
+    let o = GcOptions { s3: Some(s3.clone()), pack_min_age: Some(Duration::ZERO), ..opts() };
+    let report = gc(&r, &o).await;
+    assert!(report.finished, "{report:?}");
+    for v in &versions[1..11] {
+        assert_eq!(stored(&r.schema, &v.id()).await, 0, "unused version survived");
+    }
+    for id in keep {
+        assert_eq!(stored(&r.schema, &id).await, 1);
+    }
+    assert!(report.large_objects >= 10, "{report:?}");
+    assert!(report.packs_dead_bytes > 0, "{report:?}");
+    assert_eq!(readback(b).await, before);
+    // A store with nothing cached decodes the frame from S3 again.
+    let fresh = PackedS3Store::new(r.pg.as_ref().clone(), s3.clone());
+    let fresh: Arc<dyn ant_store::ObjectStore> =
+        Arc::new(TieredObjectStore::new(r.pg.clone(), Arc::new(fresh), 64));
+    let got = fresh.get_many(&keep).await.unwrap();
+    assert_eq!(got, vec![Some(versions[0].clone()), Some(versions[11].clone())]);
+    let gone = fresh.get_many(&[versions[5].id()]).await.unwrap();
+    assert_eq!(gone, vec![None]);
+    // The frame's pack is not deleted while live members point into it.
+    let again = gc(&r, &o).await;
+    assert_eq!(again.packs, 0, "{again:?}");
+    assert_eq!(fresh.get_many(&keep).await.unwrap().len(), 2);
+}
+
 /// `land`, retried while it is `Aborted` (as clients do): a batch that
 /// meets data condemned while it replays fails as a whole, retryably.
 async fn land_retrying(b: &Backend, r: &str, c: ObjectId) -> Result<LandOutcome, OpError> {

@@ -46,9 +46,33 @@ release of the 0.x series may change.
 
 - `ant ref set` checks fast-forwards with one `IsAncestor` call instead of
   paging through `Log` (still the fallback against older servers).
+- **Storage format (schema version 6, migration `pack_frames`).** Large
+  objects of one write that look alike (versions of one file or directory)
+  are compressed together as multi-object frames in S3 packs (magic `AFR1`,
+  at most 2 MiB uncompressed each; `ant_store::packed`). Packs written before
+  stay readable, and objects without a look-alike are still written in the
+  old single-object format. Servers that support only schema version 5
+  cannot read frames and refuse the migrated schema; for a rolling upgrade
+  start new servers with `--pack-frames false` (`ANT_PACK_FRAMES`) until
+  every server runs this release (`docs/operations.md`, Upgrading). The
+  migration adds a nullable column (`object_index.share`, a frame member's
+  share of the frame's bytes for `ant admin gc` byte counts) and rewrites
+  nothing. Note: by `docs/compatibility.md` a patch release may not add a
+  migration older servers cannot run alongside, so this ships in a minor
+  release (or with frames off by default in a patch release).
+- `ant import` cuts object batches at 64 MiB instead of 16 MiB (still at
+  most 1024 objects), so more versions of a path share a batch and a frame.
 
 ### Performance
 
+- Stored size: a git/git import (82k commits; git pack of what `master`
+  reaches 303 MiB) takes 901 MiB (Postgres 246 + S3 655) instead of
+  4,094 MiB (243 + 3,851), 3.0x the git pack instead of 13.5x. The import is
+  no slower (S3 receives 6x fewer bytes); blobless clone 7.4 -> 5.6 s, full
+  clone 22.7 -> 16.8 s (both cold, server CPU 30 -> 21 s and 77 -> 60 s),
+  cold checkout unchanged (0.33 -> 0.31 s). Reads decode at most one 2 MiB
+  frame per record (no delta chains), with a 64 MiB decoded-frame cache and
+  a 64 MiB bound on frames being decoded per server.
 - Ancestry walks (`graph::merge_base`, `graph::is_ancestor`) read whole
   windows of ancestry per store call (`MetaStore::ancestors_above`, one
   recursive query on Postgres) and use a first-parent skip index (derived

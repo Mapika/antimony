@@ -111,13 +111,17 @@ macro_rules! live {
 /// one fsync per batch.
 const BULK_ENV: &str = "ANT_PG_BULK";
 
-/// Location of a packed object: `len` bytes at `off` of pack `pack`.
+/// Location of a packed object: the record of `len` bytes at `off` of pack
+/// `pack` (a frame shared with other objects, or the object alone).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct IndexEntry {
     pub id: ObjectId,
     pub pack: [u8; 16],
     pub off: u64,
     pub len: u32,
+    /// The part of a shared frame's bytes attributed to this object (`None`:
+    /// the whole record). Written, never read back by readers.
+    pub share: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -366,6 +370,7 @@ impl PgStore {
         let packs: Vec<&[u8]> = sorted.iter().map(|e| e.pack.as_slice()).collect();
         let offs: Vec<i64> = sorted.iter().map(|e| e.off as i64).collect();
         let lens: Vec<i32> = sorted.iter().map(|e| e.len as i32).collect();
+        let shares: Vec<Option<i32>> = sorted.iter().map(|e| e.share.map(|s| s as i32)).collect();
         // Like `put_many`: rows that already exist keep pointing at their
         // pack, with their write time refreshed (`gc::refresh_existing`).
         let mut pending: Vec<usize> = (0..sorted.len()).collect();
@@ -374,9 +379,11 @@ impl PgStore {
             let packs: Vec<&[u8]> = pending.iter().map(|&i| packs[i]).collect();
             let offs: Vec<i64> = pending.iter().map(|&i| offs[i]).collect();
             let lens: Vec<i32> = pending.iter().map(|&i| lens[i]).collect();
+            let shares: Vec<Option<i32>> = pending.iter().map(|&i| shares[i]).collect();
             let insert = sqlx::query(
-                "WITH ins AS (INSERT INTO object_index (id, pack, off, len) \
-                     SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::bigint[], $4::integer[]) \
+                "WITH ins AS (INSERT INTO object_index (id, pack, off, len, share) \
+                     SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::bigint[], $4::integer[], \
+                                          $6::integer[]) \
                      ON CONFLICT (id) DO NOTHING RETURNING id) \
                  SELECT id FROM ins \
                  UNION ALL \
@@ -388,7 +395,8 @@ impl PgStore {
             .bind(&packs)
             .bind(&offs)
             .bind(&lens)
-            .bind(gc::FRESHEN_AFTER.as_secs_f64());
+            .bind(gc::FRESHEN_AFTER.as_secs_f64())
+            .bind(&shares);
             let settled = self.write(insert, self.objects_deferred()).await?;
             let missing = self.refresh_existing(gc::Table::ObjectIndex, &ids, &settled).await?;
             if missing.is_empty() {
@@ -419,7 +427,7 @@ impl PgStore {
                 .map_err(|_| StoreError::InvalidArgument("corrupt pack id".into()))?;
             let off: i64 = r.try_get("off").map_err(be)?;
             let len: i32 = r.try_get("len").map_err(be)?;
-            out.insert(id, IndexEntry { id, pack, off: off as u64, len: len as u32 });
+            out.insert(id, IndexEntry { id, pack, off: off as u64, len: len as u32, share: None });
         }
         Ok(out)
     }
