@@ -44,11 +44,18 @@
 //! - GetObjects / HasObjects / HTTP `GET /o/{id}`: unreadable objects are
 //!   reported exactly like missing ones (not found / `found=false` / 404) —
 //!   never leak existence. HTTP responses for objects outside the root zone
-//!   use `Cache-Control: private, ...` instead of `public`.
+//!   use `Cache-Control: private, ...` instead of `public`. Tree bundles
+//!   (`GET /t/{id}`) never put such objects into a `public` response; see
+//!   `crate::http` for their rules.
 //! - ReadPath: denied path → not found. Tree listings still show restricted
 //!   entry names and ids (documented v1 limitation: clients need ids to
 //!   sparse-skip; it is content access we protect). Log `--path` / Diff: drop
-//!   changes under unreadable paths.
+//!   changes under unreadable paths. LogRange with a path counts only
+//!   readable changes (as Log); Diff with `path_prefixes`, `merge_base` or
+//!   `patch` filters before any blob is read, so hunks of unreadable files
+//!   are never computed. MergeBase / IsAncestor / LandedAs reveal commit
+//!   graph facts only, which (like Log without a path) every authenticated
+//!   caller may see; unknown revs are `not_found` for everyone.
 //! - CreateChangeset: every op path must be writable, else permission_denied.
 //! - Land: principal must `can_land(ref)`, and every path changed by every
 //!   replayed commit must be writable by the principal.
@@ -551,8 +558,22 @@ pub async fn can_reference(
 /// True if the object lies outside the root zone (carries tags, but not the
 /// root tag): HTTP responses for it must not be stored by shared caches.
 pub async fn is_private(b: &Backend, policy: &Policy, id: ObjectId) -> Result<bool, StoreError> {
-    let tags = object_tags(b, policy, &[id]).await?.pop().unwrap_or_default();
-    Ok(!tags.is_empty() && policy.root_zone().is_none_or(|r| !tags.contains(&r)))
+    Ok(private_many(b, policy, &[id]).await?.pop().unwrap_or(false))
+}
+
+/// Index-aligned [`is_private`] for many ids (one tag lookup per zone and
+/// chunk).
+pub async fn private_many(
+    b: &Backend,
+    policy: &Policy,
+    ids: &[ObjectId],
+) -> Result<Vec<bool>, StoreError> {
+    let root = policy.root_zone();
+    Ok(object_tags(b, policy, ids)
+        .await?
+        .into_iter()
+        .map(|tags| !tags.is_empty() && root.as_ref().is_none_or(|r| !tags.contains(r)))
+        .collect())
 }
 
 // ---------------------------------------------------------------------------

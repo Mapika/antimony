@@ -186,76 +186,327 @@ pub async fn write_tree(objects: &dyn ObjectStore, entries: Vec<TreeEntry>) -> R
     Ok(id)
 }
 
-async fn node(b: &Backend, id: ObjectId) -> Result<CommitNode> {
-    b.meta
-        .get_commits(&[id])
-        .await?
-        .pop()
-        .flatten()
-        .ok_or_else(|| StoreError::InvalidArgument(format!("commit {id} is not recorded")))
+// ---------------------------------------------------------------------------
+// Ancestry queries
+// ---------------------------------------------------------------------------
+
+/// First `first_parent_chain` read of a walk; later reads double up to
+/// [`MAX_CHAIN_READ`], so short walks read little and long ones few times.
+const FIRST_CHAIN_READ: usize = 256;
+/// Largest `first_parent_chain` read of a walk.
+const MAX_CHAIN_READ: usize = 8192;
+/// Missing nodes fetched as chains in parallel; more than this are fetched
+/// with one `get_commits` instead (wide frontiers of merge-heavy history).
+const PARALLEL_CHAINS: usize = 8;
+
+fn not_recorded(id: ObjectId) -> StoreError {
+    StoreError::InvalidArgument(format!("commit {id} is not recorded"))
+}
+
+/// Commit-graph nodes loaded on demand for one walk. A missing node is read
+/// together with the first-parent chain below it (`first_parent_chain`, one
+/// server-side traversal in persistent stores), so a walk costs about one
+/// round trip per chain segment it enters (plus a few for long segments),
+/// not one per commit.
+struct Nodes<'a> {
+    meta: &'a dyn crate::MetaStore,
+    nodes: HashMap<ObjectId, CommitNode>,
+    chunk: usize,
+}
+
+impl<'a> Nodes<'a> {
+    /// `first_read`: the most nodes the first chain read may return.
+    fn new(b: &'a Backend, first_read: usize) -> Self {
+        Self { meta: b.meta.as_ref(), nodes: HashMap::new(), chunk: first_read }
+    }
+
+    /// Load `ids` with one `get_commits` (no chains).
+    async fn load_exact(&mut self, ids: &[ObjectId]) -> Result<()> {
+        for (id, n) in ids.iter().zip(self.meta.get_commits(ids).await?) {
+            self.nodes.insert(*id, n.ok_or_else(|| not_recorded(*id))?);
+        }
+        Ok(())
+    }
+
+    fn get(&self, id: &ObjectId) -> Result<&CommitNode> {
+        self.nodes.get(id).ok_or_else(|| not_recorded(*id))
+    }
+
+    /// Load every `(id, useful)` not loaded yet, in one round of store calls;
+    /// `useful` bounds how many first-parent nodes from `id` down can matter
+    /// to the caller (at least `id` itself is read). Unrecorded ids are an
+    /// error.
+    async fn load(&mut self, want: &[(ObjectId, usize)]) -> Result<()> {
+        let mut seen = HashSet::new();
+        let want: Vec<(ObjectId, usize)> = want
+            .iter()
+            .copied()
+            .filter(|(id, _)| !self.nodes.contains_key(id) && seen.insert(*id))
+            .collect();
+        if want.is_empty() {
+            return Ok(());
+        }
+        let chunk = self.chunk;
+        self.chunk = (chunk * 2).min(MAX_CHAIN_READ);
+        if want.len() > PARALLEL_CHAINS {
+            let ids: Vec<ObjectId> = want.iter().map(|(id, _)| *id).collect();
+            return self.load_exact(&ids).await;
+        }
+        let meta = self.meta;
+        let chains = futures::future::try_join_all(
+            want.iter()
+                .map(|(id, useful)| meta.first_parent_chain(*id, None, (*useful).clamp(1, chunk))),
+        )
+        .await?;
+        for ((id, _), chain) in want.iter().zip(chains) {
+            if chain.first().map(|n| n.id) != Some(*id) {
+                return Err(not_recorded(*id));
+            }
+            for n in chain {
+                self.nodes.entry(n.id).or_insert(n);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Commits to visit in decreasing generation order. A commit whose node is
+/// not loaded yet is queued under an upper bound of its generation (its
+/// child's minus one); popping such an entry first loads every such
+/// pending commit in one [`Nodes::load`] round and requeues them under
+/// their real generations. Bounds never undercut real generations, so the
+/// order stays exact.
+struct Queue {
+    heap: BinaryHeap<(u64, ObjectId)>,
+    /// Queued under a bound, not loaded: id → bound.
+    pending: HashMap<ObjectId, u64>,
+    queued: HashSet<ObjectId>,
+    popped: HashSet<ObjectId>,
+}
+
+impl Queue {
+    fn new() -> Self {
+        Self {
+            heap: BinaryHeap::new(),
+            pending: HashMap::new(),
+            queued: HashSet::new(),
+            popped: HashSet::new(),
+        }
+    }
+
+    /// Queue `id` (once); `bound` = an upper bound of its generation.
+    fn push(&mut self, nodes: &Nodes<'_>, id: ObjectId, bound: u64) {
+        if !self.queued.insert(id) {
+            return;
+        }
+        match nodes.nodes.get(&id) {
+            Some(n) => self.heap.push((n.generation, id)),
+            None => {
+                self.pending.insert(id, bound);
+                self.heap.push((bound, id));
+            }
+        }
+    }
+
+    /// The next commit (loaded), highest generation first, ties by id.
+    /// `useful(bound)` = how many first-parent nodes below a pending commit
+    /// with that generation bound are worth reading.
+    async fn pop(
+        &mut self,
+        nodes: &mut Nodes<'_>,
+        useful: impl Fn(u64) -> usize,
+    ) -> Result<Option<ObjectId>> {
+        while let Some((g, id)) = self.heap.pop() {
+            if self.pending.contains_key(&id) {
+                let want: Vec<(ObjectId, usize)> =
+                    self.pending.iter().map(|(id, bound)| (*id, useful(*bound))).collect();
+                nodes.load(&want).await?;
+                for (id, _) in self.pending.drain() {
+                    self.heap.push((nodes.get(&id)?.generation, id));
+                }
+                continue;
+            }
+            // Bound entries of commits loaded meanwhile are stale (or, when
+            // the bound was exact, duplicates).
+            if nodes.get(&id)?.generation == g && self.popped.insert(id) {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// True if `ancestor` is reachable from `descendant` (a commit is its own
-/// ancestor). Prunes using generation numbers.
+/// ancestor). Walks from `descendant` in generation order and never below
+/// `ancestor`'s generation; nodes are read a chain segment per store call
+/// (bounded by the generation gap), not one commit per call. Unrecorded
+/// commits are `InvalidArgument`.
 pub async fn is_ancestor(b: &Backend, ancestor: ObjectId, descendant: ObjectId) -> Result<bool> {
     if ancestor == descendant {
         return Ok(true);
     }
-    let target_gen = node(b, ancestor).await?.generation;
-    // Breadth-first by frontier: one batched `get_commits` per step instead of
-    // one round trip per commit.
-    let mut seen = HashSet::from([descendant]);
-    let mut frontier = vec![descendant];
-    while !frontier.is_empty() {
-        let nodes = b.meta.get_commits(&frontier).await?;
-        let mut next = Vec::new();
-        for (id, n) in frontier.iter().zip(nodes) {
-            let n = n.ok_or_else(|| {
-                StoreError::InvalidArgument(format!("commit {id} is not recorded"))
-            })?;
-            if n.generation <= target_gen {
-                continue;
+    // The generation gap bounds every chain read: start with the largest.
+    let mut nodes = Nodes::new(b, MAX_CHAIN_READ);
+    nodes.load_exact(&[ancestor, descendant]).await?;
+    let target = nodes.get(&ancestor)?.generation;
+    let gap = |g: u64| usize::try_from(g.saturating_sub(target)).unwrap_or(usize::MAX);
+    let top = nodes.get(&descendant)?.generation;
+    if top <= target {
+        return Ok(false);
+    }
+    let mut queue = Queue::new();
+    queue.push(&nodes, descendant, top);
+    while let Some(id) = queue.pop(&mut nodes, gap).await? {
+        let n = nodes.get(&id)?;
+        if n.generation <= target {
+            continue;
+        }
+        let (g, parents) = (n.generation, n.parents.clone());
+        for p in parents {
+            if p == ancestor {
+                return Ok(true);
             }
-            for p in n.parents {
-                if p == ancestor {
-                    return Ok(true);
-                }
-                if seen.insert(p) {
-                    next.push(p);
-                }
+            // A parent's generation is below its child's; at or below the
+            // target's it cannot reach the target.
+            if g - 1 > target {
+                queue.push(&nodes, p, g - 1);
             }
         }
-        frontier = next;
     }
     Ok(false)
 }
 
-/// A best common ancestor of `a` and `b` (highest generation), if any.
+/// True if `ancestor` lies on the first-parent chain of `descendant`
+/// (inclusive). Unrecorded commits are simply not ancestors. Reads the
+/// chain in chunks bounded by the generation gap.
+pub async fn is_first_parent_ancestor(
+    b: &Backend,
+    ancestor: ObjectId,
+    descendant: ObjectId,
+) -> Result<bool> {
+    if ancestor == descendant {
+        return Ok(true);
+    }
+    let [Some(target), Some(desc)] =
+        <[_; 2]>::try_from(b.meta.get_commits(&[ancestor, descendant]).await?)
+            .unwrap_or([None, None])
+    else {
+        return Ok(false);
+    };
+    // Generations strictly decrease along a chain: a newer `ancestor` needs
+    // no walk, and otherwise the walk is at most the generation gap long.
+    if desc.generation <= target.generation {
+        return Ok(false);
+    }
+    let gap = usize::try_from(desc.generation - target.generation).unwrap_or(usize::MAX);
+    let mut from = descendant;
+    loop {
+        let chunk =
+            b.meta.first_parent_chain(from, Some(ancestor), MAX_CHAIN_READ.min(gap)).await?;
+        let Some(last) = chunk.last() else { return Ok(false) };
+        match last.parents.first() {
+            Some(p) if *p == ancestor => return Ok(true),
+            Some(p)
+                if chunk.len() == MAX_CHAIN_READ.min(gap)
+                    && last.generation > target.generation + 1 =>
+            {
+                from = *p
+            }
+            _ => return Ok(false),
+        }
+    }
+}
+
+/// A best common ancestor of `x` and `y`: the one with the highest
+/// generation (no other common ancestor descends from it), ties broken by
+/// the larger id. `None` for unrelated histories. Paints both sides'
+/// ancestry walking in generation order; nodes are read a chain segment per
+/// store call. Unrecorded commits are `InvalidArgument`.
 pub async fn merge_base(b: &Backend, x: ObjectId, y: ObjectId) -> Result<Option<ObjectId>> {
-    // Walk both sides in generation order, painting reachability.
     const X: u8 = 1;
     const Y: u8 = 2;
-    let mut paint: std::collections::HashMap<ObjectId, u8> = Default::default();
-    let mut heap = BinaryHeap::new();
-    for (id, flag) in [(x, X), (y, Y)] {
-        let n = node(b, id).await?;
-        *paint.entry(id).or_default() |= flag;
-        heap.push((n.generation, id));
+    let mut nodes = Nodes::new(b, FIRST_CHAIN_READ);
+    nodes.load(&[(x, MAX_CHAIN_READ), (y, MAX_CHAIN_READ)]).await?;
+    if x == y {
+        return Ok(Some(x));
     }
-    let mut queued: HashSet<ObjectId> = [x, y].into();
-    while let Some((_, id)) = heap.pop() {
+    let mut paint: HashMap<ObjectId, u8> = HashMap::from([(x, X), (y, Y)]);
+    let mut queue = Queue::new();
+    let gx = nodes.get(&x)?.generation;
+    let gy = nodes.get(&y)?.generation;
+    queue.push(&nodes, x, gx);
+    queue.push(&nodes, y, gy);
+    let chunk = |_| MAX_CHAIN_READ;
+    while let Some(id) = queue.pop(&mut nodes, chunk).await? {
         let flags = paint[&id];
         if flags == X | Y {
             return Ok(Some(id));
         }
-        for p in node(b, id).await?.parents {
+        // Every descendant of a commit (higher generation) is popped before
+        // it, so its paint is final here: the first commit painted by both
+        // sides is a common ancestor of the highest generation.
+        let n = nodes.get(&id)?;
+        let (g, parents) = (n.generation, n.parents.clone());
+        for p in parents {
             *paint.entry(p).or_default() |= flags;
-            if queued.insert(p) {
-                heap.push((node(b, p).await?.generation, p));
-            } else if paint[&p] == X | Y {
-                // Re-push so it is examined with its final paint.
-                heap.push((node(b, p).await?.generation, p));
+            queue.push(&nodes, p, g - 1);
+        }
+    }
+    Ok(None)
+}
+
+/// The newest commit on `to`'s first-parent chain that is reachable from
+/// `from` (`None`: no commit of that chain is). Walks both in generation
+/// order: `from`'s whole ancestry (painted "excluded") and `to`'s first
+/// parents, until the chain meets a painted commit or `from`'s ancestry is
+/// exhausted. `log from..to` with first parents only is the chain from
+/// `to` down to, excluding, this commit. Unrecorded commits are
+/// `InvalidArgument`.
+pub async fn first_parent_range_end(
+    b: &Backend,
+    from: ObjectId,
+    to: ObjectId,
+) -> Result<Option<ObjectId>> {
+    const CHAIN: u8 = 1;
+    const EXCLUDED: u8 = 2;
+    let mut nodes = Nodes::new(b, FIRST_CHAIN_READ);
+    nodes.load(&[(to, MAX_CHAIN_READ), (from, MAX_CHAIN_READ)]).await?;
+    if from == to {
+        return Ok(Some(to));
+    }
+    let mut paint: HashMap<ObjectId, u8> = HashMap::from([(to, CHAIN), (from, EXCLUDED)]);
+    let mut queue = Queue::new();
+    let (gt, gf) = (nodes.get(&to)?.generation, nodes.get(&from)?.generation);
+    queue.push(&nodes, to, gt);
+    queue.push(&nodes, from, gf);
+    // Queued commits painted excluded; none left = the rest of the chain is in range.
+    let mut excluded = 1usize;
+    let chunk = |_| MAX_CHAIN_READ;
+    while let Some(id) = queue.pop(&mut nodes, chunk).await? {
+        let flags = paint[&id];
+        let n = nodes.get(&id)?;
+        let (g, parents) = (n.generation, n.parents.clone());
+        if flags & EXCLUDED != 0 {
+            if flags & CHAIN != 0 {
+                return Ok(Some(id));
             }
+            excluded -= 1;
+            for p in parents {
+                let before = paint.get(&p).copied().unwrap_or(0);
+                paint.insert(p, before | EXCLUDED);
+                if before & EXCLUDED == 0 {
+                    excluded += 1;
+                    queue.push(&nodes, p, g - 1);
+                }
+            }
+        } else {
+            if excluded == 0 {
+                return Ok(None);
+            }
+            let Some(p) = parents.first().copied() else { return Ok(None) };
+            let before = paint.get(&p).copied().unwrap_or(0);
+            paint.insert(p, before | CHAIN);
+            queue.push(&nodes, p, g - 1);
         }
     }
     Ok(None)
@@ -494,6 +745,217 @@ mod tests {
         // Root commit changeset is relative to the empty tree.
         assert_eq!(b.meta.get_changeset(&r).await.unwrap().unwrap().len(), 1);
         assert!(b.meta.get_changeset(&a1).await.unwrap().unwrap().is_empty());
+    }
+
+    /// Counts the graph reads of a `MemoryMetaStore` (every method forwarded).
+    #[derive(Default)]
+    struct CountingMeta {
+        inner: crate::memory::MemoryMetaStore,
+        get_commits: std::sync::atomic::AtomicUsize,
+        chains: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingMeta {
+        fn calls(&self) -> usize {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.get_commits.load(Relaxed) + self.chains.load(Relaxed)
+        }
+        fn reset(&self) {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.get_commits.store(0, Relaxed);
+            self.chains.store(0, Relaxed);
+        }
+    }
+
+    #[async_trait]
+    impl crate::MetaStore for CountingMeta {
+        async fn put_commit(&self, node: CommitNode, changes: Vec<PathChange>) -> Result<u64> {
+            self.inner.put_commit(node, changes).await
+        }
+        async fn get_commits(&self, ids: &[ObjectId]) -> Result<Vec<Option<CommitNode>>> {
+            self.get_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.get_commits(ids).await
+        }
+        async fn get_changeset(&self, id: &ObjectId) -> Result<Option<Vec<PathChange>>> {
+            self.inner.get_changeset(id).await
+        }
+        async fn first_parent_chain(
+            &self,
+            tip: ObjectId,
+            stop: Option<ObjectId>,
+            limit: usize,
+        ) -> Result<Vec<CommitNode>> {
+            self.chains.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.first_parent_chain(tip, stop, limit).await
+        }
+        async fn tail(&self, after: u64, limit: usize) -> Result<Vec<(u64, ObjectId)>> {
+            self.inner.tail(after, limit).await
+        }
+        async fn get_derived(&self, kind: &str, key: &[u8]) -> Result<Option<bytes::Bytes>> {
+            self.inner.get_derived(kind, key).await
+        }
+        async fn put_derived(&self, kind: &str, key: &[u8], value: bytes::Bytes) -> Result<()> {
+            self.inner.put_derived(kind, key, value).await
+        }
+        async fn index_history(&self, ref_name: &str, rows: &[crate::HistoryRow]) -> Result<()> {
+            self.inner.index_history(ref_name, rows).await
+        }
+        async fn query_history(
+            &self,
+            ref_name: &str,
+            prefix: &RepoPath,
+            max_generation: u64,
+            limit: usize,
+        ) -> Result<Vec<(u64, ObjectId)>> {
+            self.inner.query_history(ref_name, prefix, max_generation, limit).await
+        }
+        async fn history_watermark(&self, ref_name: &str) -> Result<Option<ObjectId>> {
+            self.inner.history_watermark(ref_name).await
+        }
+        async fn set_history_watermark(
+            &self,
+            ref_name: &str,
+            expected: Option<ObjectId>,
+            new: ObjectId,
+        ) -> Result<bool> {
+            self.inner.set_history_watermark(ref_name, expected, new).await
+        }
+        async fn clear_history(&self, ref_name: &str) -> Result<()> {
+            self.inner.clear_history(ref_name).await
+        }
+    }
+
+    /// Graph-only commits (no objects): ids derived from a counter.
+    struct Dag {
+        b: Backend,
+        meta: Arc<CountingMeta>,
+        next: u64,
+    }
+
+    impl Dag {
+        fn new() -> Self {
+            let meta = Arc::new(CountingMeta::default());
+            let mut b = Backend::in_memory();
+            b.meta = meta.clone();
+            Self { b, meta, next: 0 }
+        }
+
+        async fn add(&mut self, parents: &[ObjectId]) -> ObjectId {
+            use crate::MetaStore;
+            self.next += 1;
+            let id = EncodedObject::new(ObjectKind::Blob, &self.next.to_le_bytes()).id();
+            let pg = self.meta.inner.get_commits(parents).await.unwrap();
+            let generation =
+                1 + pg.iter().map(|n| n.as_ref().unwrap().generation).max().unwrap_or(0);
+            let node = CommitNode {
+                id,
+                tree: ObjectId([0; 32]),
+                parents: parents.to_vec(),
+                generation,
+                committer_time: 0,
+            };
+            self.meta.inner.put_commit(node, vec![]).await.unwrap();
+            id
+        }
+
+        async fn chain(&mut self, from: Option<ObjectId>, n: usize) -> Vec<ObjectId> {
+            let mut out = Vec::with_capacity(n);
+            let mut prev = from;
+            for _ in 0..n {
+                let id = self.add(prev.as_slice()).await;
+                out.push(id);
+                prev = Some(id);
+            }
+            out
+        }
+    }
+
+    /// Long linear histories cost a handful of store calls, not one per
+    /// commit (the walks read whole first-parent segments at a time).
+    #[tokio::test]
+    async fn ancestry_over_long_histories_is_batched() {
+        let mut d = Dag::new();
+        let main = d.chain(None, 20_000).await;
+        let side = d.chain(Some(main[10_000]), 50).await;
+        let b = d.b.clone();
+        let (tip, side_tip) = (main[19_999], side[49]);
+
+        d.meta.reset();
+        assert_eq!(merge_base(&b, side_tip, tip).await.unwrap(), Some(main[10_000]));
+        let calls = d.meta.calls();
+        assert!(calls <= 8, "merge_base took {calls} store calls");
+
+        d.meta.reset();
+        assert!(is_ancestor(&b, main[100], tip).await.unwrap());
+        let calls = d.meta.calls();
+        assert!(calls <= 4, "is_ancestor took {calls} store calls");
+
+        d.meta.reset();
+        assert!(!is_ancestor(&b, side[0], tip).await.unwrap());
+        let calls = d.meta.calls();
+        assert!(calls <= 4, "is_ancestor (false) took {calls} store calls");
+
+        d.meta.reset();
+        assert!(is_first_parent_ancestor(&b, main[100], tip).await.unwrap());
+        assert!(d.meta.calls() <= 4, "{}", d.meta.calls());
+
+        d.meta.reset();
+        assert_eq!(first_parent_range_end(&b, side_tip, tip).await.unwrap(), Some(main[10_000]));
+        let calls = d.meta.calls();
+        assert!(calls <= 8, "first_parent_range_end took {calls} store calls");
+
+        // Ancestor newer than the descendant: no walk at all.
+        d.meta.reset();
+        assert!(!is_ancestor(&b, tip, main[5]).await.unwrap());
+        assert_eq!(d.meta.calls(), 1);
+    }
+
+    /// Merge commits (imported history): second parents are walked too.
+    #[tokio::test]
+    async fn ancestry_through_merges() {
+        //  r - a1 - a2 - m1 - a3 ----- m2
+        //   \           /             /
+        //    b1 ------ b2 - b3 - b4 -
+        //                \
+        //                 c1
+        let mut d = Dag::new();
+        let r = d.add(&[]).await;
+        let a = d.chain(Some(r), 2).await;
+        let bs = d.chain(Some(r), 2).await;
+        let m1 = d.add(&[a[1], bs[1]]).await;
+        let a3 = d.add(&[m1]).await;
+        let b34 = d.chain(Some(bs[1]), 2).await;
+        let m2 = d.add(&[a3, b34[1]]).await;
+        let c1 = d.add(&[bs[1]]).await;
+        let b = d.b.clone();
+
+        assert!(is_ancestor(&b, bs[0], m2).await.unwrap());
+        assert!(is_ancestor(&b, b34[0], m2).await.unwrap());
+        assert!(!is_ancestor(&b, c1, m2).await.unwrap());
+        assert!(!is_first_parent_ancestor(&b, bs[1], m2).await.unwrap());
+        assert!(is_first_parent_ancestor(&b, a[0], m2).await.unwrap());
+        assert_eq!(merge_base(&b, c1, m2).await.unwrap(), Some(bs[1]));
+        assert_eq!(merge_base(&b, c1, a3).await.unwrap(), Some(bs[1]));
+        assert_eq!(merge_base(&b, a[1], b34[0]).await.unwrap(), Some(r));
+        assert_eq!(merge_base(&b, m1, m2).await.unwrap(), Some(m1));
+        // m2's first-parent chain is m2 a3 m1 a2 a1 r; from c1 it meets r
+        // (b2 is reachable from c1 but not on that chain).
+        assert_eq!(first_parent_range_end(&b, c1, m2).await.unwrap(), Some(r));
+        assert_eq!(first_parent_range_end(&b, a[0], m2).await.unwrap(), Some(a[0]));
+        assert_eq!(first_parent_range_end(&b, m2, a3).await.unwrap(), Some(a3));
+        assert_eq!(first_parent_range_end(&b, m1, m1).await.unwrap(), Some(m1));
+
+        // Unrelated histories.
+        let other = d.chain(None, 3).await;
+        assert_eq!(merge_base(&b, other[2], m2).await.unwrap(), None);
+        assert_eq!(first_parent_range_end(&b, other[2], m2).await.unwrap(), None);
+        assert!(!is_ancestor(&b, other[0], m2).await.unwrap());
+
+        // Unrecorded commits are invalid arguments.
+        let ghost = ObjectId([9; 32]);
+        assert!(matches!(merge_base(&b, ghost, m2).await, Err(StoreError::InvalidArgument(_))));
+        assert!(matches!(is_ancestor(&b, ghost, m2).await, Err(StoreError::InvalidArgument(_))));
+        assert!(!is_first_parent_ancestor(&b, ghost, m2).await.unwrap());
     }
 
     #[tokio::test]

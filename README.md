@@ -34,6 +34,9 @@ clients are always online, history lives on the server, and nobody pushes.
   sizing, local services, benchmarks.
 - [Operator guide](docs/operator-guide.md): topology, sizing, fleet workflow,
   metrics and alerts, failure runbook, backups.
+- [Compatibility](docs/compatibility.md): what each 0.x release keeps stable
+  (API, Postgres schema, on-disk formats, CLI output) and how deprecations work.
+- [Changelog](CHANGELOG.md) and [release checklist](docs/release.md).
 
 ## Layout
 
@@ -99,6 +102,9 @@ ant ws resolve src/lib.rs && ant submit -m "b: comment" && ant land        # lan
 # 6. History.
 ant log main --path src/lib.rs
 ant diff main~1 main                       # M<TAB>src/lib.rs
+ant diff --patch main~1 main               # unified diff, computed by the server
+ant log main~2..main -- src                # a range, first parents
+ant landed-as <submitted-id>               # <landed-id> main [rebased]
 ant blame main:src/lib.rs
 
 # 7. Humans and IDEs use plain git; Prometheus scrapes the HTTP port.
@@ -212,13 +218,12 @@ process. `--pg-lock-timeout` (default `10s`) bounds the wait for a ref lock. `an
 
 ## Status
 
-Early prototype, built in the open with AI agents. Working end to end against
-real Postgres + S3 (see `crates/ant-cli/tests/e2e.rs`), with property-based
-tests for codecs, changeset construction and concurrent landing.
-
-Also implemented: indexed path history and blame, and writable lazy
-workspaces (`ant ws new --lazy`, FUSE copy-on-write). In progress: scale
-benchmarks (`ant-bench`: fleet load generator, large-repo import, checkout).
+Pre-1.0 (v0.1), built in the open with AI agents. Every capability above is
+covered end to end against real Postgres + S3 and FUSE, with property tests
+for codecs, changeset construction, landing (single and multi-replica) and
+garbage collection. Measured performance is in `docs/scorecard/`; open work
+and known limitations are in `ROADMAP.md` and `CHANGELOG.md`; compatibility
+guarantees are in `docs/compatibility.md`.
 
 ## Access control and threat model
 
@@ -232,14 +237,18 @@ auth password (any user name) for `git clone`. Missing or unknown tokens get
 
 **What is protected**
 
-- *File content under unreadable paths*: `ReadPath`, `Blame`, `Diff` and
-  `Log --path` behave as if those paths did not exist.
+- *File content under unreadable paths*: `ReadPath`, `Blame`, `Diff`
+  (including patches and path prefixes) and `Log` / `LogRange` with a path
+  behave as if those paths did not exist.
 - *Objects by id*: every blob and tree written under a restricted path rule
   (a *zone*) is tagged with that zone, so `GetObjects`, `HasObjects` and
   `GET /o/<id>` report it exactly like a missing object (same code, body and
   headers). Content is readable by id if *any* place it is stored is
   readable: the same bytes at a public path are not secret. Objects outside
-  the root zone are served with `Cache-Control: private`.
+  the root zone are served with `Cache-Control: private`. Tree bundles
+  (`GET /t/<tree-id>`) never carry such objects in a `public` response, and
+  bundles that depend on the caller are `private, no-store`
+  (`docs/architecture.md`).
 - *Read by copy*: `CreateChangeset` may reference a blob by id only if the
   caller can read it or uploaded it; otherwise it is "not found". Fresh
   uploads stay hidden from everyone until a changeset places them.

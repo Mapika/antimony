@@ -35,7 +35,7 @@ capacity plan.
 | Load balancer | 1 | Must speak gRPC (HTTP/2) on 7420 and plain HTTP on 7421. Any replica can serve any request; no stickiness needed. |
 | PostgreSQL | 1 | The single source of truth for refs and metadata. Run it with whatever HA you normally use; antimony has no opinion beyond "one primary". |
 | S3-compatible store | 1 | Bucket is created on first start. Holds only objects larger than `--inline-threshold` (default 4096 bytes). |
-| HTTP cache / CDN | optional | Put it in front of `GET /o/<id>` only. Responses are `Cache-Control: public, max-age=31536000, immutable` with an `ETag`. Objects in restricted zones are served `private` (a shared cache must not store them) and unknown ids get `no-store`. Pass the CDN base URL to clients via `ANT_HTTP`. |
+| HTTP cache / CDN | optional | Put it in front of `GET /o/<id>` and `GET /t/<tree-id>` only (cache key: the path; forward `Authorization`). Responses are `Cache-Control: public, max-age=31536000, immutable` (`/o/` also with an `ETag`). Objects in restricted zones are served `private`, bundles that depend on the caller `private, no-store` (a shared cache must not store either), and unknown ids get `no-store`. Pass the CDN base URL to clients via `ANT_HTTP`; checkouts then cost about one `/t/` request per 8 MiB of small files instead of one request per file. |
 
 **Replicas and coordination.** Replicas share nothing except Postgres and S3.
 Lands on one ref are group-committed per process (up to 64 requests per
@@ -556,7 +556,7 @@ template variable on every panel):
 7. Postgres pool: in use vs max, idle
 8. History lag per ref
 9. Cache hit ratio and `ant_cache_bytes` by cache
-10. HTTP `/o` request rate and p99 (CDN miss traffic)
+10. HTTP `/o` and `/t` (`route="tree_bundles"`) request rate and p99 (CDN miss traffic)
 11. Process RSS and CPU (from node/process exporter)
 
 A compact importable Grafana dashboard (Grafana 10+, Prometheus datasource

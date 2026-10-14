@@ -2,10 +2,12 @@
 //! adapter over these functions (the HTTP object endpoint reads the store
 //! directly); tests exercise them directly against `Backend::in_memory()`.
 
+pub mod ancestry;
 pub(crate) mod cache;
 pub mod changeset;
 pub mod history;
 pub mod land;
+pub mod patch;
 pub mod query;
 mod tree_edit;
 

@@ -11,6 +11,15 @@
 //! - `has_many`: `HasObjects`.
 //! - `client()` exposes the raw generated client for other RPCs (refs,
 //!   changesets, land, queries) — the CLI uses it directly.
+//! - `get_tree_bundles(trees)` (HTTP only): `GET {http_base}/t/{hex}` per
+//!   tree (concurrency 64), each a bundle of the tree plus its blobs and
+//!   whole subdirectories (`ant_proto::bundle`); every object is verified
+//!   against its id, and the first must be the requested tree. Per tree the
+//!   result is `None` when no bundle is available: no HTTP base, transport
+//!   or decoding error, or a 404. A 404/405/501 without the `x-ant-bundle`
+//!   header means an older server without the route: bundles are then off
+//!   for this store (and its clones) and callers fetch per object.
+//! - `http_requests()`: HTTP object and bundle requests issued so far.
 //! - `connect_with_token` sends `authorization: Bearer <token>` on every
 //!   RPC and HTTP object request (servers running with an access policy).
 
@@ -20,6 +29,9 @@ use ant_proto::v1 as pb;
 use ant_proto::v1::ant_client::AntClient;
 use ant_store::{ObjectStore, Result, StoreError};
 use async_trait::async_trait;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::par::par_map;
 use bytes::Bytes;
@@ -37,6 +49,25 @@ const RPC_IDS_PER_REQUEST: usize = 4096;
 const GRPC_CONCURRENCY: usize = 4;
 /// Max total payload bytes per `PutObjects` request.
 const PUT_BATCH_BYTES: usize = 64 * 1024 * 1024;
+/// Largest decompressed tree bundle accepted (servers send up to ~8 MiB).
+const MAX_BUNDLE_BYTES: usize = 256 * 1024 * 1024;
+
+/// HTTP requests issued by a [`RemoteObjectStore`] (and its clones).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HttpRequests {
+    /// `GET /o/{id}`.
+    pub objects: u64,
+    /// `GET /t/{id}`.
+    pub bundles: u64,
+}
+
+#[derive(Default)]
+struct HttpState {
+    objects: AtomicU64,
+    bundles: AtomicU64,
+    /// The server answered `/t/` like a server without the route.
+    no_bundles: AtomicBool,
+}
 
 /// Adds `authorization: Bearer <token>` to every request when set.
 #[derive(Clone, Default)]
@@ -64,6 +95,7 @@ pub struct RemoteObjectStore {
     http: reqwest::Client,
     /// `Bearer <token>` for HTTP object reads.
     authorization: Option<String>,
+    state: Arc<HttpState>,
 }
 
 impl RemoteObjectStore {
@@ -93,11 +125,89 @@ impl RemoteObjectStore {
             http_base: http_base.map(|b| b.trim_end_matches('/').to_owned()),
             http: reqwest::Client::new(),
             authorization,
+            state: Arc::default(),
         })
     }
 
     pub fn client(&self) -> AntRpcClient {
         self.client.clone()
+    }
+
+    /// HTTP requests issued so far by this store and its clones.
+    pub fn http_requests(&self) -> HttpRequests {
+        HttpRequests {
+            objects: self.state.objects.load(Ordering::Relaxed),
+            bundles: self.state.bundles.load(Ordering::Relaxed),
+        }
+    }
+
+    /// True if [`Self::get_tree_bundles`] may fetch anything: an HTTP base
+    /// is set and the server has not shown it lacks the route.
+    pub fn tree_bundles_enabled(&self) -> bool {
+        self.http_base.is_some() && !self.state.no_bundles.load(Ordering::Relaxed)
+    }
+
+    /// The tree bundle of each of `trees` (see the module docs): verified
+    /// `(id, object)` pairs, the tree first, or `None` where no bundle is
+    /// available (the caller then fetches per object).
+    pub async fn get_tree_bundles(
+        &self,
+        trees: &[ObjectId],
+    ) -> Vec<Option<Vec<(ObjectId, EncodedObject)>>> {
+        let Some(base) = self.http_base.as_deref().filter(|_| self.tree_bundles_enabled()) else {
+            return vec![None; trees.len()];
+        };
+        stream::iter(trees.iter().copied())
+            .map(|tree| async move {
+                if self.state.no_bundles.load(Ordering::Relaxed) {
+                    return None;
+                }
+                match self.fetch_bundle(base, tree).await {
+                    Ok(found) => found,
+                    Err(e) => {
+                        tracing::debug!(error = %e, %tree, "tree bundle unavailable; fetching per object");
+                        None
+                    }
+                }
+            })
+            .buffered(HTTP_CONCURRENCY)
+            .collect()
+            .await
+    }
+
+    /// One `GET /t/{tree}`: `Ok(None)` for "no bundle" answers (404s; an
+    /// older server also turns bundles off), errors for anything unusable.
+    async fn fetch_bundle(
+        &self,
+        base: &str,
+        tree: ObjectId,
+    ) -> Result<Option<Vec<(ObjectId, EncodedObject)>>> {
+        let url = format!("{base}/t/{}", tree.to_hex());
+        let mut req = self.http.get(&url);
+        if let Some(a) = &self.authorization {
+            req = req.header(reqwest::header::AUTHORIZATION, a);
+        }
+        self.state.bundles.fetch_add(1, Ordering::Relaxed);
+        let resp = req.send().await.map_err(StoreError::backend)?;
+        let status = resp.status();
+        if !status.is_success() {
+            let has_route = resp.headers().contains_key(ant_proto::bundle::HEADER);
+            let missing_route = matches!(status.as_u16(), 404 | 405 | 501) && !has_route;
+            if missing_route {
+                self.state.no_bundles.store(true, Ordering::Relaxed);
+            }
+            if missing_route || status == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            return Err(StoreError::backend(std::io::Error::other(format!(
+                "HTTP {status} for {url}"
+            ))));
+        }
+        let body = resp.bytes().await.map_err(StoreError::backend)?;
+        let objects = tokio::task::spawn_blocking(move || decode_bundle(&body, tree))
+            .await
+            .map_err(StoreError::backend)??;
+        Ok(Some(objects))
     }
 
     /// Fetch every id over HTTP. Any failure (transport, unexpected status,
@@ -115,7 +225,11 @@ impl RemoteObjectStore {
                 let http = http.clone();
                 let url = format!("{base}/o/{}", id.to_hex());
                 let auth = auth.clone();
-                async move { fetch_http_object(&http, &url, auth.as_deref()).await }
+                let state = self.state.clone();
+                async move {
+                    state.objects.fetch_add(1, Ordering::Relaxed);
+                    fetch_http_object(&http, &url, auth.as_deref()).await
+                }
             })
             .buffered(HTTP_CONCURRENCY)
             .try_collect()
@@ -163,6 +277,18 @@ impl RemoteObjectStore {
 
 fn protocol_error(msg: &str) -> StoreError {
     StoreError::backend(std::io::Error::other(format!("protocol error: {msg}")))
+}
+
+/// Blocking: unframe a bundle body and hash-check every object; the first
+/// must be `tree`.
+fn decode_bundle(body: &[u8], tree: ObjectId) -> Result<Vec<(ObjectId, EncodedObject)>> {
+    let frames = ant_proto::bundle::decode(body, MAX_BUNDLE_BYTES).map_err(StoreError::backend)?;
+    if frames.first().map(|(id, _)| *id) != Some(tree) {
+        return Err(protocol_error("bundle does not start with the requested tree"));
+    }
+    par_map(&frames, 16, |(id, data)| decode_verified(data.clone(), id).map(|o| (*id, o)))
+        .into_iter()
+        .collect()
 }
 
 fn decode_verified(data: Bytes, id: &ObjectId) -> Result<EncodedObject> {

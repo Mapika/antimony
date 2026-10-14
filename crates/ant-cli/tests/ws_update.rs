@@ -301,3 +301,40 @@ fn run_update(lazy: bool) {
     assert_eq!(env.tip("feature"), tip0);
     drop(mounts);
 }
+
+#[test]
+fn submit_survives_evicted_blobs_sparse() {
+    submit_evicted(false);
+}
+
+#[test]
+#[ignore = "needs FUSE (/dev/fuse, fusermount3)"]
+fn submit_survives_evicted_blobs_lazy() {
+    submit_evicted(true);
+}
+
+/// A one-byte cache budget evicts every blob `submit` has just staged, so the
+/// upload must re-read the files from the workspace (working tree or upper
+/// layer) instead of failing with "missing from cache".
+fn submit_evicted(lazy: bool) {
+    let (tmp, env, _server) = start();
+    let mut mounts = Mounts { env: &env, dirs: Vec::new() };
+    let ws = tmp.path().join("ws");
+    let d = ws.to_str().expect("utf8");
+    let mut args = vec!["ws", "new", d];
+    if lazy {
+        args.push("--lazy");
+        mounts.dirs.push(ws.clone());
+    }
+    env.run(None, &args).ok();
+    let w = Some(ws.as_path());
+    fs::write(ws.join("a.txt"), "edited a\n").expect("edit");
+    fs::write(ws.join("fresh.txt"), "fresh\n").expect("add");
+    assert_eq!(lines(&env.run(w, &["status"]).ok()), ["M\ta.txt", "A\tfresh.txt"]);
+    env.run(None, &["cache", "gc", "--to", "0"]).ok();
+    let r = env.run(w, &["--cache-bytes", "1", "submit", "-m", "evicted"]).ok();
+    let commit = r.trim_end();
+    assert_eq!(env.cat(&format!("{commit}:a.txt")), "edited a\n");
+    assert_eq!(env.cat(&format!("{commit}:fresh.txt")), "fresh\n");
+    drop(mounts);
+}

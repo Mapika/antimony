@@ -1,0 +1,134 @@
+name: release
+
+# Cut by pushing a `v*` tag (see docs/release.md). Builds the Linux binary,
+# attaches it to a DRAFT GitHub release (review, then publish by hand) and
+# pushes a Docker image to GHCR tagged with the version.
+#
+# Only x86_64 Linux is built: the repository is private, so GitHub's native
+# arm64 runners are not available, and cross-compiling the whole workspace is
+# not worth the fragility for 0.1.
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+permissions:
+  contents: read
+
+jobs:
+  binary:
+    name: binary (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag must match the crate version
+        run: |
+          crate=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="ant-cli"))')
+          if [ "${GITHUB_REF_NAME}" != "v${crate}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version ${crate}"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: "false"
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: cargo build --release --locked -p ant-cli
+      - name: Smoke test
+        run: ./target/release/ant --version
+      - name: Package
+        run: |
+          name="ant-${GITHUB_REF_NAME}-${TARGET}"
+          mkdir -p "dist/${name}"
+          # The glob fails the job if no LICENSE file exists: never ship
+          # a release without one.
+          cp target/release/ant README.md CHANGELOG.md LICENSE* "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          cat "dist/${name}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ant-${{ env.TARGET }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    needs: binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Combined checksums
+        run: |
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # Release notes: this version's section of CHANGELOG.md.
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for ${version}"
+            exit 1
+          fi
+          prerelease=""
+          case "$version" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/SHA256SUMS \
+            --draft $prerelease --verify-tag \
+            --title "antimony ${GITHUB_REF_NAME}" --notes-file notes.md
+
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # v0.1.0 -> 0.1.0 and 0.1; `latest` only for final releases.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+          flavor: |
+            latest=${{ !contains(github.ref_name, '-') }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

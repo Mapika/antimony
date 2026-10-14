@@ -34,6 +34,15 @@ service Ant {
   rpc Log(LogRequest) returns (LogResponse);
   rpc Diff(DiffRequest) returns (DiffResponse);
   rpc Blame(BlameRequest) returns (BlameResponse);
+  // Best common ancestor of two revs.
+  rpc MergeBase(MergeBaseRequest) returns (MergeBaseResponse);
+  // Whether one rev is reachable from another.
+  rpc IsAncestor(IsAncestorRequest) returns (IsAncestorResponse);
+  // First-parent history of `to` minus everything reachable from
+  // `from_exclusive` (`git log --first-parent from..to`), paginated.
+  rpc LogRange(LogRangeRequest) returns (LogRangeResponse);
+  // Whether (and as which commit) a commit was landed onto a ref.
+  rpc LandedAs(LandedAsRequest) returns (LandedAsResponse);
 }
 
 message GetObjectsRequest { repeated bytes ids = 1; }
@@ -191,9 +200,87 @@ message PathChange {
   bytes old_id = 4;
   EntryMode new_mode = 5;
   bytes new_id = 6;
+  FilePatch patch = 7; // set when DiffRequest.patch (regular files and symlinks)
 }
 message DiffRequest {
   string from_rev = 1; // "" = empty tree
   string to_rev = 2;
+  // Only changes at or under one of these paths (none = everything).
+  repeated string path_prefixes = 3;
+  // Diff from merge-base(from_rev, to_rev) to to_rev (`git diff from...to`).
+  // No common ancestor: NOT_FOUND. Needs a non-empty from_rev.
+  bool merge_base = 4;
+  // Also return each changed file's line diff (PathChange.patch).
+  bool patch = 5;
+  optional uint32 context_lines = 6; // default 3
 }
-message DiffResponse { repeated PathChange changes = 1; }
+message DiffResponse {
+  repeated PathChange changes = 1;
+  // The commit the diff starts from when DiffRequest.merge_base.
+  optional bytes from_commit = 2;
+  // The response's patch budget ran out: later files carry
+  // FilePatch.too_large instead of hunks.
+  bool patch_truncated = 3;
+}
+// Line diff of one file, computed server side (unified-diff hunks).
+message FilePatch {
+  // A side is not text (not UTF-8, or contains NUL): no hunks.
+  bool binary = 1;
+  // A side exceeds the per-file limit, or the response's patch budget is
+  // spent: no hunks.
+  bool too_large = 2;
+  repeated Hunk hunks = 3;
+}
+message Hunk {
+  // 1-based first line and line count of each side, as in `@@ -a,b +c,d @@`
+  // (a side with count 0 starts at the line before the hunk).
+  uint32 old_start = 1;
+  uint32 old_lines = 2;
+  uint32 new_start = 3;
+  uint32 new_lines = 4;
+  // Each line prefixed with ' ', '-' or '+', without its line terminator;
+  // a line "\ No newline at end of file" follows a side's last line when
+  // the file does not end with a newline.
+  repeated string lines = 5;
+}
+
+message MergeBaseRequest {
+  string a = 1; // revs
+  string b = 2;
+}
+// No commit: unrelated histories. Of several best common ancestors, the one
+// with the highest generation (then the larger id) is returned.
+message MergeBaseResponse { optional bytes commit = 1; }
+
+message IsAncestorRequest {
+  string ancestor = 1; // revs; a commit is its own ancestor
+  string descendant = 2;
+  // Only along descendant's first-parent chain.
+  bool first_parent_only = 3;
+}
+message IsAncestorResponse { bool is_ancestor = 1; }
+
+message LogRangeRequest {
+  string from_exclusive = 1; // rev; "" = nothing excluded (whole history)
+  string to = 2;             // rev
+  optional string path = 3;  // as LogRequest.path
+  uint32 limit = 4;          // per page; 0 = no limit
+  string page_token = 5;     // the previous page's next_page_token
+}
+message LogRangeResponse {
+  repeated CommitInfo commits = 1; // newest first
+  string next_page_token = 2;      // "" = no more pages
+}
+
+message LandedAsRequest {
+  string commit = 1;   // rev of the commit that was submitted to Land
+  string ref_name = 2; // "" = probe the refs (in name order, at most 64)
+}
+message LandedAsResponse {
+  // The commit, or the commit a server-side rebase landed it as, is in the
+  // ref's history.
+  bool landed = 1;
+  string ref_name = 2;
+  bytes landed_commit = 3;
+  bool rebased = 4; // landed_commit != commit
+}

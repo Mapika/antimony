@@ -1,0 +1,246 @@
+//! Property tests for the commit-graph queries (`ops::ancestry`: merge
+//! base, ancestry, first-parent ancestry, log ranges with pagination)
+//! against a brute-force oracle, on random DAGs with merge commits (as
+//! imported git history has, including octopus merges and several roots),
+//! in memory; plus one larger DAG on Postgres (`--run-ignored all`).
+
+mod common;
+
+use ant_core::{Commit, Object, ObjectId, Signature, Tree};
+use ant_server::ops::ancestry;
+use ant_store::graph::write_commit;
+use ant_store::{Backend, ObjectStoreExt};
+use proptest::prelude::*;
+
+/// Node `i`'s parents (indices `< i`), first parent first.
+#[derive(Debug, Clone)]
+struct Dag(Vec<Vec<usize>>);
+
+fn dag(max: usize) -> impl Strategy<Value = Dag> {
+    (1..max).prop_flat_map(|n| {
+        let nodes: Vec<_> = (0..n)
+            .map(|i| {
+                // (kind, first parent back-offset, extra parents)
+                (0u8..10, 0usize..4, proptest::collection::vec(0usize..64, 0..3)).prop_map(
+                    move |(kind, back, extra)| {
+                        if i == 0 || kind == 0 {
+                            return vec![]; // a root
+                        }
+                        let first = i - 1 - back.min(i - 1);
+                        let mut ps = vec![first];
+                        if kind >= 7 {
+                            // A merge (octopus when there are two extras).
+                            for e in extra {
+                                let p = e % i;
+                                if !ps.contains(&p) {
+                                    ps.push(p);
+                                }
+                            }
+                        }
+                        ps
+                    },
+                )
+            })
+            .collect();
+        nodes.prop_map(Dag)
+    })
+}
+
+/// Deterministic DAG for the Postgres run (a small LCG, no extra deps).
+fn fixed_dag(n: usize, mut seed: u64) -> Dag {
+    let mut next = move |m: usize| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % m
+    };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if i == 0 || next(40) == 0 {
+            out.push(vec![]);
+            continue;
+        }
+        let mut ps = vec![i - 1 - next(3).min(i - 1)];
+        if next(4) == 0 {
+            let p = next(i);
+            if !ps.contains(&p) {
+                ps.push(p);
+            }
+        }
+        out.push(ps);
+    }
+    Dag(out)
+}
+
+struct Oracle {
+    ids: Vec<ObjectId>,
+    generation: Vec<u64>,
+    /// `anc[i][j]`: j is an ancestor of i (inclusive).
+    anc: Vec<Vec<bool>>,
+    parents: Vec<Vec<usize>>,
+}
+
+impl Oracle {
+    fn new(dag: &Dag, ids: Vec<ObjectId>) -> Self {
+        let n = dag.0.len();
+        let mut generation = vec![0u64; n];
+        let mut anc = vec![vec![false; n]; n];
+        for (i, ps) in dag.0.iter().enumerate() {
+            generation[i] = 1 + ps.iter().map(|&p| generation[p]).max().unwrap_or(0);
+            anc[i][i] = true;
+            for &p in ps {
+                let from_parent = anc[p].clone();
+                for (mine, theirs) in anc[i].iter_mut().zip(from_parent) {
+                    *mine |= theirs;
+                }
+            }
+        }
+        Self { ids, generation, anc, parents: dag.0.clone() }
+    }
+
+    fn merge_base(&self, x: usize, y: usize) -> Option<ObjectId> {
+        (0..self.ids.len())
+            .filter(|&j| self.anc[x][j] && self.anc[y][j])
+            .max_by_key(|&j| (self.generation[j], self.ids[j]))
+            .map(|j| self.ids[j])
+    }
+
+    fn first_parent_chain(&self, mut i: usize) -> Vec<usize> {
+        let mut out = vec![i];
+        while let Some(&p) = self.parents[i].first() {
+            out.push(p);
+            i = p;
+        }
+        out
+    }
+
+    fn range(&self, from: Option<usize>, to: usize) -> Vec<ObjectId> {
+        self.first_parent_chain(to)
+            .into_iter()
+            .take_while(|&c| from.is_none_or(|f| !self.anc[f][c]))
+            .map(|c| self.ids[c])
+            .collect()
+    }
+}
+
+/// Store and record the DAG's commits (the empty tree; distinct messages).
+async fn build(b: &Backend, dag: &Dag) -> Vec<ObjectId> {
+    let tree = b.objects.put(Object::Tree(Tree::empty()).encode()).await.unwrap();
+    let mut ids: Vec<ObjectId> = Vec::with_capacity(dag.0.len());
+    for (i, ps) in dag.0.iter().enumerate() {
+        let sig = Signature {
+            name: "p".into(),
+            email: "p@x".into(),
+            time: 1_700_000_000 + i as i64,
+            tz_offset_minutes: 0,
+        };
+        let c = Commit {
+            tree,
+            parents: ps.iter().map(|&p| ids[p]).collect(),
+            author: sig.clone(),
+            committer: sig,
+            extra_headers: vec![],
+            message: format!("c{i}\n").into_bytes(),
+        };
+        ids.push(write_commit(b, &c).await.unwrap());
+    }
+    ids
+}
+
+async fn all_pages(
+    b: &Backend,
+    from: Option<&str>,
+    to: &str,
+    limit: usize,
+) -> Result<Vec<ObjectId>, String> {
+    let (mut out, mut next) = (Vec::new(), None);
+    loop {
+        let page =
+            ancestry::log_range(b, from, to, None, limit, next).await.map_err(|e| e.to_string())?;
+        if limit > 0 && page.entries.len() > limit {
+            return Err(format!("page of {} > limit {limit}", page.entries.len()));
+        }
+        out.extend(page.entries.iter().map(|e| e.id));
+        match page.next {
+            Some(n) => next = Some(n),
+            None => return Ok(out),
+        }
+    }
+}
+
+/// Check every query on the pairs `pairs` against the oracle.
+async fn check(
+    b: &Backend,
+    o: &Oracle,
+    pairs: impl IntoIterator<Item = (usize, usize)>,
+    limit: usize,
+) -> Result<(), String> {
+    for (x, y) in pairs {
+        let (hx, hy) = (o.ids[x].to_hex(), o.ids[y].to_hex());
+        let mb = ancestry::merge_base(b, &hx, &hy).await.map_err(|e| e.to_string())?;
+        if mb != o.merge_base(x, y) {
+            return Err(format!("merge_base({x}, {y}) = {mb:?}, want {:?}", o.merge_base(x, y)));
+        }
+        let anc = ancestry::is_ancestor(b, &hx, &hy, false).await.map_err(|e| e.to_string())?;
+        if anc != o.anc[y][x] {
+            return Err(format!("is_ancestor({x}, {y}) = {anc}"));
+        }
+        let fp = ancestry::is_ancestor(b, &hx, &hy, true).await.map_err(|e| e.to_string())?;
+        if fp != o.first_parent_chain(y).contains(&x) {
+            return Err(format!("is_first_parent_ancestor({x}, {y}) = {fp}"));
+        }
+        let range = all_pages(b, Some(&hx), &hy, limit).await?;
+        if range != o.range(Some(x), y) {
+            return Err(format!("log_range({x}..{y}, limit {limit}) = {range:?}"));
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(common::config(48))]
+
+    #[test]
+    fn ancestry_queries_match_the_oracle(d in dag(24), limit in 0usize..4) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result: Result<(), String> = rt.block_on(async {
+            let b = Backend::in_memory();
+            let ids = build(&b, &d).await;
+            let o = Oracle::new(&d, ids);
+            let n = d.0.len();
+            // Whole histories too.
+            for y in 0..n {
+                let got = all_pages(&b, None, &o.ids[y].to_hex(), limit).await?;
+                if got != o.range(None, y) {
+                    return Err(format!("log_range(..{y}) = {got:?}"));
+                }
+            }
+            check(&b, &o, (0..n).flat_map(|x| (0..n).map(move |y| (x, y))), limit).await
+        });
+        prop_assert!(result.is_ok(), "{:?} on {:?}", result, d);
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs postgres: docker compose up -d"]
+async fn ancestry_queries_match_the_oracle_postgres() {
+    let b = common::pg::scratch_backend("query_props").await;
+    let result = tokio::spawn({
+        let b = b.clone();
+        async move {
+            let d = fixed_dag(300, 7);
+            let ids = build(&b, &d).await;
+            let o = Oracle::new(&d, ids);
+            let n = d.0.len();
+            // A sample of pairs, biased towards distant ones.
+            let pairs: Vec<(usize, usize)> =
+                (0..n).step_by(7).flat_map(|x| (0..n).step_by(11).map(move |y| (x, y))).collect();
+            check(&b, &o, pairs, 5).await
+        }
+    })
+    .await;
+    // The scratch store drops the schema with the last handle to it.
+    drop(b);
+    match result {
+        Ok(r) => r.unwrap(),
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}

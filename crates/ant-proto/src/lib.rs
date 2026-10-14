@@ -1,5 +1,8 @@
 //! Generated gRPC types for `proto/ant.proto`, plus conversions to and from
-//! the `ant_core` types they carry.
+//! the `ant_core` types they carry; [`bundle`] is the framing of the HTTP
+//! tree-bundle endpoint.
+
+pub mod bundle;
 
 pub mod v1 {
     tonic::include_proto!("ant.v1");

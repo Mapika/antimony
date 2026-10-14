@@ -107,8 +107,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aws-sdk-s3",
+ "axum",
  "bytes",
  "clap",
+ "libc",
+ "parking_lot",
  "rand 0.9.5",
  "reqwest",
  "sqlx",
@@ -209,11 +212,13 @@ name = "ant-proto"
 version = "0.1.0"
 dependencies = [
  "ant-core",
+ "bytes",
  "prost",
  "protox",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "zstd",
 ]
 
 [[package]]
@@ -282,9 +287,11 @@ dependencies = [
  "ant-store",
  "anyhow",
  "async-trait",
+ "axum",
  "bytes",
  "futures",
  "globset",
+ "ignore",
  "parking_lot",
  "reqwest",
  "tempfile",
@@ -2841,6 +2848,22 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "ignore"
+version = "0.4.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00b69833ed729dc5aa7d19541d96d6cf8e9137194207a04916d658e43168402f"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
 ]
 
 [[package]]

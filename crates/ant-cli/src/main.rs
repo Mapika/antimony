@@ -1,6 +1,7 @@
 //! The `ant` command: client for an antimony server, plus `ant serve`. This
 //! doc comment is the output contract; the end-to-end tests (`tests/*.rs`)
-//! exercise it.
+//! exercise it. What may change between releases, and how removals are
+//! announced, is in `docs/compatibility.md` (section "CLI output contract").
 //!
 //! Global flags (each also an env var):
 //!   --server <url>     ANT_SERVER   gRPC url, default http://127.0.0.1:7420
@@ -28,14 +29,41 @@
 //!       Missing path: exit 1.
 //!   ant cat <rev>:<path>        raw blob bytes. Missing/not a blob: exit 1.
 //!   ant blame <rev>:<path>                    `<commit-id> <line-no>\t<line>` per line
-//!   ant log [<rev>] [-n N] [--path <path>]   `<id> <subject>` newest first; rev default `main`
-//!   ant diff <from-rev> <to-rev>   `A|M|D\t<path>`
+//!   ant log [<rev>] [-n N] [--path <path> | -- <path>]
+//!       `<id> <subject>` newest first, first parents; rev default `main`.
+//!       `<rev>` may be a range `<a>..<b>`: the first-parent history of <b>
+//!       down to the first commit reachable from <a> (LogRange, paged by
+//!       the server; `-n` caps the total). Both ends are required.
+//!       More than one path: exit 1.
+//!   ant diff [--patch [-U N]] [--merge-base] <from-rev> <to-rev> [-- <path>...]
+//!       `A|M|D\t<path>` per changed path, sorted. `-- <path>...`: only
+//!       changes at or under those paths. `--merge-base`: diff from the
+//!       merge base of the two revs (no common ancestor: exit 1).
+//!       `--patch`: instead a unified diff computed by the server, per file
+//!       `diff --git a/<p> b/<p>`, then `new file mode <m>` / `deleted file
+//!       mode <m>` / `old mode <m>` + `new mode <m>` when applicable, then
+//!       `--- a/<p>|/dev/null`, `+++ b/<p>|/dev/null` and `@@ -a[,b] +c[,d] @@`
+//!       hunks (`-U N` context lines, default 3; ` `/`-`/`+` lines and
+//!       `\ No newline at end of file`), as `git apply` reads them. Files
+//!       with a non-text side print `Binary files <old> and <new> differ`;
+//!       files over the server's size limits print `Large files <old> and
+//!       <new> differ` (with a `hint:` on stderr when the response budget
+//!       ran out). Mode-only changes have no `---`/`+++` lines.
+//!   ant merge-base <a> <b>         `<id>` of the best common ancestor (the
+//!       highest generation, then the larger id). Unrelated histories: exit 1.
+//!   ant landed-as <commit> [--ref <name>]
+//!       Whether <commit> (as submitted to `land`) is in a ref's history,
+//!       itself or as the commit a server-side rebase landed it as (every
+//!       commit of a landed stack is mapped). stdout: `<landed-id> <ref>`,
+//!       plus ` rebased` when the landed commit differs. Without `--ref`, the
+//!       first 64 refs in name order are tried. Not landed: exit 1.
 //!   ant ref get <name>             `<id>` (missing: exit 1)
 //!   ant ref list [<prefix>]        `<id> <name>`
 //!   ant ref set <name> <rev> [--expect <id>|--create] [--force]
 //!       CAS update; mismatch: exit 1. A move to a commit that does not
 //!       descend from the current (or `--expect`ed) target is refused
-//!       (exit 1) unless `--force`. stdout: `<id>`
+//!       (exit 1) unless `--force` (checked with IsAncestor; against servers
+//!       without it, by walking Log pages). stdout: `<id>`
 //!   ant ref init [<name>] [-m <msg>]
 //!       Creates ref <name> (default `main`) at a new root commit with the empty
 //!       tree: the first commit of an empty server. stdout: `<commit-id>`.
@@ -71,10 +99,24 @@
 //!       starting with `<<<<<<< ` or `>>>>>>> `. stdout: empty.
 //!   ant status                     `A|M|D|C\t<path>` (sorted); `C` = unresolved
 //!       conflict from `ws update` (replaces the path's A/M/D line)
+//!       Untracked files that match an ignore rule are not listed (nor
+//!       submitted). Rules: the `.gitignore` files of the workspace (root and
+//!       nested, git semantics: negation, `dir/`, anchoring, `**`) and the
+//!       optional workspace-local `.ant/ignore` (root-anchored patterns,
+//!       lowest precedence); global git excludes are not read. Tracked files
+//!       are always compared, whatever the rules say; an ignored directory is
+//!       not entered. `ant status --ignored` also prints `!\t<path>` for each
+//!       ignored untracked path (an ignored directory as `<dir>/`, not its
+//!       contents), sorted with the other lines. `.gitignore` files are
+//!       ordinary files (A/M/D).
 //!   ant submit -m <msg>            uploads changed blobs (PutObjects), then
 //!       CreateChangeset with base = workspace base commit and blob_id ops.
 //!       Records the id in `.ant/last_submit`. stdout: `<commit-id>`.
-//!       Nothing to submit, or unresolved conflicts: exit 1.
+//!       Nothing to submit, or unresolved conflicts: exit 1. A blob the local
+//!       cache evicted meanwhile is re-read from the workspace file (working
+//!       tree / lazy upper layer) and uploaded only if it still hashes to the
+//!       scanned id; a file edited in that window fails with exit 1 and a
+//!       hint to run `ant status` and `ant submit` again.
 //!   ant land [--ref main] [<commit>]   default commit = `.ant/last_submit`.
 //!       Landed: stdout `landed <new-tip-id>` (+ ` rebased` if rebased), then
 //!       resets the workspace to the new tip. Conflict: stdout `conflict`
