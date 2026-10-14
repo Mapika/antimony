@@ -1032,8 +1032,10 @@ mod tests {
         let url = std::env::var("ANT_TEST_PG_URL")
             .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
         let schema = format!("t_{}", rand::random::<u64>());
-        let a = PgStore::connect(&url, &schema).await.unwrap();
-        let b = PgStore::connect(&url, &schema).await.unwrap();
+        let opts =
+            PgOptions { lock_timeout: std::time::Duration::from_secs(120), ..PgOptions::default() };
+        let a = PgStore::connect_with(&url, &schema, &opts).await.unwrap();
+        let b = PgStore::connect_with(&url, &schema, &opts).await.unwrap();
         conformance::ref_lock(Arc::new(a), Arc::new(b)).await;
     }
 

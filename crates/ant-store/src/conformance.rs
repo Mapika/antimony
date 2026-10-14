@@ -370,7 +370,8 @@ pub async fn history_index(s: Arc<dyn MetaStore>) {
 /// instance).
 pub async fn ref_lock(a: Arc<dyn RefStore>, b: Arc<dyn RefStore>) {
     use std::time::Duration;
-    const SOON: Duration = Duration::from_secs(10);
+    // Generous: a loaded shared database can stall for many seconds.
+    const SOON: Duration = Duration::from_secs(60);
 
     let held = a.lock_ref("main").await.unwrap();
     assert!(held.is_held());

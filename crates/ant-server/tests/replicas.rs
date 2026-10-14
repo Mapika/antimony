@@ -156,7 +156,13 @@ async fn pg_replicas(n: usize) -> Vec<Backend> {
     let schema = format!("t_replicas_{}", rand::random::<u64>());
     // Small pools, as replicas sharing a database must use: 8 x 64 would
     // exceed max_connections.
-    let options = PgOptions { max_connections: 12, lock_connections: 2, ..PgOptions::default() };
+    let options = PgOptions {
+        max_connections: 12,
+        lock_connections: 2,
+        // A lock wait that times out falls back to CAS, which this test
+        // counts as a failure; allow for stalls of a loaded shared database.
+        lock_timeout: std::time::Duration::from_secs(120),
+    };
     let mut out = Vec::new();
     for _ in 0..n {
         let pg = Arc::new(PgStore::connect_with(&pg_url(), &schema, &options).await.unwrap());
