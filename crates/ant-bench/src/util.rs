@@ -76,12 +76,17 @@ impl Lat {
 // Process metrics
 // ---------------------------------------------------------------------------
 
+/// A `<key>: <n> kB` field of a `/proc/<pid>/status` file, in bytes.
+pub fn proc_status_bytes(status_path: &str, key: &str) -> Option<u64> {
+    let status = std::fs::read_to_string(status_path).ok()?;
+    let line = status.lines().find(|l| l.strip_prefix(key).is_some_and(|r| r.starts_with(':')))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
+}
+
 /// Peak resident set size in bytes (`VmHWM`), if available.
 pub fn peak_rss_bytes() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
-    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
+    proc_status_bytes("/proc/self/status", "VmHWM")
 }
 
 /// (user, system) CPU seconds consumed by this process so far.
@@ -93,6 +98,11 @@ pub fn cpu_seconds() -> Option<(f64, f64)> {
     let utime: f64 = f.get(11)?.parse().ok()?;
     let stime: f64 = f.get(12)?.parse().ok()?;
     Some((utime / 100.0, stime / 100.0))
+}
+
+/// User plus system CPU seconds consumed so far (0 when unavailable).
+pub fn cpu_total() -> f64 {
+    cpu_seconds().map_or(0.0, |c| c.0 + c.1)
 }
 
 pub fn mib(bytes: u64) -> f64 {
@@ -135,13 +145,21 @@ impl Counter {
         self.nanos.load(Ordering::Relaxed) as f64 / 1e9
     }
 
-    pub fn json(&self) -> J {
+    pub fn mean_ms(&self) -> f64 {
         let calls = self.calls();
+        if calls == 0 { 0.0 } else { self.secs() * 1000.0 / calls as f64 }
+    }
+
+    pub fn max_ms(&self) -> f64 {
+        self.max_nanos.load(Ordering::Relaxed) as f64 / 1e6
+    }
+
+    pub fn json(&self) -> J {
         J::obj()
-            .with("calls", calls)
+            .with("calls", self.calls())
             .with("total_s", self.secs())
-            .with("mean_ms", if calls == 0 { 0.0 } else { self.secs() * 1000.0 / calls as f64 })
-            .with("max_ms", self.max_nanos.load(Ordering::Relaxed) as f64 / 1e6)
+            .with("mean_ms", self.mean_ms())
+            .with("max_ms", self.max_ms())
             .with("items", self.items())
             .with("bytes", self.bytes())
     }
@@ -164,12 +182,12 @@ impl Metrics {
         map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 
-    /// (name, calls, seconds, items) for every counter that has been used.
-    pub fn totals(&self) -> Vec<(String, u64, f64, u64)> {
+    /// (name, calls, seconds) for every counter that has been used.
+    pub fn totals(&self) -> Vec<(String, u64, f64)> {
         self.snapshot()
             .into_iter()
             .filter(|(_, c)| c.calls() > 0)
-            .map(|(k, c)| (k, c.calls(), c.secs(), c.items()))
+            .map(|(k, c)| (k, c.calls(), c.secs()))
             .collect()
     }
 
@@ -184,12 +202,12 @@ impl Metrics {
             "op", "calls", "total_s", "mean_ms", "max_ms", "items"
         );
         for (name, c) in self.snapshot() {
-            let calls = c.calls();
-            let mean = if calls == 0 { 0.0 } else { c.secs() * 1000.0 / calls as f64 };
             println!(
-                "  {name:<24} {calls:>9} {:>10.2} {mean:>9.2} {:>10.2} {:>10}",
+                "  {name:<24} {:>9} {:>10.2} {:>9.2} {:>10.2} {:>10}",
+                c.calls(),
                 c.secs(),
-                c.max_nanos.load(Ordering::Relaxed) as f64 / 1e6,
+                c.mean_ms(),
+                c.max_ms(),
                 c.items()
             );
         }
@@ -418,11 +436,6 @@ pub fn instrument(backend: &Backend, m: &Metrics, prefix: &str) -> Backend {
     }
 }
 
-/// Counting/timing wrapper for any `ObjectStore` (used on the checkout path).
-pub fn timed_store(inner: Arc<dyn ObjectStore>, m: &Metrics, prefix: &str) -> Arc<dyn ObjectStore> {
-    Arc::new(TimedObjects::new(inner, m, prefix))
-}
-
 // ---------------------------------------------------------------------------
 // Output and filesystem helpers
 // ---------------------------------------------------------------------------
@@ -435,13 +448,9 @@ pub fn write_json(path: &Option<PathBuf>, value: &J) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn dir_size(path: &Path) -> (u64, u64) {
-    // (files, bytes); skips the `.ant` state dir at the top level only when asked
-    // by callers via `dir_size_skip`.
-    dir_size_skip(path, None)
-}
-
-pub fn dir_size_skip(path: &Path, skip: Option<&str>) -> (u64, u64) {
+/// (files, bytes) under `path`, not following symlinks; a top-level entry
+/// named `skip` (e.g. a workspace's `.ant` state dir) is left out.
+pub fn dir_size(path: &Path, skip: Option<&str>) -> (u64, u64) {
     let mut files = 0;
     let mut bytes = 0;
     let mut stack = vec![path.to_path_buf()];

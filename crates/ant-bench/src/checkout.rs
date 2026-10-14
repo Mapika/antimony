@@ -18,7 +18,7 @@ use antd::workspace::{Sparse, Workspace};
 use anyhow::{Context as _, Result};
 
 use crate::json::J;
-use crate::util::{Metrics, cpu_seconds, dir_size, dir_size_skip, mib, timed_store, write_json};
+use crate::util::{Metrics, TimedObjects, cpu_total, dir_size, mib, write_json};
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -86,21 +86,17 @@ async fn materialize(
 ) -> Result<(Phase, Workspace, Arc<dyn ObjectStore>)> {
     let metrics = Metrics::default();
     let disk = Arc::new(DiskObjectStore::open(&a.cache, u64::MAX / 2).context("opening cache")?);
-    let net = timed_store(Arc::new(remote.clone()), &metrics, "net");
-    let rt = timed_store(
-        Arc::new(ReadThrough::over_disk(disk, net).verified_upstream()),
-        &metrics,
-        "ws",
-    );
+    let net = Arc::new(TimedObjects::new(Arc::new(remote.clone()), &metrics, "net"));
+    let read_through = Arc::new(ReadThrough::over_disk(disk, net).verified_upstream());
+    let rt: Arc<dyn ObjectStore> = Arc::new(TimedObjects::new(read_through, &metrics, "ws"));
     let tree = rt.read_commit(&commit).await?.tree;
-    let cpu0 = cpu_seconds().map_or(0.0, |c| c.0 + c.1);
+    let cpu0 = cpu_total();
     let start = Instant::now();
     let ws = Workspace::materialize(rt.as_ref(), work, commit, tree, sparse).await?;
     let secs = start.elapsed().as_secs_f64();
-    let cpu = cpu_seconds().map_or(0.0, |c| c.0 + c.1) - cpu0;
+    let cpu = cpu_total() - cpu0;
     let w = work.to_path_buf();
-    let (files, bytes) =
-        tokio::task::spawn_blocking(move || dir_size_skip(&w, Some(".ant"))).await?;
+    let (files, bytes) = tokio::task::spawn_blocking(move || dir_size(&w, Some(".ant"))).await?;
     let (wsc, nc) = (metrics.counter("ws.get_many"), metrics.counter("net.get_many"));
     Ok((
         Phase {
@@ -136,6 +132,17 @@ fn phase_json(p: &Phase) -> J {
         .with("net_secs_sum", p.net_secs)
 }
 
+fn iter_json(i: &Iter) -> J {
+    J::obj()
+        .with("cold", phase_json(&i.cold))
+        .with("warm", phase_json(&i.warm))
+        .with("status_first_s", i.status1)
+        .with("status_second_s", i.status2)
+        .with("status_changes", i.changes)
+        .with("cache_files", i.cache_files)
+        .with("cache_bytes", i.cache_bytes)
+}
+
 fn print_phase(name: &str, p: &Phase) {
     println!(
         "  {name:<5} {:>8.3}s  {:>8} files  {:>9.1} MiB  {:>9.0} files/s  {:>8.1} MiB/s  cpu {:.2}s | ws: {} get_many/{} obj | net: {} calls/{} obj/{:.1} MiB, call-time sum {:.2}s",
@@ -166,7 +173,7 @@ pub async fn run(a: Args) -> Result<()> {
             let backend = ant_store::Backend::in_memory();
             let dirs = a.synthetic_dirs.unwrap_or(files / 10 * 7);
             let t = Instant::now();
-            let (_, bytes) = crate::synth::build(&backend, files, dirs, &a.rev).await?;
+            let bytes = crate::synth::build(&backend, files, dirs, &a.rev).await?;
             println!(
                 "synthetic: {files} files, {dirs} dirs, {:.1} MiB, built in {:.1}s",
                 mib(bytes),
@@ -200,7 +207,7 @@ pub async fn run(a: Args) -> Result<()> {
         wipe(&a.cache)?;
         wipe(&work)?;
         let (cold, _ws, _) = materialize(&a, &remote, &work, commit, sparse.clone()).await?;
-        let (cache_files, cache_bytes) = dir_size(&a.cache);
+        let (cache_files, cache_bytes) = dir_size(&a.cache, None);
 
         // Warm: cache kept, fresh workspace directory.
         wipe(&work)?;
@@ -252,24 +259,7 @@ pub async fn run(a: Args) -> Result<()> {
         .with("commit", commit.to_hex())
         .with("sparse", J::Arr(a.sparse.iter().map(|s| J::from(s.as_str())).collect()))
         .with("resolve_rev_ms", resolve_ms)
-        .with(
-            "iterations",
-            J::Arr(
-                iters
-                    .iter()
-                    .map(|i| {
-                        J::obj()
-                            .with("cold", phase_json(&i.cold))
-                            .with("warm", phase_json(&i.warm))
-                            .with("status_first_s", i.status1)
-                            .with("status_second_s", i.status2)
-                            .with("status_changes", i.changes)
-                            .with("cache_files", i.cache_files)
-                            .with("cache_bytes", i.cache_bytes)
-                    })
-                    .collect(),
-            ),
-        )
+        .with("iterations", J::Arr(iters.iter().map(iter_json).collect()))
         .with("mean_cold_s", mean(&|i| i.cold.secs))
         .with("mean_warm_s", mean(&|i| i.warm.secs))
         .with("mean_status_s", mean(&|i| i.status1));

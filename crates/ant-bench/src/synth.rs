@@ -7,7 +7,7 @@
 //! and partly compressible (text-like), unique per file.
 
 use ant_core::{
-    Commit, EncodedObject, EntryMode, Object, ObjectId, ObjectKind, Signature, Tree, TreeEntry,
+    Commit, EncodedObject, EntryMode, Object, ObjectKind, Signature, Tree, TreeEntry,
 };
 use ant_store::Backend;
 use ant_store::graph::write_commit;
@@ -54,13 +54,13 @@ fn body(rng: &mut StdRng, size: usize, index: usize) -> Vec<u8> {
 }
 
 /// Populate `backend` with the synthetic tree, a commit and the ref `ref_name`.
-/// Returns (commit, total blob bytes).
+/// Returns the total blob bytes.
 pub async fn build(
     backend: &Backend,
     files: usize,
     dirs: usize,
     ref_name: &str,
-) -> anyhow::Result<(ObjectId, u64)> {
+) -> anyhow::Result<u64> {
     let dirs = dirs.max(1);
     let mut rng = StdRng::seed_from_u64(0xa17);
     let mut dir_files: Vec<Vec<TreeEntry>> = (0..dirs).map(|_| Vec::new()).collect();
@@ -128,5 +128,5 @@ pub async fn build(
     };
     let id = write_commit(backend, &commit).await?;
     backend.refs.cas_ref(ref_name, None, Some(id)).await?;
-    Ok((id, total))
+    Ok(total)
 }

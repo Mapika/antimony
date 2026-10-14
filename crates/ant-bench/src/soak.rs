@@ -607,7 +607,7 @@ pub async fn run(args: Args) -> Result<i32> {
             eprintln!("warning: dropping schema {schema}: {e:#}");
         }
         if let Some(cfg) = &s3 {
-            match crate::s3clean::delete_prefix(cfg, false).await {
+            match crate::s3clean::delete_prefix(cfg).await {
                 Ok(n) => println!("cleanup: dropped schema {schema}, deleted {n} S3 objects"),
                 Err(e) => eprintln!("warning: deleting S3 prefix {}: {e:#}", cfg.prefix),
             }
