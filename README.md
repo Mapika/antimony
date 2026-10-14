@@ -32,6 +32,8 @@ clients are always online, history lives on the server, and nobody pushes.
   paths, clients, git interop, access control.
 - [Operations](docs/operations.md): running a server, imports, policies,
   sizing, local services, benchmarks.
+- [Operator guide](docs/operator-guide.md): topology, sizing, fleet workflow,
+  metrics and alerts, failure runbook, backups.
 
 ## Layout
 
