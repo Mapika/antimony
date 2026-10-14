@@ -121,6 +121,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "ant-cache"
+version = "0.1.0"
+dependencies = [
+ "ant-auth",
+ "ant-core",
+ "ant-proto",
+ "ant-server",
+ "ant-store",
+ "antd",
+ "anyhow",
+ "axum",
+ "bytes",
+ "futures",
+ "parking_lot",
+ "prometheus-client",
+ "prometheus-parse",
+ "reqwest",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ant-cli"
 version = "0.1.0"
 dependencies = [

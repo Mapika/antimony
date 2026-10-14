@@ -13,6 +13,7 @@
 //! - [`update`]: planning a workspace's move to a new base (3-way rules).
 //! - [`walk`]: batched tree walks restricted to a few branches.
 
+pub mod claim;
 pub mod disk;
 pub mod files;
 pub mod ignore;
@@ -20,6 +21,7 @@ mod par;
 pub mod readthrough;
 pub mod remote;
 pub mod retry;
+pub mod tiers;
 pub mod update;
 pub mod walk;
 pub mod workspace;

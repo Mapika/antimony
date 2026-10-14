@@ -18,6 +18,15 @@
 //!   local hits. Trees that no bundle delivered go through `get_many`.
 //! - In-flight dedup: concurrent `get_many` calls that miss on the same id
 //!   trigger only one upstream fetch for it (a map of shared futures).
+//! - Cross-process dedup (`over_disk`, on by default;
+//!   [`ReadThrough::with_cross_process_dedup`]): before fetching, a process
+//!   claims each missing object (or tree, for bundles) with a lock file in
+//!   the shared cache (`crate::claim`). Ids another process has claimed are
+//!   fetched by that process: this one fetches and stores its own claims
+//!   first, then waits (up to [`WAIT_FOR_PEER`]) for the others' and reads
+//!   them from the cache, fetching itself whatever is still missing.
+//! - Tier counters (`crate::tiers`) record how each object was served and are
+//!   added to the cache directory's totals when the `ReadThrough` is dropped.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,13 +36,19 @@ use ant_store::{ObjectStore, Result, StoreError};
 use async_trait::async_trait;
 use futures::future::{BoxFuture, FutureExt, Shared};
 
+use crate::claim::{Claim, Claims};
 use crate::disk::DiskObjectStore;
+use crate::tiers::TierCounters;
 use crate::par::par_map;
 use crate::remote::RemoteObjectStore;
 use crate::workspace::DirFetch;
 use parking_lot::Mutex;
 
 type Fetched = std::result::Result<Arc<HashMap<ObjectId, EncodedObject>>, Arc<String>>;
+/// How long to wait for another process that claimed an object before
+/// fetching it anyway.
+pub const WAIT_FOR_PEER: std::time::Duration = std::time::Duration::from_secs(30);
+
 type InFlight = Shared<BoxFuture<'static, Fetched>>;
 
 pub struct ReadThrough {
@@ -47,6 +62,9 @@ pub struct ReadThrough {
     inflight: Arc<Mutex<HashMap<ObjectId, InFlight>>>,
     /// Source of tree bundles (HTTP), if enabled.
     bundles: Option<RemoteObjectStore>,
+    /// Cross-process fetch claims in the disk cache's directory.
+    claims: Option<Claims>,
+    stats: Arc<TierCounters>,
 }
 
 impl ReadThrough {
@@ -58,6 +76,8 @@ impl ReadThrough {
             trusted_upstream: false,
             inflight: Default::default(),
             bundles: None,
+            claims: None,
+            stats: Arc::default(),
         }
     }
 
@@ -65,13 +85,30 @@ impl ReadThrough {
     /// without being hashed again (they were just verified).
     pub fn over_disk(disk: Arc<DiskObjectStore>, upstream: Arc<dyn ObjectStore>) -> Self {
         Self {
+            claims: Some(Claims::new(disk.root())),
             local: disk.clone(),
             disk: Some(disk),
             upstream,
             trusted_upstream: false,
             inflight: Default::default(),
             bundles: None,
+            stats: Arc::default(),
         }
+    }
+
+    /// Turn cross-process fetch claims on or off (on by default over a disk
+    /// cache; off: every process fetches its own misses, as before).
+    pub fn with_cross_process_dedup(mut self, on: bool) -> Self {
+        self.claims = match (&self.disk, on) {
+            (Some(disk), true) => Some(Claims::new(disk.root())),
+            _ => None,
+        };
+        self
+    }
+
+    /// This handle's tier counters so far (`crate::tiers::NAMES` order).
+    pub fn tier_counts(&self) -> [u64; 7] {
+        self.stats.snapshot()
     }
 
     /// Fetch missing trees for walks as tree bundles from `remote` (used
@@ -92,6 +129,7 @@ impl ReadThrough {
             return self.get_many(trees).await;
         };
         let mut out = self.local.get_many(trees).await?;
+        self.stats.add(&self.stats.local_hits, out.iter().flatten().count());
         let mut misses: Vec<ObjectId> =
             trees.iter().zip(&out).filter(|(_, o)| o.is_none()).map(|(id, _)| *id).collect();
         if misses.is_empty() {
@@ -99,11 +137,19 @@ impl ReadThrough {
         }
         misses.sort_unstable();
         misses.dedup();
+        // Trees another process is already fetching as bundles are waited
+        // for after our own bundles are stored (never while holding claims).
+        let (owned, peers) = self.claim(&misses, "b-").await;
+        let (ids, guards): (Vec<ObjectId>, Vec<Option<Claim>>) = owned.into_iter().unzip();
         let mut fetched: HashMap<ObjectId, EncodedObject> = HashMap::new();
-        for bundle in remote.get_tree_bundles(&misses).await.into_iter().flatten() {
-            fetched.extend(bundle);
+        if !ids.is_empty() {
+            self.stats.add(&self.stats.bundle_requests, ids.len());
+            for bundle in remote.get_tree_bundles(&ids).await.into_iter().flatten() {
+                fetched.extend(bundle);
+            }
         }
         if !fetched.is_empty() {
+            self.stats.add(&self.stats.bundled_objects, fetched.len());
             let found: Vec<(ObjectId, EncodedObject)> =
                 fetched.iter().map(|(id, o)| (*id, o.clone())).collect();
             match &self.disk {
@@ -111,6 +157,17 @@ impl ReadThrough {
                 None => {
                     let objs: Vec<EncodedObject> = found.into_iter().map(|(_, o)| o).collect();
                     self.local.put_many(&objs).await?
+                }
+            }
+        }
+        drop(guards);
+        if !peers.is_empty() {
+            self.wait_for_peers(&peers, "b-").await;
+            let got = self.local.get_many(&peers).await?;
+            self.stats.add(&self.stats.waited_hits, got.iter().flatten().count());
+            for (id, o) in peers.iter().zip(got) {
+                if let Some(o) = o {
+                    fetched.insert(*id, o);
                 }
             }
         }
@@ -147,13 +204,36 @@ impl ReadThrough {
         self
     }
 
+    /// Claim each of `ids` (key prefix `prefix`); returns the ones this
+    /// process now owns (with their guard, `None` if claiming failed: fetch
+    /// anyway) and the ones a peer holds. Without claims everything is owned.
+    async fn claim(
+        &self,
+        ids: &[ObjectId],
+        prefix: &'static str,
+    ) -> (Vec<(ObjectId, Option<Claim>)>, Vec<ObjectId>) {
+        claim_ids(self.claims.clone(), ids.to_vec(), prefix).await
+    }
+
+    /// Wait (bounded by [`WAIT_FOR_PEER`] overall) until the peers holding
+    /// `ids` are done.
+    async fn wait_for_peers(&self, ids: &[ObjectId], prefix: &'static str) {
+        if let Some(claims) = self.claims.clone() {
+            wait_ids(claims, ids.to_vec(), prefix).await;
+        }
+    }
+
     /// Fetch `ids` from upstream, verify, and fill the local store. Re-checks
     /// local first: a previous fetch may have landed after our local miss.
+    /// With claims, ids a peer process is fetching are waited for (after this
+    /// process's own are stored) and read from the cache.
     async fn fetch(
         local: Arc<dyn ObjectStore>,
         disk: Option<Arc<DiskObjectStore>>,
         trusted: bool,
         upstream: Arc<dyn ObjectStore>,
+        claims: Option<Claims>,
+        stats: Arc<TierCounters>,
         ids: Vec<ObjectId>,
     ) -> Result<HashMap<ObjectId, EncodedObject>> {
         let mut out = HashMap::with_capacity(ids.len());
@@ -161,6 +241,7 @@ impl ReadThrough {
         for (id, o) in ids.iter().zip(local.get_many(&ids).await?) {
             match o {
                 Some(o) => {
+                    stats.add(&stats.local_hits, 1);
                     out.insert(*id, o);
                 }
                 None => missing.push(*id),
@@ -169,9 +250,49 @@ impl ReadThrough {
         if missing.is_empty() {
             return Ok(out);
         }
+        if let Some(claims) = claims {
+            let (owned, others) = claim_ids(Some(claims.clone()), missing, "").await;
+            let (mine, guards): (Vec<ObjectId>, Vec<Option<Claim>>) = owned.into_iter().unzip();
+            if !mine.is_empty() {
+                let found = Self::fetch_store(&local, &disk, trusted, &upstream, &stats, mine);
+                out.extend(found.await?);
+            }
+            drop(guards);
+            missing = Vec::new();
+            if !others.is_empty() {
+                wait_ids(claims, others.clone(), "").await;
+                let got = local.get_many(&others).await?;
+                for (id, o) in others.into_iter().zip(got) {
+                    match o {
+                        Some(o) => {
+                            stats.add(&stats.waited_hits, 1);
+                            out.insert(id, o);
+                        }
+                        None => missing.push(id),
+                    }
+                }
+            }
+        }
+        if !missing.is_empty() {
+            out.extend(Self::fetch_store(&local, &disk, trusted, &upstream, &stats, missing).await?);
+        }
+        Ok(out)
+    }
+
+    /// Upstream `get_many` of `missing`, verified, stored locally.
+    async fn fetch_store(
+        local: &Arc<dyn ObjectStore>,
+        disk: &Option<Arc<DiskObjectStore>>,
+        trusted: bool,
+        upstream: &Arc<dyn ObjectStore>,
+        stats: &TierCounters,
+        missing: Vec<ObjectId>,
+    ) -> Result<Vec<(ObjectId, EncodedObject)>> {
+        stats.add(&stats.fetched_requests, 1);
         let got = upstream.get_many(&missing).await?;
         let found: Vec<(ObjectId, EncodedObject)> =
             missing.iter().copied().zip(got).filter_map(|(id, o)| Some((id, o?))).collect();
+        stats.add(&stats.fetched_objects, found.len());
         let found = if trusted {
             found
         } else {
@@ -196,8 +317,57 @@ impl ReadThrough {
                 local.put_many(&objs).await?
             }
         }
-        out.extend(found);
-        Ok(out)
+        Ok(found)
+    }
+}
+
+/// Claim `ids` under `{prefix}{hex}` keys (see [`crate::claim`]): the ids to
+/// fetch (with their guards) and the ids a peer is fetching. Without claims,
+/// or when claiming fails, an id is ours to fetch.
+async fn claim_ids(
+    claims: Option<Claims>,
+    ids: Vec<ObjectId>,
+    prefix: &'static str,
+) -> (Vec<(ObjectId, Option<Claim>)>, Vec<ObjectId>) {
+    let Some(claims) = claims else {
+        return (ids.into_iter().map(|id| (id, None)).collect(), Vec::new());
+    };
+    let work = ids.clone();
+    let done = tokio::task::spawn_blocking(move || {
+        let mut owned = Vec::new();
+        let mut peers = Vec::new();
+        for id in work {
+            match claims.try_claim(&format!("{prefix}{}", id.to_hex())) {
+                Ok(Some(c)) => owned.push((id, Some(c))),
+                Ok(None) => peers.push(id),
+                Err(_) => owned.push((id, None)),
+            }
+        }
+        (owned, peers)
+    })
+    .await;
+    // A panic in the blocking pool is not worth failing a read: fetch all.
+    done.unwrap_or_else(|_| (ids.into_iter().map(|id| (id, None)).collect(), Vec::new()))
+}
+
+/// Wait until every peer holding one of `ids` is done, for at most
+/// [`WAIT_FOR_PEER`] in total.
+async fn wait_ids(claims: Claims, ids: Vec<ObjectId>, prefix: &'static str) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + WAIT_FOR_PEER;
+        for id in ids {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            claims.wait_released(&format!("{prefix}{}", id.to_hex()), left);
+        }
+    })
+    .await;
+}
+
+impl Drop for ReadThrough {
+    fn drop(&mut self) {
+        if let Some(disk) = &self.disk {
+            self.stats.persist(disk.root());
+        }
     }
 }
 
@@ -214,6 +384,7 @@ impl ObjectStore for ReadThrough {
         let mut out = self.local.get_many(ids).await?;
         let mut misses: Vec<ObjectId> =
             ids.iter().zip(&out).filter(|(_, o)| o.is_none()).map(|(id, _)| *id).collect();
+        self.stats.add(&self.stats.local_hits, ids.len() - misses.len());
         if misses.is_empty() {
             return Ok(out);
         }
@@ -236,16 +407,19 @@ impl ObjectStore for ReadThrough {
                     None => mine.push(*id),
                 }
             }
+            self.stats.add(&self.stats.joined, misses.len() - mine.len());
             if !mine.is_empty() {
-                let (local, disk, trusted, upstream, batch) = (
+                let (local, disk, trusted, upstream, claims, stats, batch) = (
                     self.local.clone(),
                     self.disk.clone(),
                     self.trusted_upstream,
                     self.upstream.clone(),
+                    self.claims.clone(),
+                    self.stats.clone(),
                     mine.clone(),
                 );
                 let fut: InFlight = async move {
-                    Self::fetch(local, disk, trusted, upstream, batch)
+                    Self::fetch(local, disk, trusted, upstream, claims, stats, batch)
                         .await
                         .map(Arc::new)
                         .map_err(|e| Arc::new(e.to_string()))
@@ -307,7 +481,9 @@ mod tests {
     use ant_store::memory::MemoryObjectStore;
     use ant_store::{ObjectStoreExt, conformance};
 
-    use crate::disk::DiskObjectStore;
+    use crate::claim::{Claim, Claims};
+use crate::disk::DiskObjectStore;
+use crate::tiers::TierCounters;
     use crate::test_support::CountingStore;
 
     /// Upstream that counts how many ids it was asked for and is slow.
@@ -427,5 +603,104 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         evictor.await.unwrap();
         assert!(up.ids() > objs.len(), "evicted objects were fetched again");
+    }
+
+    fn blobs(n: usize) -> Vec<EncodedObject> {
+        (0..n)
+            .map(|i| EncodedObject::new(ObjectKind::Blob, format!("blob number {i}").as_bytes()))
+            .collect()
+    }
+
+    /// Processes sharing a cache directory (here: separate handles, as each
+    /// process has its own) fetch each missing object from upstream once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn processes_sharing_a_cache_fetch_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = Arc::new(CountingStore::default().with_delay(Duration::from_millis(100)));
+        let objs = blobs(40);
+        up.inner().put_many(&objs).await.unwrap();
+        let ids: Vec<ObjectId> = objs.iter().map(|o| o.id()).collect();
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let disk = Arc::new(DiskObjectStore::open(dir.path(), u64::MAX).unwrap());
+                let rt = ReadThrough::over_disk(disk, up.clone()).verified_upstream();
+                let ids = ids.clone();
+                tokio::spawn(async move {
+                    let got = rt.get_many(&ids).await.unwrap();
+                    (got, rt.tier_counts())
+                })
+            })
+            .collect();
+        let mut waited = 0;
+        for h in handles {
+            let (got, counts) = h.await.unwrap();
+            assert!(got.iter().zip(&objs).all(|(g, o)| g.as_ref() == Some(o)));
+            waited += counts[1];
+        }
+        assert_eq!(up.ids(), objs.len(), "each object fetched once");
+        assert!(waited > 0, "some handle waited for a peer");
+        assert!(!dir.path().join("claims").read_dir().unwrap().any(|e| e.is_ok()), "claims gone");
+    }
+
+    /// Without the claims every process fetches for itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dedup_can_be_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = Arc::new(CountingStore::default().with_delay(Duration::from_millis(100)));
+        let objs = blobs(10);
+        up.inner().put_many(&objs).await.unwrap();
+        let ids: Vec<ObjectId> = objs.iter().map(|o| o.id()).collect();
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let disk = Arc::new(DiskObjectStore::open(dir.path(), u64::MAX).unwrap());
+                let rt = ReadThrough::over_disk(disk, up.clone())
+                    .verified_upstream()
+                    .with_cross_process_dedup(false);
+                let ids = ids.clone();
+                tokio::spawn(async move { rt.get_many(&ids).await.unwrap() })
+            })
+            .collect();
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert!(up.ids() > objs.len());
+    }
+
+    /// A claim left behind by a crashed process (a file nobody locks) and a
+    /// claim whose holder never delivers (upstream lacks the object) do not
+    /// block a reader: it fetches by itself.
+    #[tokio::test]
+    async fn abandoned_claims_do_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = Arc::new(CountingStore::default());
+        let o = EncodedObject::new(ObjectKind::Blob, b"after a crash");
+        up.inner().put(o.clone()).await.unwrap();
+        let disk = Arc::new(DiskObjectStore::open(dir.path(), u64::MAX).unwrap());
+        std::fs::create_dir_all(dir.path().join("claims")).unwrap();
+        std::fs::write(dir.path().join("claims").join(o.id().to_hex()), b"").unwrap();
+        let rt = ReadThrough::over_disk(disk, up.clone()).verified_upstream();
+        let t = std::time::Instant::now();
+        assert_eq!(rt.get(&o.id()).await.unwrap(), Some(o));
+        assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Counters record where objects came from and survive in the directory.
+    #[tokio::test]
+    async fn tier_counts_are_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = Arc::new(CountingStore::default());
+        let objs = blobs(5);
+        up.inner().put_many(&objs).await.unwrap();
+        let ids: Vec<ObjectId> = objs.iter().map(|o| o.id()).collect();
+        {
+            let disk = Arc::new(DiskObjectStore::open(dir.path(), u64::MAX).unwrap());
+            let rt = ReadThrough::over_disk(disk, up.clone()).verified_upstream();
+            rt.get_many(&ids).await.unwrap();
+            rt.get_many(&ids).await.unwrap();
+            let c = rt.tier_counts();
+            assert_eq!((c[0], c[5], c[6]), (5, 1, 5), "{c:?}");
+        }
+        let totals = crate::tiers::read(dir.path());
+        assert_eq!((totals[0], totals[6]), (5, 5), "{totals:?}");
     }
 }

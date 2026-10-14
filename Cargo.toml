@@ -17,6 +17,7 @@ ant-store = { path = "crates/ant-store" }
 ant-proto = { path = "crates/ant-proto" }
 ant-server = { path = "crates/ant-server" }
 antd = { path = "crates/antd" }
+ant-cache = { path = "crates/ant-cache" }
 ant-fuse = { path = "crates/ant-fuse" }
 ant-gitbridge = { path = "crates/ant-gitbridge" }
 ant-gitserve = { path = "crates/ant-gitserve" }

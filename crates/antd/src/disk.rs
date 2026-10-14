@@ -186,11 +186,29 @@ impl DiskObjectStore {
         std::fs::create_dir_all(root.join("tmp"))?;
         std::fs::create_dir_all(root.join(GC_DIR))?;
         check_cache_format(&root)?;
+        crate::claim::sweep(&root);
         let flush_at = (max_bytes / 64).clamp(1, MAX_FLUSH_BYTES);
         Ok(Self {
             shared: Arc::new(Shared { root, max_bytes, pending: AtomicU64::new(0), flush_at }),
             touch_interval: DEFAULT_TOUCH_INTERVAL,
         })
+    }
+
+    /// The size budget in bytes (`u64::MAX / 4` and above: unlimited).
+    pub fn budget(&self) -> u64 {
+        self.shared.max_bytes
+    }
+
+    /// The cache directory.
+    pub fn root(&self) -> &Path {
+        &self.shared.root
+    }
+
+    /// Bytes in the cache according to the shared counter (no scan), if a
+    /// counter exists and the budget is enforced.
+    pub fn tracked_usage(&self) -> Option<u64> {
+        let pending = self.shared.pending.load(Ordering::Relaxed);
+        self.shared.read_usage().map(|u| u.bytes.saturating_add(pending))
     }
 
     /// Bump an object's mtime on a hit only if it is older than this (zero:

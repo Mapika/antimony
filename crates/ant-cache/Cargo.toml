@@ -1,0 +1,27 @@
+[package]
+name = "ant-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ant-core.workspace = true
+ant-proto.workspace = true
+ant-store.workspace = true
+antd.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+prometheus-client.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+ant-auth.workspace = true
+ant-server.workspace = true
+prometheus-parse.workspace = true
+tempfile.workspace = true
