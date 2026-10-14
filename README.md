@@ -126,7 +126,7 @@ view.
 
 ### Access control in two minutes
 
-Restart the server with a policy; `/healthz` and `/metrics` stay
+Restart the server with a policy; `/healthz`, `/readyz` and `/metrics` stay
 unauthenticated (use `--metrics-listen 127.0.0.1:9100` to move metrics off the
 public port).
 
@@ -198,7 +198,7 @@ Each process opens up to `--pg-max-connections` (default 64) query connections
 plus `--pg-lock-connections` (default 8) lock connections. Size them so that
 replicas × (both) stays under the database's `max_connections`. Setting
 `--pg-lock-connections 0` disables the locks, which is fine for a single
-process. `ant-bench soak` exercises this setup end to end.
+process. `--pg-lock-timeout` (default `10s`) bounds the wait for a ref lock. `ant-bench soak` exercises this setup end to end.
 
 ## Status
 

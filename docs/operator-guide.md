@@ -44,7 +44,7 @@ lock (a session-level `pg_advisory_lock` on a hash of schema and ref name, on
 a dedicated "lock" connection), and keeps it for turns of about 20 ms before
 releasing it so other replicas get their turn. The lock is advisory: the ref
 compare-and-swap is what guarantees correctness. If the lock cannot be taken
-(wait over the 10 s lock timeout, or `--pg-lock-connections 0`) the replica logs
+(wait over `--pg-lock-timeout`, default 10 s, or `--pg-lock-connections 0`) the replica logs
 `ref lock unavailable; landing with CAS only` and lands without it; a lost
 CAS replays the batch from the new tip (counted in
 `ant_land_cas_retries_total`) and after 32 attempts the requests are aborted.
@@ -127,15 +127,20 @@ cache can briefly hold up to twice its budget). Watch `ant_cache_bytes` and
 the process RSS; on glibc you can set `ANT_MALLOC_TRIM_SECS=<n>` to call
 `malloc_trim` every n seconds (off by default) if RSS stays high after bursts.
 `GET /debug/stats` on the HTTP port prints cache entries and budgets, land
-queue counts and running history catch-ups as one JSON line (unauthenticated,
-and not available on the `--metrics-listen` port, so keep the HTTP port
-private or filter that path at the load balancer).
+queue counts and running history catch-ups as one JSON line. Without a policy
+it is open; with `--policy` it needs an admin token (`Authorization: Bearer
+<token>`, or Basic with the token as password): `401` without a valid token,
+`403` for a non-admin principal. It is not available on the `--metrics-listen`
+port.
 
 ### Postgres connection budget
 
 Each replica opens up to `--pg-max-connections` query connections (default 64)
 plus `--pg-lock-connections` lock connections (default 8; this bounds the
-number of distinct refs being landed on at once per replica). The rule:
+number of distinct refs being landed on at once per replica). Waiting for a
+ref lock is bounded by `--pg-lock-timeout` (`ANT_PG_LOCK_TIMEOUT`, default
+`10s`; accepts `500ms`, `10s`, `2m`); on expiry the land proceeds with CAS only.
+The rule:
 
 ```
 replicas x (pg-max-connections + pg-lock-connections)  <  Postgres max_connections - headroom
@@ -196,8 +201,28 @@ all. (The help also shows client flags such as `--server` and `--cache`; they
 have no effect on the server.) Without `--policy` the server is in open mode
 and logs `no --policy given: OPEN mode`; never run that on a network. The
 liveness endpoint `GET /healthz` returns `ok` as soon as the HTTP listener
-runs and does **not** check Postgres or S3; use a Prometheus query (store
-errors, pool size) for dependency health.
+runs and does **not** check Postgres or S3.
+
+Readiness is `GET /readyz` on the HTTP port. It is unauthenticated (also under
+a policy) and cheap: a `SELECT 1` on the Postgres query pool and a `HEAD` on
+the S3 bucket, run concurrently, each bounded by 2 s, no connection kept.
+Healthy (`200`; unconfigured dependencies are omitted, in-memory is just
+`{"status":"ok"}`):
+
+```
+{"status":"ok","postgres":"ok","s3":"ok"}
+```
+
+Otherwise `503` with each failing dependency as `down` or `timeout`, for
+example `{"status":"unavailable","postgres":"down","s3":"ok"}`. Details are in
+the server log, not the body. A saturated query pool also reads as `timeout`.
+
+Load balancer: use `/readyz` as the health check that removes a replica from
+rotation (every 5-10 s, fail after 2-3 misses, so that a Postgres blip does
+not flap), and `/healthz` for the process supervisor or Kubernetes
+`livenessProbe` (restarting a replica does not fix a down database, so do not
+use `/readyz` for liveness). `/readyz` requests are counted under
+`route="readyz"`.
 
 `--memory` starts an empty throwaway server. It cannot be seeded by
 `ant import`; create its first commit with `ant ref init main` and fill it
@@ -351,16 +376,15 @@ finished scratch refs.
 `GET /metrics` on the HTTP port, or, preferably, on a private listener with
 `--metrics-listen 10.0.0.5:9100` (the endpoint then exists only there). It is
 unauthenticated. Scrape every replica separately (do not scrape through the
-load balancer). With a policy enabled the HTTP port answers a request for
-`/metrics` with `401` rather than `404` when the metrics listener is separate;
-it is not exposed either way.
+load balancer). When the metrics listener is separate the HTTP port answers
+`/metrics` with `404`, with or without a policy.
 
 Families (all names verified in `crates/ant-server/src/metrics.rs`):
 
 | family | labels | use |
 |---|---|---|
 | `ant_rpc_requests_total`, `ant_rpc_duration_seconds` | `method`, `code` | gRPC traffic, errors and latency per method; `code` is the snake_case status |
-| `ant_http_requests_total`, `ant_http_duration_seconds` | `route`, `status` | `objects`, `git`, `healthz`, `metrics`, `other` |
+| `ant_http_requests_total`, `ant_http_duration_seconds` | `route`, `status` | `objects`, `git`, `healthz`, `readyz`, `metrics`, `other` |
 | `ant_land_outcomes_total` | `outcome` = `landed`, `rebased`, `conflict`, `aborted`, `denied` | land results |
 | `ant_land_batch_size` | histogram | requests per group-commit batch |
 | `ant_land_cas_retries_total` | | batches replayed after losing the ref CAS |

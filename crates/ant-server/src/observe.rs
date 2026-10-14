@@ -336,6 +336,8 @@ pub fn http_route(path: &str) -> &'static str {
         "git"
     } else if path == "/healthz" {
         "healthz"
+    } else if path == "/readyz" {
+        "readyz"
     } else if path == "/metrics" {
         "metrics"
     } else {
@@ -401,6 +403,7 @@ mod tests {
         assert_eq!(http_route("/o/abcd"), "objects");
         assert_eq!(http_route("/repo.git/info/refs"), "git");
         assert_eq!(http_route("/healthz"), "healthz");
+        assert_eq!(http_route("/readyz"), "readyz");
         assert_eq!(http_route("/metrics"), "metrics");
         assert_eq!(http_route("/debug/stats"), "other");
         assert_eq!(http_route("/random/\u{1F600}"), "other");
