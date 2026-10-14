@@ -18,4 +18,4 @@ if ! flock -n 9; then
 fi
 echo "$(pwd) pid $$: $*" > "$lock.owner"
 trap 'rm -f "$lock.owner"' EXIT
-"$@"
+"$@" 9>&-  # children (e.g. background servers) must not inherit the lock
