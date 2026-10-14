@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
@@ -9,7 +9,6 @@ use ant_store::graph::build_tree;
 use ant_store::memory::MemoryObjectStore;
 use antd::workspace::LocalChangeKind;
 use fuser::*;
-use parking_lot::Mutex;
 
 use super::state::*;
 use super::*;
@@ -31,17 +30,12 @@ fn mutations_and_reset_without_kernel() {
     fs::create_dir(state.join("upper")).unwrap();
     save_base(state, ObjectId([1; 32]), tree).unwrap();
     save_whiteouts(state, &BTreeSet::new()).unwrap();
-    let view = Writable {
-        _mount_lock: MountGuard::take(state).unwrap(),
-        lower: View::new(objects.clone(), tree, rt.handle().clone(), MountOptions::default()),
-        dir: state.to_path_buf(),
-        overlay: Mutex::new(Overlay {
-            paths: HashMap::from([(INodeNo(1), String::new())]),
-            handles: HashMap::new(),
-            directories: HashMap::new(),
-            next_handle: 1,
-        }),
-    };
+    let view = Writable::open(
+        MountGuard::take(state).unwrap(),
+        View::new(objects.clone(), tree, rt.handle().clone(), MountOptions::default()),
+        state.to_path_buf(),
+    )
+    .unwrap();
     let root = INodeNo(1);
     view.run(|o| {
         let ino = o.inode(root, OsStr::new("file"))?;

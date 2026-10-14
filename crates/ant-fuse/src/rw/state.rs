@@ -1,5 +1,5 @@
-//! Persistent workspace state: locks, base, whiteouts and crash-safe
-//! mutation intents.
+//! Persistent workspace state: locks, the `base`/`whiteouts` snapshots and
+//! crash recovery (the journal itself is in `journal`).
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use ant_core::{ObjectId, RepoPath};
 use parking_lot::Mutex;
 
+use super::journal::{JOURNAL, Record, append_durably, parse, read_journal};
 use super::{metadata, other};
 
 // Separate open file descriptions make flock serialize the daemon, status and
@@ -118,7 +119,18 @@ pub(super) fn save_base(state: &Path, commit: ObjectId, tree: ObjectId) -> io::R
     atomic(state, "base", format!("base_commit={commit}\nbase_tree={tree}\n").as_bytes())
 }
 
+/// The effective whiteouts: the snapshot with the journal replayed.
+#[cfg(test)]
 pub(super) fn whiteouts(state: &Path) -> io::Result<BTreeSet<String>> {
+    let mut deleted = snapshot_whiteouts(state)?;
+    let (records, _) = parse(&read_journal(state)?)?;
+    for record in records {
+        record.apply(&mut deleted);
+    }
+    Ok(deleted)
+}
+/// The `whiteouts` snapshot file alone.
+pub(super) fn snapshot_whiteouts(state: &Path) -> io::Result<BTreeSet<String>> {
     let text = fs::read_to_string(state.join("whiteouts"))?;
     text.lines()
         .map(|p| {
@@ -134,9 +146,50 @@ pub(super) fn save_whiteouts(state: &Path, paths: &BTreeSet<String>) -> io::Resu
     }
     atomic(state, "whiteouts", text.as_bytes())
 }
-// A small intent record closes the crash window between changing whiteouts
-// and removing/renaming an upper entry. Recovery rolls the operation forward.
+/// Bring the state directory to a consistent state after a crash, under the
+/// state lock: roll forward a legacy `intent`, drop a torn journal tail and
+/// roll forward a trailing journal rename. Idempotent; a no-op when clean.
 pub(super) fn recover(state: &Path) -> io::Result<()> {
+    recover_intent(state)?;
+    let data = read_journal(state)?;
+    if data.is_empty() {
+        return Ok(());
+    }
+    let (records, len) = parse(&data)?;
+    if len < data.len() {
+        let f = OpenOptions::new().write(true).open(state.join(JOURNAL))?;
+        f.set_len(len as u64)?;
+        f.sync_data()?;
+    }
+    // `reset` journals the new base before rewriting the `base` snapshot
+    // (which `ant` reads directly); finish an interrupted rewrite.
+    let last_base = records.iter().rev().find_map(|r| match r {
+        Record::Reset { commit, tree, .. } => Some((*commit, *tree)),
+        _ => None,
+    });
+    if let Some((commit, tree)) = last_base
+        && base(state)? != (commit, tree)
+    {
+        save_base(state, commit, tree)?;
+    }
+    // Records are appended in operation order and a rename is followed by
+    // `Done` before anything else, so only the last record can be unfinished.
+    if let Some(Record::Rename { old, new }) = records.last() {
+        let old = state.join("upper").join(old);
+        if metadata(&old)?.is_some() {
+            let new = state.join("upper").join(new);
+            fs::rename(&old, &new)?;
+            sync_parent(&new)?;
+            sync_parent(&old)?;
+        }
+        append_durably(state, &Record::Done)?;
+    }
+    Ok(())
+}
+
+// Written by earlier versions: one pending delete/rename, applied to the
+// whiteouts snapshot and the upper directory, then removed.
+fn recover_intent(state: &Path) -> io::Result<()> {
     let record = match fs::read_to_string(state.join("intent")) {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -152,7 +205,7 @@ pub(super) fn recover(state: &Path) -> io::Result<()> {
             return Err(other("root mutation intent"));
         }
     }
-    let mut deleted = whiteouts(state)?;
+    let mut deleted = snapshot_whiteouts(state)?;
     deleted.extend(paths.iter().map(|p| p.to_string()));
     save_whiteouts(state, &deleted)?;
     let old = state.join("upper").join(paths[0]);
@@ -173,8 +226,4 @@ pub(super) fn recover(state: &Path) -> io::Result<()> {
 }
 pub(super) fn sync_parent(path: &Path) -> io::Result<()> {
     File::open(path.parent().ok_or_else(|| other("path has no parent"))?)?.sync_all()
-}
-pub(super) fn mutate(state: &Path, record: &str) -> io::Result<()> {
-    atomic(state, "intent", record.as_bytes())?;
-    recover(state)
 }

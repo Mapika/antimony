@@ -15,6 +15,32 @@ use fuser::*;
 use super::overlay::*;
 use super::{error, file_kind, metadata, other};
 
+impl Writable {
+    fn read_lower(
+        &self,
+        o: &mut Operation<'_>,
+        ino: INodeNo,
+        id: ant_core::ObjectId,
+        offset: u64,
+        size: u32,
+    ) -> io::Result<bytes::Bytes> {
+        // A lower file may have been copied up since this read handle opened.
+        let path = o.path(ino)?;
+        if o.active(ino)
+            && let Some(m) = metadata(&o.upper(&path))?
+            && m.is_file()
+        {
+            let mut out = vec![0; size as usize];
+            let n = File::open(o.upper(&path))?.read_at(&mut out, offset)?;
+            out.truncate(n);
+            return Ok(bytes::Bytes::from(out));
+        }
+        let data = o.blob(id)?;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(data.len());
+        Ok(data.slice(start..start.saturating_add(size as usize).min(data.len())))
+    }
+}
+
 // Zero TTL and direct I/O let base replacement become visible without stale
 // kernel attributes or pages, and keep status synchronized with completed writes.
 const TTL: Duration = Duration::ZERO;
@@ -45,9 +71,8 @@ impl Filesystem for Writable {
             for (name, mode) in children {
                 entries.push((o.inode(ino, OsStr::new(&name))?, file_kind(mode), name));
             }
-            let handle = o.overlay.next_handle;
-            o.overlay.next_handle += 1;
-            o.overlay.directories.insert(handle, entries);
+            let handle = o.view.next_handle();
+            o.directories.insert(handle, entries);
             Ok(FileHandle(handle))
         });
         match result {
@@ -79,12 +104,22 @@ impl Filesystem for Writable {
         }
         reply.ok();
     }
+    fn destroy(&mut self) {
+        if let Err(error) = self.shutdown() {
+            tracing::error!(%error, "lazy workspace shutdown failed");
+        }
+    }
     fn releasedir(&self, _: &Request, _: INodeNo, fh: FileHandle, _: OpenFlags, reply: ReplyEmpty) {
         self.overlay.lock().directories.remove(&fh.0);
         reply.ok();
     }
     fn open(&self, _: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        match self.run(|o| o.open(ino, flags.0)) {
+        let result = if flags.0 & libc::O_ACCMODE != libc::O_RDONLY {
+            self.run_mut(|o| o.open(ino, flags.0))
+        } else {
+            self.run(|o| o.open(ino, flags.0))
+        };
+        match result {
             Ok(h) => reply.opened(h, FopenFlags::FOPEN_DIRECT_IO),
             Err(e) => reply.error(e.into()),
         }
@@ -100,31 +135,18 @@ impl Filesystem for Writable {
         _: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let result = self.run(|o| {
-            let handle = o.overlay.handles.get(&fh.0).ok_or_else(|| error(libc::EBADF))?;
-            let lower = match handle {
-                OpenFile::Lower(id) => Some(*id),
-                _ => None,
+        let result = self.handle(fh).and_then(|handle| {
+            let lower = match &handle.file {
+                OpenFile::Upper(f) => {
+                    // Fast path: positional read, no overlay or state lock.
+                    let mut out = vec![0; size as usize];
+                    let n = f.read_at(&mut out, offset)?;
+                    out.truncate(n);
+                    return Ok(bytes::Bytes::from(out));
+                }
+                OpenFile::Lower(id) => *id,
             };
-            let mut out = vec![0; size as usize];
-            if let OpenFile::Upper(f) = handle {
-                let n = f.read_at(&mut out, offset)?;
-                out.truncate(n);
-                return Ok(bytes::Bytes::from(out));
-            }
-            // A lower file may have been copied up since this read handle opened.
-            let path = o.path(ino)?;
-            if o.active(ino)
-                && let Some(m) = metadata(&o.upper(&path))?
-                && m.is_file()
-            {
-                let n = File::open(o.upper(&path))?.read_at(&mut out, offset)?;
-                out.truncate(n);
-                return Ok(bytes::Bytes::from(out));
-            }
-            let data = o.blob(lower.ok_or_else(|| error(libc::EBADF))?)?;
-            let start = usize::try_from(offset).unwrap_or(usize::MAX).min(data.len());
-            Ok(data.slice(start..start.saturating_add(size as usize).min(data.len())))
+            self.run(|o| self.read_lower(o, ino, lower, offset, size))
         });
         match result {
             Ok(data) => reply.data(&data),
@@ -143,16 +165,17 @@ impl Filesystem for Writable {
         _: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.run(|o| {
-            o.refresh_writer(ino, fh)?;
-            match o.overlay.handles.get(&fh.0) {
-                Some(OpenFile::Upper(f)) => {
-                    f.write_all_at(data, offset)?;
-                    Ok(data.len() as u32)
-                }
-                _ => Err(error(libc::EBADF)),
-            }
-        }) {
+        // Fast path: positional write on the handle's own file, no overlay or
+        // state lock; different files proceed in parallel.
+        let result = self.handle(fh).and_then(|handle| {
+            let OpenFile::Upper(f) = &handle.file else {
+                return Err(error(libc::EBADF));
+            };
+            f.write_all_at(data, offset)?;
+            self.check_attached(ino, fh, &handle, Some((offset, data)))?;
+            Ok(data.len() as u32)
+        });
+        match result {
             Ok(n) => reply.written(n),
             Err(e) => reply.error(e.into()),
         }
@@ -167,23 +190,23 @@ impl Filesystem for Writable {
         _: bool,
         reply: ReplyEmpty,
     ) {
-        self.overlay.lock().handles.remove(&fh.0);
+        self.handles.write().remove(&fh.0);
         reply.ok();
     }
-    fn flush(&self, _: &Request, _: INodeNo, _: FileHandle, _: LockOwner, reply: ReplyEmpty) {
-        reply.ok();
+    fn flush(&self, _: &Request, ino: INodeNo, fh: FileHandle, _: LockOwner, reply: ReplyEmpty) {
+        match self.handle(fh).and_then(|h| self.check_attached(ino, fh, &h, None)) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.into()),
+        }
     }
-    fn fsync(&self, _: &Request, _: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
-        let result = self.run(|o| match o.overlay.handles.get(&fh.0) {
-            Some(OpenFile::Upper(f)) => {
-                if datasync {
-                    f.sync_data()
-                } else {
-                    f.sync_all()
-                }
+    fn fsync(&self, _: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+        let result = self.handle(fh).and_then(|h| {
+            self.check_attached(ino, fh, &h, None)?;
+            if let OpenFile::Upper(f) = &self.handle(fh)?.file {
+                if datasync { f.sync_data()? } else { f.sync_all()? }
             }
-            Some(OpenFile::Lower(_)) => Ok(()),
-            _ => Err(error(libc::EBADF)),
+            // Also make the file's creation and earlier metadata durable.
+            self.journal.sync()
         });
         match result {
             Ok(()) => reply.ok(),
@@ -191,11 +214,14 @@ impl Filesystem for Writable {
         }
     }
     fn fsyncdir(&self, _: &Request, ino: INodeNo, _: FileHandle, _: bool, reply: ReplyEmpty) {
-        match self.run(|o| {
+        match self.run_mut(|o| {
             let p = o.copy_up(&o.path(ino)?)?;
             File::open(p)?.sync_all()
         }) {
-            Ok(()) => reply.ok(),
+            Ok(()) => match self.journal.sync() {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e.into()),
+            },
             Err(e) => reply.error(e.into()),
         }
     }
@@ -209,10 +235,12 @@ impl Filesystem for Writable {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        match self.run(|o| {
-            let ino = o.create(parent, name, mode & !umask, None, false)?;
-            let h = o.open(ino, flags)?;
-            Ok((o.attr(ino)?, h))
+        match self.run_mut(|o| {
+            let (ino, file) = o.create_entry(parent, name, mode & !umask, None, false)?;
+            let file = file.ok_or_else(|| other("created file not open"))?;
+            let attr = o.created_attr(ino, &file)?;
+            let write = flags & libc::O_ACCMODE != libc::O_RDONLY;
+            Ok((attr, self.insert_handle(OpenFile::Upper(file), write)))
         }) {
             Ok((a, h)) => reply.created(&TTL, &a, Generation(0), h, FopenFlags::FOPEN_DIRECT_IO),
             Err(e) => reply.error(e.into()),
@@ -227,7 +255,7 @@ impl Filesystem for Writable {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        match self.run(|o| {
+        match self.run_mut(|o| {
             let ino = o.create(parent, name, mode & !umask, None, true)?;
             o.attr(ino)
         }) {
@@ -243,7 +271,7 @@ impl Filesystem for Writable {
         target: &Path,
         reply: ReplyEntry,
     ) {
-        match self.run(|o| {
+        match self.run_mut(|o| {
             let ino = o.create(parent, name, 0o777, Some(target), false)?;
             o.attr(ino)
         }) {
@@ -268,13 +296,13 @@ impl Filesystem for Writable {
         }
     }
     fn unlink(&self, _: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        match self.run(|o| o.remove(parent, name, false)) {
+        match self.run_mut(|o| o.remove(parent, name, false)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.into()),
         }
     }
     fn rmdir(&self, _: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        match self.run(|o| o.remove(parent, name, true)) {
+        match self.run_mut(|o| o.remove(parent, name, true)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.into()),
         }
@@ -289,7 +317,7 @@ impl Filesystem for Writable {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        match self.run(|o| o.rename(parent, name, newparent, newname, flags)) {
+        match self.run_mut(|o| o.rename(parent, name, newparent, newname, flags)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.into()),
         }
@@ -315,18 +343,22 @@ impl Filesystem for Writable {
         _: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        let result = self.run(|o| {
-            if uid.is_some() || gid.is_some() {
-                return Err(error(libc::EPERM));
-            }
-            if size.is_some()
-                && let Some(fh) = fh
-            {
-                o.refresh_writer(ino, fh)?;
-            }
+        if uid.is_some() || gid.is_some() {
+            reply.error(Errno::EPERM);
+            return;
+        }
+        if size.is_some()
+            && let Some(fh) = fh
+            && let Err(e) = self.handle(fh).and_then(|h| self.check_attached(ino, fh, &h, None))
+        {
+            reply.error(e.into());
+            return;
+        }
+        let result = self.run_mut(|o| {
             let path = o.copy_up(&o.path(ino)?)?;
             if let Some(size) = size {
-                if let Some(OpenFile::Upper(f)) = fh.and_then(|h| o.overlay.handles.get(&h.0)) {
+                let handle = fh.and_then(|h| self.handles.read().get(&h.0).cloned());
+                if let Some(OpenFile::Upper(f)) = handle.as_ref().map(|h| &h.file) {
                     f.set_len(size)?;
                 } else {
                     OpenOptions::new().write(true).open(&path)?.set_len(size)?;

@@ -12,6 +12,7 @@ use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, RepoPath, Tree};
 use ant_store::ObjectStore;
 use antd::workspace::{LocalChange, LocalChangeKind};
 
+use super::journal::{Persisted, Record, append_durably, load};
 use super::state::*;
 use super::{hidden, mode, other};
 
@@ -157,8 +158,7 @@ pub async fn changes(
     tokio::task::spawn_blocking(move || {
         let _lock = StateLock::take(&state)?;
         recover(&state)?;
-        let (_, root) = base(&state)?;
-        let deleted = whiteouts(&state)?;
+        let Persisted { tree: root, deleted, .. } = load(&state)?;
         let upper = scan_upper(&state)?;
         let lower = rt.block_on(affected_base(objects.as_ref(), root, &upper, &deleted))?;
         let result = compare(&upper, &deleted, &lower)?;
@@ -189,18 +189,19 @@ pub async fn reset(
         let _lock = StateLock::take(&state)?;
         recover(&state)?;
         let upper = scan_upper(&state)?;
-        let mut deleted = whiteouts(&state)?;
+        let Persisted { tree: old_tree, deleted, .. } = load(&state)?;
         let lower = rt.block_on(affected_base(objects.as_ref(), tree, &upper, &deleted))?;
-        let (_, old_tree) = base(&state)?;
         let old_lower = rt.block_on(affected_base(objects.as_ref(), old_tree, &upper, &deleted))?;
         // Publish first: interruption leaves redundant copies, never loses edits.
-        save_base(&state, commit, tree)?;
-        deleted = lower
+        // A mounted daemon notices the journal append and reloads. The journal
+        // record is authoritative; recovery finishes the snapshot rewrite.
+        let whiteouts = lower
             .keys()
             .filter(|path| hidden(&deleted, path) && !upper.files.contains_key(*path))
             .cloned()
             .collect();
-        save_whiteouts(&state, &deleted)?;
+        append_durably(&state, &Record::Reset { commit, tree, whiteouts })?;
+        save_base(&state, commit, tree)?;
         for (path, value) in &upper.files {
             if lower.get(path) == Some(value) || old_lower.get(path) == Some(value) {
                 fs::remove_file(state.join("upper").join(path))?;

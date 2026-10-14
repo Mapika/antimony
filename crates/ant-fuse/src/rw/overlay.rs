@@ -1,74 +1,216 @@
-//! The copy-on-write layer: path/inode bookkeeping and every mutation, run
-//! under the state lock against the current base and whiteouts.
+//! The copy-on-write layer: path/inode bookkeeping and every mutation.
+//!
+//! Namespace operations run under the `overlay` mutex against the in-memory
+//! base tree and whiteouts (loaded once at mount); mutations also hold the
+//! state lock so `status`/`reset` in other processes see whole operations.
+//! Reads and writes on open upper files use only the `handles` map.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use ant_core::{EntryMode, ObjectId, ObjectKind, Tree, TreeEntry};
 use fuser::*;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::filesystem::{State, View};
 
+use super::journal::{COMPACT_BYTES, Journal, Record, compact, load};
 use super::state::*;
 use super::{error, file_kind, fuse_error, hidden, metadata, mode, other, under};
 
 pub(super) struct Overlay {
     pub(super) paths: HashMap<INodeNo, String>,
-    pub(super) handles: HashMap<u64, OpenFile>,
     pub(super) directories: HashMap<u64, Vec<(INodeNo, FileType, String)>>,
-    pub(super) next_handle: u64,
+    root: ObjectId,
+    deleted: BTreeSet<String>,
+    /// Journal size as of this mount's last read or append; a different
+    /// size on disk means another process (`reset`) appended.
+    journal_len: u64,
 }
+
 pub(super) enum OpenFile {
     Upper(File),
     Lower(ObjectId),
 }
+pub(super) struct Handle {
+    pub(super) file: OpenFile,
+    pub(super) writable: bool,
+    /// The inode left the namespace (unlinked or replaced): never reattach.
+    pub(super) detached: AtomicBool,
+}
+
 pub(super) struct Writable {
     pub(super) _mount_lock: MountGuard,
     pub(super) lower: View,
     pub(super) dir: PathBuf,
     pub(super) overlay: Mutex<Overlay>,
+    pub(super) handles: RwLock<HashMap<u64, Arc<Handle>>>,
+    next_handle: AtomicU64,
+    pub(super) journal: Arc<Journal>,
+    flusher: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 pub(super) struct Operation<'a> {
     pub(super) view: &'a Writable,
-    pub(super) overlay: &'a mut Overlay,
+    pub(super) paths: &'a mut HashMap<INodeNo, String>,
+    pub(super) directories: &'a mut HashMap<u64, Vec<(INodeNo, FileType, String)>>,
     pub(super) cache: &'a mut State,
     pub(super) root: ObjectId,
-    pub(super) deleted: BTreeSet<String>,
+    pub(super) deleted: &'a mut BTreeSet<String>,
+    journal_len: &'a mut u64,
 }
+
 impl Writable {
+    /// Recover the state directory, fold the journal into the snapshots and
+    /// load base and whiteouts. The caller holds the exclusive mount guard.
+    pub(super) fn open(mount_lock: MountGuard, lower: View, dir: PathBuf) -> io::Result<Self> {
+        let journal = Journal::open(&dir)?;
+        let persisted = {
+            let _lock = journal.lock()?;
+            recover(&dir)?;
+            compact(&dir, journal.file())?
+        };
+        let journal = Arc::new(journal);
+        let flusher = journal.spawn_flusher()?;
+        Ok(Self {
+            _mount_lock: mount_lock,
+            lower,
+            overlay: Mutex::new(Overlay {
+                paths: HashMap::from([(INodeNo(1), String::new())]),
+                directories: HashMap::new(),
+                root: persisted.tree,
+                deleted: persisted.deleted,
+                journal_len: persisted.len,
+            }),
+            dir,
+            handles: RwLock::new(HashMap::new()),
+            next_handle: AtomicU64::new(1),
+            journal,
+            flusher: Mutex::new(Some(flusher)),
+        })
+    }
+
+    /// A namespace operation that changes nothing on disk.
     pub(super) fn run<T>(
         &self,
         f: impl FnOnce(&mut Operation<'_>) -> io::Result<T>,
     ) -> io::Result<T> {
+        self.operate(false, f)
+    }
+    /// A namespace operation that may change the state directory.
+    pub(super) fn run_mut<T>(
+        &self,
+        f: impl FnOnce(&mut Operation<'_>) -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.operate(true, f)
+    }
+    fn operate<T>(
+        &self,
+        exclusive: bool,
+        f: impl FnOnce(&mut Operation<'_>) -> io::Result<T>,
+    ) -> io::Result<T> {
         let mut overlay = self.overlay.lock();
-        let _lock = StateLock::take(&self.dir)?;
-        recover(&self.dir)?;
-        let (_, root) = base(&self.dir)?;
-        let deleted = whiteouts(&self.dir)?;
-        f(&mut Operation {
+        let _lock = if exclusive { Some(self.journal.lock()?) } else { None };
+        if self.journal.size()? != overlay.journal_len {
+            // `reset` replaced the base (or a crashed writer left a tail).
+            let _relock = if exclusive { None } else { Some(self.journal.lock()?) };
+            recover(&self.dir)?;
+            let p = load(&self.dir)?;
+            overlay.root = p.tree;
+            overlay.deleted = p.deleted;
+            overlay.journal_len = p.len;
+        }
+        let Overlay { paths, directories, root, deleted, journal_len } = &mut *overlay;
+        let result = f(&mut Operation {
             view: self,
-            overlay: &mut overlay,
+            paths,
+            directories,
             cache: &mut self.lower.state.lock(),
-            root,
+            root: *root,
             deleted,
-        })
+            journal_len,
+        });
+        if exclusive && overlay.journal_len > COMPACT_BYTES {
+            compact(&self.dir, self.journal.file())?;
+            self.journal.compacted();
+            overlay.journal_len = 0;
+        }
+        result
+    }
+
+    pub(super) fn handle(&self, fh: FileHandle) -> io::Result<Arc<Handle>> {
+        self.handles.read().get(&fh.0).cloned().ok_or_else(|| error(libc::EBADF))
+    }
+    pub(super) fn insert_handle(&self, file: OpenFile, writable: bool) -> FileHandle {
+        let fh = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let handle = Arc::new(Handle { file, writable, detached: AtomicBool::new(false) });
+        self.handles.write().insert(fh, handle);
+        FileHandle(fh)
+    }
+    pub(super) fn next_handle(&self) -> u64 {
+        self.next_handle.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Writes to an open upper file normally touch only the file. `reset`
+    /// may prune an upper file equal to the base while it is open; the
+    /// writes then land in the unlinked inode. Detected after each write
+    /// (and on flush/fsync/truncate) by `nlink == 0`, the file is published
+    /// again at its path, with everything written to it.
+    pub(super) fn check_attached(
+        &self,
+        ino: INodeNo,
+        fh: FileHandle,
+        handle: &Arc<Handle>,
+        write: Option<(u64, &[u8])>,
+    ) -> io::Result<()> {
+        let OpenFile::Upper(f) = &handle.file else {
+            return Ok(());
+        };
+        if !handle.writable || handle.detached.load(Ordering::Relaxed) || f.metadata()?.nlink() > 0
+        {
+            return Ok(());
+        }
+        self.run_mut(|o| o.reattach(ino, fh, handle, write))
+    }
+
+    /// Final compaction and sync at unmount.
+    pub(super) fn shutdown(&self) -> io::Result<()> {
+        self.journal.stop();
+        if let Some(flusher) = self.flusher.lock().take() {
+            let _ = flusher.join();
+        }
+        let mut overlay = self.overlay.lock();
+        let _lock = self.journal.lock()?;
+        recover(&self.dir)?;
+        compact(&self.dir, self.journal.file())?;
+        self.journal.compacted();
+        overlay.journal_len = 0;
+        self.journal.sync()
     }
 }
+impl Drop for Writable {
+    fn drop(&mut self) {
+        self.journal.stop();
+        if let Some(flusher) = self.flusher.lock().take() {
+            let _ = flusher.join();
+        }
+    }
+}
+
 impl Operation<'_> {
     pub(super) fn path(&self, ino: INodeNo) -> io::Result<String> {
-        self.overlay.paths.get(&ino).cloned().ok_or_else(|| error(libc::ENOENT))
+        self.paths.get(&ino).cloned().ok_or_else(|| error(libc::ENOENT))
     }
     pub(super) fn active(&self, mut ino: INodeNo) -> bool {
         while ino != INodeNo(1) {
-            let Some(path) = self.overlay.paths.get(&ino) else {
+            let Some(path) = self.paths.get(&ino) else {
                 return false;
             };
             let parent = self.cache.nodes[(ino.0 - 1) as usize].parent;
@@ -108,15 +250,26 @@ impl Operation<'_> {
         }
         Ok(Some(entry))
     }
+    /// Whether `path` currently shows (or would show) a lower-layer entry,
+    /// i.e. whether removing it needs a whiteout.
+    fn lower_visible(&mut self, path: &str) -> io::Result<bool> {
+        Ok(!hidden(self.deleted, path) && self.lower(path)?.is_some())
+    }
+    fn upper_entry(path: &str, m: &fs::Metadata) -> TreeEntry {
+        TreeEntry {
+            name: path.rsplit('/').next().unwrap_or("").into(),
+            mode: mode(m),
+            id: ObjectId([0; 32]),
+        }
+    }
     pub(super) fn entry(&mut self, path: &str) -> io::Result<TreeEntry> {
         if let Some(m) = metadata(&self.upper(path))? {
-            return Ok(TreeEntry {
-                name: path.rsplit('/').next().unwrap_or("").into(),
-                mode: mode(&m),
-                id: ObjectId([0; 32]),
-            });
+            return Ok(Self::upper_entry(path, &m));
         }
-        if hidden(&self.deleted, path) {
+        self.lower_entry(path)
+    }
+    fn lower_entry(&mut self, path: &str) -> io::Result<TreeEntry> {
+        if hidden(self.deleted, path) {
             return Err(error(libc::ENOENT));
         }
         self.lower(path)?.ok_or_else(|| error(libc::ENOENT))
@@ -130,22 +283,28 @@ impl Operation<'_> {
         }
         let path = self.child(parent, name)?;
         let entry = self.entry(&path)?;
+        Ok(self.bind(parent, path, &entry))
+    }
+    fn bind(&mut self, parent: INodeNo, path: String, entry: &TreeEntry) -> INodeNo {
         if let Some(ino) = self.cache.paths.get(&(parent, entry.name.clone()))
             && file_kind(self.cache.nodes[(ino.0 - 1) as usize].mode) != file_kind(entry.mode)
         {
             self.cache.paths.remove(&(parent, entry.name.clone()));
         }
-        let ino = View::inode(self.cache, parent, &entry);
-        self.overlay.paths.insert(ino, path);
-        Ok(ino)
+        let ino = View::inode(self.cache, parent, entry);
+        self.paths.insert(ino, path);
+        ino
     }
     pub(super) fn blob(&mut self, id: ObjectId) -> io::Result<bytes::Bytes> {
         self.view.lower.blob(self.cache, id).map_err(fuse_error)
     }
     pub(super) fn attr(&mut self, ino: INodeNo) -> io::Result<FileAttr> {
         let path = self.path(ino)?;
-        let entry = self.entry(&path)?;
         let m = metadata(&self.upper(&path))?;
+        let entry = match &m {
+            Some(m) => Self::upper_entry(&path, m),
+            None => self.lower_entry(&path)?,
+        };
         let size = if let Some(m) = &m {
             m.len()
         } else if entry.mode.is_blob() {
@@ -153,17 +312,26 @@ impl Operation<'_> {
         } else {
             0
         };
+        Ok(self.file_attr(ino, &entry, m.as_ref(), size))
+    }
+    fn file_attr(
+        &self,
+        ino: INodeNo,
+        entry: &TreeEntry,
+        m: Option<&fs::Metadata>,
+        size: u64,
+    ) -> FileAttr {
         let time = SystemTime::UNIX_EPOCH;
-        Ok(FileAttr {
+        FileAttr {
             ino,
             size,
             blocks: size.div_ceil(512),
-            atime: m.as_ref().and_then(|m| m.accessed().ok()).unwrap_or(time),
-            mtime: m.as_ref().and_then(|m| m.modified().ok()).unwrap_or(time),
-            ctime: m.as_ref().and_then(|m| m.modified().ok()).unwrap_or(time),
+            atime: m.and_then(|m| m.accessed().ok()).unwrap_or(time),
+            mtime: m.and_then(|m| m.modified().ok()).unwrap_or(time),
+            ctime: m.and_then(|m| m.modified().ok()).unwrap_or(time),
             crtime: time,
             kind: file_kind(entry.mode),
-            perm: m.as_ref().map(|m| (m.mode() & 0o7777) as u16).unwrap_or(match entry.mode {
+            perm: m.map(|m| (m.mode() & 0o7777) as u16).unwrap_or(match entry.mode {
                 EntryMode::File => 0o644,
                 EntryMode::Symlink => 0o777,
                 _ => 0o755,
@@ -175,14 +343,14 @@ impl Operation<'_> {
             rdev: 0,
             blksize: 4096,
             flags: 0,
-        })
+        }
     }
     pub(super) fn children(&mut self, path: &str) -> io::Result<BTreeMap<String, EntryMode>> {
         if file_kind(self.entry(path)?.mode) != FileType::Directory {
             return Err(error(libc::ENOTDIR));
         }
         let mut out = BTreeMap::new();
-        if !hidden(&self.deleted, path)
+        if !hidden(self.deleted, path)
             && let Some(entry) = self.lower(path)?
             && entry.mode == EntryMode::Tree
         {
@@ -190,7 +358,7 @@ impl Operation<'_> {
             for e in tree.entries() {
                 let child =
                     if path.is_empty() { e.name.clone() } else { format!("{path}/{}", e.name) };
-                if !hidden(&self.deleted, &child) {
+                if !hidden(self.deleted, &child) {
                     out.insert(e.name.clone(), e.mode);
                 }
             }
@@ -206,6 +374,31 @@ impl Operation<'_> {
         }
         Ok(out)
     }
+
+    /// Order an upper-directory change after pending journal records.
+    fn physical(&self) -> io::Result<()> {
+        self.view.journal.before_physical()
+    }
+    fn dirty(&self, path: &Path) {
+        self.view.journal.dirty(path);
+    }
+    fn record(&mut self, record: Record) -> io::Result<()> {
+        self.view.journal.append(self.journal_len, &record)
+    }
+
+    /// Publish `data` at `full` only once it is complete and durable: a crash
+    /// leaves either no upper file (the lower one shows) or the whole copy,
+    /// never a prefix shadowing the lower file.
+    fn publish(&self, full: &Path, data: &[u8], perm: u32) -> io::Result<()> {
+        let temp = self.view.dir.join("copy.tmp");
+        let mut f = File::create(&temp)?;
+        f.write_all(data)?;
+        f.set_permissions(fs::Permissions::from_mode(perm))?;
+        f.sync_all()?;
+        fs::rename(temp, full)?;
+        self.dirty(full);
+        Ok(())
+    }
     pub(super) fn copy_up(&mut self, path: &str) -> io::Result<PathBuf> {
         let full = self.upper(path);
         if metadata(&full)?.is_some() {
@@ -215,22 +408,21 @@ impl Operation<'_> {
         if let Some((parent, _)) = path.rsplit_once('/') {
             self.copy_up(parent)?;
         }
+        self.physical()?;
         match entry.mode {
-            EntryMode::Tree | EntryMode::Gitlink => fs::create_dir(&full)?,
-            EntryMode::Symlink => symlink(OsStr::from_bytes(&self.blob(entry.id)?), &full)?,
+            EntryMode::Tree | EntryMode::Gitlink => {
+                fs::create_dir(&full)?;
+                self.dirty(&full);
+            }
+            EntryMode::Symlink => {
+                symlink(OsStr::from_bytes(&self.blob(entry.id)?), &full)?;
+                self.dirty(&full);
+            }
             _ => {
-                // Publish a complete copy only after data and permissions are durable.
-                let temp = self.view.dir.join("copy.tmp");
-                let mut f = File::create(&temp)?;
-                f.write_all(&self.blob(entry.id)?)?;
-                f.set_permissions(fs::Permissions::from_mode(
-                    if entry.mode == EntryMode::Executable { 0o755 } else { 0o644 },
-                ))?;
-                f.sync_all()?;
-                fs::rename(temp, &full)?;
+                let data = self.blob(entry.id)?;
+                self.publish(&full, &data, exec_perm(entry.mode))?;
             }
         }
-        sync_parent(&full)?;
         Ok(full)
     }
     pub(super) fn recursive_copy(&mut self, path: &str) -> io::Result<()> {
@@ -242,7 +434,7 @@ impl Operation<'_> {
         while !todo.is_empty() {
             let mut ids = Vec::new();
             for path in &todo {
-                if !hidden(&self.deleted, path)
+                if !hidden(self.deleted, path)
                     && let Some(e) = self.lower(path)?
                     && e.mode == EntryMode::Tree
                 {
@@ -264,6 +456,7 @@ impl Operation<'_> {
             }
             todo = next;
         }
+        self.physical()?;
         for batch in files.chunks(512) {
             let ids = batch.iter().map(|(_, e)| e.id).collect::<Vec<_>>();
             let objects = self.view.lower.batch_objects(&ids).map_err(fuse_error)?;
@@ -273,18 +466,11 @@ impl Operation<'_> {
                 }
                 let full = self.upper(path);
                 if entry.mode == EntryMode::Symlink {
-                    symlink(OsStr::from_bytes(object.body()), full)?;
+                    symlink(OsStr::from_bytes(object.body()), &full)?;
+                    self.dirty(&full);
                 } else {
-                    let temp = self.view.dir.join("copy.tmp");
-                    let mut f = File::create(&temp)?;
-                    f.write_all(object.body())?;
-                    f.set_permissions(fs::Permissions::from_mode(
-                        if entry.mode == EntryMode::Executable { 0o755 } else { 0o644 },
-                    ))?;
-                    f.sync_all()?;
-                    fs::rename(temp, full)?;
+                    self.publish(&full, object.body(), exec_perm(entry.mode))?;
                 }
-                sync_parent(&self.upper(path))?;
             }
         }
         Ok(())
@@ -308,8 +494,22 @@ impl Operation<'_> {
         if is_dir && !self.children(&path)?.is_empty() {
             return Err(error(libc::ENOTEMPTY));
         }
-        mutate(&self.view.dir, &format!("delete\n{path}\n"))?;
-        self.deleted.insert(path);
+        // Whiteout first: a crash in between leaves the upper copy, which
+        // wins over the whiteout, i.e. the state before the removal.
+        if self.lower_visible(&path)? {
+            self.record(Record::Whiteout(path.clone()))?;
+            self.deleted.insert(path.clone());
+        }
+        let full = self.upper(&path);
+        if let Some(m) = metadata(&full)? {
+            self.physical()?;
+            if m.is_dir() {
+                fs::remove_dir(&full)?;
+            } else {
+                fs::remove_file(&full)?;
+            }
+            self.dirty(&full);
+        }
         self.detach(parent, name);
         Ok(())
     }
@@ -321,6 +521,18 @@ impl Operation<'_> {
         target: Option<&Path>,
         directory: bool,
     ) -> io::Result<INodeNo> {
+        Ok(self.create_entry(parent, name, perm, target, directory)?.0)
+    }
+    /// Create a file, directory or symlink. A new regular file is returned
+    /// open for reading and writing.
+    pub(super) fn create_entry(
+        &mut self,
+        parent: INodeNo,
+        name: &OsStr,
+        perm: u32,
+        target: Option<&Path>,
+        directory: bool,
+    ) -> io::Result<(INodeNo, Option<File>)> {
         let path = self.child(parent, name)?;
         match self.entry(&path) {
             Ok(_) => return Err(error(libc::EEXIST)),
@@ -328,18 +540,28 @@ impl Operation<'_> {
             Err(e) => return Err(e),
         }
         self.copy_up(&self.path(parent)?)?;
+        self.physical()?;
         let full = self.upper(&path);
+        let mut file = None;
         if let Some(target) = target {
             symlink(target, &full)?;
         } else if directory {
             fs::create_dir(&full)?;
             fs::set_permissions(&full, fs::Permissions::from_mode(perm))?;
         } else {
-            let f = OpenOptions::new().write(true).create_new(true).open(&full)?;
+            let f = OpenOptions::new().read(true).write(true).create_new(true).open(&full)?;
             f.set_permissions(fs::Permissions::from_mode(perm))?;
+            file = Some(f);
         }
-        sync_parent(&full)?;
-        self.inode(parent, name)
+        self.dirty(&full);
+        let m = fs::symlink_metadata(&full)?;
+        let ino = self.bind(parent, path.clone(), &Self::upper_entry(&path, &m));
+        Ok((ino, file))
+    }
+    pub(super) fn created_attr(&self, ino: INodeNo, f: &File) -> io::Result<FileAttr> {
+        let m = f.metadata()?;
+        let path = self.path(ino)?;
+        Ok(self.file_attr(ino, &Self::upper_entry(&path, &m), Some(&m), m.len()))
     }
     pub(super) fn open(&mut self, ino: INodeNo, flags: i32) -> io::Result<FileHandle> {
         let path = self.path(ino)?;
@@ -359,25 +581,64 @@ impl Operation<'_> {
         } else {
             OpenFile::Lower(entry.id)
         };
-        let handle = self.overlay.next_handle;
-        self.overlay.next_handle += 1;
-        self.overlay.handles.insert(handle, file);
-        Ok(FileHandle(handle))
+        Ok(self.view.insert_handle(file, write))
     }
-    pub(super) fn refresh_writer(&mut self, ino: INodeNo, fh: FileHandle) -> io::Result<()> {
-        if !self.active(ino) {
+    /// See [`Writable::check_attached`].
+    fn reattach(
+        &mut self,
+        ino: INodeNo,
+        fh: FileHandle,
+        handle: &Arc<Handle>,
+        write: Option<(u64, &[u8])>,
+    ) -> io::Result<()> {
+        let current = self.view.handles.read().get(&fh.0).cloned();
+        let Some(current) = current else {
+            return Ok(());
+        };
+        if !Arc::ptr_eq(&current, handle) {
+            // Another thread already reattached: repeat this write there.
+            if let (OpenFile::Upper(f), Some((offset, data))) = (&current.file, write) {
+                f.write_all_at(data, offset)?;
+            }
             return Ok(());
         }
-        if let Some(OpenFile::Upper(f)) = self.overlay.handles.get(&fh.0)
-            && f.metadata()?.nlink() == 0
-        {
-            // Reset prunes matching copies. Reattach a still-open writer to the
-            // current path so subsequent writes remain part of the workspace.
-            let path = self.path(ino)?;
-            let full = self.copy_up(&path)?;
-            let file = OpenOptions::new().read(true).write(true).open(full)?;
-            self.overlay.handles.insert(fh.0, OpenFile::Upper(file));
+        let OpenFile::Upper(orphan) = &handle.file else {
+            return Ok(());
+        };
+        if !self.active(ino) {
+            handle.detached.store(true, Ordering::Relaxed);
+            return Ok(());
         }
+        let path = self.path(ino)?;
+        let full = self.upper(&path);
+        let replaced = metadata(&full)?.is_some();
+        if !replaced {
+            if let Some((parent, _)) = path.rsplit_once('/') {
+                self.copy_up(parent)?;
+            }
+            self.physical()?;
+            let m = orphan.metadata()?;
+            let mut data = vec![0; usize::try_from(m.len()).map_err(other)?];
+            let mut read = 0;
+            while read < data.len() {
+                match orphan.read_at(&mut data[read..], read as u64)? {
+                    0 => break,
+                    n => read += n,
+                }
+            }
+            data.truncate(read);
+            self.publish(&full, &data, m.mode() & 0o7777)?;
+        }
+        let file = OpenOptions::new().read(true).write(true).open(&full)?;
+        if replaced && let Some((offset, data)) = write {
+            file.write_all_at(data, offset)?;
+        }
+        let new = Arc::new(Handle {
+            file: OpenFile::Upper(file),
+            writable: true,
+            detached: AtomicBool::new(false),
+        });
+        self.view.handles.write().insert(fh.0, new);
         Ok(())
     }
     pub(super) fn rename(
@@ -418,20 +679,41 @@ impl Operation<'_> {
             Err(e) => return Err(e),
         }
         let ino = self.inode(parent, name)?;
-        self.recursive_copy(&old)?;
+        // A source showing lower content needs whiteouts and a full copy;
+        // an upper-only source (new files, build outputs) is a plain rename:
+        // the destination's upper entry shadows any lower one, and an empty
+        // destination directory has all its lower children hidden already.
+        let lower = self.lower_visible(&old)?;
+        if lower {
+            self.recursive_copy(&old)?;
+        }
         self.copy_up(&self.path(newparent)?)?;
-        mutate(&self.view.dir, &format!("rename\n{old}\n{new}\n"))?;
-        self.deleted.insert(old.clone());
-        self.deleted.insert(new.clone());
+        let (from, to) = (self.upper(&old), self.upper(&new));
+        if lower {
+            self.record(Record::Rename { old: old.clone(), new: new.clone() })?;
+            self.deleted.insert(old.clone());
+            self.deleted.insert(new.clone());
+        }
+        self.physical()?;
+        fs::rename(&from, &to)?;
+        self.dirty(&from);
+        self.dirty(&to);
+        if lower {
+            self.record(Record::Done)?;
+        }
         self.detach(parent, name);
         self.detach(newparent, newname);
         self.cache.paths.insert((newparent, newname.to_string_lossy().into_owned()), ino);
         self.cache.nodes[(ino.0 - 1) as usize].parent = newparent;
-        for path in self.overlay.paths.values_mut() {
+        for path in self.paths.values_mut() {
             if under(path, &old) {
                 *path = format!("{new}{}", &path[old.len()..]);
             }
         }
         Ok(())
     }
+}
+
+fn exec_perm(mode: EntryMode) -> u32 {
+    if mode == EntryMode::Executable { 0o755 } else { 0o644 }
 }
