@@ -36,6 +36,7 @@ gix = { version = "0.89", default-features = false, features = ["max-performance
 globset = "0.4"
 http = "1"
 http-body = "1"
+http-body-util = "0.1"
 hex = "0.4"
 ignore = "0.4"
 libc = "0.2"

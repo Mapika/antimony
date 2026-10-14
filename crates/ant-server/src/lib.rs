@@ -6,6 +6,7 @@ pub mod bundle;
 pub mod config;
 pub mod health;
 pub mod http;
+pub mod limits;
 pub mod metrics;
 pub mod observe;
 pub mod ops;

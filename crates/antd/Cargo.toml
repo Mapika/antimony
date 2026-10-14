@@ -12,6 +12,10 @@ anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+rand.workspace = true
+tower.workspace = true
 globset.workspace = true
 ignore.workspace = true
 parking_lot.workspace = true
@@ -22,6 +26,7 @@ tracing.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+ant-auth.workspace = true
 ant-server.workspace = true
 axum.workspace = true
 tempfile.workspace = true

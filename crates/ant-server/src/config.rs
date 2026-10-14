@@ -100,6 +100,12 @@ pub struct StoreArgs {
 }
 
 impl StoreArgs {
+    /// The Postgres query-pool size (also the basis of the default
+    /// concurrency limits, `crate::limits`).
+    pub fn pg_max_connections(&self) -> u32 {
+        self.pg_max_connections
+    }
+
     /// The Postgres URL, when a Postgres backend is selected.
     pub fn pg_url(&self) -> Option<&str> {
         self.pg_url.as_deref()

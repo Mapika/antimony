@@ -46,6 +46,7 @@ use futures::stream::{BoxStream, StreamExt};
 use tonic::{Request, Response, Status};
 
 use crate::acl::{self, Access, Acl};
+use crate::limits::{GrpcLimitLayer, LimitConfig, Limiter};
 use crate::metrics::Metrics;
 use crate::observe::{GrpcObserveLayer, Observer};
 use crate::ops::OpError;
@@ -86,6 +87,19 @@ pub async fn serve_with_metrics(
     listener: tokio::net::TcpListener,
     metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
+    let limiter = Limiter::new(LimitConfig::default(), acl.clone(), metrics.clone());
+    serve_with_limiter(backend, acl, listener, metrics, limiter).await
+}
+
+/// [`serve_with_metrics`] with an explicit [`Limiter`] (rate limits and load
+/// shedding, `crate::limits`), shared with the HTTP front end.
+pub async fn serve_with_limiter(
+    backend: Backend,
+    acl: Acl,
+    listener: tokio::net::TcpListener,
+    metrics: Arc<Metrics>,
+    limiter: Arc<Limiter>,
+) -> anyhow::Result<()> {
     let observe = GrpcObserveLayer::new(Observer::new(metrics.clone(), acl.clone()));
     let svc = AntServer::new(AntService { backend, acl, metrics })
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
@@ -94,6 +108,7 @@ pub async fn serve_with_metrics(
     let incoming = tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
     tonic::transport::Server::builder()
         .layer(observe)
+        .layer(GrpcLimitLayer::new(limiter))
         .add_service(svc)
         .serve_with_incoming(incoming)
         .await?;
