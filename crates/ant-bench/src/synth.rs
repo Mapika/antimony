@@ -6,9 +6,7 @@
 //! executable and two percent symlinks. Contents are deterministic per index
 //! and partly compressible (text-like), unique per file.
 
-use ant_core::{
-    Commit, EncodedObject, EntryMode, Object, ObjectKind, Signature, Tree, TreeEntry,
-};
+use ant_core::{Commit, EncodedObject, EntryMode, Object, ObjectKind, Signature, Tree, TreeEntry};
 use ant_store::Backend;
 use ant_store::graph::write_commit;
 use rand::rngs::StdRng;

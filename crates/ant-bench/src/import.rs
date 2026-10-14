@@ -68,7 +68,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let start = Instant::now();
     let cpu0 = cpu_seconds().unwrap_or((0.0, 0.0));
 
-    let ticker = tokio::spawn(progress(start, put_objects.clone(), recorded.clone(), metrics.clone()));
+    let ticker =
+        tokio::spawn(progress(start, put_objects.clone(), recorded.clone(), metrics.clone()));
 
     let import = ant_gitbridge::import(&args.git_dir, &timed, &opts);
     let (result, timed_out) = if args.max_seconds > 0 {
