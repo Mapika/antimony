@@ -65,6 +65,16 @@ pub fn command() -> clap::Command {
     for name in LOCAL_COMMANDS {
         cmd = cmd.mut_subcommand(name, hide_client_globals);
     }
+    // `cache-serve` uses the cache flags but is no client of a server.
+    cmd = cmd.mut_subcommand("cache-serve", |sub| {
+        sub.mut_args(|a| {
+            if ["server", "http", "token", "directory"].contains(&a.get_id().as_str()) {
+                a.hide(true)
+            } else {
+                a
+            }
+        })
+    });
     cmd
 }
 
@@ -192,17 +202,59 @@ pub enum Command {
         #[command(subcommand)]
         cmd: AdminCmd,
     },
-    /// Inspect and trim the local object cache (`cache stats`, `cache gc`).
+    /// Inspect, trim and seed the local object cache (`cache stats`, `cache gc`, `cache seed`).
     Cache {
         #[command(subcommand)]
         cmd: CacheCmd,
     },
+    /// Run a cache tier: serve the server's HTTP object surface from a local
+    /// disk cache (`--cache`, `--cache-bytes`), filling misses from `--upstream`.
+    CacheServe(CacheServeArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CacheServeArgs {
+    /// Address to serve on.
+    #[arg(long, env = "ANT_CACHE_LISTEN", default_value = "127.0.0.1:7422")]
+    pub listen: std::net::SocketAddr,
+    /// HTTP base url of the upstream: the origin's `--http-listen` address or
+    /// another `cache-serve` (e.g. http://origin:7421).
+    #[arg(long, env = "ANT_CACHE_UPSTREAM")]
+    pub upstream: String,
+    /// How reads are authorized. `forward` (default): every request is
+    /// checked with the upstream using the caller's own credentials, so the
+    /// cache never serves what the origin would refuse. `open`: the upstream
+    /// enforces no access policy (checked at startup); serve everyone from
+    /// disk.
+    #[arg(long, value_enum, env = "ANT_CACHE_AUTH", default_value = "forward")]
+    pub auth: CacheAuth,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheAuth {
+    Forward,
+    Open,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum CacheCmd {
     /// Objects and bytes in the cache, and its budget.
-    Stats,
+    Stats {
+        /// Also print the per-tier counters recorded in this cache directory
+        /// (where objects came from: disk, other processes, bundles, fetches).
+        #[arg(long)]
+        tiers: bool,
+    },
+    /// Fetch a tree (a rev, optionally `<rev>:<path>`) into the cache without
+    /// writing files, so later checkouts on this node are cache hits.
+    Seed {
+        /// `<rev>` or `<rev>:<path>`.
+        target: String,
+        /// Sparse pattern (repeatable), as for `ws new --sparse`. No patterns
+        /// = the whole tree.
+        #[arg(long)]
+        sparse: Vec<String>,
+    },
     /// Evict least-recently-used objects: down to 90% of the budget if over
     /// it, or down to `--to` bytes.
     Gc {
@@ -464,6 +516,32 @@ mod tests {
         // Still accepted where they were before.
         let cli = Cli::try_parse_from(["ant", "serve", "--memory", "--token", "x", "-C", "/"]);
         assert!(cli.is_ok(), "{cli:?}");
+    }
+
+    #[test]
+    fn cache_tier_commands() {
+        let cli =
+            Cli::try_parse_from(["ant", "cache-serve", "--upstream", "http://o:7421"]).unwrap();
+        let Command::CacheServe(a) = cli.command else { panic!() };
+        assert_eq!(a.auth, CacheAuth::Forward);
+        assert_eq!(a.listen.port(), 7422);
+        assert!(Cli::try_parse_from(["ant", "cache-serve"]).is_err(), "--upstream is required");
+        let cli = Cli::try_parse_from(["ant", "cache-serve", "--upstream", "x", "--auth", "open"])
+            .unwrap();
+        assert!(matches!(cli.command, Command::CacheServe(a) if a.auth == CacheAuth::Open));
+        let mut cmd = command();
+        let help = cmd.find_subcommand_mut("cache-serve").unwrap().render_long_help().to_string();
+        assert!(help.contains("--cache <") && help.contains("--cache-bytes"), "{help}");
+        for flag in ["--token", "--server", "--http <", "-C <"] {
+            assert!(!help.contains(flag), "cache-serve --help mentions {flag}:\n{help}");
+        }
+        let cli = Cli::try_parse_from(["ant", "cache", "stats", "--tiers"]).unwrap();
+        assert!(matches!(cli.command, Command::Cache { cmd: CacheCmd::Stats { tiers: true } }));
+        let cli =
+            Cli::try_parse_from(["ant", "cache", "seed", "main:src", "--sparse", "a"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Cache { cmd: CacheCmd::Seed { sparse, .. } } if sparse == ["a"])
+        );
     }
 
     #[test]

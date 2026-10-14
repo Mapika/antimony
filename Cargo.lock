@@ -98,6 +98,7 @@ dependencies = [
 name = "ant-bench"
 version = "0.1.0"
 dependencies = [
+ "ant-cache",
  "ant-core",
  "ant-gitbridge",
  "ant-proto",
@@ -121,10 +122,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "ant-cache"
+version = "0.1.0"
+dependencies = [
+ "ant-auth",
+ "ant-core",
+ "ant-proto",
+ "ant-server",
+ "ant-store",
+ "antd",
+ "anyhow",
+ "axum",
+ "bytes",
+ "futures",
+ "parking_lot",
+ "prometheus-client",
+ "prometheus-parse",
+ "reqwest",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ant-cli"
 version = "0.1.0"
 dependencies = [
  "ant-auth",
+ "ant-cache",
  "ant-core",
  "ant-fuse",
  "ant-gitbridge",
@@ -136,10 +161,12 @@ dependencies = [
  "async-trait",
  "clap",
  "clap_complete",
+ "futures",
  "sqlx",
  "tempfile",
  "tokio",
  "tonic",
+ "tracing",
 ]
 
 [[package]]

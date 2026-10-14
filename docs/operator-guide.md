@@ -259,6 +259,108 @@ Sparse workspaces keep checkouts proportional to what an agent touches. Full
 96k-file checkout on the dev machine: 4.2-4.7 s cold, 1.4-1.9 s warm,
 `status` 0.09-0.18 s (ROADMAP).
 
+### Cache tier (`ant cache-serve`)
+
+`ant cache-serve` is a caching proxy for the immutable HTTP surface
+(`GET /o/<id>` and the tree bundles `GET /t/<tree>`). It keeps the objects in
+a disk cache in the client format and fills misses from an upstream: the
+origin's `--http-listen` address or another `cache-serve`, so tiers chain
+(`client -> node -> region -> origin`). Clients use it by pointing `--http` /
+`ANT_HTTP` at it; their gRPC connection (refs, changesets, land, queries)
+still goes to the origin.
+
+```
+ant cache-serve --cache /var/cache/ant-tier --cache-bytes 200000000000 \
+    --upstream http://origin:7421 --listen 0.0.0.0:7422 --auth forward
+```
+
+`--cache` is required: the default client cache holds whatever its user may
+read and must not be served. The disk budget, LRU eviction and `ant cache
+stats` / `ant cache gc` work on it exactly as for a client cache (pass the
+same `--cache`); the bundle index (`<cache>/bundles`, tiny files that say
+which objects make up a tree's bundle) is pruned to 2% of the budget (at
+least 16 MiB). Every object from the upstream is hash-checked against the
+requested id before it is stored, so an upstream cannot poison the cache.
+Concurrent misses for one object share one upstream request.
+
+**Access control: the cache never answers on its own authority.**
+Which objects a principal may read depends on path rules and zone tags
+(`Access policy`), and the origin's answer depends on the caller, so a shared
+cache keyed by object id alone would hand an object to someone the origin
+would refuse. The two modes:
+
+- `--auth forward` (default; correct for any upstream, including one running
+  with a policy). The caller's `Authorization` header is forwarded on every
+  request. For an object the cache holds, it sends the origin a conditional
+  `GET /o/<id>` with `If-None-Match` and the caller's credentials; the origin
+  authorizes it like any read and answers `304` without reading its stores,
+  and only then does the cache serve the bytes from disk. Any other answer
+  (401, 403, 404, 5xx, no answer) is passed through and nothing is served,
+  so the cache fails closed and revocations take effect immediately. Misses
+  are forwarded with the caller's credentials and stored (the disk is never
+  readable except through that check). A miss by principal B while principal
+  A's fetch of the same object is in flight first passes the conditional
+  check, then takes the bytes: waiting never skips authorization. Tree
+  bundles depend on the caller (objects they cannot read are left out), so
+  `/t/` is forwarded uncached with the origin's own headers; the objects in
+  it are kept for later checked `/o/` reads. What forward mode saves is the
+  object bytes and the origin's store reads, not the requests.
+- `--auth open`, for an origin started without `--policy` (or a cache-serve in
+  open mode in front of one): every object is readable by everyone, so hits
+  cost the origin nothing and bundles are rebuilt from disk. The cache checks
+  at startup that the upstream really is open (an unauthenticated `GET
+  /debug/stats` must be `200`; a server with a policy answers `401`, a
+  forward-mode cache `404`) and refuses to start otherwise, so an open cache
+  cannot be put in front of a protected origin by accident. It ignores and
+  never forwards `Authorization` headers.
+
+The cache's own listener has no authentication: bind it where the clients
+that may read the data can reach it. An open cache serves everything to
+whoever connects to it.
+
+Operations: `GET /healthz`, `/readyz` (static) and `GET /metrics` on the same
+listener; logs on stderr as for `ant serve` (`RUST_LOG`). The cache enforces
+its budget and refreshes its gauges every minute. Metrics (names verified in
+`crates/ant-cache/src/metrics.rs`):
+
+| family | labels | meaning |
+|---|---|---|
+| `ant_cacheserve_requests_total` | `route` (`objects`, `bundles`), `result` | `hit` (disk, open mode), `revalidated` (disk, origin confirmed the caller, forward mode), `miss` (fetched by this request), `joined` (shared an in-flight fetch), `passthrough` (forward-mode bundle), `refused` (origin said 401/403/404 to a forward request), `not_found`, `error`. Tier hit ratio = (`hit` + `revalidated`) / all |
+| `ant_cacheserve_response_bytes_total` | `route` | body bytes sent |
+| `ant_cacheserve_upstream_requests_total` | `route`, `kind` (`fetch`, `revalidate`), `status` (`0` = transport error) | requests to the upstream |
+| `ant_cacheserve_upstream_bytes_total` | `route` | body bytes received |
+| `ant_cacheserve_inflight_fetches` | | upstream fetches in flight |
+| `ant_cacheserve_disk_bytes`, `_disk_budget_bytes`, `_index_bytes` | | tracked cache size (shared counter, no scan), budget, bundle index |
+
+Useful alerts: a falling hit ratio, a rising `error` or `status="0"` share
+(the upstream is unreachable: forward mode then refuses everything, open mode
+still serves what it holds), `disk_bytes` pinned at the budget with a low hit
+ratio (undersized).
+
+Measured (96k-file synthetic checkout over HTTP with tree bundles, open mode,
+loopback, dev machine): a client against a cold tier 4.0 s, origin sees
+1,990 requests; further clients with empty caches against the warm tier
+2.5 s, 0 origin requests (direct to the origin: 2.2 s). The gain is origin
+load and distance, not loopback speed: the tier re-encodes a bundle from its
+objects (decompress, recompress) where the origin serves from memory.
+
+**Seeding and sharing on a node.** `ant cache seed <rev>[:<path>]
+[--sparse <pattern>]...` walks a tree as `ws new` would (tree bundles when
+`--http` is set) and fetches every blob in scope into the cache without
+writing files; run it from a snapshot or image build step, or a cron on the
+node, so jobs start with hits. It works on a cache-serve's `--cache`
+directory too, to warm a tier offline. Processes sharing a cache directory
+also fetch each missing object (or tree bundle) once: the first claims it
+with an `flock` lock file under `<cache>/claims`, the others wait for it and
+read the result from the cache (30 s at most, then they fetch it
+themselves; a crashed holder releases its claim with the process).
+`ANT_CACHE_DEDUP=0` turns it off. 8 concurrent cold checkouts of a 48k-file
+tree through one cache (tmpfs): 18,633 HTTP requests and 599k objects
+received without it, 2,354 requests and 75k objects (the distinct ones) with
+it; wall time 4.8 s to 2.0 s. `ant cache stats --tiers` prints where this
+cache's objects have come from over its lifetime (`local_hits`,
+`waited_hits`, `joined`, `bundled_objects`, `fetched_objects`, ...).
+
 ## 3. Starting a replica
 
 ```sh
@@ -572,6 +674,8 @@ Families (all names verified in `crates/ant-server/src/metrics.rs`):
 | `ant_ref_watch_events_total`, `ant_ref_watch_coalesced_events_total` | | ref events sent; of those, coalesced ones (catch-ups, gap fills, slow watchers) |
 | `ant_pg_pool_size`, `_idle`, `_in_use`, `_max` | | query pool (the lock pool is not included) |
 | `ant_build_info` | `version`, `git` | always 1 |
+
+`ant cache-serve` has its own `ant_cacheserve_*` families (see Cache tier).
 
 Notes: `ant_land_outcomes_total` counts one per land request. `rebased` is a
 successful land that the server rebased, so total successes are

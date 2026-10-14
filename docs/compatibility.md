@@ -111,6 +111,10 @@ binary's supported version is printed by `ant admin schema` as `supported <n>`.
 | sparse workspace | `format=` line in `.ant/workspace` | 1 |
 | lazy (FUSE) workspace state | `<state>/format`, journal record kinds | 1 |
 
+- Additions inside a format that older binaries ignore do not change its
+  version: `gc/` (size counter, locks, `gc/tiers` counters), `claims/`
+  (cross-process fetch claims) and, for a cache tier, `bundles/` (bundle
+  index) sit next to `objects/`, which keeps its layout.
 - A **missing marker means version 1**, the layout from before markers
   existed; those caches and workspaces keep working.
 - Readers accept every version up to the one they were built for and

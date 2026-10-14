@@ -105,7 +105,11 @@ impl Ctx {
         disk: Arc<DiskObjectStore>,
     ) -> Result<(Arc<ReadThrough>, RemoteObjectStore)> {
         let remote = self.remote().await?;
+        // Processes sharing the cache directory fetch each missing object
+        // once (`antd::claim`); ANT_CACHE_DEDUP=0 turns that off.
+        let dedup = std::env::var("ANT_CACHE_DEDUP").map_or(true, |v| v != "0");
         let rt = ReadThrough::over_disk(disk, Arc::new(remote.clone()))
+            .with_cross_process_dedup(dedup)
             .verified_upstream()
             .with_tree_bundles(remote.clone());
         Ok((Arc::new(rt), remote))
