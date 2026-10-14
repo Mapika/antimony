@@ -372,3 +372,149 @@ async fn update_respects_sparse_scope() {
     let st = ws.status(objs.as_ref()).await.unwrap();
     assert!(st.is_empty(), "{st:?}");
 }
+
+fn kinds(changes: &[LocalChange]) -> Vec<(String, LocalChangeKind)> {
+    changes.iter().map(|c| (c.path.to_string(), c.kind)).collect()
+}
+
+fn put(dir: &Path, path: &str, body: &str) {
+    let full = dir.join(path);
+    fs::create_dir_all(full.parent().unwrap()).unwrap();
+    fs::write(full, body).unwrap();
+}
+
+#[tokio::test]
+async fn ignored_untracked_files_are_not_reported() {
+    let objs = MemoryObjectStore::default();
+    let t = build_tree(
+        &objs,
+        &[
+            (".gitignore", b"target/\n*.log\n!keep.log\n/rootonly\n"),
+            ("src/lib.rs", b"L"),
+            ("src/.gitignore", b"gen_*\n"),
+        ],
+    )
+    .await
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("ws");
+    let ws = Workspace::materialize(&objs, &dir, C, t, Sparse::all()).await.unwrap();
+    // Build-like output.
+    put(&dir, "target/debug/app", "bin");
+    put(&dir, "crates/x/target/out.o", "o");
+    put(&dir, "a.log", "l");
+    put(&dir, "keep.log", "k");
+    put(&dir, "rootonly", "r");
+    put(&dir, "sub/rootonly", "not anchored here");
+    put(&dir, "src/gen_a.rs", "g");
+    put(&dir, "other/gen_a.rs", "not covered by src/.gitignore");
+    // A file named `target` is not a directory: dir-only pattern.
+    put(&dir, "docs/target", "file");
+    // Workspace-local rules.
+    put(&dir, ".ant/ignore", "scratch/\n");
+    put(&dir, "scratch/notes", "n");
+
+    let (changes, ignored) = ws.status_with_ignored(&objs).await.unwrap();
+    let got: Vec<String> = kinds(&changes).into_iter().map(|(p, _)| p).collect();
+    assert_eq!(got, ["docs/target", "keep.log", "other/gen_a.rs", "sub/rootonly"]);
+    assert!(changes.iter().all(|c| c.kind == LocalChangeKind::Added));
+    assert_eq!(
+        ignored,
+        ["a.log", "crates/x/target/", "rootonly", "scratch/", "src/gen_a.rs", "target/"]
+    );
+    // `status` agrees with the first half.
+    assert_eq!(ws.status(&objs).await.unwrap(), changes);
+}
+
+#[tokio::test]
+async fn tracked_files_stay_tracked_despite_ignore_rules() {
+    use LocalChangeKind::{Deleted, Modified};
+    let objs = MemoryObjectStore::default();
+    let t = build_tree(
+        &objs,
+        &[
+            (".gitignore", b"*.lock\nvendor/\n"),
+            ("Cargo.lock", b"v1"),
+            ("vendor/lib/a.c", b"A"),
+            ("vendor/b.c", b"B"),
+        ],
+    )
+    .await
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("ws");
+    let ws = Workspace::materialize(&objs, &dir, C, t, Sparse::all()).await.unwrap();
+    assert!(ws.status(&objs).await.unwrap().is_empty());
+    put(&dir, "Cargo.lock", "v2");
+    put(&dir, "vendor/lib/a.c", "A2");
+    fs::remove_file(dir.join("vendor/b.c")).unwrap();
+    // Untracked neighbours inside the tracked-but-ignored directory stay hidden.
+    put(&dir, "vendor/lib/new.o", "x");
+    put(&dir, "vendor/newdir/x", "x");
+    let (changes, ignored) = ws.status_with_ignored(&objs).await.unwrap();
+    assert_eq!(
+        kinds(&changes),
+        [
+            ("Cargo.lock".to_string(), Modified),
+            ("vendor/b.c".to_string(), Deleted),
+            ("vendor/lib/a.c".to_string(), Modified),
+        ]
+    );
+    assert_eq!(ignored, ["vendor/lib/new.o", "vendor/newdir/"]);
+}
+
+#[tokio::test]
+async fn gitignore_files_are_ordinary_files_and_edits_take_effect() {
+    let objs = MemoryObjectStore::default();
+    let t = build_tree(&objs, &[("a", b"A")]).await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("ws");
+    let ws = Workspace::materialize(&objs, &dir, C, t, Sparse::all()).await.unwrap();
+    put(&dir, ".gitignore", "out/\n");
+    put(&dir, "out/x", "x");
+    let changes = ws.status(&objs).await.unwrap();
+    assert_eq!(kinds(&changes), [(".gitignore".to_string(), LocalChangeKind::Added)]);
+    // A pattern can ignore the rule file itself, like in git.
+    put(&dir, ".gitignore", "out/\n.gitignore\n");
+    assert!(ws.status(&objs).await.unwrap().is_empty());
+    // A negation in a nested file re-includes within its subtree only.
+    put(&dir, ".gitignore", "*.bin\n");
+    put(&dir, "keep/.gitignore", "!*.bin\n");
+    put(&dir, "keep/a.bin", "1");
+    put(&dir, "drop/a.bin", "2");
+    let got: Vec<String> =
+        ws.status(&objs).await.unwrap().iter().map(|c| c.path.to_string()).collect();
+    assert_eq!(got, [".gitignore", "keep/.gitignore", "keep/a.bin", "out/x"]);
+}
+
+/// An ignored directory is not entered: 50k files below it cost nothing.
+#[tokio::test]
+async fn ignored_directory_is_not_scanned() {
+    use std::time::{Duration, Instant};
+    let objs = MemoryObjectStore::default();
+    let t = build_tree(&objs, &[(".gitignore", b"target/\n"), ("src/a.rs", b"A")]).await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("ws");
+    let ws = Workspace::materialize(&objs, &dir, C, t, Sparse::all()).await.unwrap();
+    let measure = || async {
+        let mut best = Duration::MAX;
+        for _ in 0..5 {
+            let start = Instant::now();
+            assert!(ws.status(&objs).await.unwrap().is_empty());
+            best = best.min(start.elapsed());
+        }
+        best
+    };
+    let before = measure().await;
+    for d in 0..50 {
+        let sub = dir.join(format!("target/d{d}"));
+        fs::create_dir_all(&sub).unwrap();
+        for f in 0..1000 {
+            fs::write(sub.join(format!("f{f}")), b"x").unwrap();
+        }
+    }
+    let after = measure().await;
+    eprintln!("status with 50k ignored files: {after:?} (without: {before:?})");
+    // Generous bound against noise: scanning 50k files takes far longer.
+    assert!(after < before + Duration::from_millis(50), "{after:?} vs {before:?}");
+}
