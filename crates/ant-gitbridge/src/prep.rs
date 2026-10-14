@@ -134,41 +134,7 @@ impl<'g> Prepper<'g> {
             }
 
             let (mut i, mut j) = (0usize, 0usize);
-            while i < newp.ents.len() || j < oldp.ents.len() {
-                let (n, o): (Option<&Ent>, Option<&Ent>) =
-                    match (newp.ents.get(i), oldp.ents.get(j)) {
-                        (Some(a), Some(b)) => {
-                            match ant_core::git_name_cmp(
-                                newp.name_bytes(a),
-                                a.mode.is_tree(),
-                                oldp.name_bytes(b),
-                                b.mode.is_tree(),
-                            ) {
-                                std::cmp::Ordering::Less => {
-                                    i += 1;
-                                    (Some(a), None)
-                                }
-                                std::cmp::Ordering::Greater => {
-                                    j += 1;
-                                    (None, Some(b))
-                                }
-                                std::cmp::Ordering::Equal => {
-                                    i += 1;
-                                    j += 1;
-                                    (Some(a), Some(b))
-                                }
-                            }
-                        }
-                        (Some(a), None) => {
-                            i += 1;
-                            (Some(a), None)
-                        }
-                        (None, Some(b)) => {
-                            j += 1;
-                            (None, Some(b))
-                        }
-                        (None, None) => break,
-                    };
+            while let Some((n, o)) = next_pair(&newp, &oldp, &mut i, &mut j) {
                 if let (Some(n), Some(o)) = (n, o)
                     && n.mode == o.mode
                     && n.id == o.id
@@ -239,6 +205,50 @@ impl<'g> Prepper<'g> {
         bytes += trees.values().map(|t| t.weight()).sum::<usize>();
         Ok(Prep { idx, source, raw, trees, blobs, changes, bytes })
     }
+}
+
+/// The next step of a merge join of two trees' entries (both in git order,
+/// positions `i` and `j`): entries with the same name and kind pair up,
+/// others come alone. `None` once both are exhausted.
+fn next_pair<'p>(
+    new: &'p Parsed,
+    old: &'p Parsed,
+    i: &mut usize,
+    j: &mut usize,
+) -> Option<(Option<&'p Ent>, Option<&'p Ent>)> {
+    Some(match (new.ents.get(*i), old.ents.get(*j)) {
+        (Some(a), Some(b)) => {
+            match ant_core::git_name_cmp(
+                new.name_bytes(a),
+                a.mode.is_tree(),
+                old.name_bytes(b),
+                b.mode.is_tree(),
+            ) {
+                std::cmp::Ordering::Less => {
+                    *i += 1;
+                    (Some(a), None)
+                }
+                std::cmp::Ordering::Greater => {
+                    *j += 1;
+                    (None, Some(b))
+                }
+                std::cmp::Ordering::Equal => {
+                    *i += 1;
+                    *j += 1;
+                    (Some(a), Some(b))
+                }
+            }
+        }
+        (Some(a), None) => {
+            *i += 1;
+            (Some(a), None)
+        }
+        (None, Some(b)) => {
+            *j += 1;
+            (None, Some(b))
+        }
+        (None, None) => return None,
+    })
 }
 
 struct State {

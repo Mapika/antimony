@@ -988,53 +988,7 @@ impl Run<'_> {
     }
 
     async fn real(&mut self) -> Result<()> {
-        let state = sqlx::query(
-            "SELECT phase, extract(epoch FROM started_at)::float8 AS started, \
-                    extract(epoch FROM cutoff)::float8 AS cutoff, quiesce_secs, stats \
-             FROM gc_state WHERE phase <> 'done'",
-        )
-        .fetch_optional(&mut *self.conn)
-        .await
-        .map_err(be)?;
-        let (mut phase, started, quiesce) = match state {
-            Some(r) => {
-                let phase: String = r.try_get("phase").map_err(be)?;
-                self.cutoff = r.try_get("cutoff").map_err(be)?;
-                let stats: String = r.try_get("stats").map_err(be)?;
-                self.report.decode_into(&stats);
-                self.report.resumed = true;
-                let started: f64 = r.try_get("started").map_err(be)?;
-                let quiesce: f64 = r.try_get("quiesce_secs").map_err(be)?;
-                self.say(&format!("resuming the interrupted run (phase {phase})"));
-                (phase, started, quiesce)
-            }
-            None => {
-                // Leftovers of an aborted run must not be swept unmarked.
-                sqlx::raw_sql("DELETE FROM gc_condemned; TRUNCATE gc_live")
-                    .execute(&mut *self.conn)
-                    .await
-                    .map_err(be)?;
-                let started = self.now().await?;
-                self.cutoff = started - secs(self.opts.grace);
-                sqlx::query(
-                    "INSERT INTO gc_state (phase, started_at, cutoff, grace_secs, quiesce_secs) \
-                     VALUES ('mark', to_timestamp($1), to_timestamp($2), $3, $4) \
-                     ON CONFLICT (singleton) DO UPDATE SET phase = 'mark', \
-                         started_at = EXCLUDED.started_at, cutoff = EXCLUDED.cutoff, \
-                         grace_secs = EXCLUDED.grace_secs, \
-                         quiesce_secs = EXCLUDED.quiesce_secs, condemned_at = NULL, \
-                         remarked_at = NULL, finished_at = NULL, stats = ''",
-                )
-                .bind(started)
-                .bind(self.cutoff)
-                .bind(secs(self.opts.grace))
-                .bind(secs(self.opts.quiesce))
-                .execute(&mut *self.conn)
-                .await
-                .map_err(be)?;
-                ("mark".to_owned(), started, secs(self.opts.quiesce))
-            }
-        };
+        let (mut phase, started, quiesce) = self.start_or_resume().await?;
         self.report.cutoff = self.timestamp_text(self.cutoff).await?;
         // Everything written since the mark began, with a margin for
         // transactions that were open then.
@@ -1092,6 +1046,59 @@ impl Run<'_> {
                 }
             }
         }
+    }
+
+    /// Resume the interrupted run recorded in `gc_state`, or start a new one
+    /// (cutoff `grace` before now). Returns the phase to run, the run's start
+    /// time and its quiesce period (Unix seconds, seconds).
+    async fn start_or_resume(&mut self) -> Result<(String, f64, f64)> {
+        let state = sqlx::query(
+            "SELECT phase, extract(epoch FROM started_at)::float8 AS started, \
+                    extract(epoch FROM cutoff)::float8 AS cutoff, quiesce_secs, stats \
+             FROM gc_state WHERE phase <> 'done'",
+        )
+        .fetch_optional(&mut *self.conn)
+        .await
+        .map_err(be)?;
+        Ok(match state {
+            Some(r) => {
+                let phase: String = r.try_get("phase").map_err(be)?;
+                self.cutoff = r.try_get("cutoff").map_err(be)?;
+                let stats: String = r.try_get("stats").map_err(be)?;
+                self.report.decode_into(&stats);
+                self.report.resumed = true;
+                let started: f64 = r.try_get("started").map_err(be)?;
+                let quiesce: f64 = r.try_get("quiesce_secs").map_err(be)?;
+                self.say(&format!("resuming the interrupted run (phase {phase})"));
+                (phase, started, quiesce)
+            }
+            None => {
+                // Leftovers of an aborted run must not be swept unmarked.
+                sqlx::raw_sql("DELETE FROM gc_condemned; TRUNCATE gc_live")
+                    .execute(&mut *self.conn)
+                    .await
+                    .map_err(be)?;
+                let started = self.now().await?;
+                self.cutoff = started - secs(self.opts.grace);
+                sqlx::query(
+                    "INSERT INTO gc_state (phase, started_at, cutoff, grace_secs, quiesce_secs) \
+                     VALUES ('mark', to_timestamp($1), to_timestamp($2), $3, $4) \
+                     ON CONFLICT (singleton) DO UPDATE SET phase = 'mark', \
+                         started_at = EXCLUDED.started_at, cutoff = EXCLUDED.cutoff, \
+                         grace_secs = EXCLUDED.grace_secs, \
+                         quiesce_secs = EXCLUDED.quiesce_secs, condemned_at = NULL, \
+                         remarked_at = NULL, finished_at = NULL, stats = ''",
+                )
+                .bind(started)
+                .bind(self.cutoff)
+                .bind(secs(self.opts.grace))
+                .bind(secs(self.opts.quiesce))
+                .execute(&mut *self.conn)
+                .await
+                .map_err(be)?;
+                ("mark".to_owned(), started, secs(self.opts.quiesce))
+            }
+        })
     }
 
     async fn save_stats(&mut self) -> Result<()> {
@@ -1160,8 +1167,6 @@ impl Run<'_> {
     async fn sweep_batch(&mut self) -> Result<Batch> {
         use sqlx::Connection;
         let fence = fence_key(&self.store.schema);
-        let commit_keyed = self.opts.commit_keyed_kinds.clone();
-        let cutoff = self.cutoff;
         let limit = self.opts.batch.max(1) as i64;
         let mut tx = self.conn.begin().await.map_err(be)?;
         // Wait for ref moves in flight; hold off new ones until commit.
@@ -1192,99 +1197,37 @@ impl Run<'_> {
             tx.commit().await.map_err(be)?;
             return Ok(Batch::Done);
         }
-        // A writer holding a row lock is refreshing it: skip, never wait.
-        let objects = sqlx::query(
-            "DELETE FROM objects WHERE id IN (SELECT id FROM objects WHERE id = ANY($1) \
-                 AND written_at < to_timestamp($2) ORDER BY id FOR UPDATE SKIP LOCKED) \
-             RETURNING id, octet_length(data)::bigint AS bytes",
-        )
-        .bind(&taken)
-        .bind(cutoff)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(be)?;
-        let index = sqlx::query(
-            "DELETE FROM object_index WHERE id IN (SELECT id FROM object_index \
-                 WHERE id = ANY($1) AND written_at < to_timestamp($2) \
-                 ORDER BY id FOR UPDATE SKIP LOCKED) \
-             RETURNING id, len::bigint AS bytes",
-        )
-        .bind(&taken)
-        .bind(cutoff)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(be)?;
-        // A commit record goes only with its object (or when the object is
-        // gone already): one that was stored again keeps its record.
-        let commits: Vec<Vec<u8>> = sqlx::query_scalar(
-            "DELETE FROM commits WHERE id IN (SELECT id FROM commits c \
-                 WHERE id = ANY($1) AND written_at < to_timestamp($2) \
-                   AND NOT EXISTS (SELECT 1 FROM objects o WHERE o.id = c.id) \
-                   AND NOT EXISTS (SELECT 1 FROM object_index x WHERE x.id = c.id) \
-                 ORDER BY id FOR UPDATE SKIP LOCKED) \
-             RETURNING id",
-        )
-        .bind(&taken)
-        .bind(cutoff)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(be)?;
-        sqlx::query("DELETE FROM log WHERE commit_id = ANY($1)")
-            .bind(&commits)
-            .execute(&mut *tx)
-            .await
-            .map_err(be)?;
-        let legacy = sqlx::query("DELETE FROM changes WHERE commit_id = ANY($1)")
-            .bind(&commits)
-            .execute(&mut *tx)
-            .await
-            .map_err(be)?
-            .rows_affected();
-        let changesets = sqlx::query(
-            "DELETE FROM changesets WHERE commit_id IN (SELECT commit_id FROM changesets s \
-                 WHERE commit_id = ANY($1) AND written_at < to_timestamp($2) \
-                   AND NOT EXISTS (SELECT 1 FROM commits c WHERE c.id = s.commit_id) \
-                 ORDER BY commit_id FOR UPDATE SKIP LOCKED) \
-             RETURNING commit_id AS id, octet_length(data)::bigint AS bytes",
-        )
-        .bind(&taken)
-        .bind(cutoff)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(be)?;
-        // Keys are `<commit id><path>`; paths are UTF-8, never 0xff.
-        let derived = sqlx::query(
-            "DELETE FROM derived d USING unnest($1::bytea[]) AS t(id) \
-             WHERE d.kind = ANY($2) AND d.key >= t.id AND d.key < t.id || '\\xff'::bytea",
-        )
-        .bind(&commits)
-        .bind(&commit_keyed)
-        .execute(&mut *tx)
-        .await
-        .map_err(be)?
-        .rows_affected();
+        let deleted =
+            delete_rows(&mut tx, &taken, self.cutoff, &self.opts.commit_keyed_kinds).await?;
         tx.commit().await.map_err(be)?;
 
+        self.tally(taken.len(), &deleted)?;
+        Ok(Batch::Deleted)
+    }
+
+    /// Add a sweep batch's deletions to the report; `taken`: ids it took
+    /// from `gc_condemned`.
+    fn tally(&mut self, taken: usize, d: &Deleted) -> Result<()> {
         let sum = |rows: &[PgRow]| -> Result<u64> {
             rows.iter().map(|r| Ok(r.try_get::<i64, _>("bytes").map_err(be)? as u64)).sum()
         };
         let mut gone: HashSet<Vec<u8>> = HashSet::new();
-        for r in objects.iter().chain(&index).chain(&changesets) {
+        for r in d.objects.iter().chain(&d.index).chain(&d.changesets) {
             gone.insert(r.try_get::<Vec<u8>, _>("id").map_err(be)?);
         }
-        gone.extend(commits.iter().cloned());
+        gone.extend(d.commits.iter().cloned());
         let r = &mut self.report;
-        r.objects += objects.len() as u64;
-        r.object_bytes += sum(&objects)?;
-        r.large_objects += index.len() as u64;
-        r.large_object_bytes += sum(&index)?;
-        r.commits += commits.len() as u64;
-        r.legacy_changes += legacy;
-        r.changesets += changesets.len() as u64;
-        r.changeset_bytes += sum(&changesets)?;
-        r.derived += derived;
-        r.kept += (taken.len() as u64).saturating_sub(gone.len() as u64);
-        Ok(Batch::Deleted)
+        r.objects += d.objects.len() as u64;
+        r.object_bytes += sum(&d.objects)?;
+        r.large_objects += d.index.len() as u64;
+        r.large_object_bytes += sum(&d.index)?;
+        r.commits += d.commits.len() as u64;
+        r.legacy_changes += d.legacy;
+        r.changesets += d.changesets.len() as u64;
+        r.changeset_bytes += sum(&d.changesets)?;
+        r.derived += d.derived;
+        r.kept += (taken as u64).saturating_sub(gone.len() as u64);
+        Ok(())
     }
 
     /// Delete packs without index rows that are older than the pack minimum
@@ -1344,6 +1287,101 @@ impl Run<'_> {
             }
         }
     }
+}
+
+/// Rows deleted by one sweep batch.
+struct Deleted {
+    /// Deleted objects, index rows and changesets (`id`, `bytes`).
+    objects: Vec<PgRow>,
+    index: Vec<PgRow>,
+    changesets: Vec<PgRow>,
+    /// Ids of the deleted commit records.
+    commits: Vec<Vec<u8>>,
+    /// Legacy `changes` rows and derived rows deleted.
+    legacy: u64,
+    derived: u64,
+}
+
+/// Delete the rows of the condemned ids `taken` that are older than
+/// `cutoff`, in the sweep batch's transaction `tx`.
+async fn delete_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    taken: &[Vec<u8>],
+    cutoff: f64,
+    commit_keyed: &[String],
+) -> Result<Deleted> {
+    // A writer holding a row lock is refreshing it: skip, never wait.
+    let objects = sqlx::query(
+        "DELETE FROM objects WHERE id IN (SELECT id FROM objects WHERE id = ANY($1) \
+             AND written_at < to_timestamp($2) ORDER BY id FOR UPDATE SKIP LOCKED) \
+         RETURNING id, octet_length(data)::bigint AS bytes",
+    )
+    .bind(taken)
+    .bind(cutoff)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(be)?;
+    let index = sqlx::query(
+        "DELETE FROM object_index WHERE id IN (SELECT id FROM object_index \
+             WHERE id = ANY($1) AND written_at < to_timestamp($2) \
+             ORDER BY id FOR UPDATE SKIP LOCKED) \
+         RETURNING id, len::bigint AS bytes",
+    )
+    .bind(taken)
+    .bind(cutoff)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(be)?;
+    // A commit record goes only with its object (or when the object is
+    // gone already): one that was stored again keeps its record.
+    let commits: Vec<Vec<u8>> = sqlx::query_scalar(
+        "DELETE FROM commits WHERE id IN (SELECT id FROM commits c \
+             WHERE id = ANY($1) AND written_at < to_timestamp($2) \
+               AND NOT EXISTS (SELECT 1 FROM objects o WHERE o.id = c.id) \
+               AND NOT EXISTS (SELECT 1 FROM object_index x WHERE x.id = c.id) \
+             ORDER BY id FOR UPDATE SKIP LOCKED) \
+         RETURNING id",
+    )
+    .bind(taken)
+    .bind(cutoff)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(be)?;
+    sqlx::query("DELETE FROM log WHERE commit_id = ANY($1)")
+        .bind(&commits)
+        .execute(&mut **tx)
+        .await
+        .map_err(be)?;
+    let legacy = sqlx::query("DELETE FROM changes WHERE commit_id = ANY($1)")
+        .bind(&commits)
+        .execute(&mut **tx)
+        .await
+        .map_err(be)?
+        .rows_affected();
+    let changesets = sqlx::query(
+        "DELETE FROM changesets WHERE commit_id IN (SELECT commit_id FROM changesets s \
+             WHERE commit_id = ANY($1) AND written_at < to_timestamp($2) \
+               AND NOT EXISTS (SELECT 1 FROM commits c WHERE c.id = s.commit_id) \
+             ORDER BY commit_id FOR UPDATE SKIP LOCKED) \
+         RETURNING commit_id AS id, octet_length(data)::bigint AS bytes",
+    )
+    .bind(taken)
+    .bind(cutoff)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(be)?;
+    // Keys are `<commit id><path>`; paths are UTF-8, never 0xff.
+    let derived = sqlx::query(
+        "DELETE FROM derived d USING unnest($1::bytea[]) AS t(id) \
+         WHERE d.kind = ANY($2) AND d.key >= t.id AND d.key < t.id || '\\xff'::bytea",
+    )
+    .bind(&commits)
+    .bind(commit_keyed)
+    .execute(&mut **tx)
+    .await
+    .map_err(be)?
+    .rows_affected();
+    Ok(Deleted { objects, index, changesets, commits, legacy, derived })
 }
 
 enum Batch {
