@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use ant_store::postgres::PgStore;
+use ant_store::postgres::{PgOptions, PgStore};
 use ant_store::s3::{S3Config, S3ObjectStore};
 use ant_store::tiered::{DEFAULT_INLINE_THRESHOLD, TieredObjectStore};
 use ant_store::{Backend, ObjectStore};
@@ -22,6 +22,15 @@ pub struct StoreArgs {
     /// Postgres schema holding the tables.
     #[arg(long, env = "ANT_PG_SCHEMA", default_value = "ant")]
     pg_schema: String,
+
+    /// Postgres query-pool size per process. Replicas sharing a database
+    /// need (max + lock connections) x replicas under its max_connections.
+    #[arg(long, env = "ANT_PG_MAX_CONNECTIONS", default_value_t = 64)]
+    pg_max_connections: u32,
+
+    /// Postgres connections for per-ref land locks (refs landed on at once).
+    #[arg(long, env = "ANT_PG_LOCK_CONNECTIONS", default_value_t = 8)]
+    pg_lock_connections: u32,
 
     /// S3 endpoint for large objects.
     #[arg(long, env = "ANT_S3_ENDPOINT")]
@@ -97,9 +106,17 @@ impl StoreArgs {
             }
             (false, Some(url)) => {
                 let pg = Arc::new(
-                    PgStore::connect(url, &self.pg_schema)
-                        .await
-                        .context("connecting to Postgres")?,
+                    PgStore::connect_with(
+                        url,
+                        &self.pg_schema,
+                        &PgOptions {
+                            max_connections: self.pg_max_connections,
+                            lock_connections: self.pg_lock_connections,
+                            ..PgOptions::default()
+                        },
+                    )
+                    .await
+                    .context("connecting to Postgres")?,
                 );
                 let objects: Arc<dyn ObjectStore> = match self.s3_config()? {
                     None => pg.clone(),

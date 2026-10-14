@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use ant_core::{EncodedObject, ObjectId};
 use ant_store::{
-    Backend, CasOutcome, CommitNode, MetaStore, ObjectStore, PathChange, RefStore, Result,
+    Backend, CasOutcome, CommitNode, MetaStore, ObjectStore, PathChange, RefLock, RefStore, Result,
 };
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -253,6 +253,7 @@ pub struct TimedRefs {
     cas: Arc<Counter>,
     cas_mismatch: Arc<Counter>,
     list: Arc<Counter>,
+    lock: Arc<Counter>,
 }
 
 #[async_trait]
@@ -278,6 +279,10 @@ impl RefStore for TimedRefs {
 
     async fn list_refs(&self, prefix: &str) -> Result<Vec<(String, ObjectId)>> {
         timed(&self.list, 1, self.inner.list_refs(prefix)).await
+    }
+
+    async fn lock_ref(&self, name: &str) -> Result<RefLock> {
+        timed(&self.lock, 1, self.inner.lock_ref(name)).await
     }
 }
 
@@ -395,6 +400,7 @@ pub fn instrument(backend: &Backend, m: &Metrics, prefix: &str) -> Backend {
             cas: c("cas_ref"),
             cas_mismatch: c("cas_ref.mismatch"),
             list: c("list_refs"),
+            lock: c("lock_ref"),
         }),
         meta: Arc::new(TimedMeta {
             inner: backend.meta.clone(),
