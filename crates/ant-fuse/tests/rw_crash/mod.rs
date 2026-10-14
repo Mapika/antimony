@@ -1,5 +1,7 @@
 //! Crash tests: kill the daemon at random points of a scripted workload.
 
+pub mod update;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
@@ -46,9 +48,9 @@ fn base_tree(fixture: &str) -> Tree {
 }
 
 /// splitmix64
-struct Rng(u64);
+pub struct Rng(pub u64);
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);

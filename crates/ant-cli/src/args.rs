@@ -79,7 +79,7 @@ pub enum Command {
         #[command(subcommand)]
         cmd: RefCmd,
     },
-    /// Create and manage workspaces (`ws new`, `ws unmount`).
+    /// Create and manage workspaces (`ws new`, `ws update`, `ws resolve`, `ws unmount`).
     Ws {
         #[command(subcommand)]
         cmd: WsCmd,
@@ -177,6 +177,7 @@ pub enum RefCmd {
         prefix: String,
     },
     /// Move a ref to a rev (compare-and-swap; `--create` for a new ref).
+    /// Moves that are not fast-forwards need `--force`.
     Set {
         /// Ref to update.
         name: String,
@@ -188,11 +189,30 @@ pub enum RefCmd {
         /// Require that the ref does not exist yet.
         #[arg(long)]
         create: bool,
+        /// Allow a move to a commit that does not descend from the current
+        /// (or expected) target, e.g. a rewind.
+        #[arg(long)]
+        force: bool,
     },
 }
 
 #[derive(Subcommand, Debug)]
 pub enum WsCmd {
+    /// Move the workspace to a new base, carrying local edits over
+    /// (3-way merging files changed on both sides).
+    Update {
+        /// Rev to move to (default: the ref the workspace was created at,
+        /// else `main`).
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// Mark conflicted paths (as `ant status` prints them) resolved, once
+    /// their conflict markers are gone.
+    Resolve {
+        /// Conflicted repo paths.
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
     /// Unmount a lazy workspace, keeping its edits.
     Unmount {
         /// The lazy workspace directory.
@@ -230,5 +250,22 @@ mod tests {
         );
         let cli = Cli::try_parse_from(["ant", "ws", "unmount", "/tmp/ws"]).unwrap();
         assert!(matches!(cli.command, Command::Ws { cmd: WsCmd::Unmount { .. } }));
+    }
+
+    #[test]
+    fn update_resolve_and_forced_ref_set() {
+        let cli = Cli::try_parse_from(["ant", "ws", "update"]).unwrap();
+        assert!(matches!(cli.command, Command::Ws { cmd: WsCmd::Update { to: None } }));
+        let cli = Cli::try_parse_from(["ant", "ws", "update", "--to", "main~1"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Ws { cmd: WsCmd::Update { to: Some(t) } } if t == "main~1")
+        );
+        assert!(Cli::try_parse_from(["ant", "ws", "resolve"]).is_err());
+        let cli = Cli::try_parse_from(["ant", "ws", "resolve", "a", "b/c"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Ws { cmd: WsCmd::Resolve { paths } } if paths.len() == 2)
+        );
+        let cli = Cli::try_parse_from(["ant", "ref", "set", "main", "x", "--force"]).unwrap();
+        assert!(matches!(cli.command, Command::Ref { cmd: RefCmd::Set { force: true, .. } }));
     }
 }

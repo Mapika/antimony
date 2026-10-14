@@ -39,8 +39,8 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
         Command::Ref { cmd } => match cmd {
             RefCmd::Get { name } => refs::get(&ctx, &name).await,
             RefCmd::List { prefix } => refs::list(&ctx, &prefix).await,
-            RefCmd::Set { name, rev, expect, create } => {
-                refs::set(&ctx, &name, &rev, expect, create).await
+            RefCmd::Set { name, rev, expect, create, force } => {
+                refs::set(&ctx, &name, &rev, expect, create, force).await
             }
         },
         Command::Ws { cmd: WsCmd::New { dir, at, sparse, lazy } } => {
@@ -50,6 +50,8 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
                 ws::new(&ctx, &dir, &at, sparse).await
             }
         }
+        Command::Ws { cmd: WsCmd::Update { to } } => ws::update(&ctx, to).await,
+        Command::Ws { cmd: WsCmd::Resolve { paths } } => ws::resolve(&ctx, paths).await,
         Command::Ws { cmd: WsCmd::Unmount { dir } } => ws::unmount(&dir).await,
         Command::Ws { cmd: WsCmd::Serve { dir, state } } => ws::serve(&ctx, &dir, &state).await,
         Command::Status => ws::status(&ctx).await,

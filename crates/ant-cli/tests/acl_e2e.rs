@@ -229,10 +229,11 @@ fn cli_with_tokens() {
     env.fails(Some(READER), None, &["ws", "new", full.to_str().expect("utf8"), "--at", "main"]);
     // Refs: main is admin-only for direct updates.
     let tip = env.ok(Some(READER), None, &["ref", "get", "main"]);
-    let err =
-        env.fails(Some(READER), None, &["ref", "set", "main", "main~1", "--expect", tip.trim()]);
+    // (Rewinding a ref needs --force, so this reaches the ref rule.)
+    let rewind = ["ref", "set", "main", "main~1", "--expect", tip.trim(), "--force"];
+    let err = env.fails(Some(READER), None, &rewind);
     assert!(err.contains("cannot update ref main"), "{err}");
-    env.ok(Some(ADMIN), None, &["ref", "set", "main", "main~1", "--expect", tip.trim()]);
+    env.ok(Some(ADMIN), None, &rewind);
 }
 
 /// Create `main` (src/lib.rs, secrets/key) as the writer over raw gRPC:

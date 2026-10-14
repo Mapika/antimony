@@ -91,11 +91,38 @@ mod support {
     }
 
     pub fn build(rt: &tokio::runtime::Runtime, name: &str) -> (Arc<MemoryObjectStore>, ObjectId) {
+        if name == "update" {
+            let (objects, old, _) = build_update(rt);
+            return (objects, old);
+        }
         let objects = Arc::new(MemoryObjectStore::default());
         let files = fixture(name);
         let entries = files.iter().map(|(p, c)| (p.as_str(), c.as_slice())).collect::<Vec<_>>();
         let tree = rt.block_on(build_tree(objects.as_ref(), &entries)).unwrap();
         (objects, tree)
+    }
+
+    /// The `update` fixture: one store holding an old and a new base.
+    pub fn build_update(
+        rt: &tokio::runtime::Runtime,
+    ) -> (Arc<MemoryObjectStore>, ObjectId, ObjectId) {
+        let objects = Arc::new(MemoryObjectStore::default());
+        let mut trees = [ObjectId([0; 32]); 2];
+        for (side, tree) in trees.iter_mut().enumerate() {
+            let files = super::rw_crash::update::base_files(side == 1);
+            let entries = files.iter().map(|(p, c)| (p.as_str(), c.as_slice())).collect::<Vec<_>>();
+            *tree = rt.block_on(build_tree(objects.as_ref(), &entries)).unwrap();
+        }
+        (objects, trees[0], trees[1])
+    }
+
+    /// Body of the `update_child` test: run `ant_fuse::rw::update` on the
+    /// state directory to the `update` fixture's new base.
+    pub fn update_main() {
+        let state = PathBuf::from(std::env::var_os("ANT_RW_STATE").unwrap());
+        let rt = runtime();
+        let (objects, _, new) = build_update(&rt);
+        rt.block_on(ant_fuse::rw::update(objects, &state, ObjectId([2; 32]), new)).unwrap();
     }
 
     pub fn runtime() -> tokio::runtime::Runtime {
@@ -193,6 +220,13 @@ use support::*;
 fn daemon_child() {
     if let Ok(fixture) = std::env::var("ANT_RW_DAEMON") {
         daemon_main(&fixture);
+    }
+}
+
+#[test]
+fn update_child() {
+    if std::env::var_os("ANT_RW_UPDATE").is_some() {
+        update_main();
     }
 }
 
@@ -397,4 +431,21 @@ fn crash_daemon_kill_preserves_completed_operations() {
     let rounds =
         std::env::var("ANT_RW_CRASH_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(25);
     rw_crash::run(seed, rounds);
+}
+
+/// Kill `ws update` of a mounted lazy workspace (hundreds of 3-way merges,
+/// conflicts, upstream-only and local-only changes) at random points: the
+/// live mount, a remount and `status` must show either the old base with
+/// the original edits or the new base with all merged edits, never a mix.
+/// `ANT_RW_UPDATE_SEED` reproduces, `ANT_RW_UPDATE_ROUNDS` sets the kills.
+#[test]
+#[ignore = "needs FUSE (/dev/fuse, fusermount3)"]
+fn crash_update_kill_is_all_or_nothing() {
+    let seed = std::env::var("ANT_RW_UPDATE_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos() as u64);
+    let rounds =
+        std::env::var("ANT_RW_UPDATE_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
+    rw_crash::update::run(seed, rounds);
 }

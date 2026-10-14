@@ -19,7 +19,6 @@ async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true
 clap.workspace = true
-diffy.workspace = true
 futures.workspace = true
 http.workspace = true
 http-body.workspace = true
