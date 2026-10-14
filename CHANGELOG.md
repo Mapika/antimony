@@ -49,10 +49,13 @@ release of the 0.x series may change.
 
 ### Performance
 
-- Ancestry walks (`graph::merge_base`, `graph::is_ancestor`) read commit nodes a first-parent segment per store call
-  (`first_parent_chain`, bounded by the generation gap) instead of one
-  round trip per commit: a merge base 10,000 commits back takes 7 store
-  calls instead of about 10,000.
+- Ancestry walks (`graph::merge_base`, `graph::is_ancestor`) read whole
+  windows of ancestry per store call (`MetaStore::ancestors_above`, one
+  recursive query on Postgres) and use a first-parent skip index (derived
+  kind `graph/skip/v1`, filled lazily and by the importer, collected by GC);
+  `rev~N` resolves in O(log N) lookups. On rust-lang/rust (343k commits),
+  `merge-base main main~2000` went from 170 s to 10 ms, and `ref set`
+  fast-forward checks across 40k merges take about 12 ms.
 
 - First (uncached) `blame` of a long-lived file is 10-25x faster, with
   byte-identical output: changes between versions are diffed on the changed
@@ -179,22 +182,21 @@ guarantees) and the ROADMAP status:
 
 | measure | result |
 |---|---|
-| Landing, 64 agents, Postgres + S3 | 2,450 to 4,070 lands/s across scorecard runs (median 3,870/s in the latest bisect work), p99 28 to 84 ms (median 38 ms), 0 aborts, exact history |
-| Landing, 16 agents | 2,230 to 2,510 lands/s, p99 about 7 ms |
-| `create_changeset` p50, 16 agents | 1.9 to 3.0 ms |
+| Landing, 64 agents, Postgres + S3 | 4,138 lands/s, p99 26.5 ms, 0 aborts, exact history (final scorecard; earlier runs 2,450 to 4,276/s) |
+| Landing, 16 agents | 2,230 to 2,650 lands/s, p99 about 7 ms |
+| `create_changeset` p50, 16 agents | 1.9 to 2.0 ms |
 | Import of git/git (82k commits) | 6,400 to 6,800 commits/s, 0.8 to 0.9 GiB peak RSS |
+| Import of rust-lang/rust (343k commits, 1.1 GB pack) | 110 s (3,124 commits/s), 1.6 GiB peak RSS; log 11 ms, path log 18 ms, blame 363 ms first / 10 ms cached, merge-base 10 ms |
 | Linux kernel import (partial runs) | 1.0 to 1.5k commits/s, flat memory, about 2 GiB RSS |
 | Soak | 4 replicas x 1,000 agents x 30 min: 266k lands, 0 errors, exact history, flat RSS |
-| Checkout, synthetic 96k files (medians) | cold 2.7 s, warm 1.27 s, status 0.09 s |
+| Checkout, synthetic 96k files (medians) | cold 2.5 s, warm 1.1 s, status 0.1 s |
 | Queries on kernel-size history | log 6 to 40 ms, path log 17 to 36 ms, blame 55 ms cached (first blame 0.6 s on git/git) |
-| Git export, git/git | `--depth 1` 0.6 to 0.9 s; `blob:none` clone 116 MiB in 14 s (native git: 5.8 s) |
+| Git export | git/git: `--depth 1` 0.7 s, `blob:none` clone 88 MiB in 7.0 s (1.2x native git); rust-lang/rust `blob:none` 33 s (native 30 s) |
 | Lazy workspace writes | 72% of direct write speed, 7,700 small files/s, `cargo build` 1.27x |
 
-The afternoon scorecard of 2026-10-14 scored 25 of 27 targets; its two
-failures were the 96k-file checkout rows, whose quiet-machine medians (above)
-meet the targets (the run was a first-run outlier). It also showed the
-64-agent landing regression listed in the ROADMAP work queue: re-run the
-scorecard before relying on those landing numbers.
+The final pre-release scorecard
+([docs/scorecard/2026-10-14-final.md](docs/scorecard/2026-10-14-final.md))
+passes all 27 rows.
 
 ### Known limitations
 
@@ -203,8 +205,12 @@ scorecard before relying on those landing numbers.
   authors, ids, parents) is visible to every authenticated principal.
   Response timing still differs slightly between missing and hidden objects.
   Tokens are bearer secrets: run behind TLS. See the README's threat model.
-- **First blame of a long-lived large file takes seconds** (cached
-  afterwards).
+- **Ancestry through merged-in branches is a walk.** Reachability that only
+  goes through second parents (a topic commit merged long ago, or a negative
+  answer far back) still reads every commit above the target's generation,
+  in a few batched calls (0.2 s on rust-lang/rust). The first ancestry query
+  on a repo imported before this release fills the skip index once (about
+  0.4 s on rust-lang/rust).
 - **Commit creation latency** is bounded by one durable Postgres commit.
 - **Linux only for lazy views.** FUSE workspaces and `ant mount` need Linux;
   there is no macOS client yet (planned, NFS fallback first). Sparse
