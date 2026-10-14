@@ -43,10 +43,13 @@ pub fn entries(base: Entry, ours: Entry, theirs: Entry) -> EntryMerge {
     if let (Some(base), Some(ours), Some(theirs)) = (base, ours, theirs)
         && [base.0, ours.0, theirs.0]
             .into_iter()
-            .all(|m| matches!(m, EntryMode::File | EntryMode::Executable))
-        && (ours.0 == base.0 || theirs.0 == base.0)
+            .all(|m| matches!(m.class(), EntryMode::File | EntryMode::Executable))
+        && (ours.0.class() == base.0.class() || theirs.0.class() == base.0.class())
     {
-        let mode = if ours.0 == base.0 { theirs.0 } else { ours.0 };
+        // Legacy spellings behave like their class; a mode the other side
+        // changed wins, and an unchanged side's exact spelling is dropped
+        // (git also writes canonical modes when it rewrites a tree).
+        let mode = if ours.0.class() == base.0.class() { theirs.0 } else { ours.0 };
         return EntryMerge::Text { mode, base: base.1, ours: ours.1, theirs: theirs.1 };
     }
     EntryMerge::Conflict

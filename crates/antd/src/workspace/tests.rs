@@ -132,6 +132,39 @@ async fn modes_symlinks_and_gitlinks() {
     assert!(ws.status(&objs).await.unwrap().is_empty());
 }
 
+/// Trees from old histories (`100664`, `100775`, zero-padded `040000`)
+/// check out like their semantic class and show a clean status.
+#[tokio::test]
+async fn legacy_modes_check_out_as_their_class() {
+    let legacy = |m: &str| EntryMode::from_octal(m.as_bytes()).unwrap();
+    let objs = MemoryObjectStore::default();
+    let plain = objs.put(EncodedObject::new(ObjectKind::Blob, b"plain\n")).await.unwrap();
+    let exe = objs.put(EncodedObject::new(ObjectKind::Blob, b"#!/bin/sh\n")).await.unwrap();
+    let inner = Object::Tree(
+        Tree::new(vec![TreeEntry { mode: legacy("100664"), name: "f".into(), id: plain }]).unwrap(),
+    )
+    .encode();
+    let inner = objs.put(inner).await.unwrap();
+    let tree = Object::Tree(
+        Tree::new(vec![
+            TreeEntry { mode: legacy("100640"), name: "plain".into(), id: plain },
+            TreeEntry { mode: legacy("100775"), name: "run.sh".into(), id: exe },
+            TreeEntry { mode: legacy("040000"), name: "dir".into(), id: inner },
+        ])
+        .unwrap(),
+    )
+    .encode();
+    let t = objs.put(tree).await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("ws");
+    let ws = Workspace::materialize(&objs, &dir, C, t, Sparse::all()).await.unwrap();
+    let mode = |p: &str| std::fs::metadata(dir.join(p)).unwrap().permissions().mode();
+    assert_eq!(mode("plain") & 0o111, 0);
+    assert_eq!(mode("run.sh") & 0o111, 0o111);
+    assert_eq!(std::fs::read(dir.join("dir/f")).unwrap(), b"plain\n");
+    assert!(ws.status(&objs).await.unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn status_detects_changes() {
     let objs = MemoryObjectStore::default();

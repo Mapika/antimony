@@ -216,7 +216,7 @@ impl<'g> Converter<'g> {
         let mut prev: Option<&crate::tree::Ent> = None;
         for e in &parsed.ents {
             let name = parsed.name_bytes(e);
-            let child = match e.mode {
+            let child = match e.mode.class() {
                 EntryMode::Tree => {
                     let len = self.path.len();
                     if len > 0 {
@@ -276,7 +276,7 @@ impl<'g> Converter<'g> {
         view: &mut View,
         emit: bool,
     ) -> anyhow::Result<ObjectId> {
-        match mode {
+        match mode.class() {
             // Submodule pointer: carried through, never fetched. The foreign
             // commit id is zero-padded to 32 bytes (lossless for SHA-1/256).
             EntryMode::Gitlink => {

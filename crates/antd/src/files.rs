@@ -40,5 +40,5 @@ pub fn read_body(path: &Path, meta: &fs::Metadata) -> io::Result<Vec<u8>> {
 
 /// Permission bits a workspace gives a file of `mode`.
 pub fn file_perm(mode: EntryMode) -> u32 {
-    if mode == EntryMode::Executable { 0o755 } else { 0o644 }
+    if mode.class() == EntryMode::Executable { 0o755 } else { 0o644 }
 }

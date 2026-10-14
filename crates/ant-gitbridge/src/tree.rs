@@ -98,7 +98,7 @@ pub(crate) fn parse_tree(
                 if path.is_empty() { "/" } else { path },
             );
         }
-        let mode = EntryMode::from_octal_lenient(&rest[..sp])?;
+        let mode = EntryMode::from_octal(&rest[..sp])?;
         let mut sha = [0u8; 20];
         sha.copy_from_slice(&rest[nul + 1..end]);
         ents.push(Ent {
@@ -159,6 +159,25 @@ mod tests {
         assert_eq!(key_cmp(b"foo", false, b"foo", false), Ordering::Equal);
         assert_eq!(key_cmp(b"a", false, b"ab", false), Ordering::Less);
         assert_eq!(key_cmp(b"a", true, b"ab", false), Ordering::Less);
+    }
+
+    #[test]
+    fn legacy_modes_keep_spelling_and_class() {
+        let id = Oid::null(gix::hash::Kind::Sha1);
+        let mut raw = Vec::new();
+        for (mode, name) in [("100664", "a"), ("100640", "b"), ("040000", "d"), ("100775", "x")] {
+            raw.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+            raw.extend_from_slice(&[9; 20]);
+        }
+        let t = parse_tree(&id, raw, "", None).unwrap();
+        let spelled: Vec<_> = t.ents.iter().map(|e| e.mode.as_octal().into_owned()).collect();
+        assert_eq!(spelled, ["100664", "100640", "040000", "100775"]);
+        assert!(t.find(b"d", true).is_some(), "040000 is a directory");
+        let classes: Vec<_> = t.ents.iter().map(|e| e.mode.class()).collect();
+        assert_eq!(
+            classes,
+            [EntryMode::File, EntryMode::File, EntryMode::Tree, EntryMode::Executable]
+        );
     }
 
     #[test]

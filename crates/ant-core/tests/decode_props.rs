@@ -413,7 +413,8 @@ proptest! {
         names in prop::collection::btree_set("[a-c]{1,2}", 1..5),
         modes in prop::collection::vec(prop_oneof![
             Just("100644"), Just("100664"), Just("100755"), Just("120000"),
-            Just("40000"), Just("040000"), Just("160000")], 5),
+            Just("40000"), Just("040000"), Just("160000"), Just("100640"),
+            Just("0100644"), Just("0"), Just("00"), Just("40755"), Just("7")], 5),
         reverse in any::<bool>(),
     ) {
         let mut raw = Vec::new();
@@ -454,14 +455,77 @@ proptest! {
     }
 }
 
+/// Legacy modes that tolerant parsers accept are kept byte-for-byte (the
+/// SHA-256 conversion copies the mode text), and classified like their
+/// semantic class.
 #[test]
-fn regression_noncanonical_mode() {
-    assert!(Tree::decode(&raw_entry("100664", "a", 1)).is_err());
+fn legacy_modes_roundtrip_bytes_and_ids() {
+    for (mode, class) in [
+        ("100664", EntryMode::File),
+        ("100640", EntryMode::File),
+        ("100775", EntryMode::Executable),
+        ("100700", EntryMode::Executable),
+        ("100000", EntryMode::File),
+        ("040000", EntryMode::Tree),
+        ("40755", EntryMode::Tree),
+        ("120755", EntryMode::Symlink),
+        ("160755", EntryMode::Gitlink),
+        ("0100644", EntryMode::File),
+    ] {
+        let raw = raw_entry(mode, "a", 1);
+        let t = Tree::decode(&raw).unwrap_or_else(|e| panic!("{mode}: {e}"));
+        assert_eq!(t.encode(), raw, "{mode}");
+        let m = t.entries()[0].mode;
+        assert!(m.is_legacy(), "{mode}");
+        assert_eq!(m.class(), class, "{mode}");
+        assert_eq!(m.as_octal(), mode);
+        // The same entry with the canonical spelling is a different tree/id.
+        let canon = Tree::new(vec![TreeEntry { mode: class, ..t.entries()[0].clone() }]).unwrap();
+        assert_ne!(
+            EncodedObject::new(ObjectKind::Tree, &canon.encode()).id(),
+            EncodedObject::new(ObjectKind::Tree, &raw).id()
+        );
+    }
 }
 
 #[test]
-fn regression_zero_padded_tree_mode() {
-    assert!(Tree::decode(&raw_entry("040000", "a", 1)).is_err());
+fn canonical_spellings_stay_canonical() {
+    for (mode, want) in [
+        ("100644", EntryMode::File),
+        ("100755", EntryMode::Executable),
+        ("120000", EntryMode::Symlink),
+        ("40000", EntryMode::Tree),
+        ("160000", EntryMode::Gitlink),
+    ] {
+        assert_eq!(EntryMode::from_octal(mode.as_bytes()).unwrap(), want);
+        assert_eq!(want.class(), want);
+    }
+}
+
+#[test]
+fn rejects_non_octal_and_oversized_modes() {
+    for bad in ["", "8", "10064a", "-100644", "+100644", " 100644", "12345670123"] {
+        assert!(EntryMode::from_octal(bad.as_bytes()).is_err(), "{bad:?}");
+    }
+}
+
+proptest! {
+    /// Mode spelling <-> mode is a bijection on accepted strings.
+    #[test]
+    fn mode_spelling_roundtrips(s in "[0-7]{1,10}") {
+        let m = EntryMode::from_octal(s.as_bytes()).unwrap();
+        prop_assert_eq!(m.as_octal(), s.as_str());
+        prop_assert_eq!(m.class().class(), m.class());
+        prop_assert!(!m.class().is_legacy());
+    }
+
+    /// Two different spellings never denote the same mode.
+    #[test]
+    fn distinct_spellings_distinct_modes(a in "[0-7]{1,10}", b in "[0-7]{1,10}") {
+        let ma = EntryMode::from_octal(a.as_bytes()).unwrap();
+        let mb = EntryMode::from_octal(b.as_bytes()).unwrap();
+        prop_assert_eq!(ma == mb, a == b);
+    }
 }
 
 #[test]

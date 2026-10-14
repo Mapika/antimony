@@ -101,8 +101,8 @@ pub async fn diff_trees_with(
                 let path = dir.join(name)?;
                 let o_tree = o.filter(|e| e.mode.is_tree()).map(|e| e.id);
                 let n_tree = n.filter(|e| e.mode.is_tree()).map(|e| e.id);
-                let o_leaf = o.filter(|e| !e.mode.is_tree()).map(|e| (e.mode, e.id));
-                let n_leaf = n.filter(|e| !e.mode.is_tree()).map(|e| (e.mode, e.id));
+                let o_leaf = o.filter(|e| !e.mode.is_tree()).map(|e| (e.mode.class(), e.id));
+                let n_leaf = n.filter(|e| !e.mode.is_tree()).map(|e| (e.mode.class(), e.id));
                 if o_tree.is_some() || n_tree.is_some() {
                     next.push((path.clone(), o_tree, n_tree));
                 }
@@ -135,7 +135,7 @@ pub async fn lookup_path(
             return Ok(None);
         }
         match objects.read_tree(&cur.1).await?.get(comp) {
-            Some(e) => cur = (e.mode, e.id),
+            Some(e) => cur = (e.mode.class(), e.id),
             None => return Ok(None),
         }
     }

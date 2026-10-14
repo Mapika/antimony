@@ -65,7 +65,7 @@ pub async fn walk(
                     match visit(&path, e, *flag) {
                         Visit::Skip => {}
                         Visit::Leaf => {
-                            out.insert(path, (e.mode, e.id));
+                            out.insert(path, (e.mode.class(), e.id));
                         }
                         Visit::Descend(flag) => next.push((path, e.id, flag)),
                     }

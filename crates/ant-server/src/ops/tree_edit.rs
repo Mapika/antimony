@@ -66,9 +66,11 @@ pub(super) async fn load_directories<const N: usize>(
     Ok(dirs)
 }
 
+/// The leaf or directory entry at `path`, with legacy modes reduced to their
+/// semantic class (so merges and recorded changes never see legacy spellings).
 pub(super) fn entry(dirs: &Directories, path: &RepoPath) -> Option<Entry> {
     let (parent, name) = path.split_last()?;
-    dirs.get(&parent)?.get(name).map(|e| (e.mode, e.id))
+    dirs.get(&parent)?.get(name).map(|e| (e.mode.class(), e.id))
 }
 
 /// The changeset entry for setting the leaf at `path` in `dirs` to `new`

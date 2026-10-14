@@ -10,8 +10,10 @@ pub const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 
 impl From<ant_core::EntryMode> for v1::EntryMode {
     fn from(mode: ant_core::EntryMode) -> Self {
-        match mode {
-            ant_core::EntryMode::File => v1::EntryMode::File,
+        // Legacy modes travel as their semantic class; their exact spelling
+        // is only visible in the tree objects themselves.
+        match mode.class() {
+            ant_core::EntryMode::File | ant_core::EntryMode::Legacy(_) => v1::EntryMode::File,
             ant_core::EntryMode::Executable => v1::EntryMode::Executable,
             ant_core::EntryMode::Symlink => v1::EntryMode::Symlink,
             ant_core::EntryMode::Tree => v1::EntryMode::Tree,

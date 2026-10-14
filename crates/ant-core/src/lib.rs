@@ -19,5 +19,5 @@ pub use error::{Error, Result};
 pub use id::ObjectId;
 pub use object::{EncodedObject, Object, ObjectKind, hash_object};
 pub use path::RepoPath;
-pub use tree::{EntryMode, Tree, TreeEntry};
+pub use tree::{EntryMode, LegacyMode, Tree, TreeEntry};
 pub use version::NewerFormat;

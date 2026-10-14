@@ -9,10 +9,23 @@ hold the detailed contracts.
 
 Objects are git objects (`blob`, `tree`, `commit`) in git's encoding, hashed
 with **SHA-256**, so ids equal those of a `--object-format=sha256` git
-repository. Decoding is canonical-only: sorted tree entries, standard modes,
-plain decimal lengths. Two different byte strings can therefore never decode
-to the same object. Commit text (names, emails, messages, extra headers) is
-raw bytes, so real-world histories round-trip byte for byte.
+repository. Decoding is canonical-only: sorted tree entries, mode text that
+maps one-to-one to a mode, plain decimal lengths. Two different byte strings
+can therefore never decode to the same object. Commit text (names, emails,
+messages, extra headers) is raw bytes, so real-world histories round-trip byte
+for byte.
+
+Old histories contain non-canonical tree entry modes (`100664`, `100640`,
+zero-padded `040000`, `40755`, ...). git's SHA-256 conversion copies mode text
+verbatim, so to keep ids equal we do too: `EntryMode::Legacy` stores the exact
+spelling (any 1-10 octal digits other than the five standard spellings; one
+representation per string, so decoding stays injective). Behaviour always goes
+through `EntryMode::class()` (git's `canon_mode`: regular file, executable if
+the owner-execute bit is set, symlink, directory, otherwise gitlink); the
+protobuf API, recorded changesets, workspaces and the CLI only ever show the
+class. Untouched entries keep their spelling when a tree is rewritten; entries
+an operation writes get canonical modes, as when git rewrites a tree.
+Antimony itself never creates a legacy mode.
 
 ## Storage (`ant-store`)
 

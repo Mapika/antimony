@@ -199,7 +199,7 @@ pub(super) fn write_items(
         if !fresh {
             remove_existing(&full).with_context(|| format!("clearing {}", full.display()))?;
         }
-        let meta = match it.mode {
+        let meta = match it.mode.class() {
             EntryMode::Gitlink => {
                 fs::create_dir_all(&full)?;
                 out.push((key, None));
@@ -211,9 +211,9 @@ pub(super) fn write_items(
                 fs::symlink_metadata(&full)?
             }
             EntryMode::File | EntryMode::Executable => write_file(&full, it.mode, &it.body)?,
-            EntryMode::Tree => bail!("tree entry {key} passed as a leaf"),
+            EntryMode::Tree | EntryMode::Legacy(_) => bail!("tree entry {key} passed as a leaf"),
         };
-        out.push((key, Some(Entry { mode: it.mode, id: it.id, stat: stat_of(&meta) })));
+        out.push((key, Some(Entry { mode: it.mode.class(), id: it.id, stat: stat_of(&meta) })));
     }
     Ok(out)
 }
@@ -291,7 +291,7 @@ pub(super) fn expand_tree(
                 subtrees.push((child, e.id));
             }
         } else if matcher.matches(&child) {
-            leaves.push((child, e.mode, e.id));
+            leaves.push((child, e.mode.class(), e.id));
         }
     }
     Ok((subtrees, leaves))

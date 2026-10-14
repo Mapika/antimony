@@ -75,7 +75,7 @@ pub(super) async fn affected_base(
         let all = inherited || deleted.contains(path) || upper.files.contains_key(path);
         if !all && !exact.contains(path) && !branches.contains(path) {
             Visit::Skip
-        } else if e.mode == EntryMode::Tree {
+        } else if e.mode.is_tree() {
             Visit::Descend(all)
         } else {
             Visit::Leaf

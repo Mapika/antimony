@@ -153,7 +153,7 @@ pub fn mode_from_pb(v: i32) -> Result<EntryMode> {
 }
 
 pub fn kind_name(m: EntryMode) -> &'static str {
-    match m {
+    match m.class() {
         EntryMode::Tree => "tree",
         EntryMode::Gitlink => "commit",
         _ => "blob",

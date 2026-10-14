@@ -115,7 +115,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use ant_core::{ObjectId, ObjectKind};
+use ant_core::{EntryMode, ObjectId, ObjectKind};
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 
@@ -358,11 +358,11 @@ fn tree_children(body: &[u8], out: &mut Vec<(ObjectId, i16)>) -> Result<()> {
         }
         let id = ObjectId::from_bytes(&rest[..ObjectId::LEN])?;
         rest = &rest[ObjectId::LEN..];
-        // Directory modes: "40000" (git writes it so) or "040000".
-        let mode = std::str::from_utf8(mode).map_err(|_| malformed())?.trim_start_matches('0');
-        match mode {
-            "40000" => out.push((id, KIND_TREE)),
-            "160000" => {}
+        // Legacy spellings ("040000", "40755", ...) behave like their class;
+        // an unparsable mode is treated as a blob so its target stays alive.
+        match EntryMode::from_octal(mode).map(EntryMode::class) {
+            Ok(EntryMode::Tree) => out.push((id, KIND_TREE)),
+            Ok(EntryMode::Gitlink) => {}
             _ => out.push((id, KIND_BLOB)),
         }
     }
@@ -1470,6 +1470,31 @@ mod tests {
         conn.close_on_drop();
         drop(conn);
         run(&s, &opts()).await;
+    }
+
+    /// Legacy mode spellings must not hide subtrees from the collector.
+    #[test]
+    fn tree_children_classify_legacy_modes() {
+        let m = |s: &str| EntryMode::from_octal(s.as_bytes()).unwrap();
+        let t = Tree::new(vec![
+            TreeEntry { mode: m("100664"), name: "a".into(), id: ObjectId([1; 32]) },
+            TreeEntry { mode: m("040000"), name: "d".into(), id: ObjectId([2; 32]) },
+            TreeEntry { mode: m("40755"), name: "e".into(), id: ObjectId([3; 32]) },
+            TreeEntry { mode: m("160755"), name: "g".into(), id: ObjectId([4; 32]) },
+        ])
+        .unwrap();
+        let o = Object::Tree(t).encode();
+        let mut out = Vec::new();
+        tree_children(o.body(), &mut out).unwrap();
+        out.sort();
+        assert_eq!(
+            out,
+            [
+                (ObjectId([1; 32]), KIND_BLOB),
+                (ObjectId([2; 32]), KIND_TREE),
+                (ObjectId([3; 32]), KIND_TREE)
+            ]
+        );
     }
 
     #[test]

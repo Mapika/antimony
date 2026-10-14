@@ -21,3 +21,4 @@ tracing.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 reqwest.workspace = true
+ant-gitbridge.workspace = true
