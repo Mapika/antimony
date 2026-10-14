@@ -47,6 +47,10 @@ pub struct Args {
     /// Disk cache directory (wiped for cold runs).
     #[arg(long)]
     pub cache: PathBuf,
+    /// Cache size budget in bytes (default: effectively unlimited, so no
+    /// accounting; pass e.g. 21474836480 to measure the budget machinery).
+    #[arg(long)]
+    pub cache_bytes: Option<u64>,
     /// Workspace directory (default: `<cache>.ws`).
     #[arg(long)]
     pub workdir: Option<PathBuf>,
@@ -85,7 +89,10 @@ async fn materialize(
     sparse: Sparse,
 ) -> Result<(Phase, Workspace, Arc<dyn ObjectStore>)> {
     let metrics = Metrics::default();
-    let disk = Arc::new(DiskObjectStore::open(&a.cache, u64::MAX / 2).context("opening cache")?);
+    let disk = Arc::new(
+        DiskObjectStore::open(&a.cache, a.cache_bytes.unwrap_or(u64::MAX / 2))
+            .context("opening cache")?,
+    );
     let net = Arc::new(TimedObjects::new(Arc::new(remote.clone()), &metrics, "net"));
     let read_through = Arc::new(ReadThrough::over_disk(disk, net).verified_upstream());
     let rt: Arc<dyn ObjectStore> = Arc::new(TimedObjects::new(read_through, &metrics, "ws"));

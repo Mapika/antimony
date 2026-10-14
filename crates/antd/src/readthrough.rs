@@ -218,6 +218,7 @@ mod tests {
     use ant_store::memory::MemoryObjectStore;
     use ant_store::{ObjectStoreExt, conformance};
 
+    use crate::disk::DiskObjectStore;
     use crate::test_support::CountingStore;
 
     /// Upstream that counts how many ids it was asked for and is slow.
@@ -286,5 +287,56 @@ mod tests {
         let liar = EncodedObject::new(ObjectKind::Blob, b"not what you asked for");
         let rt = ReadThrough::new(Arc::new(MemoryObjectStore::default()), Arc::new(Lying(liar)));
         assert!(rt.get(&ObjectId([3; 32])).await.is_err());
+    }
+
+    /// A reader racing the evictor (files vanish between lookup and open,
+    /// or mid-read) always gets correct bytes: a lost file is a miss and is
+    /// refetched from upstream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reader_racing_eviction_refetches() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(DiskObjectStore::open(dir.path(), u64::MAX).unwrap());
+        let up = Arc::new(CountingStore::default());
+        let objs: Vec<_> = (0..64)
+            .map(|i| {
+                let body: Vec<u8> =
+                    (0..5000u32).map(|j| (j.wrapping_mul(i + 7) >> 3) as u8).collect();
+                EncodedObject::new(ObjectKind::Blob, &body)
+            })
+            .collect();
+        up.inner.put_many(&objs).await.unwrap();
+        let rt = Arc::new(ReadThrough::over_disk(disk.clone(), up.clone()).verified_upstream());
+        let ids: Vec<ObjectId> = objs.iter().map(|o| o.id()).collect();
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let evictor = {
+            let (disk, stop) = (disk.clone(), stop.clone());
+            tokio::spawn(async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    disk.evict_to(0).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let (rt, ids, objs) = (rt.clone(), ids.clone(), objs.clone());
+                tokio::spawn(async move {
+                    for _ in 0..40 {
+                        let got = rt.get_many(&ids).await.unwrap();
+                        assert_eq!(got.len(), objs.len());
+                        for (g, o) in got.iter().zip(&objs) {
+                            assert_eq!(g.as_ref(), Some(o));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for r in readers {
+            r.await.unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        evictor.await.unwrap();
+        assert!(up.ids() > objs.len(), "evicted objects were fetched again");
     }
 }

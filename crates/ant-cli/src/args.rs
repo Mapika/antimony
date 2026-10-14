@@ -156,6 +156,24 @@ pub enum Command {
         #[command(subcommand)]
         cmd: AdminCmd,
     },
+    /// Inspect and trim the local object cache (`cache stats`, `cache gc`).
+    Cache {
+        #[command(subcommand)]
+        cmd: CacheCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CacheCmd {
+    /// Objects and bytes in the cache, and its budget.
+    Stats,
+    /// Evict least-recently-used objects: down to 90% of the budget if over
+    /// it, or down to `--to` bytes.
+    Gc {
+        /// Evict until at most this many bytes remain, whatever the budget.
+        #[arg(long, value_name = "BYTES")]
+        to: Option<u64>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

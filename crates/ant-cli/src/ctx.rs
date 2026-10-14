@@ -37,6 +37,9 @@ pub fn print_hint(hint: &str) {
     eprintln!("hint: {hint}");
 }
 
+/// How often a daemon flushes its cache accounting and enforces the budget.
+const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
 pub struct Ctx {
     pub server: String,
     pub http: Option<String>,
@@ -84,8 +87,24 @@ impl Ctx {
 
     /// `ReadThrough(DiskObjectStore, RemoteObjectStore)` plus the remote itself.
     pub async fn read_through(&self) -> Result<(Arc<ReadThrough>, RemoteObjectStore)> {
+        self.read_through_over(self.disk()?).await
+    }
+
+    /// [`read_through`](Self::read_through) for long-running daemons (`ant
+    /// mount`, lazy workspaces): the cache budget is also enforced every
+    /// [`MAINTENANCE_INTERVAL`], not only when this process writes.
+    pub async fn read_through_daemon(&self) -> Result<(Arc<ReadThrough>, RemoteObjectStore)> {
+        let disk = self.disk()?;
+        disk.spawn_maintenance(MAINTENANCE_INTERVAL);
+        self.read_through_over(disk).await
+    }
+
+    async fn read_through_over(
+        &self,
+        disk: Arc<DiskObjectStore>,
+    ) -> Result<(Arc<ReadThrough>, RemoteObjectStore)> {
         let remote = self.remote().await?;
-        let rt = ReadThrough::over_disk(self.disk()?, Arc::new(remote.clone())).verified_upstream();
+        let rt = ReadThrough::over_disk(disk, Arc::new(remote.clone())).verified_upstream();
         Ok((Arc::new(rt), remote))
     }
 }

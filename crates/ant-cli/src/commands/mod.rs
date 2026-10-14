@@ -2,10 +2,11 @@
 
 use anyhow::Result;
 
-use crate::args::{AdminCmd, Cli, Command, RefCmd, WsCmd};
+use crate::args::{AdminCmd, CacheCmd, Cli, Command, RefCmd, WsCmd};
 use crate::ctx::{Ctx, Outcome};
 
 mod admin;
+mod cache;
 mod import;
 mod mount;
 mod query;
@@ -58,5 +59,7 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
         Command::Mount { rev, mountpoint } => mount::run(&ctx, &rev, &mountpoint).await,
         Command::Admin { cmd: AdminCmd::ReindexAcl(a) } => admin::reindex_acl(a).await,
         Command::Admin { cmd: AdminCmd::Schema(a) } => admin::schema(a).await,
+        Command::Cache { cmd: CacheCmd::Stats } => cache::stats(&ctx).await,
+        Command::Cache { cmd: CacheCmd::Gc { to } } => cache::gc(&ctx, to).await,
     }
 }

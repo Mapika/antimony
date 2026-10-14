@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result};
 use crate::ctx::{Ctx, Outcome, resolve_commit};
 
 pub async fn run(ctx: &Ctx, rev: &str, mountpoint: &Path) -> Result<Outcome> {
-    let (rt, remote) = ctx.read_through().await?;
+    let (rt, remote) = ctx.read_through_daemon().await?;
     let commit = resolve_commit(&mut remote.client(), rev).await?;
     let tree = rt.read_commit(&commit).await?.tree;
 
