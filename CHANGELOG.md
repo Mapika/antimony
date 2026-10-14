@@ -8,6 +8,14 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+### Performance
+
+- First (uncached) `blame` of a long-lived file is 10-25x faster, with
+  byte-identical output: changes between versions are diffed on the changed
+  region only (bytewise prefix/suffix, integer line ids, bit-parallel LCS
+  with the previous tie-break), version diffs run in parallel on blocking
+  threads, and blob reads are prefetched a few batches ahead of the walk.
+
 ## [0.1.0] - Unreleased
 
 First release. Working end to end against real Postgres and S3, covered by

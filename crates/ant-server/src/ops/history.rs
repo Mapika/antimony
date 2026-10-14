@@ -37,9 +37,14 @@
 //! `blame(b, rev, path)`: per-line attribution of the file at `rev`.
 //! Walks the file's history newest→oldest (the index when available, else
 //! first-parent changesets); each change line-maps the previous version
-//! against the newer one (`line_map`, an LCS) and attributes lines that
-//! commit introduced; lines surviving to the file's creation belong to the
-//! creating commit. Results are cached as derived data `"blame/v1"`,
+//! against the newer one (`diff_texts`: common prefix/suffix found bytewise,
+//! the changed middle interned to integer line ids and diffed by a
+//! bit-parallel LCS with a deterministic tie-break; `line_map` in the tests
+//! is the quadratic reference with identical results) and attributes lines
+//! that commit introduced; lines surviving to the file's creation belong to
+//! the creating commit. A producer task reads change batches (16, doubling
+//! to 128) and starts their blob `get_many`s a few batches ahead of the
+//! walk. Results are cached as derived data `"blame/v1"`,
 //! key = rev id ++ path bytes, value = compact encoding.
 //! Binary (non-UTF-8) files → `InvalidArgument`. Missing path → `NotFound`.
 
@@ -47,7 +52,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use ant_core::{ObjectId, RepoPath};
-use ant_store::{Backend, ChangeKind, HistoryRow, PathChange};
+use ant_store::{Backend, ChangeKind, HistoryRow, PathChange, StoreError};
 use bytes::Bytes;
 
 use super::query::{self, LogEntry};
@@ -63,8 +68,12 @@ const CHAIN_CHUNK: usize = 8192;
 const MAX_ROUNDS: usize = 4;
 /// Derived-data kind for cached blame results.
 pub(crate) const BLAME_KIND: &str = "blame/v1";
-/// Commits whose changesets/blobs are fetched per blame step.
-const BLAME_CHUNK: usize = 64;
+/// Largest batch of changes (and previous-version blobs) fetched per blame step.
+const BLAME_CHUNK: usize = 128;
+/// First (small) batch of a blame walk, so short histories fetch little.
+const BLAME_FIRST_CHUNK: usize = 16;
+/// Batches read ahead of the walk.
+const BLAME_PREFETCH: usize = 4;
 /// Cap on LCS table cells for one line diff; larger middles count as replaced.
 const MAX_LCS_CELLS: usize = 4_000_000;
 /// Unindexed commits `lagging_path_log` scans before giving up on the index.
@@ -480,9 +489,9 @@ fn decode_blame(v: &[u8], lines: usize) -> Option<Vec<ObjectId>> {
     (0..lines).map(|i| table.get(u32_at(base + 4 + i * 4)?).copied()).collect()
 }
 
-/// For each line of `new`, the index of the matching line of `old`, or None
-/// if the line was introduced. Common prefix/suffix are trimmed, then an LCS
-/// runs on the middle (counted as fully replaced if too large).
+/// Reference implementation of [`line_map_ids`] (quadratic LCS table over the
+/// strings themselves); the oracle the optimised version is tested against.
+#[cfg(test)]
 fn line_map(old: &[&str], new: &[&str]) -> Vec<Option<usize>> {
     let mut map = vec![None; new.len()];
     let pre = old.iter().zip(new).take_while(|(a, b)| a == b).count();
@@ -524,10 +533,305 @@ fn line_map(old: &[&str], new: &[&str]) -> Vec<Option<usize>> {
     map
 }
 
+/// Row-wise bit-parallel LCS table (Hyyro): `rows[r]` encodes, for the first
+/// `r` symbols of `x`, the increments of the LCS length along `y`'s prefixes,
+/// so any `L[r][c]` is a popcount away.
+struct LcsRows {
+    words: usize,
+    bits: Vec<u64>,
+    /// Zero bits in all words before word `w` of row `r`.
+    zeros_before: Vec<u32>,
+}
+
+impl LcsRows {
+    fn new(x: &[u32], y: &[u32]) -> Self {
+        let words = y.len().div_ceil(64);
+        // Match masks, only for symbols that occur in `x` (ids are dense:
+        // they come from one interner).
+        let slots = x.iter().chain(y).max().map_or(0, |&m| m as usize + 1);
+        let mut mask_of = vec![u32::MAX; slots];
+        let mut distinct = 0usize;
+        for &a in x {
+            if mask_of[a as usize] == u32::MAX {
+                mask_of[a as usize] = distinct as u32;
+                distinct += 1;
+            }
+        }
+        let mut masks = vec![0u64; distinct * words];
+        for (k, &b) in y.iter().enumerate() {
+            let m = mask_of[b as usize];
+            if m != u32::MAX {
+                masks[m as usize * words + k / 64] |= 1 << (k % 64);
+            }
+        }
+        let mut bits = vec![0u64; (x.len() + 1) * words];
+        let mut zeros_before = vec![0u32; (x.len() + 1) * words];
+        bits[..words].fill(!0);
+        for (r, a) in x.iter().enumerate() {
+            let mask = &masks[mask_of[*a as usize] as usize * words..][..words];
+            let (prev, next) = bits[r * words..(r + 2) * words].split_at_mut(words);
+            let mut carry = false;
+            for ((n, &v), &m) in next.iter_mut().zip(&*prev).zip(mask) {
+                let u = v & m;
+                let (s1, c1) = v.overflowing_add(u);
+                let (s2, c2) = s1.overflowing_add(carry as u64);
+                carry = c1 | c2;
+                *n = s2 | (v & !m);
+            }
+        }
+        for r in 0..=x.len() {
+            let mut z = 0u32;
+            for w in 0..words {
+                zeros_before[r * words + w] = z;
+                z += (!bits[r * words + w]).count_ones();
+            }
+        }
+        LcsRows { words, bits, zeros_before }
+    }
+
+    /// LCS length of the first `r` symbols of `x` and first `c` of `y`.
+    fn len(&self, r: usize, c: usize) -> u32 {
+        let (w, rem) = (c / 64, c % 64);
+        if rem == 0 {
+            return if w == self.words {
+                self.zeros_before[r * self.words + w - 1]
+                    + (!self.bits[r * self.words + w - 1]).count_ones()
+            } else {
+                self.zeros_before[r * self.words + w]
+            };
+        }
+        let word = !self.bits[r * self.words + w] & ((1u64 << rem) - 1);
+        self.zeros_before[r * self.words + w] + word.count_ones()
+    }
+}
+
+/// For each line of `new`, the index of the matching line of `old`, or None
+/// if the line was introduced. Common prefix/suffix are trimmed, then an LCS
+/// runs on the middle (counted as fully replaced if too large). Same result
+/// as the quadratic reference `line_map`, including its tie-breaking.
+fn line_map_ids(old: &[u32], new: &[u32]) -> Vec<Option<usize>> {
+    let mut map = vec![None; new.len()];
+    let pre = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let suf =
+        old[pre..].iter().rev().zip(new[pre..].iter().rev()).take_while(|(a, b)| a == b).count();
+    for (i, m) in map.iter_mut().enumerate().take(pre) {
+        *m = Some(i);
+    }
+    for k in 0..suf {
+        map[new.len() - 1 - k] = Some(old.len() - 1 - k);
+    }
+    let (o, n) = (&old[pre..old.len() - suf], &new[pre..new.len() - suf]);
+    if o.is_empty() || n.is_empty() || (o.len() + 1).saturating_mul(n.len() + 1) > MAX_LCS_CELLS {
+        return map;
+    }
+    // t[i][j] = LCS(o[i..], n[j..]) = LCS of the reversed prefixes of lengths
+    // (|o|-i, |n|-j); the table is symmetric, so rows go to the shorter side.
+    let ro: Vec<u32> = o.iter().rev().copied().collect();
+    let rn: Vec<u32> = n.iter().rev().copied().collect();
+    let swapped = rn.len() < ro.len();
+    let rows = if swapped { LcsRows::new(&rn, &ro) } else { LcsRows::new(&ro, &rn) };
+    let t = |i: usize, j: usize| {
+        let (a, b) = (o.len() - i, n.len() - j);
+        if swapped { rows.len(b, a) } else { rows.len(a, b) }
+    };
+    let (mut i, mut j) = (0, 0);
+    while i < o.len() && j < n.len() {
+        if o[i] == n[j] {
+            map[pre + j] = Some(pre + i);
+            i += 1;
+            j += 1;
+        } else if t(i + 1, j) >= t(i, j + 1) {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    map
+}
+
+/// Fast multiplicative hasher for line interning, keyed per process so that
+/// colliding lines cannot be crafted in advance.
+#[derive(Clone)]
+struct SeededFx(u64);
+
+struct FxState(u64);
+
+impl std::hash::BuildHasher for SeededFx {
+    type Hasher = FxState;
+    fn build_hasher(&self) -> FxState {
+        FxState(self.0)
+    }
+}
+
+impl std::hash::Hasher for FxState {
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let w = u64::from_le_bytes(c.try_into().unwrap_or([0; 8]));
+            self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(K);
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut b = [0u8; 8];
+            b[..rest.len()].copy_from_slice(rest);
+            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(b)).wrapping_mul(K);
+        }
+    }
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 29)
+    }
+}
+
+static LINE_HASH_SEED: LazyLock<u64> = LazyLock::new(|| {
+    use std::hash::BuildHasher;
+    std::collections::hash_map::RandomState::new().hash_one(0x5eed_u64)
+});
+
+/// Number of lines `str::lines` yields for `b` (valid UTF-8 or not: only
+/// newlines matter).
+fn line_count(b: &[u8]) -> usize {
+    b.iter().filter(|&&c| c == b'\n').count() + usize::from(b.last().is_some_and(|&c| c != b'\n'))
+}
+
+/// Interns the lines of two texts into one id space.
+fn intern_pair(old: &str, new: &str) -> (Vec<u32>, Vec<u32>) {
+    let mut ids: HashMap<&str, u32, SeededFx> = HashMap::with_capacity_and_hasher(
+        line_count(old.as_bytes()) + line_count(new.as_bytes()) / 4 + 8,
+        SeededFx(*LINE_HASH_SEED),
+    );
+    let mut intern = |text| -> Vec<u32> {
+        let text: &str = text;
+        text.lines()
+            .map(|l| {
+                let next = ids.len() as u32;
+                *ids.entry(l).or_insert(next)
+            })
+            .collect()
+    };
+    let o = intern(old);
+    (o, intern(new))
+}
+
+/// [`line_map_ids`] over two texts split like `str::lines`. Only the part
+/// between the common prefix and suffix (found bytewise, snapped to line
+/// boundaries) is split and interned, so a small edit costs a memcmp over
+/// the file plus the diff of the edited region.
+fn diff_texts(old: &str, new: &str) -> Vec<Option<usize>> {
+    let (ob, nb) = (old.as_bytes(), new.as_bytes());
+    // Common prefix, snapped back to just after its last newline.
+    let p = ob.iter().zip(nb).take_while(|(a, b)| a == b).count();
+    let p = ob[..p].iter().rposition(|&c| c == b'\n').map_or(0, |i| i + 1);
+    let mut pre = line_count(&ob[..p]);
+    // Extend to the maximal common prefix of *lines* (CRLF and LF endings
+    // compare equal; a repeated line may continue it past the first byte
+    // difference), as the reference does before looking at the suffix.
+    let (mut po, mut pn) = (p, p);
+    for (a, b) in old[p..].split_inclusive('\n').zip(new[p..].split_inclusive('\n')) {
+        if a.lines().next() != b.lines().next() {
+            break;
+        }
+        (po, pn, pre) = (po + a.len(), pn + b.len(), pre + 1);
+    }
+    let (ob, nb) = (&ob[po..], &nb[pn..]);
+    // Common suffix: the largest one that starts at a line start in both.
+    let s = ob.iter().rev().zip(nb.iter().rev()).take_while(|(a, b)| a == b).count();
+    let aligned = |k: usize| {
+        (k == ob.len() || ob[ob.len() - k - 1] == b'\n')
+            && (k == nb.len() || nb[nb.len() - k - 1] == b'\n')
+    };
+    let s = if aligned(s) {
+        s
+    } else {
+        // The `s` common bytes: a line start inside them is aligned in both.
+        ob[ob.len() - s..].iter().position(|&c| c == b'\n').map_or(0, |i| s - i - 1)
+    };
+    let suf = line_count(&ob[ob.len() - s..]);
+    // All cut points follow a newline (or are text ends): char boundaries.
+    let (o_mid, n_mid) = (&old[po..old.len() - s], &new[pn..new.len() - s]);
+
+    let (oi, ni) = intern_pair(o_mid, n_mid);
+    let (old_lines, new_lines) = (pre + oi.len() + suf, pre + ni.len() + suf);
+    let mid = line_map_ids(&oi, &ni);
+    let mut map = Vec::with_capacity(new_lines);
+    map.extend((0..pre).map(Some));
+    map.extend(mid.into_iter().map(|m| m.map(|k| pre + k)));
+    map.extend((old_lines - suf..old_lines).map(Some));
+    debug_assert_eq!(map.len(), new_lines);
+    map
+}
+
 fn utf8(bytes: &[u8], path: &RepoPath) -> OpResult<String> {
     std::str::from_utf8(bytes)
         .map(str::to_owned)
         .map_err(|_| OpError::InvalidArgument(format!("{path} is not valid UTF-8")))
+}
+
+/// One batch of a file's history with the blobs of its previous versions.
+struct BlameChunk {
+    step: Vec<(ObjectId, PathChange)>,
+    blobs: HashMap<ObjectId, ant_core::EncodedObject>,
+}
+
+async fn fetch_chunk(b: Backend, step: Vec<(ObjectId, PathChange)>) -> OpResult<BlameChunk> {
+    let mut ids: Vec<ObjectId> = step.iter().filter_map(|(_, c)| c.old.map(|(_, id)| id)).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let fetched = b.objects.get_many(&ids).await?;
+    let mut blobs = HashMap::with_capacity(ids.len());
+    for (id, o) in ids.into_iter().zip(fetched) {
+        blobs.insert(id, o.ok_or_else(|| OpError::not_found_object(id))?);
+    }
+    Ok(BlameChunk { step, blobs })
+}
+
+/// Reads a file's history ahead of the walk: a producer task pulls change
+/// batches (growing from `BLAME_FIRST_CHUNK` to `BLAME_CHUNK`) and starts
+/// their blob fetches, keeping up to `BLAME_PREFETCH` batches in flight so
+/// store latency overlaps the diffing. Dropping it stops the producer;
+/// fetches already started finish unobserved.
+struct Prefetch {
+    rx: tokio::sync::mpsc::Receiver<tokio::task::JoinHandle<OpResult<BlameChunk>>>,
+    producer: tokio::task::JoinHandle<()>,
+}
+
+impl Prefetch {
+    fn start(b: Backend, path: RepoPath, mut history: FileHistory) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(BLAME_PREFETCH);
+        let producer = tokio::spawn(async move {
+            let mut n = BLAME_FIRST_CHUNK;
+            loop {
+                match history.next(&b, &path, n).await {
+                    Ok(step) if step.is_empty() => break,
+                    Ok(step) => {
+                        if tx.send(tokio::spawn(fetch_chunk(b.clone(), step))).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(tokio::spawn(async move { Err(e) })).await;
+                        break;
+                    }
+                }
+                n = (n * 2).min(BLAME_CHUNK);
+            }
+        });
+        Prefetch { rx, producer }
+    }
+
+    /// The next batch, or None when the history is exhausted.
+    async fn next(&mut self) -> OpResult<Option<BlameChunk>> {
+        match self.rx.recv().await {
+            None => Ok(None),
+            Some(handle) => handle.await.map_err(StoreError::backend)?.map(Some),
+        }
+    }
+}
+
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        self.producer.abort();
+    }
 }
 
 fn attribute(owners: Vec<ObjectId>, lines: Vec<&str>) -> Vec<BlameLine> {
@@ -555,6 +859,110 @@ pub async fn blame_as(
     blame(b, rev, path).await
 }
 
+/// The body of an object as its own `Bytes` handle (no copy).
+fn body_bytes(o: &ant_core::EncodedObject) -> Bytes {
+    let all = o.as_bytes();
+    all.slice(all.len() - o.body().len()..)
+}
+
+/// [`diff_texts`] for each `(older, newer)` pair, spread over blocking
+/// threads; `None` where either side is not UTF-8.
+async fn diff_pairs(pairs: Vec<(Bytes, Bytes)>) -> OpResult<Vec<Option<Vec<Option<usize>>>>> {
+    const MIN_PER_TASK: usize = 4;
+    let diff = |(old, new): &(Bytes, Bytes)| {
+        let (old, new) = (std::str::from_utf8(old).ok()?, std::str::from_utf8(new).ok()?);
+        Some(diff_texts(old, new))
+    };
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    let per_task = pairs.len().div_ceil(workers).max(MIN_PER_TASK);
+    if pairs.len() <= per_task {
+        return Ok(pairs.iter().map(diff).collect());
+    }
+    let mut pairs = pairs;
+    let mut tasks = Vec::new();
+    while !pairs.is_empty() {
+        let rest = pairs.split_off(per_task.min(pairs.len()));
+        let mine = std::mem::replace(&mut pairs, rest);
+        tasks.push(tokio::task::spawn_blocking(move || mine.iter().map(diff).collect::<Vec<_>>()));
+    }
+    let mut out = Vec::new();
+    for t in tasks {
+        out.extend(t.await.map_err(StoreError::backend)?);
+    }
+    Ok(out)
+}
+
+/// The uncached blame walk: the commit owning each line of `text`, the file
+/// at `rev` (= commit `id`).
+async fn blame_owners(
+    b: &Backend,
+    rev: &str,
+    id: ObjectId,
+    path: &RepoPath,
+    head: Bytes,
+) -> OpResult<Vec<ObjectId>> {
+    let lines = std::str::from_utf8(&head).map_or(0, |t| t.lines().count());
+    let history = match indexed_ref_for(b, rev, id).await? {
+        Some(r) => {
+            let g =
+                b.meta.get_commits(&[id]).await?.pop().flatten().map_or(u64::MAX, |n| n.generation);
+            let hits = b.meta.query_history(&r, path, g, usize::MAX).await?;
+            FileHistory::Indexed(hits.into_iter().map(|(_, id)| id).collect())
+        }
+        None => FileHistory::Scan { next: Some(id), buf: VecDeque::new() },
+    };
+    let mut chunks = Prefetch::start(b.clone(), path.clone(), history);
+
+    // `cur[k]` = line index, in the version being walked, of final line k.
+    let mut cur: Vec<Option<usize>> = (0..lines).map(Some).collect();
+    let mut owners: Vec<Option<ObjectId>> = vec![None; lines];
+    let mut remaining = lines;
+    // The version being walked: the file at `rev`, then each older blob
+    // (empty before the file's creation).
+    let mut walked = head;
+    let mut oldest = id;
+    'walk: while remaining > 0 {
+        let Some(chunk) = chunks.next().await? else { break };
+        // The (older, newer) text pairs of this batch. Their diffs do not
+        // depend on the attribution so far: compute them in parallel, then
+        // apply them in order (stopping where the sequential walk stops).
+        let mut steps = Vec::with_capacity(chunk.step.len());
+        let mut pairs = Vec::with_capacity(chunk.step.len());
+        for (commit, change) in chunk.step {
+            if change.kind == ChangeKind::Deleted {
+                continue;
+            }
+            let older =
+                change.old.map_or_else(Bytes::new, |(_, bid)| body_bytes(&chunk.blobs[&bid]));
+            pairs.push((older.clone(), std::mem::replace(&mut walked, older)));
+            steps.push((commit, change.old.is_none()));
+        }
+        let maps = diff_pairs(pairs).await?;
+        for ((commit, created), map) in steps.into_iter().zip(maps) {
+            let map =
+                map.ok_or_else(|| OpError::InvalidArgument(format!("{path} is not valid UTF-8")))?;
+            oldest = commit;
+            for (slot, owner) in cur.iter_mut().zip(owners.iter_mut()) {
+                let Some(j) = *slot else { continue };
+                match map.get(j).copied().flatten() {
+                    Some(o) => *slot = Some(o),
+                    None => {
+                        *owner = Some(commit);
+                        *slot = None;
+                        remaining -= 1;
+                    }
+                }
+            }
+            if created || remaining == 0 {
+                break 'walk;
+            }
+        }
+    }
+    // History ran out (e.g. pruned): attribute leftovers to the oldest commit seen.
+    let owners: Vec<ObjectId> = owners.into_iter().map(|o| o.unwrap_or(oldest)).collect();
+    Ok(owners)
+}
+
 pub async fn blame(b: &Backend, rev: &str, path: &RepoPath) -> OpResult<Vec<BlameLine>> {
     let id = query::resolve_rev(b, rev).await?;
     let info = query::read_path(b, rev, path, true)
@@ -574,68 +982,7 @@ pub async fn blame(b: &Backend, rev: &str, path: &RepoPath) -> OpResult<Vec<Blam
         return Ok(attribute(owners, lines));
     }
 
-    let mut history = match indexed_ref_for(b, rev, id).await? {
-        Some(r) => {
-            let g =
-                b.meta.get_commits(&[id]).await?.pop().flatten().map_or(u64::MAX, |n| n.generation);
-            let hits = b.meta.query_history(&r, path, g, usize::MAX).await?;
-            FileHistory::Indexed(hits.into_iter().map(|(_, id)| id).collect())
-        }
-        None => FileHistory::Scan { next: Some(id), buf: VecDeque::new() },
-    };
-
-    // `cur[k]` = line index, in the version being walked, of final line k.
-    let mut cur: Vec<Option<usize>> = (0..lines.len()).map(Some).collect();
-    let mut owners: Vec<Option<ObjectId>> = vec![None; lines.len()];
-    let mut remaining = lines.len();
-    let mut cur_text = text.clone();
-    let mut oldest = id;
-    'walk: while remaining > 0 {
-        let step = history.next(b, path, BLAME_CHUNK).await?;
-        if step.is_empty() {
-            break;
-        }
-        let mut blob_ids: Vec<ObjectId> =
-            step.iter().filter_map(|(_, c)| c.old.map(|(_, id)| id)).collect();
-        blob_ids.sort_unstable();
-        blob_ids.dedup();
-        let fetched = b.objects.get_many(&blob_ids).await?;
-        let mut old_blobs: HashMap<ObjectId, ant_core::EncodedObject> = HashMap::new();
-        for (bid, o) in blob_ids.iter().zip(fetched) {
-            old_blobs.insert(*bid, o.ok_or_else(|| OpError::not_found_object(*bid))?);
-        }
-        for (commit, change) in step {
-            if change.kind == ChangeKind::Deleted {
-                continue;
-            }
-            oldest = commit;
-            let old_text = match change.old {
-                Some((_, bid)) => utf8(old_blobs[&bid].body(), path)?,
-                None => String::new(),
-            };
-            let map = line_map(
-                &old_text.lines().collect::<Vec<_>>(),
-                &cur_text.lines().collect::<Vec<_>>(),
-            );
-            for (slot, owner) in cur.iter_mut().zip(owners.iter_mut()) {
-                let Some(j) = *slot else { continue };
-                match map.get(j).copied().flatten() {
-                    Some(o) => *slot = Some(o),
-                    None => {
-                        *owner = Some(commit);
-                        *slot = None;
-                        remaining -= 1;
-                    }
-                }
-            }
-            cur_text = old_text;
-            if change.old.is_none() || remaining == 0 {
-                break 'walk;
-            }
-        }
-    }
-    // History ran out (e.g. pruned): attribute leftovers to the oldest commit seen.
-    let owners: Vec<ObjectId> = owners.into_iter().map(|o| o.unwrap_or(oldest)).collect();
+    let owners = blame_owners(b, rev, id, path, content).await?;
     b.meta.put_derived(BLAME_KIND, &key, encode_blame(&owners)).await?;
     Ok(attribute(owners, lines))
 }
@@ -645,7 +992,7 @@ mod tests {
     use super::*;
     use crate::ops::land::{LandOutcome, land};
     use crate::ops::query;
-    use crate::ops::test_support::{commit, delete, write};
+    use crate::ops::test_support::{commit, delete, read, write};
     use ant_store::HistoryRow;
 
     async fn landed(
@@ -889,6 +1236,364 @@ mod tests {
         assert_eq!(m(&["a", "b", "c"], &["a", "x", "c"]), vec![Some(0), None, Some(2)]);
         assert_eq!(m(&["a", "b", "c", "d"], &["b", "a", "d"]), vec![Some(1), None, Some(3)]);
         assert_eq!(m(&["a", "a"], &["a", "a", "a"]), vec![Some(0), Some(1), None]);
+    }
+
+    /// Line ids for a sequence of small-alphabet symbols.
+    fn ids_and_strs(v: &[u8]) -> (Vec<u32>, Vec<String>) {
+        (v.iter().map(|&x| u32::from(x)).collect(), v.iter().map(|x| format!("l{x}")).collect())
+    }
+
+    fn assert_maps_agree(o: &[u8], n: &[u8]) {
+        let ((oi, os), (ni, ns)) = (ids_and_strs(o), ids_and_strs(n));
+        let (or, nr): (Vec<&str>, Vec<&str>) =
+            (os.iter().map(String::as_str).collect(), ns.iter().map(String::as_str).collect());
+        assert_eq!(line_map_ids(&oi, &ni), line_map(&or, &nr), "old={o:?} new={n:?}");
+    }
+
+    #[test]
+    fn line_map_ids_matches_reference_on_edge_shapes() {
+        assert_maps_agree(&[], &[]);
+        assert_maps_agree(&[1], &[]);
+        assert_maps_agree(&[], &[1]);
+        assert_maps_agree(&[1, 2, 3], &[3, 2, 1]);
+        assert_maps_agree(&[1, 1, 1, 1], &[1, 1]);
+        // Rows on either side, widths around the 64-bit word boundary.
+        for w in [1usize, 63, 64, 65, 127, 128, 129, 200] {
+            let a: Vec<u8> = (0..w).map(|i| (i * 7 % 5) as u8).collect();
+            let b: Vec<u8> = (0..w + 3).map(|i| (i * 3 % 4) as u8).collect();
+            assert_maps_agree(&a, &b);
+            assert_maps_agree(&b, &a);
+            assert_maps_agree(&a[..w / 2], &b);
+            assert_maps_agree(&b, &a[..w / 2]);
+        }
+    }
+
+    /// Around the LCS size cap: just under it the table is used, just over it
+    /// the middle counts as replaced; both as in the reference.
+    #[test]
+    fn line_map_ids_matches_reference_at_the_cell_cap() {
+        for w in [1990usize, 2010] {
+            let a: Vec<u8> = (0..w).map(|i| (i * 31 % 7) as u8).collect();
+            let mut b: Vec<u8> = a.iter().rev().copied().collect();
+            b[0] = 9;
+            b.push(8);
+            assert_maps_agree(&a, &b);
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn line_map_ids_matches_reference(
+            o in proptest::collection::vec(0u8..6, 0..300),
+            n in proptest::collection::vec(0u8..6, 0..300),
+        ) {
+            assert_maps_agree(&o, &n);
+        }
+
+        #[test]
+        fn line_map_ids_matches_reference_on_edits(
+            base in proptest::collection::vec(0u8..40, 0..250),
+            edits in proptest::collection::vec((0usize..250, 0usize..6, 0u8..40), 0..8),
+        ) {
+            let mut new = base.clone();
+            for (at, del, ins) in edits {
+                let at = at.min(new.len());
+                let end = (at + del).min(new.len());
+                new.splice(at..end, [ins]);
+            }
+            assert_maps_agree(&base, &new);
+        }
+    }
+
+    /// Text from `(symbol, terminator)` pairs; terminators mix LF, CRLF, a bare
+    /// CR and nothing (only meaningful on the last line).
+    fn render_text(v: &[(u8, u8)]) -> String {
+        let mut t = String::new();
+        for (sym, term) in v {
+            t.push_str(&format!("line{sym}"));
+            t.push_str(["\n", "\r\n", "\r", "", "\n\n"][usize::from(*term) % 5]);
+        }
+        t
+    }
+
+    fn assert_texts_agree(o: &str, n: &str) {
+        let (ol, nl): (Vec<&str>, Vec<&str>) = (o.lines().collect(), n.lines().collect());
+        assert_eq!(diff_texts(o, n), line_map(&ol, &nl), "old={o:?} new={n:?}");
+    }
+
+    #[test]
+    fn diff_texts_matches_reference_on_edge_shapes() {
+        for (o, n) in [
+            ("", ""),
+            ("a", "a"),
+            ("a\n", "a"),
+            ("a", "a\n"),
+            ("a\r\n", "a\n"),
+            ("a\n", "a\r\n"),
+            ("a\nb", "a\nbb"),
+            ("b\n", "xb\n"),
+            ("xb\n", "b\n"),
+            ("a\nb\n", "a\nx\nb\n"),
+            ("a\n\n\nb\n", "a\n\nb\n"),
+            ("a\r", "a\r\n"),
+            ("\n", "\n\n"),
+            ("same\nx\nsame\n", "same\ny\nsame\n"),
+            ("ü\nb\n", "ü\nc\n"),
+        ] {
+            assert_texts_agree(o, n);
+            assert_texts_agree(n, o);
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn diff_texts_matches_reference(
+            o in proptest::collection::vec((0u8..5, 0u8..5), 0..40),
+            n in proptest::collection::vec((0u8..5, 0u8..5), 0..40),
+        ) {
+            assert_texts_agree(&render_text(&o), &render_text(&n));
+        }
+
+        #[test]
+        fn diff_texts_matches_reference_on_edits(
+            base in proptest::collection::vec((0u8..30, 0u8..2), 0..120),
+            edits in proptest::collection::vec((0usize..120, 0usize..5, 0u8..30, 0u8..5), 0..6),
+        ) {
+            let mut new = base.clone();
+            for (at, del, sym, term) in edits {
+                let at = at.min(new.len());
+                let end = (at + del).min(new.len());
+                new.splice(at..end, [(sym, term)]);
+            }
+            assert_texts_agree(&render_text(&base), &render_text(&new));
+        }
+    }
+
+    /// The pre-optimisation blame (batched blob reads, `line_map` over
+    /// strings), minus the derived-data cache. The oracle for the optimised walk.
+    async fn blame_oracle(b: &Backend, rev: &str, path: &RepoPath) -> OpResult<Vec<BlameLine>> {
+        let id = query::resolve_rev(b, rev).await?;
+        let info = query::read_path(b, rev, path, true).await?.unwrap();
+        let text = utf8(&info.content.unwrap(), path)?;
+        let lines: Vec<&str> = text.lines().collect();
+        let mut history = match indexed_ref_for(b, rev, id).await? {
+            Some(r) => {
+                let g = b.meta.get_commits(&[id]).await?.pop().flatten().unwrap().generation;
+                let hits = b.meta.query_history(&r, path, g, usize::MAX).await?;
+                FileHistory::Indexed(hits.into_iter().map(|(_, id)| id).collect())
+            }
+            None => FileHistory::Scan { next: Some(id), buf: VecDeque::new() },
+        };
+        let mut cur: Vec<Option<usize>> = (0..lines.len()).map(Some).collect();
+        let mut owners: Vec<Option<ObjectId>> = vec![None; lines.len()];
+        let mut remaining = lines.len();
+        let mut cur_text = text.clone();
+        let mut oldest = id;
+        'walk: while remaining > 0 {
+            let step = history.next(b, path, 64).await?;
+            if step.is_empty() {
+                break;
+            }
+            let mut blob_ids: Vec<ObjectId> =
+                step.iter().filter_map(|(_, c)| c.old.map(|(_, id)| id)).collect();
+            blob_ids.sort_unstable();
+            blob_ids.dedup();
+            let fetched = b.objects.get_many(&blob_ids).await?;
+            let old_blobs: HashMap<_, _> = blob_ids.iter().copied().zip(fetched).collect();
+            for (commit, change) in step {
+                if change.kind == ChangeKind::Deleted {
+                    continue;
+                }
+                oldest = commit;
+                let old_text = match change.old {
+                    Some((_, bid)) => utf8(old_blobs[&bid].as_ref().unwrap().body(), path)?,
+                    None => String::new(),
+                };
+                let map = line_map(
+                    &old_text.lines().collect::<Vec<_>>(),
+                    &cur_text.lines().collect::<Vec<_>>(),
+                );
+                for (slot, owner) in cur.iter_mut().zip(owners.iter_mut()) {
+                    let Some(j) = *slot else { continue };
+                    match map.get(j).copied().flatten() {
+                        Some(o) => *slot = Some(o),
+                        None => {
+                            *owner = Some(commit);
+                            *slot = None;
+                            remaining -= 1;
+                        }
+                    }
+                }
+                cur_text = old_text;
+                if change.old.is_none() || remaining == 0 {
+                    break 'walk;
+                }
+            }
+        }
+        Ok(attribute(owners.into_iter().map(|o| o.unwrap_or(oldest)).collect(), lines))
+    }
+
+    /// Deterministic pseudo-random histories (edits, deletions and
+    /// re-additions, CRLF, empty files, absent final newline): the optimised
+    /// blame equals the oracle for every version, indexed and not, cached
+    /// and not.
+    #[tokio::test]
+    async fn blame_equals_oracle_on_random_histories() {
+        for seed in 0..12u64 {
+            let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = move |m: usize| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                (rng % m as u64) as usize
+            };
+            let b = Backend::in_memory();
+            let nl = if seed % 3 == 0 { "\r\n" } else { "\n" };
+            let mut lines: Vec<String> = (0..next(40)).map(|i| format!("init {i}")).collect();
+            let render = |l: &[String]| {
+                let mut t = l.join(nl);
+                if !l.is_empty() && !l.len().is_multiple_of(5) {
+                    t.push_str(nl);
+                }
+                t
+            };
+            let c0 =
+                commit(&b, None, vec![write("f", &render(&lines)), write("o", "x")]).await.unwrap();
+            land(&b, "main", c0).await.unwrap();
+            let mut tip = c0;
+            let mut exists = true;
+            let mut tips = vec![tip];
+            for step in 0..60 {
+                let op = if !exists {
+                    exists = true;
+                    lines = (0..next(30)).map(|i| format!("again {step} {i}")).collect();
+                    write("f", &render(&lines))
+                } else if next(15) == 0 {
+                    exists = false;
+                    delete("f")
+                } else {
+                    for _ in 0..1 + next(4) {
+                        let at = next(lines.len() + 1);
+                        match next(3) {
+                            0 => lines.insert(at, format!("new {step} {}", next(5))),
+                            1 if at < lines.len() => {
+                                lines.remove(at);
+                            }
+                            _ if at < lines.len() => lines[at] = format!("mod {step} {}", next(3)),
+                            _ => {}
+                        }
+                    }
+                    if next(8) == 0 {
+                        lines.reverse();
+                    }
+                    write("f", &render(&lines))
+                };
+                tip = landed(&b, tip, vec![op, write("o", &step.to_string())]).await;
+                tips.push(tip);
+            }
+            if seed % 2 == 0 {
+                catch_up(&b, "main").await.unwrap();
+            }
+            let path = RepoPath::new("f").unwrap();
+            for t in tips {
+                let rev = t.to_string();
+                if query::read_path(&b, &rev, &path, true).await.unwrap().is_none() {
+                    continue;
+                }
+                let want = blame_oracle(&b, &rev, &path).await.unwrap();
+                assert_eq!(blame(&b, &rev, &path).await.unwrap(), want, "seed {seed} {rev}");
+                assert_eq!(blame(&b, &rev, &path).await.unwrap(), want, "cached, seed {seed}");
+            }
+        }
+    }
+
+    /// Micro-benchmark: first blame of a long-lived 1700-line file with 1200
+    /// versions, optimised vs the reference walk. In memory by default; with
+    /// `ANT_BLAME_BENCH_SCHEMA=<schema>` on Postgres (localhost:54329) and S3
+    /// (localhost:9009, bucket `ant-blame`) like a deployment. Run with
+    /// `cargo test -p ant-server --release --lib blame_bench -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "benchmark"]
+    async fn blame_bench() {
+        use std::time::Instant;
+        let b = match std::env::var("ANT_BLAME_BENCH_SCHEMA") {
+            Err(_) => Backend::in_memory(),
+            Ok(schema) => {
+                #[derive(clap::Parser)]
+                struct Args {
+                    #[command(flatten)]
+                    store: crate::config::StoreArgs,
+                }
+                let args = <Args as clap::Parser>::parse_from([
+                    "bench",
+                    "--pg-url=postgres://ant:ant@localhost:54329/ant",
+                    &format!("--pg-schema={schema}"),
+                    "--s3-endpoint=http://localhost:9009",
+                    "--s3-bucket=ant-blame",
+                    "--s3-access-key=x",
+                    "--s3-secret-key=x",
+                ]);
+                args.store.backend().await.unwrap()
+            }
+        };
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |m: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % m as u64) as usize
+        };
+        let mut lines: Vec<String> = (0..1700).map(|i| format!("    int v{i} = f({i});")).collect();
+        let c0 = commit(&b, None, vec![write("f", &(lines.join("\n") + "\n"))]).await.unwrap();
+        land(&b, "main", c0).await.unwrap();
+        let mut tip = c0;
+        for step in 0..if cfg!(debug_assertions) { 150 } else { 1200 } {
+            let k = if step % 10 == 0 { 2 } else { 1 + next(3) };
+            for e in 0..k {
+                // every tenth commit edits both ends of the file
+                let at = if step % 10 == 0 { [3, lines.len() - 3][e] } else { next(lines.len()) };
+                match next(3) {
+                    0 => lines.insert(at, format!("    new {step} {e}")),
+                    1 => {
+                        lines.remove(at);
+                    }
+                    _ => lines[at] = format!("    mod {step} {e}"),
+                }
+            }
+            tip = landed(&b, tip, vec![write("f", &(lines.join("\n") + "\n"))]).await;
+        }
+        catch_up(&b, "main").await.unwrap();
+        let path = RepoPath::new("f").unwrap();
+        let rev = tip.to_string();
+        let (mut reference, mut first, mut cached) = (vec![], vec![], vec![]);
+        let mut want = None;
+        blame(&b, &rev, &path).await.unwrap(); // populates the cache
+        for _ in 0..5 {
+            let t = Instant::now();
+            let w = blame_oracle(&b, &rev, &path).await.unwrap();
+            reference.push(t.elapsed());
+            let t = Instant::now();
+            let text = utf8(&read(&b, tip, "f").await.unwrap().into_bytes(), &path).unwrap();
+            let got = blame_owners(&b, &rev, tip, &path, Bytes::from(text)).await.unwrap();
+            first.push(t.elapsed());
+            assert_eq!(got, w.iter().map(|l| l.commit).collect::<Vec<_>>());
+            want = Some(w);
+            let t = Instant::now();
+            blame(&b, &rev, &path).await.unwrap();
+            cached.push(t.elapsed());
+        }
+        assert!(want.is_some());
+        for (name, v) in
+            [("reference", &mut reference), ("first", &mut first), ("cached", &mut cached)]
+        {
+            v.sort();
+            println!(
+                "blame {name}: median {:?} (min {:?}, max {:?})",
+                v[v.len() / 2],
+                v[0],
+                v[v.len() - 1]
+            );
+        }
     }
 
     #[tokio::test]
