@@ -126,7 +126,8 @@ impl RefStore for MemoryRefStore {
     async fn lock_ref(&self, name: &str) -> Result<RefLock> {
         validate_ref_name(name)?;
         let mutex = self.locks.lock().entry(name.to_string()).or_default().clone();
-        let mut lock = MemoryRefLock { locks: self.locks.clone(), name: name.to_string(), guard: None };
+        let mut lock =
+            MemoryRefLock { locks: self.locks.clone(), name: name.to_string(), guard: None };
         // `lock` owns the entry from here, so a cancelled wait still cleans up.
         lock.guard = Some(mutex.lock_owned().await);
         Ok(RefLock::held(lock))

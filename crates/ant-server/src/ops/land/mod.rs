@@ -45,8 +45,8 @@ use ant_store::Backend;
 
 use super::{OpError, OpResult};
 use crate::acl::Access;
-pub(crate) use queue::queue_stats;
 use queue::enqueue_checked;
+pub(crate) use queue::queue_stats;
 use replay::BatchState;
 use verify::{Verified, verify_land};
 

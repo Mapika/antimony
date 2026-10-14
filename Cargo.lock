@@ -213,6 +213,7 @@ dependencies = [
  "diffy",
  "futures",
  "proptest",
+ "rand 0.9.5",
  "reqwest",
  "sqlx",
  "tempfile",
