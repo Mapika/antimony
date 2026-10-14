@@ -21,8 +21,9 @@
 //!   must be linear and grow by exactly the number of successful lands, and
 //!   every agent file must hold its last landed content), a dead replica, an
 //!   error rate above `--max-error-rate` (conflicts are outcomes, not
-//!   errors), an RSS growth trend after `--rss-warmup` (default: the second
-//!   half of the run) above
+//!   errors), an RSS growth trend after `--rss-warmup` (default: once the
+//!   replica's caches first rolled over a generation, and at least the
+//!   second half of the run; before that RSS grows with the caches) above
 //!   `--max-rss-growth-mib-per-hour`, or any operation's window p99 above
 //!   `--max-p99-drift` × its first-window p99 (and above `--p99-floor-ms`).
 //! - Afterwards the schema is dropped and the run's S3 prefix deleted
@@ -112,8 +113,9 @@ pub struct Args {
     /// `INDEX:KEY=VALUE` for one replica; repeatable).
     #[arg(long)]
     pub replica_env: Vec<String>,
-    /// Seconds excluded from the RSS trend (cache warm-up); default: half
-    /// the run.
+    /// Seconds excluded from the RSS trend (cache warm-up); default: until
+    /// the replica's caches first roll over, and at least half the run (just
+    /// half when they never roll over).
     #[arg(long)]
     pub rss_warmup: Option<u64>,
     /// Keep the schema and S3 data afterwards.
@@ -517,6 +519,18 @@ fn print_window(w: &WindowReport) {
     }
 }
 
+/// End of the first window in which replica `i`'s cache weight dropped:
+/// the caches' first generation rollover. Before it RSS grows with the
+/// caches by design (bounded by their budgets), so it is no leak.
+fn rss_warmup(windows: &[WindowReport], i: usize) -> Option<f64> {
+    let weights: Vec<(f64, Option<u64>)> =
+        windows.iter().map(|w| (w.end_s, w.replicas.get(i).and_then(|r| r.cache_bytes))).collect();
+    weights
+        .windows(2)
+        .find(|p| matches!((p[0].1, p[1].1), (Some(a), Some(b)) if b < a))
+        .map(|p| p[1].0)
+}
+
 /// Least-squares slope of `(x, y)` points.
 fn slope(points: &[(f64, f64)]) -> f64 {
     let n = points.len() as f64;
@@ -872,9 +886,15 @@ async fn drive(
             failures.push(format!("replica {i} died"));
         }
     }
-    let warmup = args.rss_warmup.unwrap_or(args.duration / 2) as f64;
     let mut rss_slopes = Vec::new();
     for i in 0..args.replicas {
+        let warmup = match args.rss_warmup {
+            Some(secs) => secs as f64,
+            None => {
+                let half = args.duration as f64 / 2.0;
+                rss_warmup(&windows, i).map_or(half, |rolled| rolled.max(half))
+            }
+        };
         let pts: Vec<(f64, f64)> = windows
             .iter()
             .filter(|w| w.end_s > warmup)
