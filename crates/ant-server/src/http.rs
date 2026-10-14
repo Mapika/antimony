@@ -47,25 +47,14 @@ const CONTENT_TYPE: &str = "application/x-ant-object";
 const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const CACHE_PRIVATE: &str = "private, max-age=31536000, immutable";
 const CACHE_NO_STORE: &str = "no-store";
+/// `WWW-Authenticate` challenge for the object and stats endpoints.
+const BEARER_CHALLENGE: &str = "Bearer realm=\"antimony\"";
 
 /// Serve the HTTP object endpoint plus the read-only git export
-/// (`/repo.git`) on an already-bound listener until it fails.
-pub async fn serve_on(backend: Backend, listener: tokio::net::TcpListener) -> std::io::Result<()> {
-    serve_with_acl(backend, Acl::open(), listener).await
-}
-
-/// [`serve_on`] enforcing `acl` (object endpoint and git export).
-pub async fn serve_with_acl(
-    backend: Backend,
-    acl: Acl,
-    listener: tokio::net::TcpListener,
-) -> std::io::Result<()> {
-    serve_with_metrics(backend, acl, listener, Metrics::new(), true).await
-}
-
-/// [`serve_with_acl`] recording HTTP metrics, request ids and slow-request
-/// logs (`crate::observe`) into `metrics`; `expose_metrics` serves
-/// `GET /metrics` on this listener.
+/// (`/repo.git`) on an already-bound listener until it fails, enforcing
+/// `acl` and recording HTTP metrics, request ids and slow-request logs
+/// (`crate::observe`) into `metrics`; `expose_metrics` serves `GET /metrics`
+/// on this listener.
 pub async fn serve_with_metrics(
     backend: Backend,
     acl: Acl,
@@ -92,14 +81,10 @@ pub async fn serve_metrics(
     axum::serve(listener, app).await
 }
 
-/// Object endpoint plus git export, enforcing `acl`.
-pub fn app_with_acl(backend: Backend, acl: Acl) -> Router {
-    app_with_metrics(backend, acl, Metrics::new(), true)
-}
-
-/// [`app_with_acl`] with the observation layer (metrics, request ids, slow
-/// logs); `expose_metrics` adds `GET /metrics`.
-pub fn app_with_metrics(
+/// Object endpoint plus git export, enforcing `acl`, with the observation
+/// layer (metrics, request ids, slow logs); `expose_metrics` adds
+/// `GET /metrics`.
+fn app_with_metrics(
     backend: Backend,
     acl: Acl,
     metrics: Arc<Metrics>,
@@ -123,15 +108,8 @@ async fn scrape(State(metrics): State<Arc<Metrics>>) -> Response {
     ([(header::CONTENT_TYPE, crate::metrics::CONTENT_TYPE)], body).into_response()
 }
 
-pub fn router(backend: Backend) -> Router {
-    router_with_acl(backend, Acl::open())
-}
-
-/// The object endpoint (`/o/{hex}`, `/healthz`) enforcing `acl`.
-pub fn router_with_acl(backend: Backend, acl: Acl) -> Router {
-    router_with_state(backend, acl, Metrics::new(), true)
-}
-
+/// The object endpoint, health, readiness and stats routes (plus
+/// `/metrics` when `expose_metrics`), without the git export.
 fn router_with_state(
     backend: Backend,
     acl: Acl,
@@ -171,7 +149,7 @@ async fn readyz(State(state): State<HttpState>) -> Response {
 /// only admin principals may read it.
 async fn debug_stats(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     match state.acl.authenticate_header(authorization(&headers)) {
-        Err(e) => return unauthorized("Bearer realm=\"antimony\"", e),
+        Err(e) => return unauthorized(BEARER_CHALLENGE, e),
         Ok(Some(access)) if !access.is_admin() => {
             return (StatusCode::FORBIDDEN, "admin token required").into_response();
         }
@@ -271,7 +249,7 @@ async fn get_object(
 ) -> Response {
     let access = match acl.authenticate_header(authorization(&headers)) {
         Ok(a) => a,
-        Err(e) => return unauthorized("Bearer realm=\"antimony\"", e),
+        Err(e) => return unauthorized(BEARER_CHALLENGE, e),
     };
     let id = match ObjectId::from_str(&hex) {
         Ok(id) => id,
