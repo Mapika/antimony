@@ -109,6 +109,7 @@ dependencies = [
  "aws-sdk-s3",
  "bytes",
  "clap",
+ "libc",
  "rand 0.9.5",
  "reqwest",
  "sqlx",

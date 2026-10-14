@@ -54,6 +54,11 @@ pub struct Args {
     /// Workspace directory (default: `<cache>.ws`).
     #[arg(long)]
     pub workdir: Option<PathBuf>,
+    /// Sleep this long between the cold and the warm checkout, so the cached
+    /// objects are older than the disk cache's recency-touch interval (60 s)
+    /// and the warm read pays the mtime bumps a long-lived cache would.
+    #[arg(long, default_value_t = 0)]
+    pub warm_delay_secs: u64,
     #[arg(long)]
     pub json: Option<PathBuf>,
 }
@@ -213,11 +218,16 @@ pub async fn run(a: Args) -> Result<()> {
         // Cold: no cache, no workspace.
         wipe(&a.cache)?;
         wipe(&work)?;
+        settle("before cold").await;
         let (cold, _ws, _) = materialize(&a, &remote, &work, commit, sparse.clone()).await?;
         let (cache_files, cache_bytes) = dir_size(&a.cache, None);
 
         // Warm: cache kept, fresh workspace directory.
         wipe(&work)?;
+        if a.warm_delay_secs > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(a.warm_delay_secs)).await;
+        }
+        settle("before warm").await;
         let (warm, ws, rt) = materialize(&a, &remote, &work, commit, sparse.clone()).await?;
 
         // status on the unchanged workspace (twice: first may touch more state).
@@ -249,13 +259,20 @@ pub async fn run(a: Args) -> Result<()> {
 
     let n = iters.len() as f64;
     let mean = |f: &dyn Fn(&Iter) -> f64| iters.iter().map(f).sum::<f64>() / n;
+    let series = |f: &dyn Fn(&Iter) -> f64| iters.iter().map(f).collect::<Vec<f64>>();
+    let (cold_s, warm_s) = (series(&|i| i.cold.secs), series(&|i| i.warm.secs));
+    let (status_s, status2_s) = (series(&|i| i.status1), series(&|i| i.status2));
     println!(
-        "mean over {} iteration(s): cold {:.3}s, warm {:.3}s, status {:.3}s / {:.3}s; resolve_rev {resolve_ms:.1}ms",
+        "over {} iteration(s), median (min / mean): cold {:.3}s ({:.3} / {:.3}), warm {:.3}s ({:.3} / {:.3}), status {:.3}s / {:.3}s; resolve_rev {resolve_ms:.1}ms",
         iters.len(),
+        median(&cold_s),
+        min(&cold_s),
         mean(&|i| i.cold.secs),
+        median(&warm_s),
+        min(&warm_s),
         mean(&|i| i.warm.secs),
-        mean(&|i| i.status1),
-        mean(&|i| i.status2)
+        median(&status_s),
+        median(&status2_s)
     );
 
     let json = J::obj()
@@ -267,6 +284,19 @@ pub async fn run(a: Args) -> Result<()> {
         .with("sparse", J::Arr(a.sparse.iter().map(|s| J::from(s.as_str())).collect()))
         .with("resolve_rev_ms", resolve_ms)
         .with("iterations", J::Arr(iters.iter().map(iter_json).collect()))
+        // Headline numbers are medians: one outlier iteration (page-cache or
+        // writeback noise) must not decide a target. Per-iteration values are
+        // in `cold_s`/`warm_s`/`status_s` and in `iterations`.
+        .with("median_cold_s", median(&cold_s))
+        .with("median_warm_s", median(&warm_s))
+        .with("median_status_s", median(&status_s))
+        .with("min_cold_s", min(&cold_s))
+        .with("min_warm_s", min(&warm_s))
+        .with("min_status_s", min(&status_s))
+        .with("cold_s", floats(&cold_s))
+        .with("warm_s", floats(&warm_s))
+        .with("status_s", floats(&status_s))
+        .with("status_second_s", floats(&status2_s))
         .with("mean_cold_s", mean(&|i| i.cold.secs))
         .with("mean_warm_s", mean(&|i| i.warm.secs))
         .with("mean_status_s", mean(&|i| i.status1));
@@ -278,5 +308,36 @@ fn wipe(path: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+fn median(v: &[f64]) -> f64 {
+    let mut s = v.to_vec();
+    s.sort_by(f64::total_cmp);
+    match s.len() {
+        0 => f64::NAN,
+        n if n % 2 == 1 => s[n / 2],
+        n => (s[n / 2 - 1] + s[n / 2]) / 2.0,
+    }
+}
+
+fn min(v: &[f64]) -> f64 {
+    v.iter().copied().fold(f64::INFINITY, f64::min)
+}
+
+fn floats(v: &[f64]) -> J {
+    J::Arr(v.iter().map(|x| J::from(*x)).collect())
+}
+
+/// Flush dirty pages (the previous phase's writes and the wipe's deletions)
+/// before the next timed phase, so deferred writeback of work done outside the
+/// timing is not charged to it. A cold phase right after a heavy import was
+/// measured at 5x its settled time otherwise. The wait is printed, not timed.
+async fn settle(what: &str) {
+    let t = Instant::now();
+    let _ = tokio::task::spawn_blocking(|| unsafe { libc::sync() }).await;
+    let s = t.elapsed().as_secs_f64();
+    if s > 0.5 {
+        println!("  (sync {what}: {s:.1}s)");
     }
 }
