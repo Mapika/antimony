@@ -13,9 +13,18 @@ struct Args {
     serve: ServeArgs,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run(Args::parse().serve).await {
+fn main() -> ExitCode {
+    let args = Args::parse().serve;
+    // Before the runtime exists: threads keep the arena they start with.
+    ant_server::serve::configure_malloc(args.malloc_arenas);
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: starting runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match rt.block_on(run(args)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e:#}");

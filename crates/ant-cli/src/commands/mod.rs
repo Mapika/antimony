@@ -15,7 +15,7 @@ mod ws;
 
 pub async fn run(cli: Cli) -> Result<Outcome> {
     let cli = match cli.command {
-        Command::Serve(a) => return ant_server::serve::run(a).await.map(|()| Outcome::empty()),
+        Command::Serve(a) => return ant_server::serve::run(*a).await.map(|()| Outcome::empty()),
         Command::Completions { shell } => {
             let mut out = Vec::new();
             clap_complete::generate(shell, &mut crate::args::command(), "ant", &mut out);

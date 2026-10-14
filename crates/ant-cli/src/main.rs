@@ -253,6 +253,10 @@ fn static_hint(e: &anyhow::Error) -> Option<&'static str> {
 
 fn main() -> ExitCode {
     let cli = args::parse();
+    if let args::Command::Serve(serve) = &cli.command {
+        // Before the runtime exists: threads keep the arena they start with.
+        ant_server::serve::configure_malloc(serve.malloc_arenas);
+    }
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {

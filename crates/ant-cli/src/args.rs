@@ -181,7 +181,7 @@ pub enum Command {
         mountpoint: PathBuf,
     },
     /// Run the antimony server (gRPC + HTTP object endpoint).
-    Serve(ant_server::serve::ServeArgs),
+    Serve(Box<ant_server::serve::ServeArgs>),
     /// Print a shell completion script.
     Completions {
         /// Target shell.
