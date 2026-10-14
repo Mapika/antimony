@@ -11,6 +11,7 @@
 //! Output contract (stdout, one record per line, no decoration). Ids are
 //! 64-char lowercase hex. Errors go to stderr as `error: <message>` with exit
 //! code 1, except where stated.
+//! A failure with an obvious remedy adds a `hint: <text>` line after it.
 //!
 //!   ant import <git-dir> [--git-ref refs/heads/main] [--ref main] <store flags>
 //!       Store flags are exactly ant-server's (`--memory` | `--pg-url` +
@@ -40,6 +41,7 @@
 //!       Landed: stdout `landed <new-tip-id>` (+ ` rebased` if rebased), then
 //!       resets the workspace to the new tip. Conflict: stdout `conflict`
 //!       followed by one path per line, exit code 2.
+//!       stderr then carries a `hint: ...` line on how to proceed.
 //!   ant mount <rev> <mountpoint>   read-only FUSE view, foreground until SIGINT/SIGTERM
 //!   ant admin reindex-acl <rev> --policy <file> [--full] [--history] <store flags>
 //!       Zone-tag objects for access control straight in the stores (after
@@ -72,11 +74,31 @@ use clap::Parser;
 
 /// A one-line hint for failures with an obvious remedy.
 fn hint_for(e: &anyhow::Error) -> Option<&'static str> {
+    use tonic::Code;
+    if let Some(rpc) = e.downcast_ref::<ctx::RpcError>() {
+        return match rpc.code {
+            Code::Unauthenticated => Some(
+                "set ANT_TOKEN (or --token) to a token whose sha256 is listed in the server's policy",
+            ),
+            Code::PermissionDenied => {
+                Some("your token's principal lacks access to this path or ref; check the policy")
+            }
+            Code::NotFound if rpc.message.starts_with("ref ") => {
+                Some("list the existing refs with `ant ref list`")
+            }
+            Code::Unavailable => Some("is `ant serve` running? set ANT_SERVER (or --server)"),
+            _ => None,
+        };
+    }
     let first = e.to_string();
     if first.starts_with("connecting to ") {
         Some("is `ant serve` running? set ANT_SERVER (or --server) to its gRPC url")
     } else if first.contains("HOME is not set") {
         Some("pass --cache <dir> or set ANT_CACHE")
+    } else if first.starts_with("ref ") && first.ends_with(" not found") {
+        Some("list the existing refs with `ant ref list`")
+    } else if first.starts_with("not inside an ant workspace") {
+        Some("create one with `ant ws new <dir>`, or point at one with -C <dir>")
     } else {
         None
     }
@@ -113,4 +135,30 @@ fn main() -> ExitCode {
     // Drop the runtime without waiting on lingering background tasks.
     rt.shutdown_background();
     ExitCode::from(code as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rpc(code: tonic::Code, message: &str) -> anyhow::Error {
+        anyhow::Error::new(ctx::RpcError { code, message: message.into() })
+    }
+
+    #[test]
+    fn hints_by_error_kind() {
+        let h = |e: anyhow::Error| hint_for(&e).unwrap_or("");
+        assert!(h(rpc(tonic::Code::Unauthenticated, "missing bearer token")).contains("ANT_TOKEN"));
+        assert!(h(rpc(tonic::Code::PermissionDenied, "nope")).contains("policy"));
+        assert!(h(rpc(tonic::Code::NotFound, "ref x")).contains("ant ref list"));
+        assert!(hint_for(&rpc(tonic::Code::NotFound, "path y")).is_none());
+        assert!(h(anyhow::anyhow!("ref x not found")).contains("ant ref list"));
+        assert!(h(anyhow::anyhow!("not inside an ant workspace (no .ant)")).contains("ws new"));
+        assert!(hint_for(&anyhow::anyhow!("something else")).is_none());
+    }
+
+    #[test]
+    fn rpc_error_displays_bare_message() {
+        assert_eq!(rpc(tonic::Code::NotFound, "ref x").to_string(), "ref x");
+    }
 }

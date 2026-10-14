@@ -55,10 +55,14 @@ pub async fn set(
         .rpc()?
         .into_inner();
     if !r.updated {
+        let exists = r.actual.is_some();
         let actual = match r.actual {
             Some(a) => id_from(&a)?.to_string(),
             None => "(missing)".into(),
         };
+        if create && exists {
+            bail!("ref {name} already exists (at {actual})");
+        }
         bail!("ref {name} changed concurrently; actual value is {actual}");
     }
     Ok(Outcome::ok(format!("{}\n", id_from(&new)?)))

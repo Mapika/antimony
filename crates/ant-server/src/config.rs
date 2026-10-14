@@ -38,18 +38,23 @@ pub struct StoreArgs {
     #[arg(long, env = "ANT_S3_ENDPOINT")]
     s3_endpoint: Option<String>,
 
+    /// S3 bucket for large objects.
     #[arg(long, env = "ANT_S3_BUCKET")]
     s3_bucket: Option<String>,
 
+    /// Key prefix inside the bucket.
     #[arg(long, env = "ANT_S3_PREFIX", default_value = "")]
     s3_prefix: String,
 
+    /// S3 access key id.
     #[arg(long, env = "ANT_S3_ACCESS_KEY")]
     s3_access_key: Option<String>,
 
+    /// S3 secret access key.
     #[arg(long, env = "ANT_S3_SECRET_KEY")]
     s3_secret_key: Option<String>,
 
+    /// S3 region.
     #[arg(long, env = "ANT_S3_REGION", default_value = "us-east-1")]
     s3_region: String,
 

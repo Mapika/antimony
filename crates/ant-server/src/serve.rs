@@ -74,7 +74,8 @@ pub fn init_logging(format: Option<LogFormat>) {
     } else {
         LogFormat::Json
     });
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn"));
     let builder = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr);
     let _ = match format {
         LogFormat::Text => builder.try_init(),

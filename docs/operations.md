@@ -21,7 +21,9 @@ ant serve \
 ```
 
 Every flag has an `ANT_*` environment variable (`ANT_PG_URL`, `ANT_POLICY`, …;
-see `ant serve --help`). The schema and tables are created on first start.
+see `ant serve --help`). The schema, tables and S3 bucket are created on first
+start. For a copy-paste walk-through of a whole session, see the README
+quickstart.
 Without `--policy` the server runs in **open mode** (no authentication) and
 logs a warning; never expose an open-mode server.
 
@@ -60,7 +62,7 @@ to 0, `ant_pg_pool_in_use` near `ant_pg_pool_max`, and p99
 
 **Logs.** `--log-format json|text` (`ANT_LOG_FORMAT`; default `text` on a
 terminal, `json` otherwise) writes to stderr; the level comes from `RUST_LOG`
-(default `info`). In JSON each line carries its enclosing spans, so every log
+(default `info,sqlx=warn`; sqlx's per-start schema notices are muted). In JSON each line carries its enclosing spans, so every log
 line of a request has the request's `request_id`.
 
 **Request ids.** Every gRPC and HTTP request has an id: an incoming
