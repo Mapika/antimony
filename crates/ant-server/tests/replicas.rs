@@ -17,12 +17,13 @@ use ant_server::ops::changeset::{ChangesetRequest, FileOp, WriteContent, create_
 use ant_server::ops::land::{LandOutcome, land};
 use ant_store::memory::{MemoryMetaStore, MemoryObjectStore, MemoryRefStore};
 use ant_store::postgres::{PgOptions, PgStore};
-use ant_store::{Backend, CasOutcome, ObjectStoreExt, RefLock, RefStore};
+use ant_store::{Backend, CasOutcome, ObjectStoreExt, RefLock, RefLockRelease, RefStore};
 use async_trait::async_trait;
 use bytes::Bytes;
 use common::*;
 
-/// Forwards to a shared ref store (lock included) and counts CAS mismatches.
+/// Forwards to a shared ref store (lock included) and counts CAS and publish
+/// mismatches.
 struct CountingRefs {
     inner: Arc<dyn RefStore>,
     mismatches: Arc<AtomicUsize>,
@@ -52,7 +53,43 @@ impl RefStore for CountingRefs {
     }
 
     async fn lock_ref(&self, name: &str) -> ant_store::Result<RefLock> {
-        self.inner.lock_ref(name).await
+        let lock = self.inner.lock_ref(name).await?;
+        if !lock.is_held() {
+            return Ok(lock);
+        }
+        Ok(RefLock::held(CountingLock { inner: lock, mismatches: self.mismatches.clone() }))
+    }
+}
+
+/// Forwards to a held lock and counts mismatched publishes (lands move the
+/// ref through the lock's publish when the store supports it).
+struct CountingLock {
+    inner: RefLock,
+    mismatches: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl RefLockRelease for CountingLock {
+    async fn release(self: Box<Self>) -> ant_store::Result<()> {
+        self.inner.release().await
+    }
+
+    fn can_publish(&self) -> bool {
+        self.inner.can_publish()
+    }
+
+    async fn publish(
+        &mut self,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+        kind: &str,
+        derived: Vec<(Vec<u8>, Bytes)>,
+    ) -> ant_store::Result<CasOutcome> {
+        let out = self.inner.publish(expected, new, kind, derived).await?;
+        if matches!(out, CasOutcome::Mismatch { .. }) {
+            self.mismatches.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(out)
     }
 }
 
