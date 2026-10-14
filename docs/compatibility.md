@@ -1,0 +1,143 @@
+# Compatibility contract (v0.x)
+
+antimony versions follow [Semantic Versioning](https://semver.org) with the
+usual 0.x reading: while the major version is 0, the **minor** version
+(`0.1` to `0.2`) may contain breaking changes, but only the ones listed
+below as allowed, and only with the notice described under "Deprecations".
+A **patch** release (`0.1.0` to `0.1.1`) never breaks any surface in this
+document. From `1.0` on, anything this document allows in a minor release
+moves to major releases.
+
+Every release records changes to these surfaces in `CHANGELOG.md`, under the
+headings **Changed**, **Deprecated**, **Removed** or **Security**. A change to
+a surface below that is not in the changelog is a bug.
+
+Four surfaces are relied on by deployed clients and stored data. In the
+tables, "within 0.x" means within the 0.x series, "patch" means releases that
+differ only in the third number.
+
+## 1. gRPC API (`proto/ant.proto`, package `ant.v1`)
+
+| change | patch | minor (0.x) |
+|---|---|---|
+| New optional fields, new messages, new RPCs | allowed | allowed |
+| New enum values | allowed | allowed (clients must tolerate unknown values) |
+| Stricter validation of requests that were already invalid | allowed | allowed |
+| Changing the meaning, type or number of an existing field | never | never: a new field is added and the old one deprecated |
+| Removing or renaming a field, message or RPC | never | only after one minor release of deprecation |
+| New or different gRPC status code for an existing failure | never | allowed, listed in the changelog |
+| New package version (`ant.v2`) | n/a | only for a redesign; `ant.v1` keeps being served for at least one minor release |
+
+Field numbers and names of removed fields are `reserve`d, never reused. The
+HTTP object endpoint (`GET /o/<id>`, `Cache-Control: immutable`, object bytes
+in the git encoding) follows the same rules: object ids and encodings never
+change; paths of other HTTP endpoints (`/healthz`, `/readyz`, `/metrics`,
+`/debug/stats`, the git smart-HTTP export) may change in a minor release with
+a deprecation notice. Metric names and labels may be added in any release and
+renamed or removed only after one minor release of deprecation.
+
+Client/server skew: a client works against a server of the same minor
+version and, for as long as the rules above hold, one minor version older or
+newer. Upgrade servers first, then clients.
+
+## 2. Postgres schema
+
+The schema is versioned (`schema_version` table, `ant admin schema`). The
+binary's supported version is printed by `ant admin schema` as `supported <n>`.
+
+- **Migrations are forward-only, additive and idempotent**. They run on start
+  of `ant serve`, `ant import` and `ant admin` (or with `ant admin schema
+  --migrate`, with `--no-migrate` to keep control), in one transaction under a
+  per-schema advisory lock. There are no down-migrations; **back up before
+  upgrading**.
+- **A binary refuses a schema newer than it supports** (exit 1, `hint:
+  upgrade ant`). It never reads, writes or migrates it. Downgrading across a
+  migration is therefore unsupported: restore the backup instead.
+- **Patch releases** never add migrations that older servers of the same
+  minor cannot run alongside, so a rolling restart is always safe.
+- **Minor releases** may add migrations. Running servers of the previous
+  minor keep working against the migrated schema unless the changelog says a
+  migration needs all servers stopped first (it will then be the only
+  allowed exception). A migration that rewrites data or locks tables for long
+  is called out in **Upgrading** in `docs/operations.md`.
+- Applied migrations are never edited; a fix is a new migration.
+- Pre-versioning data (version 0) is adopted in place and stays readable for
+  all of 0.x.
+- Table and column names are an implementation detail: use the API, the
+  CLI, or `ant admin` rather than reading tables directly. Operational
+  surfaces that are documented (`schema_version`, `gc_*` working tables for
+  the GC) change only through migrations that are announced in the changelog.
+
+## 3. On-disk client formats
+
+| format | marker | now |
+|---|---|---|
+| shared disk cache | `<cache>/format` | 1 |
+| sparse workspace | `format=` line in `.ant/workspace` | 1 |
+| lazy (FUSE) workspace state | `<state>/format`, journal record kinds | 1 |
+
+- A **missing marker means version 1**, the layout from before markers
+  existed; those caches and workspaces keep working.
+- Readers accept every version up to the one they were built for and
+  **refuse newer ones** (or journal records of an unknown kind) with `hint:
+  upgrade ant`, without modifying anything.
+- A newer binary upgrades old state **in place and only when it is safe**,
+  or documents the one-time step (for example emptying the cache with `ant
+  cache gc --to 0`, which is always possible because the cache is
+  rebuildable). Workspaces that hold uncommitted edits are never discarded by
+  an upgrade: if they cannot be read in place the release must say how to
+  carry the edits over (`ant submit` with the old binary).
+- A format version bump is a minor-release change at the earliest, and the
+  changelog names it. Patch releases never bump a format.
+- Downgrading `ant` on a machine that already wrote a newer format is
+  unsupported (and refused, see above).
+
+## 4. CLI output contract
+
+The module documentation of `crates/ant-cli/src/main.rs` is the contract for
+commands, flags, environment variables, stdout records, stderr messages and
+exit codes (`0` ok, `1` error, `2` land/update conflict). The end-to-end tests
+under `crates/ant-cli/tests` exercise it.
+
+- **Stable within 0.x**: the stdout record formats of the listed commands
+  (one record per line, tab or space separated as documented), exit codes, the
+  `error: ` / `hint: ` stderr prefixes, flag and environment variable names.
+  Scripts may parse stdout.
+- **Allowed in a minor release**: new commands, flags, environment variables;
+  new *trailing* columns or new lines after the documented ones where the
+  contract says output is a list (parse by splitting and ignore extra
+  fields; never rely on a line count); new `hint:` lines; changed wording of
+  `error:` text and hints (match on exit codes, not messages).
+- **Allowed with deprecation**: removing or renaming a command, flag,
+  environment variable or output field, or changing a record format, only
+  after the notice below.
+- **Never in a patch release**: anything that makes a script written for the
+  same minor stop working.
+- stderr progress output (for example `gc: ...` lines) and `--help` text are
+  for humans and may change at any time.
+- `ant --version` prints `ant <version> (<short git sha>[-dirty])`; the
+  parenthesised part is absent for builds outside a git checkout. Parse the
+  first two words only.
+
+## Deprecations
+
+1. The release that deprecates something marks it in the changelog under
+   **Deprecated**, in the module docs / `--help` of the CLI, in
+   `proto/ant.proto` comments (`// Deprecated: ...`, plus
+   `[deprecated = true]` for fields) and in the docs.
+2. Where there is a way to notice at runtime, the thing emits a one-line
+   warning (`warning: ... is deprecated, use ... (removal in 0.N)` on stderr
+   for the CLI; a log line, once per process, on the server). Warnings never
+   change stdout or exit codes.
+3. It keeps working unchanged for **at least one full minor release** after
+   the one that deprecated it, and is removed (changelog: **Removed**) in
+   that next minor at the earliest.
+4. Security fixes may shorten this; the changelog then says so under
+   **Security**.
+
+## What is not covered
+
+Rust crate APIs (`ant-core`, `ant-store`, ... are published as workspace
+members, not as a library), test helpers, `ant-bench` flags and output,
+benchmark and scorecard numbers, log message text, the contents of
+`/debug/stats`, and anything marked experimental in its documentation.

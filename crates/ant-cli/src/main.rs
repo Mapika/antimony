@@ -1,6 +1,7 @@
 //! The `ant` command: client for an antimony server, plus `ant serve`. This
 //! doc comment is the output contract; the end-to-end tests (`tests/*.rs`)
-//! exercise it.
+//! exercise it. What may change between releases, and how removals are
+//! announced, is in `docs/compatibility.md` (section "CLI output contract").
 //!
 //! Global flags (each also an env var):
 //!   --server <url>     ANT_SERVER   gRPC url, default http://127.0.0.1:7420
