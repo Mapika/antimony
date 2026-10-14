@@ -332,6 +332,8 @@ impl<B: Body> Body for ObservedBody<B> {
 fn http_route(path: &str) -> &'static str {
     if path.starts_with("/o/") {
         "objects"
+    } else if path.starts_with("/t/") {
+        "tree_bundles"
     } else if path == "/repo.git" || path.starts_with("/repo.git/") {
         "git"
     } else if path == "/healthz" {
@@ -401,6 +403,7 @@ mod tests {
     #[test]
     fn http_routes_are_a_closed_set() {
         assert_eq!(http_route("/o/abcd"), "objects");
+        assert_eq!(http_route("/t/abcd"), "tree_bundles");
         assert_eq!(http_route("/repo.git/info/refs"), "git");
         assert_eq!(http_route("/healthz"), "healthz");
         assert_eq!(http_route("/readyz"), "readyz");

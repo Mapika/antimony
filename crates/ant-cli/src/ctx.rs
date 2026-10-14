@@ -85,7 +85,8 @@ impl Ctx {
         Ok(Arc::new(d))
     }
 
-    /// `ReadThrough(DiskObjectStore, RemoteObjectStore)` plus the remote itself.
+    /// `ReadThrough(DiskObjectStore, RemoteObjectStore)` plus the remote
+    /// itself; walks may use HTTP tree bundles when `--http` is set.
     pub async fn read_through(&self) -> Result<(Arc<ReadThrough>, RemoteObjectStore)> {
         self.read_through_over(self.disk()?).await
     }
@@ -104,7 +105,9 @@ impl Ctx {
         disk: Arc<DiskObjectStore>,
     ) -> Result<(Arc<ReadThrough>, RemoteObjectStore)> {
         let remote = self.remote().await?;
-        let rt = ReadThrough::over_disk(disk, Arc::new(remote.clone())).verified_upstream();
+        let rt = ReadThrough::over_disk(disk, Arc::new(remote.clone()))
+            .verified_upstream()
+            .with_tree_bundles(remote.clone());
         Ok((Arc::new(rt), remote))
     }
 }

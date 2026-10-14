@@ -107,7 +107,7 @@ pub async fn new(ctx: &Ctx, dir: &Path, at: &str, patterns: Vec<String>) -> Resu
     let commit = resolve_commit(&mut remote.client(), at).await?;
     let tree = rt.read_commit(&commit).await?.tree;
     let track = tracked_ref(&remote, at).await?;
-    Workspace::materialize(rt.as_ref(), dir, commit, tree, sparse).await?;
+    Workspace::materialize_with(rt.as_ref(), Some(rt.as_ref()), dir, commit, tree, sparse).await?;
     if let Some(name) = track {
         tokio::fs::write(dir.join(".ant").join(TRACK), format!("{name}\n")).await?;
     }

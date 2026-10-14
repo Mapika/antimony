@@ -107,9 +107,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aws-sdk-s3",
+ "axum",
  "bytes",
  "clap",
  "libc",
+ "parking_lot",
  "rand 0.9.5",
  "reqwest",
  "sqlx",
@@ -210,11 +212,13 @@ name = "ant-proto"
 version = "0.1.0"
 dependencies = [
  "ant-core",
+ "bytes",
  "prost",
  "protox",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "zstd",
 ]
 
 [[package]]
@@ -283,6 +287,7 @@ dependencies = [
  "ant-store",
  "anyhow",
  "async-trait",
+ "axum",
  "bytes",
  "futures",
  "globset",

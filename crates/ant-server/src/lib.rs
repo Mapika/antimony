@@ -2,6 +2,7 @@
 //! (`rpc`) and plain-HTTP immutable object (`http`) front ends.
 
 pub mod acl;
+pub mod bundle;
 pub mod config;
 pub mod health;
 pub mod http;
