@@ -1,14 +1,20 @@
 //! On-disk content-addressed object cache.
 //!
 //! - Layout: `{root}/objects/{hex[0..2]}/{hex}`; file content is the
-//!   zstd-compressed (level 1) encoded object. Temp files go in `{root}/tmp`
-//!   (same filesystem) and are `rename`d into place, never written at the
-//!   final path. If the final path already exists, the write is skipped.
+//!   zstd-compressed (level 1) encoded object. Writes go to a `.tmp.*` file
+//!   in the same shard directory (a same-directory `rename` is cheap and
+//!   parallel; one across directories serializes on a filesystem-wide lock)
+//!   and are `rename`d into place, never written at the final path. Readers
+//!   and `scan` ignore `.tmp.*`; `{root}/tmp` is kept for older clients. If the final path already exists, the write is skipped.
 //! - `get_many`: missing file → `None`. A corrupt file (bad zstd / framing)
 //!   is deleted and reported as `None` (it's a cache). A hit bumps the
 //!   file's mtime to "now" (`File::set_modified`) so eviction is LRU-ish;
 //!   failures to bump are ignored.
 //! - Filesystem work runs in `spawn_blocking`, one blocking task per batch.
+//!   Inside a batch, objects are read/written by several threads
+//!   ([`par_map`]); zstd contexts are thread-local and reused. Objects are
+//!   compressed with the content size in the frame header so reads allocate
+//!   once (older entries without it still decode).
 //! - `gc()`: if the total size of `objects/` exceeds `max_bytes`, deletes
 //!   oldest-mtime files until it is under 90% of `max_bytes`. Returns bytes
 //!   freed. Concurrent readers may race with deletion; that just produces a
@@ -16,9 +22,10 @@
 //! - `ObjectStore::put_many` writes every object (no size check);
 //!   `gc` is the only place that evicts.
 
-use std::io::ErrorKind;
+use std::cell::RefCell;
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use ant_core::{EncodedObject, ObjectId};
@@ -26,7 +33,92 @@ use ant_store::{ObjectStore, Result, StoreError};
 use async_trait::async_trait;
 use bytes::Bytes;
 
+/// Prefix of in-progress writes inside a shard directory.
+const TMP_PREFIX: &str = ".tmp.";
+
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Largest decompressed size trusted from a frame header (guards allocation
+/// against a corrupt header; larger objects take the streaming path).
+const MAX_PREALLOC: u64 = 1 << 30;
+
+thread_local! {
+    static DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { RefCell::new(None) };
+    static COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> =
+        const { RefCell::new(None) };
+}
+
+/// Threads to use for CPU/syscall-bound batch work.
+pub(crate) fn parallelism() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(32))
+}
+
+/// Helper threads still available process-wide. Concurrent `par_map` callers
+/// share this budget, so many simultaneous batches cannot oversubscribe the
+/// machine (which shows up as lock spinning in the filesystem, not speed).
+fn helper_budget() -> &'static AtomicUsize {
+    static BUDGET: std::sync::OnceLock<AtomicUsize> = std::sync::OnceLock::new();
+    BUDGET.get_or_init(|| AtomicUsize::new(parallelism().saturating_sub(1)))
+}
+
+/// Take up to `want` helper threads from the shared budget.
+fn take_helpers(want: usize) -> usize {
+    let budget = helper_budget();
+    let mut cur = budget.load(Ordering::Relaxed);
+    loop {
+        let take = cur.min(want);
+        if take == 0 {
+            return 0;
+        }
+        match budget.compare_exchange_weak(cur, cur - take, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return take,
+            Err(now) => cur = now,
+        }
+    }
+}
+
+/// Map `f` over `items` on the calling thread plus helper threads drawn from
+/// a process-wide budget of [`parallelism`], keeping at least `min_per_thread`
+/// items per thread (small inputs run inline). Results are in input order.
+pub(crate) fn par_map<T: Sync, R: Send>(
+    items: &[T],
+    min_per_thread: usize,
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    let wanted = items.len().div_ceil(min_per_thread.max(1)).min(parallelism());
+    let helpers = if wanted > 1 { take_helpers(wanted - 1) } else { 0 };
+    if helpers == 0 {
+        return items.iter().map(f).collect();
+    }
+    const CHUNK: usize = 8;
+    let next = AtomicUsize::new(0);
+    let work = || {
+        let mut mine: Vec<(usize, Vec<R>)> = Vec::new();
+        loop {
+            let start = next.fetch_add(CHUNK, Ordering::Relaxed);
+            if start >= items.len() {
+                break;
+            }
+            let end = (start + CHUNK).min(items.len());
+            mine.push((start, items[start..end].iter().map(&f).collect()));
+        }
+        mine
+    };
+    let parts: Vec<Vec<(usize, Vec<R>)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..helpers).map(|_| scope.spawn(work)).collect();
+        let mut parts = vec![work()];
+        for h in handles {
+            parts.push(h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+        }
+        parts
+    });
+    helper_budget().fetch_add(helpers, Ordering::AcqRel);
+    let mut flat: Vec<(usize, Vec<R>)> = parts.into_iter().flatten().collect();
+    flat.sort_unstable_by_key(|(start, _)| *start);
+    flat.into_iter().flat_map(|(_, v)| v).collect()
+}
 
 pub struct DiskObjectStore {
     root: PathBuf,
@@ -44,6 +136,21 @@ impl DiskObjectStore {
 
     pub fn path_for(&self, id: &ObjectId) -> PathBuf {
         object_path(&self.root, id)
+    }
+
+    /// Store objects whose ids the caller has already established (e.g.
+    /// verified on fetch), skipping the re-hash `put_many` would do. Ids that
+    /// do not match their object poison the cache; callers must have checked.
+    pub async fn put_many_trusted(&self, objects: Vec<(ObjectId, EncodedObject)>) -> Result<()> {
+        if objects.is_empty() {
+            return Ok(());
+        }
+        let root = self.root.clone();
+        blocking(move || {
+            par_map(&objects, 16, |(id, o)| write_one(&root, id, o)).into_iter().collect()
+        })
+        .await
+        .map_err(StoreError::backend)
     }
 
     /// Total bytes on disk under `objects/`.
@@ -106,6 +213,9 @@ fn scan(root: &Path) -> std::io::Result<Vec<(PathBuf, u64, SystemTime)>> {
         for f in std::fs::read_dir(shard.path())? {
             let f = f?;
             // Racing deletions just shrink the result.
+            if f.file_name().as_encoded_bytes().starts_with(TMP_PREFIX.as_bytes()) {
+                continue; // in-progress write
+            }
             let Ok(meta) = f.metadata() else { continue };
             if meta.is_file() {
                 out.push((f.path(), meta.len(), meta.modified()?));
@@ -115,19 +225,44 @@ fn scan(root: &Path) -> std::io::Result<Vec<(PathBuf, u64, SystemTime)>> {
     Ok(out)
 }
 
+fn decompress(compressed: &[u8]) -> Option<Vec<u8>> {
+    match zstd::zstd_safe::get_frame_content_size(compressed) {
+        Ok(Some(n)) if n <= MAX_PREALLOC => DECOMPRESSOR.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot = zstd::bulk::Decompressor::new().ok();
+            }
+            slot.as_mut()?.decompress(compressed, n as usize).ok()
+        }),
+        _ => zstd::decode_all(compressed).ok(),
+    }
+}
+
+fn compress(raw: &[u8]) -> std::io::Result<Vec<u8>> {
+    COMPRESSOR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(zstd::bulk::Compressor::new(1)?);
+        }
+        match slot.as_mut() {
+            Some(c) => c.compress(raw),
+            None => Err(std::io::Error::other("zstd compressor unavailable")),
+        }
+    })
+}
+
 fn read_one(path: &Path) -> Option<EncodedObject> {
-    let compressed = match std::fs::read(path) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    let decoded = zstd::decode_all(&compressed[..])
-        .ok()
-        .and_then(|raw| EncodedObject::from_bytes(Bytes::from(raw)).ok());
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut compressed = Vec::new();
+    if let Ok(meta) = file.metadata() {
+        compressed.reserve_exact(meta.len() as usize);
+    }
+    file.read_to_end(&mut compressed).ok()?;
+    let decoded =
+        decompress(&compressed).and_then(|raw| EncodedObject::from_bytes(Bytes::from(raw)).ok());
     match decoded {
         Some(o) => {
-            if let Ok(f) = std::fs::File::open(path) {
-                let _ = f.set_modified(SystemTime::now());
-            }
+            let _ = file.set_modified(SystemTime::now());
             Some(o)
         }
         None => {
@@ -143,21 +278,27 @@ fn write_one(root: &Path, id: &ObjectId, obj: &EncodedObject) -> std::io::Result
     if dest.exists() {
         return Ok(());
     }
-    let compressed = zstd::encode_all(&obj.as_bytes()[..], 1)?;
-    let tmp = root.join("tmp").join(format!(
-        "{}.{}.{}",
-        id.to_hex(),
+    let compressed = compress(&obj.as_bytes()[..])?;
+    // Temp file beside its destination: a rename within one directory only
+    // locks that directory, whereas a cross-directory rename takes a
+    // filesystem-wide lock that serializes every concurrent writer.
+    let tmp = dest.with_file_name(format!(
+        "{TMP_PREFIX}{}.{}",
         std::process::id(),
         TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, compressed)?;
-    let renamed = match std::fs::rename(&tmp, &dest) {
+    let write = |tmp: &Path| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(tmp)?;
+        f.write_all(&compressed)
+    };
+    let written = match write(&tmp) {
         Err(e) if e.kind() == ErrorKind::NotFound => {
             std::fs::create_dir_all(dest.parent().unwrap_or(root))?;
-            std::fs::rename(&tmp, &dest)
+            write(&tmp)
         }
         r => r,
     };
+    let renamed = written.and_then(|()| std::fs::rename(&tmp, &dest));
     if renamed.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -172,7 +313,7 @@ impl ObjectStore for DiskObjectStore {
         }
         let root = self.root.clone();
         let ids = ids.to_vec();
-        blocking(move || Ok(ids.iter().map(|id| read_one(&object_path(&root, id))).collect()))
+        blocking(move || Ok(par_map(&ids, 32, |id| read_one(&object_path(&root, id)))))
             .await
             .map_err(StoreError::backend)
     }
@@ -184,10 +325,7 @@ impl ObjectStore for DiskObjectStore {
         let root = self.root.clone();
         let objects = objects.to_vec();
         blocking(move || {
-            for o in &objects {
-                write_one(&root, &o.id(), o)?;
-            }
-            Ok(())
+            par_map(&objects, 16, |o| write_one(&root, &o.id(), o)).into_iter().collect()
         })
         .await
         .map_err(StoreError::backend)
@@ -196,7 +334,7 @@ impl ObjectStore for DiskObjectStore {
     async fn has_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {
         let root = self.root.clone();
         let ids = ids.to_vec();
-        blocking(move || Ok(ids.iter().map(|id| object_path(&root, id).exists()).collect()))
+        blocking(move || Ok(par_map(&ids, 256, |id| object_path(&root, id).exists())))
             .await
             .map_err(StoreError::backend)
     }
@@ -243,6 +381,42 @@ mod tests {
         std::fs::write(s.path_for(&o.id()), b"garbage").unwrap();
         assert_eq!(s.get(&o.id()).await.unwrap(), None);
         assert!(!s.path_for(&o.id()).exists());
+    }
+
+    #[tokio::test]
+    async fn reads_frames_without_content_size() {
+        // Entries written by older versions used the streaming encoder.
+        let dir = tempfile::tempdir().unwrap();
+        let s = DiskObjectStore::open(dir.path(), u64::MAX).unwrap();
+        let o = EncodedObject::new(ObjectKind::Blob, &vec![7u8; 10_000]);
+        let path = s.path_for(&o.id());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, zstd::encode_all(&o.as_bytes()[..], 1).unwrap()).unwrap();
+        assert_eq!(s.get(&o.id()).await.unwrap(), Some(o));
+    }
+
+    #[tokio::test]
+    async fn large_batches_roundtrip_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = DiskObjectStore::open(dir.path(), u64::MAX).unwrap();
+        let objs: Vec<_> = (0..1000)
+            .map(|i| EncodedObject::new(ObjectKind::Blob, format!("object {i}").as_bytes()))
+            .collect();
+        s.put_many(&objs).await.unwrap();
+        let mut ids: Vec<_> = objs.iter().map(|o| o.id()).collect();
+        ids.insert(500, ObjectId([9; 32]));
+        let got = s.get_many(&ids).await.unwrap();
+        assert!(got[500].is_none());
+        for (i, o) in objs.iter().enumerate() {
+            assert_eq!(got[if i < 500 { i } else { i + 1 }].as_ref(), Some(o));
+        }
+        // No in-progress files are left in shard directories.
+        assert!(s.disk_usage().await.unwrap() > 0);
+        for shard in std::fs::read_dir(dir.path().join("objects")).unwrap() {
+            for f in std::fs::read_dir(shard.unwrap().path()).unwrap() {
+                assert!(!f.unwrap().file_name().to_string_lossy().starts_with(".tmp."));
+            }
+        }
     }
 
     #[tokio::test]

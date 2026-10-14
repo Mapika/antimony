@@ -22,10 +22,21 @@ use crate::util::{Metrics, cpu_seconds, dir_size, dir_size_skip, mib, timed_stor
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
+    /// gRPC URL of the server; omit with `--synthetic-files`.
     #[arg(long)]
-    pub server: String,
+    pub server: Option<String>,
     #[arg(long)]
     pub http: Option<String>,
+    /// Serve a synthetic kernel-shaped tree with this many files from an
+    /// in-process in-memory server.
+    #[arg(long)]
+    pub synthetic_files: Option<usize>,
+    /// Directories in the synthetic tree (default 70% of files).
+    #[arg(long)]
+    pub synthetic_dirs: Option<usize>,
+    /// With --synthetic-files, fetch over the in-process HTTP endpoint, not gRPC.
+    #[arg(long)]
+    pub use_http: bool,
     #[arg(long, default_value = "main")]
     pub rev: String,
     /// Sparse pattern (repeatable); none = full checkout.
@@ -76,7 +87,11 @@ async fn materialize(
     let metrics = Metrics::default();
     let disk = Arc::new(DiskObjectStore::open(&a.cache, u64::MAX / 2).context("opening cache")?);
     let net = timed_store(Arc::new(remote.clone()), &metrics, "net");
-    let rt = timed_store(Arc::new(ReadThrough::new(disk, net)), &metrics, "ws");
+    let rt = timed_store(
+        Arc::new(ReadThrough::over_disk(disk, net).verified_upstream()),
+        &metrics,
+        "ws",
+    );
     let tree = rt.read_commit(&commit).await?.tree;
     let cpu0 = cpu_seconds().map_or(0.0, |c| c.0 + c.1);
     let start = Instant::now();
@@ -145,7 +160,24 @@ pub async fn run(a: Args) -> Result<()> {
         s.push(".ws");
         PathBuf::from(s)
     });
-    let remote = RemoteObjectStore::connect(&a.server, a.http.as_deref()).await?;
+    let (server_url, http_url) = match (&a.server, a.synthetic_files) {
+        (Some(s), None) => (s.clone(), a.http.clone()),
+        (None, Some(files)) => {
+            let backend = ant_store::Backend::in_memory();
+            let dirs = a.synthetic_dirs.unwrap_or(files / 10 * 7);
+            let t = Instant::now();
+            let (_, bytes) = crate::synth::build(&backend, files, dirs, &a.rev).await?;
+            println!(
+                "synthetic: {files} files, {dirs} dirs, {:.1} MiB, built in {:.1}s",
+                mib(bytes),
+                t.elapsed().as_secs_f64()
+            );
+            let srv = ant_server::serve::spawn_local(backend, ant_server::acl::Acl::open()).await?;
+            (srv.grpc_url(), a.use_http.then(|| srv.http_url()))
+        }
+        _ => anyhow::bail!("give exactly one of --server or --synthetic-files"),
+    };
+    let remote = RemoteObjectStore::connect(&server_url, http_url.as_deref()).await?;
     let t = Instant::now();
     let commit = remote
         .client()
@@ -159,7 +191,7 @@ pub async fn run(a: Args) -> Result<()> {
     let sparse = if a.sparse.is_empty() { Sparse::all() } else { Sparse::new(a.sparse.clone())? };
     println!(
         "checkout: server={} http={:?} rev={} ({commit}) sparse={:?} iterations={}",
-        a.server, a.http, a.rev, a.sparse, a.iterations
+        server_url, http_url, a.rev, a.sparse, a.iterations
     );
 
     let mut iters = Vec::new();
@@ -214,8 +246,8 @@ pub async fn run(a: Args) -> Result<()> {
 
     let json = J::obj()
         .with("command", "checkout")
-        .with("server", a.server.as_str())
-        .with("http", a.http.clone())
+        .with("server", server_url.as_str())
+        .with("http", http_url.clone())
         .with("rev", a.rev.as_str())
         .with("commit", commit.to_hex())
         .with("sparse", J::Arr(a.sparse.iter().map(|s| J::from(s.as_str())).collect()))

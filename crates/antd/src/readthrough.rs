@@ -5,6 +5,10 @@
 //!   one `upstream.get_many(misses)`; `verify` each fetched object against
 //!   its requested id (mismatch → `StoreError::Backend`); one
 //!   `local.put_many(fetched)`; return merged results in input order.
+//! - `verified_upstream()` skips the second hash when the upstream already
+//!   verifies (`RemoteObjectStore` does); `over_disk` stores fetched objects
+//!   into the disk cache without re-hashing them. Otherwise verification runs
+//!   on several threads.
 //! - `put_many`: write to upstream first, then local (write-through).
 //! - `has_many`: local first, upstream for misses.
 //! - In-flight dedup: concurrent `get_many` calls that miss on the same id
@@ -17,6 +21,8 @@ use ant_core::{EncodedObject, ObjectId};
 use ant_store::{ObjectStore, Result, StoreError};
 use async_trait::async_trait;
 use futures::future::{BoxFuture, FutureExt, Shared};
+
+use crate::disk::{DiskObjectStore, par_map};
 use parking_lot::Mutex;
 
 type Fetched = std::result::Result<Arc<HashMap<ObjectId, EncodedObject>>, Arc<String>>;
@@ -24,19 +30,46 @@ type InFlight = Shared<BoxFuture<'static, Fetched>>;
 
 pub struct ReadThrough {
     local: Arc<dyn ObjectStore>,
+    /// `local` again, when it is a [`DiskObjectStore`]: fetched objects are
+    /// already verified, so they are stored without being re-hashed.
+    disk: Option<Arc<DiskObjectStore>>,
     upstream: Arc<dyn ObjectStore>,
+    /// Upstream verifies what it returns (e.g. `RemoteObjectStore`).
+    trusted_upstream: bool,
     inflight: Arc<Mutex<HashMap<ObjectId, InFlight>>>,
 }
 
 impl ReadThrough {
     pub fn new(local: Arc<dyn ObjectStore>, upstream: Arc<dyn ObjectStore>) -> Self {
-        Self { local, upstream, inflight: Default::default() }
+        Self { local, disk: None, upstream, trusted_upstream: false, inflight: Default::default() }
+    }
+
+    /// Read-through over a disk cache. Fetched objects are written to it
+    /// without being hashed again (they were just verified).
+    pub fn over_disk(disk: Arc<DiskObjectStore>, upstream: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            local: disk.clone(),
+            disk: Some(disk),
+            upstream,
+            trusted_upstream: false,
+            inflight: Default::default(),
+        }
+    }
+
+    /// Declare that `upstream` already hash-verifies every object it returns
+    /// (true of [`RemoteObjectStore`], also behind wrappers that merely
+    /// forward), so fetched objects are not hashed a second time.
+    pub fn verified_upstream(mut self) -> Self {
+        self.trusted_upstream = true;
+        self
     }
 
     /// Fetch `ids` from upstream, verify, and fill the local store. Re-checks
     /// local first: a previous fetch may have landed after our local miss.
     async fn fetch(
         local: Arc<dyn ObjectStore>,
+        disk: Option<Arc<DiskObjectStore>>,
+        trusted: bool,
         upstream: Arc<dyn ObjectStore>,
         ids: Vec<ObjectId>,
     ) -> Result<HashMap<ObjectId, EncodedObject>> {
@@ -53,15 +86,34 @@ impl ReadThrough {
         if missing.is_empty() {
             return Ok(out);
         }
-        let mut fetched = Vec::new();
-        for (id, o) in missing.iter().zip(upstream.get_many(&missing).await?) {
-            if let Some(o) = o {
-                o.verify(id).map_err(StoreError::backend)?;
-                fetched.push(o.clone());
-                out.insert(*id, o);
+        let got = upstream.get_many(&missing).await?;
+        let found: Vec<(ObjectId, EncodedObject)> =
+            missing.iter().copied().zip(got).filter_map(|(id, o)| Some((id, o?))).collect();
+        let found = if trusted {
+            found
+        } else {
+            // Hash in parallel; the first mismatch (in input order) is the error.
+            let verdicts = tokio::task::spawn_blocking(move || {
+                let r = par_map(&found, 16, |(id, o)| o.verify(id));
+                (found, r)
+            })
+            .await
+            .map_err(StoreError::backend)?;
+            let (found, results) = verdicts;
+            results
+                .into_iter()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(StoreError::backend)?;
+            found
+        };
+        match disk {
+            Some(disk) => disk.put_many_trusted(found.clone()).await?,
+            None => {
+                let objs: Vec<EncodedObject> = found.iter().map(|(_, o)| o.clone()).collect();
+                local.put_many(&objs).await?
             }
         }
-        local.put_many(&fetched).await?;
+        out.extend(found);
         Ok(out)
     }
 }
@@ -95,10 +147,15 @@ impl ObjectStore for ReadThrough {
                 }
             }
             if !mine.is_empty() {
-                let (local, upstream, batch) =
-                    (self.local.clone(), self.upstream.clone(), mine.clone());
+                let (local, disk, trusted, upstream, batch) = (
+                    self.local.clone(),
+                    self.disk.clone(),
+                    self.trusted_upstream,
+                    self.upstream.clone(),
+                    mine.clone(),
+                );
                 let fut: InFlight = async move {
-                    Self::fetch(local, upstream, batch)
+                    Self::fetch(local, disk, trusted, upstream, batch)
                         .await
                         .map(Arc::new)
                         .map_err(|e| Arc::new(e.to_string()))

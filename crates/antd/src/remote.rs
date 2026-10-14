@@ -20,6 +20,8 @@ use ant_proto::v1 as pb;
 use ant_proto::v1::ant_client::AntClient;
 use ant_store::{ObjectStore, Result, StoreError};
 use async_trait::async_trait;
+
+use crate::disk::par_map;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use tonic::metadata::{Ascii, MetadataValue};
@@ -31,6 +33,8 @@ use tonic::transport::Channel;
 const HTTP_CONCURRENCY: usize = 64;
 /// Max ids per `GetObjects` / `HasObjects` request.
 const RPC_IDS_PER_REQUEST: usize = 4096;
+/// `GetObjects` requests in flight per `get_many`.
+const GRPC_CONCURRENCY: usize = 4;
 /// Max total payload bytes per `PutObjects` request.
 const PUT_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
@@ -106,50 +110,54 @@ impl RemoteObjectStore {
         let http = self.http.clone();
         let base = base.to_owned();
         let auth = self.authorization.clone();
-        stream::iter(ids.iter().copied())
+        let raw: Vec<Option<Bytes>> = stream::iter(ids.iter().copied())
             .map(move |id| {
                 let http = http.clone();
                 let url = format!("{base}/o/{}", id.to_hex());
                 let auth = auth.clone();
-                async move { fetch_http_object(&http, &url, auth.as_deref(), id).await }
+                async move { fetch_http_object(&http, &url, auth.as_deref()).await }
             })
             .buffered(HTTP_CONCURRENCY)
             .try_collect()
-            .await
+            .await?;
+        decode_all_verified(ids, raw).await
     }
 
     /// Fetch ids via the `GetObjects` stream, in chunks of at most
     /// `RPC_IDS_PER_REQUEST`. Results are returned in input order.
     async fn get_many_grpc(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
-        let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(RPC_IDS_PER_REQUEST) {
-            let req = pb::GetObjectsRequest { ids: chunk.iter().map(|i| i.0.to_vec()).collect() };
-            let mut stream = self
-                .client
-                .clone()
-                .get_objects(req)
-                .await
-                .map_err(StoreError::backend)?
-                .into_inner();
-            let mut received = 0usize;
-            while let Some(item) = stream.message().await.map_err(StoreError::backend)? {
-                let expected =
-                    chunk.get(received).ok_or_else(|| protocol_error("extra object in stream"))?;
-                if item.id != expected.0 {
-                    return Err(protocol_error("object stream out of order"));
-                }
-                out.push(if item.found {
-                    Some(decode_verified(Bytes::from(item.data), expected)?)
-                } else {
-                    None
-                });
-                received += 1;
+        // A few requests in flight at once; `buffered` keeps them in order.
+        let chunks: Vec<Vec<ObjectId>> =
+            ids.chunks(RPC_IDS_PER_REQUEST).map(<[ObjectId]>::to_vec).collect();
+        let parts: Vec<Vec<Option<Bytes>>> = stream::iter(chunks)
+            .map(|chunk| {
+                let this = self.clone();
+                async move { this.get_chunk_grpc(&chunk).await }
+            })
+            .buffered(GRPC_CONCURRENCY)
+            .try_collect()
+            .await?;
+        decode_all_verified(ids, parts.into_iter().flatten().collect()).await
+    }
+
+    /// One `GetObjects` request; raw (unverified) objects in `chunk` order.
+    async fn get_chunk_grpc(&self, chunk: &[ObjectId]) -> Result<Vec<Option<Bytes>>> {
+        let req = pb::GetObjectsRequest { ids: chunk.iter().map(|i| i.0.to_vec()).collect() };
+        let mut stream =
+            self.client.clone().get_objects(req).await.map_err(StoreError::backend)?.into_inner();
+        let mut raw: Vec<Option<Bytes>> = Vec::with_capacity(chunk.len());
+        while let Some(item) = stream.message().await.map_err(StoreError::backend)? {
+            let expected =
+                chunk.get(raw.len()).ok_or_else(|| protocol_error("extra object in stream"))?;
+            if item.id != expected.0 {
+                return Err(protocol_error("object stream out of order"));
             }
-            if received != chunk.len() {
-                return Err(protocol_error("object stream ended early"));
-            }
+            raw.push(item.found.then(|| Bytes::from(item.data)));
         }
-        Ok(out)
+        if raw.len() != chunk.len() {
+            return Err(protocol_error("object stream ended early"));
+        }
+        Ok(raw)
     }
 }
 
@@ -163,12 +171,30 @@ fn decode_verified(data: Bytes, id: &ObjectId) -> Result<EncodedObject> {
     Ok(obj)
 }
 
+/// Frame and hash-check every fetched object (the sole verification of
+/// remote data), spread over several threads: hashing a large checkout is
+/// CPU-bound and must not run on the async executor.
+async fn decode_all_verified(
+    ids: &[ObjectId],
+    raw: Vec<Option<Bytes>>,
+) -> Result<Vec<Option<EncodedObject>>> {
+    let work: Vec<(ObjectId, Option<Bytes>)> = ids.iter().copied().zip(raw).collect();
+    tokio::task::spawn_blocking(move || {
+        par_map(&work, 16, |(id, data)| {
+            data.as_ref().map(|d| decode_verified(d.clone(), id)).transpose()
+        })
+        .into_iter()
+        .collect()
+    })
+    .await
+    .map_err(StoreError::backend)?
+}
+
 async fn fetch_http_object(
     http: &reqwest::Client,
     url: &str,
     authorization: Option<&str>,
-    id: ObjectId,
-) -> Result<Option<EncodedObject>> {
+) -> Result<Option<Bytes>> {
     let mut req = http.get(url);
     if let Some(a) = authorization {
         req = req.header(reqwest::header::AUTHORIZATION, a);
@@ -176,10 +202,7 @@ async fn fetch_http_object(
     let resp = req.send().await.map_err(StoreError::backend)?;
     match resp.status() {
         s if s == reqwest::StatusCode::NOT_FOUND => Ok(None),
-        s if s.is_success() => {
-            let body = resp.bytes().await.map_err(StoreError::backend)?;
-            Ok(Some(decode_verified(body, &id)?))
-        }
+        s if s.is_success() => Ok(Some(resp.bytes().await.map_err(StoreError::backend)?)),
         s => Err(StoreError::backend(std::io::Error::other(format!("HTTP {s} for {url}")))),
     }
 }

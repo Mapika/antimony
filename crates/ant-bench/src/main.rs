@@ -16,6 +16,7 @@ mod json;
 mod replicas;
 mod s3clean;
 mod soak;
+mod synth;
 mod util;
 
 use clap::{Parser, Subcommand};

@@ -263,7 +263,6 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
- "walkdir",
  "zstd",
 ]
 
