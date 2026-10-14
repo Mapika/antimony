@@ -173,6 +173,7 @@ pub(crate) async fn import_tuned(
     tuning: Tuning,
 ) -> anyhow::Result<ImportStats> {
     let batch_objects = opts.batch_objects.max(1);
+    let locks = Locks::acquire(backend, &opts.refs).await?;
     let (tx, rx) = mpsc::channel::<Msg>(4);
     let producer = {
         let repo = repo.to_path_buf();
@@ -184,7 +185,7 @@ pub(crate) async fn import_tuned(
         })
     };
     let mut stats = ImportStats::default();
-    let written = write(backend, rx, &mut stats).await;
+    let written = write(backend, rx, &mut stats, locks).await;
     let produced = producer.await?;
     written?;
     produced?;
@@ -202,6 +203,62 @@ struct Counts {
     blobs: u64,
 }
 
+/// Writer locks on the refs being imported.
+///
+/// When the store can publish through a lock (Postgres: a session opened
+/// before any write below), the import runs with deferred durability:
+/// objects, commits, changesets and mappings are acknowledged before their
+/// WAL flush, which removes a synchronous flush per statement from the
+/// serial recording path. Crash safety:
+/// - The database log is sequential and a crash loses only a suffix of it.
+///   Every write below is acknowledged before the writes that depend on it
+///   are sent (objects before the commits naming them, commits before their
+///   mappings), so whatever survives a crash is a consistent prefix: a
+///   re-run finds the surviving mappings and continues incrementally.
+/// - A ref moves only through [`ant_store::RefLock::publish`], one
+///   synchronous commit on the lock's own session. That session predates the
+///   deferred writes and a crash ends it, so a successful publish proves no
+///   crash happened and flushes every earlier write with it. Nothing is
+///   reachable from a ref before it is durable.
+///
+/// Stores without such locks write synchronously, as before.
+struct Locks {
+    held: Vec<(String, ant_store::RefLock)>,
+}
+
+impl Locks {
+    async fn acquire(backend: &Backend, refs: &[(String, String)]) -> anyhow::Result<Self> {
+        let mut names: Vec<&str> = refs.iter().map(|(_, a)| a.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        let mut held = Vec::with_capacity(names.len());
+        for name in names {
+            let lock = backend
+                .refs
+                .lock_ref(name)
+                .await
+                .with_context(|| format!("locking ref {name} for import"))?;
+            held.push((name.to_string(), lock));
+        }
+        Ok(Self { held })
+    }
+
+    /// Whether every ref can be published through its lock.
+    fn deferred(&self) -> bool {
+        !self.held.is_empty() && self.held.iter().all(|(_, l)| l.can_publish())
+    }
+
+    fn get(&mut self, name: &str) -> Option<&mut ant_store::RefLock> {
+        self.held.iter_mut().find(|(n, _)| n == name).map(|(_, l)| l)
+    }
+
+    async fn release(self) {
+        for (_, lock) in self.held {
+            let _ = lock.release().await;
+        }
+    }
+}
+
 enum Item {
     Batch(JoinHandle<anyhow::Result<Counts>>, Vec<NewCommit>),
     Tip { ant_ref: String, id: ObjectId, ack: std::sync::mpsc::SyncSender<()> },
@@ -211,9 +268,11 @@ async fn write(
     backend: &Backend,
     mut rx: mpsc::Receiver<Msg>,
     stats: &mut ImportStats,
+    locks: Locks,
 ) -> anyhow::Result<()> {
+    let deferred = locks.deferred();
     let (rec_tx, rec_rx) = mpsc::channel::<Item>(RECORD_QUEUE);
-    let recorder = tokio::spawn(record(backend.clone(), rec_rx));
+    let recorder = tokio::spawn(record(backend.clone(), rec_rx, locks));
     let budget = Arc::new(Semaphore::new(INFLIGHT_BYTES >> 20));
     while let Some(msg) = rx.recv().await {
         let item = match msg {
@@ -223,7 +282,12 @@ async fn write(
                 let b = backend.clone();
                 let task = tokio::spawn(async move {
                     let _permit = permit;
-                    store_objects(&b, objects, check_present).await
+                    if deferred {
+                        ant_store::deferred_durability(store_objects(&b, objects, check_present))
+                            .await
+                    } else {
+                        store_objects(&b, objects, check_present).await
+                    }
                 });
                 Item::Batch(task, commits)
             }
@@ -241,12 +305,32 @@ async fn write(
 /// Record commits in order: wait for each batch's objects, merge small
 /// batches, and keep the derived mapping one step behind so it overlaps the
 /// next commit write. A mapping is only written after its commits.
-async fn record(backend: Backend, mut rx: mpsc::Receiver<Item>) -> anyhow::Result<ImportStats> {
+async fn record(
+    backend: Backend,
+    rx: mpsc::Receiver<Item>,
+    mut locks: Locks,
+) -> anyhow::Result<ImportStats> {
+    let result = if locks.deferred() {
+        ant_store::deferred_durability(record_inner(&backend, rx, &mut locks)).await
+    } else {
+        record_inner(&backend, rx, &mut locks).await
+    };
+    locks.release().await;
+    result
+}
+
+async fn record_inner(
+    backend: &Backend,
+    mut rx: mpsc::Receiver<Item>,
+    locks: &mut Locks,
+) -> anyhow::Result<ImportStats> {
+    let deferred = locks.deferred();
     let mut stats = ImportStats::default();
     let mut pending: Vec<NewCommit> = Vec::new();
     let mut mapping_task: Option<JoinHandle<anyhow::Result<()>>> = None;
 
     async fn flush(
+        deferred: bool,
         backend: &Backend,
         pending: &mut Vec<NewCommit>,
         mapping_task: &mut Option<JoinHandle<anyhow::Result<()>>>,
@@ -269,7 +353,11 @@ async fn record(backend: Backend, mut rx: mpsc::Receiver<Item>) -> anyhow::Resul
         let meta = backend.meta.clone();
         *mapping_task = Some(tokio::spawn(async move {
             // After the commits: a mapping must never point at an unrecorded commit.
-            meta.put_derived_many(COMMIT_KIND, mapping).await?;
+            if deferred {
+                ant_store::deferred_durability(meta.put_derived_many(COMMIT_KIND, mapping)).await?;
+            } else {
+                meta.put_derived_many(COMMIT_KIND, mapping).await?;
+            }
             Ok(())
         }));
         Ok(())
@@ -283,16 +371,20 @@ async fn record(backend: Backend, mut rx: mpsc::Receiver<Item>) -> anyhow::Resul
                 stats.blobs += counts.blobs;
                 pending.extend(commits);
                 if pending.len() >= RECORD_COMMITS {
-                    flush(&backend, &mut pending, &mut mapping_task, &mut stats).await?;
+                    flush(deferred, backend, &mut pending, &mut mapping_task, &mut stats).await?;
                 }
             }
             Item::Tip { ant_ref, id, ack } => {
-                flush(&backend, &mut pending, &mut mapping_task, &mut stats).await?;
+                flush(deferred, backend, &mut pending, &mut mapping_task, &mut stats).await?;
                 if let Some(prev) = mapping_task.take() {
                     prev.await.context("mapping writer")??;
                 }
                 let expected = backend.refs.get_ref(&ant_ref).await?;
-                match backend.refs.cas_ref(&ant_ref, expected, Some(id)).await? {
+                let outcome = match locks.get(&ant_ref).filter(|l| l.can_publish()) {
+                    Some(lock) => lock.publish(expected, id, "import.tip", Vec::new()).await?,
+                    None => backend.refs.cas_ref(&ant_ref, expected, Some(id)).await?,
+                };
+                match outcome {
                     CasOutcome::Updated => {}
                     CasOutcome::Mismatch { actual } => {
                         bail!("ref {ant_ref} changed during import (now {actual:?})")
@@ -302,7 +394,7 @@ async fn record(backend: Backend, mut rx: mpsc::Receiver<Item>) -> anyhow::Resul
             }
         }
     }
-    flush(&backend, &mut pending, &mut mapping_task, &mut stats).await?;
+    flush(deferred, backend, &mut pending, &mut mapping_task, &mut stats).await?;
     if let Some(prev) = mapping_task.take() {
         prev.await.context("mapping writer")??;
     }
