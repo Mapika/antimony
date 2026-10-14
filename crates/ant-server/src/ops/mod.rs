@@ -12,6 +12,9 @@ mod tree_edit;
 #[cfg(test)]
 mod test_support;
 
+#[cfg(test)]
+mod legacy_mode_tests;
+
 use ant_core::ObjectId;
 use ant_store::StoreError;
 

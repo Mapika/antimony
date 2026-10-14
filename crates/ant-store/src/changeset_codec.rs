@@ -36,9 +36,10 @@ fn kind_from(c: u8) -> Result<ChangeKind> {
 }
 
 fn mode_code(m: Option<EntryMode>) -> u8 {
-    match m {
+    // Recorded changes carry semantic classes; `class()` never yields Legacy.
+    match m.map(EntryMode::class) {
         None => 0,
-        Some(EntryMode::File) => 1,
+        Some(EntryMode::File | EntryMode::Legacy(_)) => 1,
         Some(EntryMode::Executable) => 2,
         Some(EntryMode::Symlink) => 3,
         Some(EntryMode::Tree) => 4,

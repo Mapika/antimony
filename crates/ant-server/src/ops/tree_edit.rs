@@ -106,9 +106,11 @@ pub(super) async fn load_directories_with<const N: usize>(
     Ok(dirs)
 }
 
+/// The leaf or directory entry at `path`, with legacy modes reduced to their
+/// semantic class (so merges and recorded changes never see legacy spellings).
 pub(super) fn entry(dirs: &Directories, path: &RepoPath) -> Option<Entry> {
     let (parent, name) = path.split_last()?;
-    dirs.get(&parent)?.get(name).map(|e| (e.mode, e.id))
+    dirs.get(&parent)?.get(name).map(|e| (e.mode.class(), e.id))
 }
 
 pub(super) fn deepest_first(dirs: &Directories) -> Vec<RepoPath> {

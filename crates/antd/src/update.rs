@@ -254,7 +254,7 @@ pub async fn entries_at(
                             next.push((path, e.id));
                         }
                     } else if wanted.contains(path.as_str()) {
-                        out.insert(RepoPath::new(path)?, Some((e.mode, e.id)));
+                        out.insert(RepoPath::new(path)?, Some((e.mode.class(), e.id)));
                     }
                 }
             }

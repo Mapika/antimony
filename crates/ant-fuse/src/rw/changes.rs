@@ -100,10 +100,10 @@ pub(super) async fn affected_base(
                     if !all && !exact.contains(&path) && !branches.contains(&path) {
                         continue;
                     }
-                    if e.mode == EntryMode::Tree {
+                    if e.mode.is_tree() {
                         next.push((path, e.id, all));
                     } else {
-                        out.insert(path, (e.mode, e.id));
+                        out.insert(path, (e.mode.class(), e.id));
                     }
                 }
             }

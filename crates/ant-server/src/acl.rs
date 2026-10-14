@@ -695,7 +695,7 @@ async fn reindex_trees(
                 add_occurrence(&mut occ, policy, &root, path, *id);
                 for e in Tree::decode(object.body())?.entries() {
                     let child = path.join(&e.name)?;
-                    match e.mode {
+                    match e.mode.class() {
                         EntryMode::Tree => next.push((child, e.id)),
                         EntryMode::Gitlink => {}
                         _ => add_occurrence(&mut occ, policy, &root, &child, e.id),

@@ -519,7 +519,7 @@ fn ensure_dir(parent: &Path, last: &mut Option<PathBuf>) -> io::Result<()> {
 /// creation), one `write`, one `fstat`.
 fn write_file(full: &Path, mode: EntryMode, body: &[u8]) -> anyhow::Result<fs::Metadata> {
     use std::io::Write;
-    let perm = if mode == EntryMode::Executable { 0o755 } else { 0o644 };
+    let perm = if mode.class() == EntryMode::Executable { 0o755 } else { 0o644 };
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -549,7 +549,7 @@ fn write_items(dir: &Path, items: Vec<WriteItem>, fresh: bool) -> anyhow::Result
         if !fresh {
             remove_existing(&full).with_context(|| format!("clearing {}", full.display()))?;
         }
-        let meta = match it.mode {
+        let meta = match it.mode.class() {
             EntryMode::Gitlink => {
                 fs::create_dir_all(&full)?;
                 out.push((key, None));
@@ -561,9 +561,9 @@ fn write_items(dir: &Path, items: Vec<WriteItem>, fresh: bool) -> anyhow::Result
                 fs::symlink_metadata(&full)?
             }
             EntryMode::File | EntryMode::Executable => write_file(&full, it.mode, &it.body)?,
-            EntryMode::Tree => bail!("tree entry {key} passed as a leaf"),
+            EntryMode::Tree | EntryMode::Legacy(_) => bail!("tree entry {key} passed as a leaf"),
         };
-        out.push((key, Some(Entry { mode: it.mode, id: it.id, stat: stat_of(&meta) })));
+        out.push((key, Some(Entry { mode: it.mode.class(), id: it.id, stat: stat_of(&meta) })));
     }
     Ok(out)
 }
@@ -641,7 +641,7 @@ fn expand_tree(
                 subtrees.push((child, e.id));
             }
         } else if matcher.matches(&child) {
-            leaves.push((child, e.mode, e.id));
+            leaves.push((child, e.mode.class(), e.id));
         }
     }
     Ok((subtrees, leaves))
@@ -1287,6 +1287,40 @@ mod tests {
         assert_eq!(m & 0o111, 0o111);
         assert_eq!(std::fs::read_link(dir.join("link")).unwrap(), PathBuf::from("run.sh"));
         assert!(dir.join("sub").is_dir());
+        assert!(ws.status(&objs).await.unwrap().is_empty());
+    }
+
+    /// Trees from old histories (`100664`, `100775`, zero-padded `040000`)
+    /// check out like their semantic class and show a clean status.
+    #[tokio::test]
+    async fn legacy_modes_check_out_as_their_class() {
+        let legacy = |m: &str| EntryMode::from_octal(m.as_bytes()).unwrap();
+        let objs = MemoryObjectStore::default();
+        let plain = objs.put(EncodedObject::new(ObjectKind::Blob, b"plain\n")).await.unwrap();
+        let exe = objs.put(EncodedObject::new(ObjectKind::Blob, b"#!/bin/sh\n")).await.unwrap();
+        let inner = Object::Tree(
+            Tree::new(vec![TreeEntry { mode: legacy("100664"), name: "f".into(), id: plain }])
+                .unwrap(),
+        )
+        .encode();
+        let inner = objs.put(inner).await.unwrap();
+        let tree = Object::Tree(
+            Tree::new(vec![
+                TreeEntry { mode: legacy("100640"), name: "plain".into(), id: plain },
+                TreeEntry { mode: legacy("100775"), name: "run.sh".into(), id: exe },
+                TreeEntry { mode: legacy("040000"), name: "dir".into(), id: inner },
+            ])
+            .unwrap(),
+        )
+        .encode();
+        let t = objs.put(tree).await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ws");
+        let ws = Workspace::materialize(&objs, &dir, C, t, Sparse::all()).await.unwrap();
+        let mode = |p: &str| std::fs::metadata(dir.join(p)).unwrap().permissions().mode();
+        assert_eq!(mode("plain") & 0o111, 0);
+        assert_eq!(mode("run.sh") & 0o111, 0o111);
+        assert_eq!(std::fs::read(dir.join("dir/f")).unwrap(), b"plain\n");
         assert!(ws.status(&objs).await.unwrap().is_empty());
     }
 

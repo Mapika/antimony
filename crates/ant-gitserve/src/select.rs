@@ -191,7 +191,7 @@ impl Walk {
             self.ordered.push(Planned { id, path, size, blob: false });
             for entry in entries(object.body()) {
                 let (mode, name, id) = entry?;
-                if !(mode == EntryMode::Tree || mode.is_blob() && !self.no_blobs) {
+                if !(mode.is_tree() || mode.is_blob() && !self.no_blobs) {
                     continue;
                 }
                 // Mark on enqueue, not dequeue: shared subtrees must not
@@ -203,7 +203,7 @@ impl Walk {
                 path.hash(&mut hash);
                 name.hash(&mut hash);
                 let path = hash.finish();
-                if mode == EntryMode::Tree {
+                if mode.is_tree() {
                     self.queue.push_back((id, path));
                 } else {
                     self.ordered.push(Planned { id, path, size: 0, blob: true });

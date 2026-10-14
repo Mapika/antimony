@@ -183,8 +183,8 @@ impl<'g> Prepper<'g> {
                 let name = std::str::from_utf8(name_bytes).unwrap_or_default();
                 let n_tree = n.filter(|e| e.mode.is_tree()).map(|e| e.id);
                 let o_tree = o.filter(|e| e.mode.is_tree()).map(|e| e.id);
-                let n_leaf = n.filter(|e| !e.mode.is_tree()).map(|e| (e.mode, e.id));
-                let o_leaf = o.filter(|e| !e.mode.is_tree()).map(|e| (e.mode, e.id));
+                let n_leaf = n.filter(|e| !e.mode.is_tree()).map(|e| (e.mode.class(), e.id));
+                let o_leaf = o.filter(|e| !e.mode.is_tree()).map(|e| (e.mode.class(), e.id));
                 let child =
                     if f.path.is_empty() { name.to_string() } else { format!("{}/{name}", f.path) };
 
@@ -212,7 +212,8 @@ impl<'g> Prepper<'g> {
                         && mode.is_blob()
                         && !known
                         && !others.iter().flatten().any(|p| {
-                            p.find(name_bytes, false).is_some_and(|e| e.mode == mode && e.id == id)
+                            p.find(name_bytes, false)
+                                .is_some_and(|e| e.mode.class() == mode && e.id == id)
                         })
                     {
                         wanted.insert(id);

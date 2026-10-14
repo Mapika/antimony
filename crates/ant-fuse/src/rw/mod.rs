@@ -149,7 +149,7 @@ fn mode(m: &fs::Metadata) -> EntryMode {
     }
 }
 fn file_kind(m: EntryMode) -> FileType {
-    match m {
+    match m.class() {
         EntryMode::Tree | EntryMode::Gitlink => FileType::Directory,
         EntryMode::Symlink => FileType::Symlink,
         _ => FileType::RegularFile,

@@ -20,7 +20,7 @@ fn io_error(error: impl std::fmt::Display) -> Errno {
 }
 
 fn kind(mode: EntryMode) -> FileType {
-    match mode {
+    match mode.class() {
         EntryMode::Tree | EntryMode::Gitlink => FileType::Directory,
         EntryMode::Symlink => FileType::Symlink,
         _ => FileType::RegularFile,
@@ -128,7 +128,7 @@ impl View {
 
     pub(super) fn inode(s: &mut State, parent: INodeNo, entry: &TreeEntry) -> INodeNo {
         *s.paths.entry((parent, entry.name.clone())).or_insert_with(|| {
-            s.nodes.push(Node { parent, mode: entry.mode, id: entry.id });
+            s.nodes.push(Node { parent, mode: entry.mode.class(), id: entry.id });
             INodeNo(s.nodes.len() as u64)
         })
     }
@@ -187,7 +187,7 @@ impl View {
         let mut ids: Vec<_> = tree
             .entries()
             .iter()
-            .filter(|e| e.mode == EntryMode::Tree && !s.trees.contains_key(&e.id))
+            .filter(|e| e.mode.is_tree() && !s.trees.contains_key(&e.id))
             .map(|e| e.id)
             .collect();
         ids.sort_unstable();

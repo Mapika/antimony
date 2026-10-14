@@ -351,7 +351,7 @@ impl Operation<'_> {
             let Some(next) = tree.get(part) else {
                 return Ok(None);
             };
-            entry = next.clone();
+            entry = TreeEntry { mode: next.mode.class(), ..next.clone() };
         }
         Ok(Some(entry))
     }
@@ -465,7 +465,7 @@ impl Operation<'_> {
                 let child =
                     if path.is_empty() { e.name.clone() } else { format!("{path}/{}", e.name) };
                 if !hidden(self.deleted, &child) {
-                    out.insert(e.name.clone(), e.mode);
+                    out.insert(e.name.clone(), e.mode.class());
                 }
             }
         }
