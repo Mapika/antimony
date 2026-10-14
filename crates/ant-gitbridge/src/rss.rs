@@ -57,11 +57,6 @@ pub(crate) fn limit_arenas() {
     // SAFETY: mallopt only sets allocator tunables.
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 4);
-        // Fixed thresholds: big buffers are mapped and returned to the OS when
-        // freed instead of fragmenting the heap (the dynamic threshold grows
-        // to 32 MiB after the first large free).
-        libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
-        libc::mallopt(libc::M_TRIM_THRESHOLD, 16 << 20);
     }
 }
 

@@ -84,11 +84,11 @@ const RECORD_QUEUE: usize = 64;
 /// Commits recorded per `put_commits`: batches are merged up to this size.
 const RECORD_COMMITS: usize = 1500;
 /// Resident file-backed memory above which mapped packs are released.
-const PACK_RSS_LIMIT: usize = 64 << 20;
+const PACK_RSS_LIMIT: usize = 96 << 20;
 /// Delta-base cache per git handle (one per worker thread).
-const DELTA_CACHE_BYTES: usize = 24 << 20;
+const DELTA_CACHE_BYTES: usize = 16 << 20;
 /// Largest memo, in objects (56 bytes each).
-const MEMO_MAX_ENTRIES: usize = 1 << 23;
+const MEMO_MAX_ENTRIES: usize = 1 << 22;
 
 #[derive(Debug, Clone)]
 pub struct ImportOptions {
@@ -365,6 +365,7 @@ fn produce(
     let sync = repo.into_sync();
     rss::limit_arenas();
     let workers = tuning.workers();
+    let progress = std::env::var_os("ANT_IMPORT_STATS").is_some();
     let mut sink = Some(Sink::new(tx, batch_objects));
     let mut memo: Option<Memo> = None;
     for (git_ref, ant_ref) in refs {
@@ -391,7 +392,18 @@ fn produce(
                         conv.convert(prep)?;
                     }
                     chunks += 1;
-                    if chunks.is_multiple_of(8) {
+                    if progress && chunks.is_multiple_of(2000) {
+                        eprintln!(
+                            "import: commits={} memo hits={} misses={} fallback trees={} blobs={} ids={}",
+                            conv.stats.commits,
+                            conv.memo.hits,
+                            conv.memo.misses,
+                            conv.stats.fallback_trees,
+                            conv.stats.fallback_blobs,
+                            conv.stats.fallback_ids
+                        );
+                    }
+                    if chunks.is_multiple_of(4) {
                         rss::trim_mapped_packs(PACK_RSS_LIMIT);
                         rss::release_heap();
                     }

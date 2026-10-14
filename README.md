@@ -67,6 +67,16 @@ One binary, `ant`, is both the server and the client; the standalone
 server via `ANT_SERVER` (default `http://127.0.0.1:7420`).
 `ant completions <bash|zsh|fish|...>` prints a shell completion script.
 
+### Importing a large history
+
+`ant import` converts in parallel and keeps memory flat (a fixed-size memo, byte-bounded
+caches); the Linux kernel's 1.5M commits need about 1.5 GiB of anonymous memory. Large
+objects (above `--inline-threshold`) are bundled into packs in S3 with an index in
+Postgres, so S3 sees thousands of large requests instead of millions of small ones.
+For a one-off bulk load, `ANT_PG_BULK=1` commits object inserts without waiting for the
+WAL flush; commit records and refs still commit synchronously, so a crash can only lose
+objects that nothing references yet. `ANT_IMPORT_WORKERS` sets the conversion threads.
+
 ### Docker
 
 ```sh

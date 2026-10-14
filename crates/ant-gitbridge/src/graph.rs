@@ -101,7 +101,16 @@ fn read_heads(
             .map(|chunk| {
                 s.spawn(move || {
                     let mut reader = Reader::new(repo.to_thread_local());
-                    chunk.iter().map(|id| parse_head(id, &reader.read(id)?)).collect()
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for (i, id) in chunk.iter().enumerate() {
+                        out.push(parse_head(id, &reader.read(id)?)?);
+                        // Commits are scattered over the whole pack: release
+                        // the mapped pages as we go.
+                        if i % 256 == 255 {
+                            crate::rss::trim_mapped_packs(64 << 20);
+                        }
+                    }
+                    Ok(out)
                 })
             })
             .collect();
