@@ -100,7 +100,7 @@ impl<K: Hash + Eq + Clone, V: Clone> Cache<K, V> {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Generations<K, V>> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        crate::lock(&self.inner)
     }
 
     pub(crate) fn get(&self, key: &K) -> Option<V> {
@@ -195,7 +195,7 @@ fn scoped<S: ?Sized, C>(
     store: &Arc<S>,
     make: impl FnOnce() -> C,
 ) -> Arc<C> {
-    let mut entries = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let mut entries = crate::lock(&registry);
     entries.retain(|(weak, _)| weak.strong_count() > 0);
     let weak = Arc::downgrade(store);
     if let Some((_, caches)) = entries.iter().find(|(w, _)| Weak::ptr_eq(w, &weak)) {
@@ -222,7 +222,7 @@ pub(crate) fn meta(store: &Arc<dyn MetaStore>) -> Arc<MetaCaches> {
 
 /// Clones the caches of every live registration, releasing the lock first.
 fn live<S: ?Sized, C>(registry: &Registry<S, C>) -> Vec<Arc<C>> {
-    let entries = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let entries = crate::lock(&registry);
     entries.iter().filter(|(w, _)| w.strong_count() > 0).map(|(_, c)| c.clone()).collect()
 }
 

@@ -238,7 +238,7 @@ static CATCH_UPS: LazyLock<Mutex<HashMap<CatchUpKey, bool>>> = LazyLock::new(Def
 
 /// Number of (backend, ref) catch-ups currently running in the background.
 pub(crate) fn running_catch_ups() -> usize {
-    CATCH_UPS.lock().unwrap_or_else(|e| e.into_inner()).len()
+    crate::lock(&CATCH_UPS).len()
 }
 
 /// Fire-and-forget `catch_up`, coalesced per (backend, ref): if one is already
@@ -252,7 +252,7 @@ pub fn schedule_catch_up(b: &Backend, ref_name: &str) {
 pub fn schedule_catch_up_observed(b: &Backend, ref_name: &str, metrics: Option<Arc<Metrics>>) {
     let key = (Arc::as_ptr(&b.meta).cast::<()>() as usize, ref_name.to_string());
     {
-        let mut running = CATCH_UPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut running = crate::lock(&CATCH_UPS);
         if let Some(dirty) = running.get_mut(&key) {
             *dirty = true;
             return;
@@ -266,7 +266,7 @@ pub fn schedule_catch_up_observed(b: &Backend, ref_name: &str, metrics: Option<A
             if let Err(error) = catch_up_observed(&b, &ref_name, metrics.as_deref()).await {
                 tracing::warn!(%error, ref_name, "history catch-up failed");
             }
-            let mut running = CATCH_UPS.lock().unwrap_or_else(|e| e.into_inner());
+            let mut running = crate::lock(&CATCH_UPS);
             match running.get_mut(&key) {
                 Some(dirty) if *dirty => *dirty = false,
                 _ => {

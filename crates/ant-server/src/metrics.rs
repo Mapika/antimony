@@ -61,7 +61,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ant_core::{EncodedObject, ObjectId, RepoPath};
-use ant_store::postgres::PgStore;
 use ant_store::{
     Backend, CasOutcome, CommitNode, HistoryRow, MetaStore, ObjectStore, PathChange, RefLock,
     RefStore, Result as StoreResult,
@@ -149,29 +148,38 @@ fn store_histogram() -> Histogram {
     Histogram::new(exponential_buckets(0.0001, 2.0, 18))
 }
 
+/// Register a clone of `metric` (they share state) and return it.
+fn register<M: prometheus_client::registry::Metric + Clone>(
+    registry: &mut Registry,
+    name: &str,
+    help: &str,
+    metric: M,
+) -> M {
+    registry.register(name, help, metric.clone());
+    metric
+}
+
 fn hist_family<L: Clone + std::hash::Hash + Eq>(f: fn() -> Histogram) -> HistFamily<L> {
     Family::new_with_constructor(f)
 }
 
-/// The 64 most recently active refs, newest first.
+/// The [`MAX_REF_LABELS`] most recently active refs, newest first.
 #[derive(Default)]
 struct RecentRefs(VecDeque<String>);
 
 impl RecentRefs {
-    /// Mark `name` active. Returns the label to use plus the ref pushed out of
-    /// the set, if any.
-    fn touch(&mut self, name: &str) -> (String, Option<String>) {
+    /// Mark `name` active. Returns the ref pushed out of the set, if any.
+    fn touch(&mut self, name: &str) -> Option<String> {
         if let Some(pos) = self.0.iter().position(|r| r == name) {
             if pos != 0
                 && let Some(r) = self.0.remove(pos)
             {
                 self.0.push_front(r);
             }
-            return (name.to_owned(), None);
+            return None;
         }
         self.0.push_front(name.to_owned());
-        let evicted = if self.0.len() > MAX_REF_LABELS { self.0.pop_back() } else { None };
-        (name.to_owned(), evicted)
+        if self.0.len() > MAX_REF_LABELS { self.0.pop_back() } else { None }
     }
 
     fn label(&self, name: &str) -> String {
@@ -202,7 +210,6 @@ pub struct Metrics {
     pg_in_use: Gauge,
     pg_max: Gauge,
     recent_refs: Mutex<RecentRefs>,
-    pg: Mutex<Option<Arc<PgStore>>>,
     probes: Mutex<crate::health::Probes>,
     /// Cache lookup totals already folded into the counters (starts at the
     /// process-wide values when this `Metrics` is created).
@@ -213,95 +220,107 @@ impl Metrics {
     pub fn new() -> Arc<Self> {
         let mut registry = Registry::default();
 
-        let rpc_requests = Family::<RpcLabels, Counter>::default();
-        registry.register(
+        let rpc_requests = register(
+            &mut registry,
             "ant_rpc_requests",
             "gRPC requests by method and status",
-            rpc_requests.clone(),
+            Family::<RpcLabels, Counter>::default(),
         );
-        let rpc_duration = hist_family::<MethodLabels>(request_histogram);
-        registry.register(
+        let rpc_duration = register(
+            &mut registry,
             "ant_rpc_duration_seconds",
             "gRPC request duration until the response body ends",
-            rpc_duration.clone(),
+            hist_family::<MethodLabels>(request_histogram),
         );
-        let http_requests = Family::<HttpLabels, Counter>::default();
-        registry.register(
+        let http_requests = register(
+            &mut registry,
             "ant_http_requests",
             "HTTP requests by route and status",
-            http_requests.clone(),
+            Family::<HttpLabels, Counter>::default(),
         );
-        let http_duration = hist_family::<RouteLabels>(request_histogram);
-        registry.register(
+        let http_duration = register(
+            &mut registry,
             "ant_http_duration_seconds",
             "HTTP request duration until the response headers are ready",
-            http_duration.clone(),
+            hist_family::<RouteLabels>(request_histogram),
         );
 
-        let land_batch_size = Histogram::new(exponential_buckets(1.0, 2.0, 7));
-        registry.register(
+        let land_batch_size = register(
+            &mut registry,
             "ant_land_batch_size",
             "Land requests per group-commit batch",
-            land_batch_size.clone(),
+            Histogram::new(exponential_buckets(1.0, 2.0, 7)),
         );
-        let land_outcomes = Family::<OutcomeLabels, Counter>::default();
-        registry.register("ant_land_outcomes", "Land requests by outcome", land_outcomes.clone());
-        let land_cas_retries = Counter::default();
-        registry.register(
+        let land_outcomes = register(
+            &mut registry,
+            "ant_land_outcomes",
+            "Land requests by outcome",
+            Family::<OutcomeLabels, Counter>::default(),
+        );
+        let land_cas_retries = register(
+            &mut registry,
             "ant_land_cas_retries",
             "Land batches replayed after losing the ref CAS",
-            land_cas_retries.clone(),
+            Counter::default(),
         );
-        let land_queue_depth = Family::<RefLabels, Gauge>::default();
-        registry.register(
+        let land_queue_depth = register(
+            &mut registry,
             "ant_land_queue_depth",
             "Land requests waiting per ref (most recently active refs, rest as other)",
-            land_queue_depth.clone(),
+            Family::<RefLabels, Gauge>::default(),
         );
 
-        let store_duration = hist_family::<StoreOpLabels>(store_histogram);
-        registry.register(
+        let store_duration = register(
+            &mut registry,
             "ant_store_op_duration_seconds",
             "Store call duration by store and operation",
-            store_duration.clone(),
+            hist_family::<StoreOpLabels>(store_histogram),
         );
-        let store_errors = Family::<StoreOpLabels, Counter>::default();
-        registry.register("ant_store_errors", "Failed store calls", store_errors.clone());
+        let store_errors = register(
+            &mut registry,
+            "ant_store_errors",
+            "Failed store calls",
+            Family::<StoreOpLabels, Counter>::default(),
+        );
 
-        let cache_hits = Family::<CacheLabels, Counter>::default();
-        registry.register(
+        let cache_hits = register(
+            &mut registry,
             "ant_cache_hits",
             "Cache lookups served from the cache",
-            cache_hits.clone(),
+            Family::<CacheLabels, Counter>::default(),
         );
-        let cache_misses = Family::<CacheLabels, Counter>::default();
-        registry.register(
+        let cache_misses = register(
+            &mut registry,
             "ant_cache_misses",
             "Cache lookups that went to the store",
-            cache_misses.clone(),
+            Family::<CacheLabels, Counter>::default(),
         );
-        let cache_bytes = Family::<CacheLabels, Gauge>::default();
-        registry.register(
+        let cache_bytes = register(
+            &mut registry,
             "ant_cache_bytes",
             "Approximate bytes held per cache",
-            cache_bytes.clone(),
+            Family::<CacheLabels, Gauge>::default(),
         );
 
-        let history_lag = Family::<RefLabels, Gauge>::default();
-        registry.register(
+        let history_lag = register(
+            &mut registry,
             "ant_history_lag_commits",
             "Commits the path-history index is behind the ref",
-            history_lag.clone(),
+            Family::<RefLabels, Gauge>::default(),
         );
-        let history_catch_up = Histogram::new(exponential_buckets(0.001, 2.0, 16));
-        registry.register(
+        let history_catch_up = register(
+            &mut registry,
             "ant_history_catch_up_seconds",
             "Duration of history catch-ups that indexed commits",
-            history_catch_up.clone(),
+            Histogram::new(exponential_buckets(0.001, 2.0, 16)),
         );
 
-        let build = Family::<BuildLabels, Gauge>::default();
-        registry.register("ant_build_info", "Build information (value is always 1)", build.clone());
+        let build = register(
+            &mut registry,
+            "ant_build_info",
+            "Build information (value is always 1)",
+            Family::<BuildLabels, Gauge>::default(),
+        );
         build
             .get_or_create(&BuildLabels {
                 version: env!("CARGO_PKG_VERSION"),
@@ -309,26 +328,30 @@ impl Metrics {
             })
             .set(1);
 
-        let pg_size = Gauge::default();
-        registry.register(
+        let pg_size = register(
+            &mut registry,
             "ant_pg_pool_size",
             "Open Postgres query-pool connections",
-            pg_size.clone(),
+            Gauge::default(),
         );
-        let pg_idle = Gauge::default();
-        registry.register(
+        let pg_idle = register(
+            &mut registry,
             "ant_pg_pool_idle",
             "Idle Postgres query-pool connections",
-            pg_idle.clone(),
+            Gauge::default(),
         );
-        let pg_in_use = Gauge::default();
-        registry.register(
+        let pg_in_use = register(
+            &mut registry,
             "ant_pg_pool_in_use",
             "Postgres query-pool connections in use",
-            pg_in_use.clone(),
+            Gauge::default(),
         );
-        let pg_max = Gauge::default();
-        registry.register("ant_pg_pool_max", "Configured Postgres query-pool size", pg_max.clone());
+        let pg_max = register(
+            &mut registry,
+            "ant_pg_pool_max",
+            "Configured Postgres query-pool size",
+            Gauge::default(),
+        );
 
         // Closed label sets appear (as zeros) before their first event.
         for outcome in ["landed", "rebased", "conflict", "aborted", "denied"] {
@@ -364,30 +387,20 @@ impl Metrics {
             pg_in_use,
             pg_max,
             recent_refs: Mutex::new(RecentRefs::default()),
-            pg: Mutex::new(None),
             probes: Mutex::new(crate::health::Probes::default()),
             cache_synced: Mutex::new(lookup_counters()),
         })
     }
 
-    /// Report the Postgres pool of `pg` in the `ant_pg_pool_*` gauges.
-    pub fn set_pg(&self, pg: Arc<PgStore>) {
-        *self.pg.lock().unwrap_or_else(|e| e.into_inner()) = Some(pg.clone());
-        self.probes.lock().unwrap_or_else(|e| e.into_inner()).pg = Some(pg);
-    }
-
-    /// Register the dependencies `GET /readyz` probes (also sets the
-    /// Postgres pool reported in the gauges).
+    /// Register the dependencies `GET /readyz` probes; a Postgres probe's
+    /// pool is also reported in the `ant_pg_pool_*` gauges.
     pub fn set_probes(&self, probes: crate::health::Probes) {
-        if let Some(pg) = &probes.pg {
-            *self.pg.lock().unwrap_or_else(|e| e.into_inner()) = Some(pg.clone());
-        }
-        *self.probes.lock().unwrap_or_else(|e| e.into_inner()) = probes;
+        *crate::lock(&self.probes) = probes;
     }
 
     /// The dependencies `GET /readyz` probes.
     pub fn probes(&self) -> crate::health::Probes {
-        self.probes.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        crate::lock(&self.probes).clone()
     }
 
     // -- transports -------------------------------------------------------
@@ -429,16 +442,14 @@ impl Metrics {
 
     /// Mark `ref_name` recently active (it keeps its own `ref` label).
     pub(crate) fn touch_ref(&self, ref_name: &str) {
-        let (_, evicted) =
-            self.recent_refs.lock().unwrap_or_else(|e| e.into_inner()).touch(ref_name);
-        if let Some(evicted) = evicted {
+        if let Some(evicted) = crate::lock(&self.recent_refs).touch(ref_name) {
             self.history_lag.remove(&RefLabels { r#ref: evicted });
         }
     }
 
     pub(crate) fn set_history_lag(&self, ref_name: &str, commits: usize) {
         self.touch_ref(ref_name);
-        let label = self.recent_refs.lock().unwrap_or_else(|e| e.into_inner()).label(ref_name);
+        let label = crate::lock(&self.recent_refs).label(ref_name);
         self.history_lag.get_or_create(&RefLabels { r#ref: label }).set(commits as i64);
     }
 
@@ -514,7 +525,7 @@ impl Metrics {
         // queues disappear.
         let mut depth: std::collections::BTreeMap<String, i64> = Default::default();
         {
-            let recent = self.recent_refs.lock().unwrap_or_else(|e| e.into_inner());
+            let recent = crate::lock(&self.recent_refs);
             for (name, len) in queue_depths() {
                 *depth.entry(recent.label(&name)).or_default() += len as i64;
             }
@@ -533,7 +544,7 @@ impl Metrics {
                 .set(s.weight_bytes as i64);
         }
         let totals = lookup_counters();
-        let mut synced = self.cache_synced.lock().unwrap_or_else(|e| e.into_inner());
+        let mut synced = crate::lock(&self.cache_synced);
         for (i, cache) in CACHE_NAMES.into_iter().enumerate() {
             let labels = CacheLabels { cache };
             self.cache_hits.get_or_create(&labels).inc_by(totals[i].0.saturating_sub(synced[i].0));
@@ -544,7 +555,7 @@ impl Metrics {
         *synced = totals;
         drop(synced);
 
-        let pg = self.pg.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let pg = crate::lock(&self.probes).pg.clone();
         if let Some(pg) = pg {
             let s = pg.pool_stats();
             self.pg_size.set(i64::from(s.size));
@@ -759,12 +770,12 @@ mod tests {
     fn recent_refs_cap_and_fold() {
         let mut r = RecentRefs::default();
         for i in 0..MAX_REF_LABELS {
-            let (_, evicted) = r.touch(&format!("r{i}"));
+            let evicted = r.touch(&format!("r{i}"));
             assert!(evicted.is_none());
         }
         // Touching an old ref keeps it; a new one pushes out the oldest.
         r.touch("r0");
-        let (_, evicted) = r.touch("new");
+        let evicted = r.touch("new");
         assert_eq!(evicted.as_deref(), Some("r1"));
         assert_eq!(r.label("r0"), "r0");
         assert_eq!(r.label("r1"), OTHER);

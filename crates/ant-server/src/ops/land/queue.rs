@@ -75,7 +75,7 @@ impl Drop for Worker {
         if self.active {
             // Panic/runtime shutdown closes every queued reply. In-flight
             // replies are owned by the task and close when its future drops.
-            QUEUES.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.key);
+            crate::lock(&QUEUES).remove(&self.key);
         }
     }
 }
@@ -86,7 +86,7 @@ impl Worker {
         tokio::task::yield_now().await;
         loop {
             {
-                let mut queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+                let mut queues = crate::lock(&QUEUES);
                 match queues.get(&self.key) {
                     None => return,
                     Some(queue) if queue.is_empty() => {
@@ -211,7 +211,7 @@ impl Worker {
 
     /// Up to [`MAX_BATCH`] queued requests, in arrival order.
     fn drain(&self) -> Option<Vec<Request>> {
-        let mut queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queues = crate::lock(&QUEUES);
         let queue = queues.get_mut(&self.key)?;
         if queue.is_empty() {
             return None;
@@ -222,7 +222,7 @@ impl Worker {
 
     /// Put drained but unanswered requests back at the front of the queue.
     fn requeue(&self, requests: Vec<Request>) {
-        let mut queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queues = crate::lock(&QUEUES);
         // The queue lives as long as this worker is active.
         if let Some(queue) = queues.get_mut(&self.key) {
             for request in requests.into_iter().rev() {
@@ -397,13 +397,13 @@ impl Batch {
 
 /// Live land queues and the requests waiting in them (process-wide).
 pub(crate) fn queue_stats() -> (usize, usize) {
-    let queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+    let queues = crate::lock(&QUEUES);
     (queues.len(), queues.values().map(VecDeque::len).sum())
 }
 
 /// Waiting requests per ref name, summed over backends (for metrics).
 pub(crate) fn queue_depths() -> Vec<(String, usize)> {
-    let queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+    let queues = crate::lock(&QUEUES);
     let mut by_ref: HashMap<&str, usize> = HashMap::new();
     for (key, queue) in queues.iter() {
         *by_ref.entry(key.3.as_str()).or_default() += queue.len();
@@ -436,7 +436,7 @@ pub(super) fn enqueue_checked(
         ref_name.to_owned(),
     );
     let (reply, receiver) = oneshot::channel();
-    let mut queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut queues = crate::lock(&QUEUES);
     let lead = !queues.contains_key(&key);
     queues.entry(key.clone()).or_default().push_back(Request {
         commit,
