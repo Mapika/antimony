@@ -173,27 +173,7 @@ impl Workspace {
     ) -> anyhow::Result<Self> {
         let matcher = sparse.compile()?;
 
-        // Breadth-first walk: one get_many per level for the subtrees we need;
-        // the trees of a level are decoded in parallel.
-        let matcher = Arc::new(matcher);
-        let mut leaves: Vec<(RepoPath, EntryMode, ObjectId)> = Vec::new();
-        let mut frontier = vec![(RepoPath::root(), base_tree)];
-        while !frontier.is_empty() {
-            let level = fetch_level(objects, dirs, &matcher, &frontier).await?;
-            let m = matcher.clone();
-            let expanded = tokio::task::spawn_blocking(move || {
-                let work: Vec<_> = frontier.into_iter().zip(level).collect();
-                par_map(&work, 64, |((parent, id), obj)| expand_tree(&m, parent, id, obj.clone()))
-            })
-            .await?;
-            let mut next = Vec::new();
-            for r in expanded {
-                let (subtrees, found) = r?;
-                next.extend(subtrees);
-                leaves.extend(found);
-            }
-            frontier = next;
-        }
+        let leaves = walk_leaves(objects, dirs, matcher, base_tree).await?;
 
         let d = dir.to_path_buf();
         let levels = leaf_dirs(&leaves);
@@ -496,6 +476,75 @@ impl Workspace {
 
 /// The trees of one walk level, in `frontier` order: directories wholly in
 /// scope through `dirs` (when given), the rest with one `get_many`.
+/// The leaves (files, symlinks, gitlinks) of `base_tree` the matcher selects,
+/// found by a breadth-first walk with one fetch per level (whole directories
+/// through `dirs` where the matcher covers them and it is set).
+async fn walk_leaves(
+    objects: &dyn ObjectStore,
+    dirs: Option<&dyn DirFetch>,
+    matcher: sparse::Matcher,
+    base_tree: ObjectId,
+) -> anyhow::Result<Vec<(RepoPath, EntryMode, ObjectId)>> {
+    // One get_many per level for the subtrees we need; the trees of a level
+    // are decoded in parallel.
+    let matcher = Arc::new(matcher);
+    let mut leaves: Vec<(RepoPath, EntryMode, ObjectId)> = Vec::new();
+    let mut frontier = vec![(RepoPath::root(), base_tree)];
+    while !frontier.is_empty() {
+        let level = fetch_level(objects, dirs, &matcher, &frontier).await?;
+        let m = matcher.clone();
+        let expanded = tokio::task::spawn_blocking(move || {
+            let work: Vec<_> = frontier.into_iter().zip(level).collect();
+            par_map(&work, 64, |((parent, id), obj)| expand_tree(&m, parent, id, obj.clone()))
+        })
+        .await?;
+        let mut next = Vec::new();
+        for r in expanded {
+            let (subtrees, found) = r?;
+            next.extend(subtrees);
+            leaves.extend(found);
+        }
+        frontier = next;
+    }
+    Ok(leaves)
+}
+
+/// What [`seed`] covered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Seeded {
+    /// Leaves (files, symlinks) in scope.
+    pub leaves: usize,
+    /// Distinct blobs among them.
+    pub blobs: usize,
+}
+
+/// Blob ids handed to [`seed`]'s `ensure` per call.
+const SEED_BATCH: usize = 2048;
+
+/// Make the tree `base_tree` (restricted to `sparse`) local through
+/// `objects`/`dirs`: walk it exactly as a checkout would, so the same bundles
+/// are fetched, then pass every blob in scope, in batches, to `ensure` (which
+/// fetches the ones that are missing locally). No files are written.
+pub async fn seed(
+    objects: &dyn ObjectStore,
+    dirs: Option<&dyn DirFetch>,
+    base_tree: ObjectId,
+    sparse: &Sparse,
+    ensure: &(
+         dyn Fn(Vec<ObjectId>) -> futures::future::BoxFuture<'static, ant_store::Result<()>> + Sync
+     ),
+) -> anyhow::Result<Seeded> {
+    let leaves = walk_leaves(objects, dirs, sparse.compile()?, base_tree).await?;
+    let mut blobs: Vec<ObjectId> =
+        leaves.iter().filter(|(_, m, _)| *m != EntryMode::Gitlink).map(|(_, _, id)| *id).collect();
+    blobs.sort_unstable();
+    blobs.dedup();
+    for batch in blobs.chunks(SEED_BATCH) {
+        ensure(batch.to_vec()).await?;
+    }
+    Ok(Seeded { leaves: leaves.len(), blobs: blobs.len() })
+}
+
 async fn fetch_level(
     objects: &dyn ObjectStore,
     dirs: Option<&dyn DirFetch>,

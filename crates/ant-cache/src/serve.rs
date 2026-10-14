@@ -276,7 +276,8 @@ impl CacheServe {
             })
             .await
             .map_err(|e| Arc::new(e.to_string()))?;
-            let obj = verified.map_err(|e| Arc::new(format!("upstream sent a corrupt object: {e}")))?;
+            let obj =
+                verified.map_err(|e| Arc::new(format!("upstream sent a corrupt object: {e}")))?;
             if let Err(e) = self.disk.put_many_trusted(vec![(id, obj)]).await {
                 tracing::warn!(%id, "storing object failed: {e}");
             }
@@ -311,8 +312,14 @@ impl CacheServe {
     /// reading them.
     async fn revalidate(&self, id: &ObjectId, auth: Option<&str>) -> Result<Reply, String> {
         let etag = format!("\"{}\"", id.to_hex());
-        self.upstream_get(&format!("/o/{}", id.to_hex()), "objects", "revalidate", auth, Some(&etag))
-            .await
+        self.upstream_get(
+            &format!("/o/{}", id.to_hex()),
+            "objects",
+            "revalidate",
+            auth,
+            Some(&etag),
+        )
+        .await
     }
 
     // -- bundles ----------------------------------------------------------
@@ -351,7 +358,8 @@ impl CacheServe {
     /// Open mode: the bundle of `tree` from the upstream, stored and indexed.
     async fn fetch_bundle(&self, tree: ObjectId) -> FlightOut {
         let path = format!("/t/{}", tree.to_hex());
-        let reply = self.upstream_get(&path, "bundles", "fetch", None, None).await.map_err(Arc::new)?;
+        let reply =
+            self.upstream_get(&path, "bundles", "fetch", None, None).await.map_err(Arc::new)?;
         if reply.status == StatusCode::OK {
             self.ingest_bundle(tree, reply.body.clone(), true)
                 .await
@@ -527,7 +535,9 @@ async fn get_object(
         }
     };
     match (me.auth, local) {
-        (AuthMode::Open, Some(obj)) => object_response(&me, &id, obj, CACHE_IMMUTABLE, "hit", &headers),
+        (AuthMode::Open, Some(obj)) => {
+            object_response(&me, &id, obj, CACHE_IMMUTABLE, "hit", &headers)
+        }
         (AuthMode::Open, None) => fill_object(&me, id, None).await,
         (AuthMode::Forward, Some(obj)) => {
             // Never serve on our own authority: the origin must confirm.
@@ -567,7 +577,8 @@ async fn fill_object(me: &Arc<CacheServe>, id: ObjectId, auth: Option<String>) -
             Ok(r) if r.status == StatusCode::NOT_MODIFIED => {
                 if let Ok(done) = fut.await
                     && done.status == StatusCode::OK
-                    && let Ok(Some(obj)) = me.disk.get_many(&[id]).await.map(|mut v| v.pop().flatten())
+                    && let Ok(Some(obj)) =
+                        me.disk.get_many(&[id]).await.map(|mut v| v.pop().flatten())
                 {
                     let cache = done
                         .headers
@@ -654,7 +665,11 @@ async fn bundle_response(me: &Arc<CacheServe>, hex: &str, headers: &HeaderMap) -
                         me2.ingest.add_permits(1);
                     });
                 }
-                let tag = if reply.status == StatusCode::OK { "passthrough" } else { tag_for(&reply, true) };
+                let tag = if reply.status == StatusCode::OK {
+                    "passthrough"
+                } else {
+                    tag_for(&reply, true)
+                };
                 reply_response(me, "bundles", &reply, tag)
             }
             Err(e) => {

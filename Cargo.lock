@@ -148,6 +148,7 @@ name = "ant-cli"
 version = "0.1.0"
 dependencies = [
  "ant-auth",
+ "ant-cache",
  "ant-core",
  "ant-fuse",
  "ant-gitbridge",
@@ -159,10 +160,12 @@ dependencies = [
  "async-trait",
  "clap",
  "clap_complete",
+ "futures",
  "sqlx",
  "tempfile",
  "tokio",
  "tonic",
+ "tracing",
 ]
 
 [[package]]

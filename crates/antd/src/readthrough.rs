@@ -38,9 +38,9 @@ use futures::future::{BoxFuture, FutureExt, Shared};
 
 use crate::claim::{Claim, Claims};
 use crate::disk::DiskObjectStore;
-use crate::tiers::TierCounters;
 use crate::par::par_map;
 use crate::remote::RemoteObjectStore;
+use crate::tiers::TierCounters;
 use crate::workspace::DirFetch;
 use parking_lot::Mutex;
 
@@ -106,6 +106,19 @@ impl ReadThrough {
         self
     }
 
+    /// Fetch whichever of `ids` are missing locally (without reading the ones
+    /// that are present); returns how many were missing. Objects upstream
+    /// lacks are not an error.
+    pub async fn ensure_local(&self, ids: &[ObjectId]) -> Result<usize> {
+        let present = self.local.has_many(ids).await?;
+        let misses: Vec<ObjectId> =
+            ids.iter().zip(&present).filter(|(_, p)| !**p).map(|(id, _)| *id).collect();
+        if !misses.is_empty() {
+            self.get_many(&misses).await?;
+        }
+        Ok(misses.len())
+    }
+
     /// This handle's tier counters so far (`crate::tiers::NAMES` order).
     pub fn tier_counts(&self) -> [u64; 7] {
         self.stats.snapshot()
@@ -140,6 +153,8 @@ impl ReadThrough {
         // Trees another process is already fetching as bundles are waited
         // for after our own bundles are stored (never while holding claims).
         let (owned, peers) = self.claim(&misses, "b-").await;
+        // A peer may have finished between our local miss and our claim.
+        let owned = drop_present(self.local.as_ref(), owned).await?;
         let (ids, guards): (Vec<ObjectId>, Vec<Option<Claim>>) = owned.into_iter().unzip();
         let mut fetched: HashMap<ObjectId, EncodedObject> = HashMap::new();
         if !ids.is_empty() {
@@ -252,6 +267,10 @@ impl ReadThrough {
         }
         if let Some(claims) = claims {
             let (owned, others) = claim_ids(Some(claims.clone()), missing, "").await;
+            // A peer may have finished between our local miss and our claim.
+            let claimed = owned.len();
+            let owned = drop_present(local.as_ref(), owned).await?;
+            let landed_meanwhile = owned.len() != claimed;
             let (mine, guards): (Vec<ObjectId>, Vec<Option<Claim>>) = owned.into_iter().unzip();
             if !mine.is_empty() {
                 let found = Self::fetch_store(&local, &disk, trusted, &upstream, &stats, mine);
@@ -272,9 +291,20 @@ impl ReadThrough {
                     }
                 }
             }
+            if landed_meanwhile {
+                let lacking: Vec<ObjectId> =
+                    ids.iter().filter(|id| !out.contains_key(id)).copied().collect();
+                for (id, o) in lacking.iter().zip(local.get_many(&lacking).await?) {
+                    if let Some(o) = o {
+                        out.insert(*id, o);
+                    }
+                }
+            }
         }
         if !missing.is_empty() {
-            out.extend(Self::fetch_store(&local, &disk, trusted, &upstream, &stats, missing).await?);
+            out.extend(
+                Self::fetch_store(&local, &disk, trusted, &upstream, &stats, missing).await?,
+            );
         }
         Ok(out)
     }
@@ -348,6 +378,20 @@ async fn claim_ids(
     .await;
     // A panic in the blocking pool is not worth failing a read: fetch all.
     done.unwrap_or_else(|_| (ids.into_iter().map(|id| (id, None)).collect(), Vec::new()))
+}
+
+/// Drop the claims on ids that are in the local store after all (the
+/// previous holder finished between our miss and our claim).
+async fn drop_present(
+    local: &dyn ObjectStore,
+    owned: Vec<(ObjectId, Option<Claim>)>,
+) -> Result<Vec<(ObjectId, Option<Claim>)>> {
+    if owned.is_empty() {
+        return Ok(owned);
+    }
+    let ids: Vec<ObjectId> = owned.iter().map(|(id, _)| *id).collect();
+    let present = local.has_many(&ids).await?;
+    Ok(owned.into_iter().zip(present).filter(|(_, p)| !*p).map(|(o, _)| o).collect())
 }
 
 /// Wait until every peer holding one of `ids` is done, for at most
@@ -482,9 +526,9 @@ mod tests {
     use ant_store::{ObjectStoreExt, conformance};
 
     use crate::claim::{Claim, Claims};
-use crate::disk::DiskObjectStore;
-use crate::tiers::TierCounters;
+    use crate::disk::DiskObjectStore;
     use crate::test_support::CountingStore;
+    use crate::tiers::TierCounters;
 
     /// Upstream that counts how many ids it was asked for and is slow.
     fn slow_upstream() -> CountingStore {

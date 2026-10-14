@@ -122,13 +122,7 @@ async fn protected() -> Protected {
     acl::reindex(&backend, &policy, commit).await.unwrap();
     let secrets_dir = tree_at(&backend, root, "secrets").await;
     let origin = spawn_local(backend, Acl::new(policy)).await.unwrap();
-    Protected {
-        origin,
-        root,
-        secrets_dir,
-        secret: blob_id(SECRET),
-        public: blob_id("readme\n"),
-    }
+    Protected { origin, root, secrets_dir, secret: blob_id(SECRET), public: blob_id("readme\n") }
 }
 
 struct Tier {
@@ -276,7 +270,9 @@ async fn racing_principals_do_not_share_a_fetch_across_access() {
         assert_eq!(w2.status(), 200);
         for r in [r1, r2] {
             assert_eq!(r.status(), 404);
-            assert!(!r.bytes().await.unwrap().windows(SECRET.len()).any(|w| w == SECRET.as_bytes()));
+            assert!(
+                !r.bytes().await.unwrap().windows(SECRET.len()).any(|w| w == SECRET.as_bytes())
+            );
         }
     }
 }
@@ -318,7 +314,8 @@ async fn bundles_are_forwarded_and_what_they_leave_behind_stays_gated() {
 
     // The root bundle: the reader's equals the origin's, the writer's too.
     for token in [READER, WRITER] {
-        let direct = get(&format!("{}/t/{}", p.origin.http_url(), p.root.to_hex()), Some(token)).await;
+        let direct =
+            get(&format!("{}/t/{}", p.origin.http_url(), p.root.to_hex()), Some(token)).await;
         let via = bundle(&p.root, Some(token)).await;
         assert_eq!(via.status(), direct.status());
         assert_eq!(
@@ -326,10 +323,12 @@ async fn bundles_are_forwarded_and_what_they_leave_behind_stays_gated() {
             direct.headers().get("cache-control"),
             "origin's caching headers pass through"
         );
-        assert_eq!(bundle_ids(&via.bytes().await.unwrap()), bundle_ids(&direct.bytes().await.unwrap()));
+        assert_eq!(
+            bundle_ids(&via.bytes().await.unwrap()),
+            bundle_ids(&direct.bytes().await.unwrap())
+        );
     }
-    let reader_ids =
-        bundle_ids(&bundle(&p.root, Some(READER)).await.bytes().await.unwrap());
+    let reader_ids = bundle_ids(&bundle(&p.root, Some(READER)).await.bytes().await.unwrap());
     assert!(!reader_ids.contains(&p.secret) && !reader_ids.contains(&p.secrets_dir));
 }
 
@@ -360,7 +359,8 @@ struct Open {
 async fn open_origin() -> Open {
     let backend = Backend::in_memory();
     let metrics = Metrics::new();
-    let origin = spawn_local_with_metrics(backend.clone(), Acl::open(), metrics.clone()).await.unwrap();
+    let origin =
+        spawn_local_with_metrics(backend.clone(), Acl::open(), metrics.clone()).await.unwrap();
     Open { origin, metrics, backend }
 }
 
@@ -381,7 +381,10 @@ async fn open_mode_fills_once_then_serves_from_disk() {
     for _ in 0..5 {
         let r = get(&url, Some("ignored-token")).await;
         assert_eq!((r.status().as_u16(), cache_tag(&r)), (200, "hit".to_owned()));
-        assert_eq!(r.headers().get("etag").unwrap().to_str().unwrap(), format!("\"{}\"", blob.id().to_hex()));
+        assert_eq!(
+            r.headers().get("etag").unwrap().to_str().unwrap(),
+            format!("\"{}\"", blob.id().to_hex())
+        );
         assert_eq!(r.bytes().await.unwrap().as_ref(), blob.as_bytes().as_ref());
     }
     assert_eq!(origin_requests(&o.metrics), before, "hits never reach the origin");
@@ -471,10 +474,13 @@ async fn corrupt_upstream_objects_are_rejected_and_not_stored() {
     let liar = EncodedObject::new(ObjectKind::Blob, b"not what you asked for");
     let body = liar.as_bytes().to_vec();
     let app = axum::Router::new()
-        .route("/o/{hex}", route(move || {
-            let body = body.clone();
-            async move { body }
-        }))
+        .route(
+            "/o/{hex}",
+            route(move || {
+                let body = body.clone();
+                async move { body }
+            }),
+        )
         .route("/debug/stats", route(|| async { "{}" }));
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let up = format!("http://{}", l.local_addr().unwrap());
@@ -545,7 +551,12 @@ async fn metrics_report_tiers() {
     };
     assert_eq!(value(r#"ant_cacheserve_requests_total{route="objects",result="hit"}"#), 3);
     assert_eq!(value(r#"ant_cacheserve_requests_total{route="objects",result="miss"}"#), 1);
-    assert_eq!(value(r#"ant_cacheserve_upstream_requests_total{route="objects",kind="fetch",status="200"}"#), 1);
+    assert_eq!(
+        value(
+            r#"ant_cacheserve_upstream_requests_total{route="objects",kind="fetch",status="200"}"#
+        ),
+        1
+    );
     assert!(value(r#"ant_cacheserve_response_bytes_total{route="objects"}"#) > 0);
     assert!(text.contains("ant_cacheserve_disk_budget_bytes"));
     assert!(text.trim_end().ends_with("# EOF"));
@@ -576,8 +587,15 @@ async fn build_files(objects: &dyn ObjectStore, n: usize) -> ObjectId {
     for i in 0..n {
         let d = root.dirs.entry(format!("d{}", i % 13)).or_default();
         let d = d.dirs.entry(format!("s{}", i % 7)).or_default();
-        let blob = EncodedObject::new(ObjectKind::Blob, format!("file {i}\n").repeat(i % 30 + 1).as_bytes());
-        d.entries.push(TreeEntry { mode: EntryMode::File, name: format!("f{i}.txt"), id: blob.id() });
+        let blob = EncodedObject::new(
+            ObjectKind::Blob,
+            format!("file {i}\n").repeat(i % 30 + 1).as_bytes(),
+        );
+        d.entries.push(TreeEntry {
+            mode: EntryMode::File,
+            name: format!("f{i}.txt"),
+            id: blob.id(),
+        });
         objs.push(blob);
     }
     let id = store(root, &mut objs);

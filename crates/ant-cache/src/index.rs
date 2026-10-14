@@ -136,8 +136,10 @@ mod tests {
         for n in 0..10u8 {
             ix.write(&id(n), &[id(n)]).unwrap();
             let f = std::fs::File::options().write(true).open(ix.path(&id(n))).unwrap();
-            f.set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000 + n as u64))
-                .unwrap();
+            f.set_modified(
+                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000 + n as u64),
+            )
+            .unwrap();
         }
         assert_eq!(ix.bytes(), 10 * 40);
         assert_eq!(ix.prune(1000), 0);

@@ -7,6 +7,7 @@ use crate::ctx::{Ctx, Outcome};
 
 mod admin;
 mod cache;
+mod cache_serve;
 mod import;
 mod mount;
 mod query;
@@ -16,6 +17,11 @@ mod ws;
 pub async fn run(cli: Cli) -> Result<Outcome> {
     let cli = match cli.command {
         Command::Serve(a) => return ant_server::serve::run(*a).await.map(|()| Outcome::empty()),
+        Command::CacheServe(a) => {
+            return cache_serve::run(a, cli.cache, cli.cache_bytes)
+                .await
+                .map(|()| Outcome::empty());
+        }
         Command::Completions { shell } => {
             let mut out = Vec::new();
             clap_complete::generate(shell, &mut crate::args::command(), "ant", &mut out);
@@ -26,7 +32,9 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
     let ctx = Ctx::from_cli(&cli)?;
     match cli.command {
         // Handled above, before the client context is built.
-        Command::Serve(_) | Command::Completions { .. } => Ok(Outcome::empty()),
+        Command::Serve(_) | Command::CacheServe(_) | Command::Completions { .. } => {
+            Ok(Outcome::empty())
+        }
         Command::Import(a) => import::run(a).await,
         Command::Ls { target } => query::ls(&ctx, &target).await,
         Command::Cat { target } => query::cat(&ctx, &target).await,
@@ -70,7 +78,10 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
         Command::Admin { cmd: AdminCmd::ReindexAcl(a) } => admin::reindex_acl(a).await,
         Command::Admin { cmd: AdminCmd::Schema(a) } => admin::schema(a).await,
         Command::Admin { cmd: AdminCmd::Gc(a) } => admin::gc(a).await,
-        Command::Cache { cmd: CacheCmd::Stats } => cache::stats(&ctx).await,
+        Command::Cache { cmd: CacheCmd::Stats { tiers } } => cache::stats(&ctx, tiers).await,
+        Command::Cache { cmd: CacheCmd::Seed { target, sparse } } => {
+            cache::seed(&ctx, &target, sparse).await
+        }
         Command::Cache { cmd: CacheCmd::Gc { to } } => cache::gc(&ctx, to).await,
     }
 }
