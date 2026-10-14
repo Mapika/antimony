@@ -7,11 +7,13 @@
 //! - [`readthrough`]: the cache in front of the server, with batched,
 //!   de-duplicated and hash-verified fetches.
 //! - [`remote`]: the server as an `ObjectStore` (gRPC, optionally HTTP reads).
-//! - [`workspace`]: sparse working copies (real files on disk).
+//! - [`workspace`]: sparse working copies (real files on disk); [`files`]:
+//!   file helpers shared with lazy workspaces.
 //! - [`update`]: planning a workspace's move to a new base (3-way rules).
 //! - [`walk`]: batched tree walks restricted to a few branches.
 
 pub mod disk;
+pub mod files;
 mod par;
 pub mod readthrough;
 pub mod remote;

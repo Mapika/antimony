@@ -2,8 +2,6 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use ant_core::{EncodedObject, EntryMode, ObjectKind, RepoPath, hash_object};
@@ -12,19 +10,15 @@ use anyhow::{Context, anyhow};
 
 use super::index::{Index, stat_of};
 use super::{LocalChange, LocalChangeKind, STATE_DIR};
+use crate::files::{entry_mode, read_body};
 use crate::par::par_map;
 use crate::walk::BATCH;
 
 /// Shape of a file on disk: git mode plus its body (target for symlinks).
 pub(super) fn hash_disk(full: &Path, meta: &fs::Metadata) -> anyhow::Result<(EntryMode, Vec<u8>)> {
-    if meta.file_type().is_symlink() {
-        let target =
-            fs::read_link(full).with_context(|| format!("reading link {}", full.display()))?;
-        return Ok((EntryMode::Symlink, target.into_os_string().into_vec()));
-    }
-    let mode = if meta.mode() & 0o111 != 0 { EntryMode::Executable } else { EntryMode::File };
-    let body = fs::read(full).with_context(|| format!("reading {}", full.display()))?;
-    Ok((mode, body))
+    let what = if meta.file_type().is_symlink() { "reading link" } else { "reading" };
+    let body = read_body(full, meta).with_context(|| format!("{what} {}", full.display()))?;
+    Ok((entry_mode(meta), body))
 }
 
 pub(super) async fn put_blobs(

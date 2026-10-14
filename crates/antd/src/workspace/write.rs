@@ -16,6 +16,7 @@ use futures::StreamExt;
 
 use super::index::{Entry, stat_of};
 use super::sparse::Matcher;
+use crate::files::file_perm;
 use crate::par::par_map;
 use crate::walk::BATCH;
 
@@ -164,7 +165,7 @@ pub(super) fn write_file(
     body: &[u8],
 ) -> anyhow::Result<fs::Metadata> {
     use std::io::Write;
-    let perm = if mode == EntryMode::Executable { 0o755 } else { 0o644 };
+    let perm = file_perm(mode);
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)

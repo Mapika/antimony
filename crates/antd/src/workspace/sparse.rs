@@ -4,6 +4,8 @@ use ant_core::RepoPath;
 use anyhow::{Context, bail};
 use globset::GlobBuilder;
 
+use crate::files::is_under as under;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sparse {
     pub patterns: Vec<String>,
@@ -72,14 +74,6 @@ pub(super) fn normalize_pattern(pattern: String) -> anyhow::Result<String> {
     RepoPath::new(trimmed.as_str())
         .with_context(|| format!("invalid sparse pattern {pattern:?}"))?;
     Ok(trimmed)
-}
-
-/// `path` equals `prefix` or lies beneath it.
-pub(super) fn under(path: &str, prefix: &str) -> bool {
-    path == prefix
-        || (path.len() > prefix.len()
-            && path.starts_with(prefix)
-            && path.as_bytes()[prefix.len()] == b'/')
 }
 
 pub(super) struct Matcher {

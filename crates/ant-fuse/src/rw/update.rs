@@ -32,8 +32,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ant_core::{EntryMode, ObjectId, RepoPath};
+use ant_core::{ObjectId, RepoPath};
 use ant_store::ObjectStore;
+use antd::files::file_perm;
 use antd::update::{PathUpdate, Target};
 
 use super::changes::{Local, affected_base, local_changes};
@@ -165,7 +166,7 @@ pub(super) async fn update_with(
         fs::create_dir(&staging)?;
         for (i, (_, mode, data)) in writes.iter().enumerate() {
             step("stage")?;
-            let perm = if *mode == EntryMode::Executable { 0o755 } else { 0o644 };
+            let perm = file_perm(*mode);
             let mut f = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -303,6 +304,7 @@ fn create_dirs(upper: &Path, dir: &Path, dirty: &mut BTreeSet<PathBuf>) -> io::R
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
+    use ant_core::EntryMode;
     use ant_store::graph::build_tree;
     use ant_store::memory::MemoryObjectStore;
     use antd::walk::{Visit, walk};

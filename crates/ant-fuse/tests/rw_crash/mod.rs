@@ -9,6 +9,8 @@ use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
+use antd::files::is_under as under;
+
 use super::support::{self, Daemon, build, runtime};
 
 /// The visible workspace: directories (`None`) and files (content, exec bit).
@@ -100,10 +102,6 @@ fn close(f: fs::File) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
-}
-
-fn under(path: &str, dir: &str) -> bool {
-    path == dir || path.strip_prefix(dir).is_some_and(|r| r.starts_with('/'))
 }
 
 fn overlay_at(content: &mut Vec<u8>, offset: u64, data: &[u8]) {

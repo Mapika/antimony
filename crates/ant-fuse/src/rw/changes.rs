@@ -4,12 +4,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self};
 use std::io::{self};
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 
 use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, RepoPath};
 use ant_store::ObjectStore;
+use antd::files::read_body;
 use antd::walk::{BATCH, Visit, WalkError, walk};
 use antd::workspace::{LocalChange, LocalChangeKind};
 
@@ -40,11 +40,7 @@ pub(super) fn scan_upper(state: &Path) -> io::Result<Upper> {
                 out.dirs.insert(path.clone());
                 todo.push(path);
             } else {
-                let data = if m.file_type().is_symlink() {
-                    fs::read_link(entry.path())?.as_os_str().as_bytes().to_vec()
-                } else {
-                    fs::read(entry.path())?
-                };
+                let data = read_body(&entry.path(), &m)?;
                 let blob = EncodedObject::new(ObjectKind::Blob, &data);
                 out.files.insert(path, (mode(&m), blob.id()));
                 out.blobs.push(blob);

@@ -19,7 +19,8 @@ fn io_error(error: impl std::fmt::Display) -> Errno {
     Errno::EIO
 }
 
-fn kind(mode: EntryMode) -> FileType {
+/// How a tree entry of `mode` appears in the filesystem.
+pub(crate) fn kind(mode: EntryMode) -> FileType {
     match mode {
         EntryMode::Tree | EntryMode::Gitlink => FileType::Directory,
         EntryMode::Symlink => FileType::Symlink,

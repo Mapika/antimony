@@ -93,16 +93,16 @@ mod update;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use ant_core::{EntryMode, ObjectId};
+use ant_core::ObjectId;
 use ant_store::ObjectStore;
-use fuser::{BackgroundSession, Config, Errno, FileType, MountOption};
+use antd::files::{entry_mode as mode, is_under as under};
+use fuser::{BackgroundSession, Config, Errno, MountOption};
 
 use crate::MountOptions;
-use crate::filesystem::View;
+use crate::filesystem::{View, kind as file_kind};
 pub use changes::{changes, reset};
 use overlay::Writable;
 pub use state::STATE_FORMAT;
@@ -124,9 +124,6 @@ fn other(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-fn under(path: &str, prefix: &str) -> bool {
-    path == prefix || path.strip_prefix(prefix).is_some_and(|s| s.starts_with('/'))
-}
 fn hidden(paths: &BTreeSet<String>, path: &str) -> bool {
     paths.contains(path) || path.match_indices('/').any(|(i, _)| paths.contains(&path[..i]))
 }
@@ -135,24 +132,6 @@ fn metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
         Ok(m) => Ok(Some(m)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
-    }
-}
-fn mode(m: &fs::Metadata) -> EntryMode {
-    if m.is_dir() {
-        EntryMode::Tree
-    } else if m.file_type().is_symlink() {
-        EntryMode::Symlink
-    } else if m.mode() & 0o111 != 0 {
-        EntryMode::Executable
-    } else {
-        EntryMode::File
-    }
-}
-fn file_kind(m: EntryMode) -> FileType {
-    match m {
-        EntryMode::Tree | EntryMode::Gitlink => FileType::Directory,
-        EntryMode::Symlink => FileType::Symlink,
-        _ => FileType::RegularFile,
     }
 }
 
