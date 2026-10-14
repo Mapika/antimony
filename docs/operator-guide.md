@@ -174,10 +174,12 @@ becomes visible; give Postgres I/O headroom.
 
 ### Client cache
 
-The shared per-machine disk cache defaults to 20 GiB (`--cache-bytes` /
-`ANT_CACHE_BYTES`), LRU-evicted by file mtime when it exceeds the limit
-(evicts down to 90 percent). Size it to the working set of the paths your
-agents touch, multiplied by the number of distinct bases they check out.
+The shared per-machine disk cache has a 20 GiB budget by default
+(`--cache-bytes` / `ANT_CACHE_BYTES`). LRU eviction by file mtime (down
+to 90 percent of the budget) exists as `DiskObjectStore::gc`, but no
+command runs it yet: today the budget is not enforced, so watch the cache
+directory's size. Size it to the working set of the paths your agents
+touch, multiplied by the number of distinct bases they check out.
 Sparse workspaces keep checkouts proportional to what an agent touches. Full
 96k-file checkout on the dev machine: 4.2-4.7 s cold, 1.4-1.9 s warm,
 `status` 0.09-0.18 s (ROADMAP).

@@ -102,7 +102,8 @@ cache hit can never hide a missing object.
 
 - **Shared disk cache:** one content-addressed store per machine
   (`antd::disk`), safe for many concurrent processes (write-temp-then-rename),
-  with LRU eviction. A read-through layer fetches misses from the server in
+  with LRU eviction (`DiskObjectStore::gc`; nothing runs it automatically
+  yet, so the cache is unbounded in practice). A read-through layer fetches misses from the server in
   batches, de-duplicates in-flight fetches and verifies hashes.
 - **Sparse workspaces:** real files on disk for the paths matching sparse
   patterns. `status` compares against an index of stat data, so only changed
