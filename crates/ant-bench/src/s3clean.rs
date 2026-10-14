@@ -30,10 +30,10 @@ fn client(cfg: &S3Config) -> aws_sdk_s3::Client {
     aws_sdk_s3::Client::from_conf(conf)
 }
 
-/// Delete every object under `cfg.prefix` in `cfg.bucket` (all objects in the bucket when the prefix is empty), then
-/// try to delete the bucket itself when `delete_bucket` is true (ignore a BucketNotEmpty/any error on the bucket
-/// delete, but return it in the count's Err only if listing/deleting objects fails). Returns the number of objects deleted.
-pub async fn delete_prefix(cfg: &S3Config, delete_bucket: bool) -> Result<u64> {
+/// Delete every object under `cfg.prefix` in `cfg.bucket` (every object in
+/// the bucket when the prefix is empty) and return how many were deleted. A
+/// missing bucket counts as empty; the bucket itself is kept.
+pub async fn delete_prefix(cfg: &S3Config) -> Result<u64> {
     let client = client(cfg);
     // Trailing slash so that prefix "run" does not also match sibling "run2/...".
     let prefix = match cfg.prefix.trim_end_matches('/') {
@@ -68,11 +68,6 @@ pub async fn delete_prefix(cfg: &S3Config, delete_bucket: bool) -> Result<u64> {
             Some(t) if page.is_truncated().unwrap_or(false) => token = Some(t.to_owned()),
             _ => break,
         }
-    }
-
-    if delete_bucket {
-        // Best effort: the bucket may be non-empty (other prefixes) or already gone.
-        let _ = client.delete_bucket().bucket(&cfg.bucket).send().await;
     }
     Ok(deleted)
 }
@@ -134,8 +129,8 @@ mod tests {
         store.put_many(&objs).await.expect("put_many");
         assert_eq!(store.has_many(&ids).await.expect("has_many"), vec![true; 3]);
 
-        assert_eq!(delete_prefix(&cfg, false).await.expect("delete_prefix"), 3);
+        assert_eq!(delete_prefix(&cfg).await.expect("delete_prefix"), 3);
         assert_eq!(store.has_many(&ids).await.expect("has_many"), vec![false; 3]);
-        assert_eq!(delete_prefix(&cfg, false).await.expect("delete_prefix again"), 0);
+        assert_eq!(delete_prefix(&cfg).await.expect("delete_prefix again"), 0);
     }
 }

@@ -8,104 +8,20 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use ant_core::{EntryMode, ObjectId, RepoPath};
+use ant_core::{EntryMode, ObjectId};
 use ant_server::ops::OpError;
-use ant_server::ops::changeset::{ChangesetRequest, FileOp, WriteContent, create_changeset};
+use ant_server::ops::changeset::{ChangesetRequest, create_changeset};
 use ant_server::ops::land::{LandOutcome, land};
-use ant_store::postgres::{PgOptions, PgStore};
-use ant_store::{Backend, CasOutcome, ObjectStoreExt, RefLock, RefLockRelease, RefStore};
-use async_trait::async_trait;
-use bytes::Bytes;
+use ant_store::{Backend, ObjectStoreExt};
+use common::pg::{self, CountingRefs, OnLock, RefCounts};
 use common::*;
-
-fn pg_url() -> String {
-    std::env::var("ANT_TEST_PG_URL")
-        .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into())
-}
-
-#[derive(Default)]
-struct Counts {
-    cas: AtomicUsize,
-    publishes: AtomicUsize,
-    mismatches: AtomicUsize,
-    /// Terminate the next lock's session right after it is granted.
-    kill_next_lock: AtomicBool,
-}
-
-/// Forwards to Postgres, counting plain CASes and lock publishes.
-struct Observed {
-    inner: Arc<PgStore>,
-    schema: String,
-    counts: Arc<Counts>,
-}
-
-/// A granted lock, forwarding publishes and counting their outcomes.
-struct CountingLock {
-    inner: RefLock,
-    counts: Arc<Counts>,
-}
-
-#[async_trait]
-impl RefLockRelease for CountingLock {
-    async fn release(self: Box<Self>) -> ant_store::Result<()> {
-        self.inner.release().await
-    }
-
-    fn can_publish(&self) -> bool {
-        self.inner.can_publish()
-    }
-
-    async fn publish(
-        &mut self,
-        expected: Option<ObjectId>,
-        new: ObjectId,
-        kind: &str,
-        derived: Vec<(Vec<u8>, Bytes)>,
-    ) -> ant_store::Result<CasOutcome> {
-        self.counts.publishes.fetch_add(1, Ordering::SeqCst);
-        let out = self.inner.publish(expected, new, kind, derived).await?;
-        if matches!(out, CasOutcome::Mismatch { .. }) {
-            self.counts.mismatches.fetch_add(1, Ordering::SeqCst);
-        }
-        Ok(out)
-    }
-}
-
-#[async_trait]
-impl RefStore for Observed {
-    async fn get_ref(&self, name: &str) -> ant_store::Result<Option<ObjectId>> {
-        self.inner.get_ref(name).await
-    }
-
-    async fn cas_ref(
-        &self,
-        name: &str,
-        expected: Option<ObjectId>,
-        new: Option<ObjectId>,
-    ) -> ant_store::Result<CasOutcome> {
-        self.counts.cas.fetch_add(1, Ordering::SeqCst);
-        self.inner.cas_ref(name, expected, new).await
-    }
-
-    async fn list_refs(&self, prefix: &str) -> ant_store::Result<Vec<(String, ObjectId)>> {
-        self.inner.list_refs(prefix).await
-    }
-
-    async fn lock_ref(&self, name: &str) -> ant_store::Result<RefLock> {
-        let lock = self.inner.lock_ref(name).await?;
-        if self.counts.kill_next_lock.swap(false, Ordering::SeqCst) {
-            terminate_lock_session(&self.schema, name).await;
-        }
-        Ok(RefLock::held(CountingLock { inner: lock, counts: self.counts.clone() }))
-    }
-}
 
 /// Kill the session holding the ref lock, as a database crash would.
 async fn terminate_lock_session(schema: &str, name: &str) {
     use sqlx::Connection;
-    let mut conn = sqlx::PgConnection::connect(&pg_url()).await.unwrap();
+    let mut conn = sqlx::PgConnection::connect(&pg::pg_url()).await.unwrap();
     let killed: bool = sqlx::query_scalar(
         "SELECT pg_terminate_backend(pid) FROM pg_locks \
          WHERE locktype = 'advisory' AND granted AND objsubid = 1 \
@@ -118,40 +34,33 @@ async fn terminate_lock_session(schema: &str, name: &str) {
     assert!(killed);
 }
 
-async fn replicas(n: usize, counts: &Arc<Counts>) -> Vec<Backend> {
-    let schema = format!("t_land_pg_{}", rand::random::<u64>());
-    let options = PgOptions {
-        max_connections: 12,
-        lock_connections: 2,
-        lock_timeout: std::time::Duration::from_secs(120),
-        ..PgOptions::default()
-    };
-    let mut out = Vec::new();
-    for i in 0..n {
-        // The first replica drops the schema (all replicas are idle by then).
-        let pg = Arc::new(if i == 0 {
-            PgStore::connect_scratch_with(&pg_url(), &schema, &options).await.unwrap()
-        } else {
-            PgStore::connect_with(&pg_url(), &schema, &options).await.unwrap()
-        });
-        let refs = Arc::new(Observed {
-            inner: pg.clone(),
-            schema: schema.clone(),
-            counts: counts.clone(),
-        });
-        out.push(Backend { objects: pg.clone(), refs, meta: pg });
-    }
-    out
+/// `n` replicas whose ref stores count CASes and publishes; the next lock
+/// granted after `kill_next_lock` is set has its session terminated.
+async fn replicas(
+    n: usize,
+    counts: &Arc<RefCounts>,
+    kill_next_lock: &Arc<AtomicBool>,
+) -> Vec<Backend> {
+    let (schema, stores) = pg::replica_stores("t_land_pg", n).await;
+    let kill = kill_next_lock.clone();
+    let on_lock: OnLock = Arc::new(move |name| {
+        let (kill, schema) = (kill.clone(), schema.clone());
+        Box::pin(async move {
+            if kill.swap(false, Ordering::SeqCst) {
+                terminate_lock_session(&schema, &name).await;
+            }
+        })
+    });
+    stores
+        .into_iter()
+        .map(|pg| CountingRefs::wrap(pg::backend(pg), counts, Some(on_lock.clone())))
+        .collect()
 }
 
 async fn change(b: &Backend, base: ObjectId, path: &str) -> ObjectId {
     let req = ChangesetRequest {
         base: Some(base),
-        ops: vec![FileOp::Write {
-            path: RepoPath::new(path).unwrap(),
-            mode: EntryMode::File,
-            content: WriteContent::Inline(Bytes::from(format!("{path}\n"))),
-        }],
+        ops: vec![write(path, format!("{path}\n"))],
         author: sig(),
         committer: None,
         message: format!("{path}\n"),
@@ -182,8 +91,8 @@ async fn seed(b: &Backend) -> ObjectId {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "needs postgres: docker compose up -d"]
 async fn pg_replicas_land_by_publishing_on_the_lock_session() {
-    let counts = Arc::new(Counts::default());
-    let replicas = replicas(4, &counts).await;
+    let counts = Arc::new(RefCounts::default());
+    let replicas = replicas(4, &counts, &Arc::default()).await;
     let c0 = seed(&replicas[0]).await;
     let mut tasks = Vec::new();
     for (r, b) in replicas.iter().enumerate() {
@@ -206,7 +115,7 @@ async fn pg_replicas_land_by_publishing_on_the_lock_session() {
     // the replicas so well that no publish mismatched.
     assert_eq!(counts.cas.load(Ordering::SeqCst), 0);
     assert!(counts.publishes.load(Ordering::SeqCst) > 0);
-    assert_eq!(counts.mismatches.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.publish_mismatches.load(Ordering::SeqCst), 0);
     // The mappings were published with the ref: retries are no-ops on any
     // replica.
     let tip = replicas[0].refs.get_ref("main").await.unwrap().unwrap();
@@ -223,12 +132,13 @@ async fn pg_replicas_land_by_publishing_on_the_lock_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs postgres: docker compose up -d"]
 async fn pg_land_publishes_nothing_when_the_lock_session_dies() {
-    let counts = Arc::new(Counts::default());
-    let b = replicas(1, &counts).await.remove(0);
+    let counts = Arc::new(RefCounts::default());
+    let kill_next_lock = Arc::new(AtomicBool::new(false));
+    let b = replicas(1, &counts, &kill_next_lock).await.remove(0);
     let c0 = seed(&b).await;
     let a = change(&b, c0, "a").await;
     let c = change(&b, c0, "c").await;
-    counts.kill_next_lock.store(true, Ordering::SeqCst);
+    kill_next_lock.store(true, Ordering::SeqCst);
     // The batch is replayed and written under the dead session; its publish
     // must fail rather than make anything reachable.
     let (ra, rc) = tokio::join!(land(&b, "main", a), land(&b, "main", c));

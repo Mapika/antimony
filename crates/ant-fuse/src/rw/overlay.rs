@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use ant_core::{EntryMode, ObjectId, ObjectKind, Tree, TreeEntry};
+use antd::files::file_perm;
 use fuser::*;
 use parking_lot::{Condvar, Mutex, RwLock};
 
@@ -526,7 +527,7 @@ impl Operation<'_> {
             }
             _ => {
                 let data = self.blob(entry.id)?;
-                self.publish(&full, &data, exec_perm(entry.mode))?;
+                self.publish(&full, &data, file_perm(entry.mode))?;
             }
         }
         Ok(full)
@@ -575,7 +576,7 @@ impl Operation<'_> {
                     symlink(OsStr::from_bytes(object.body()), &full)?;
                     self.dirty(&full);
                 } else {
-                    self.publish(&full, object.body(), exec_perm(entry.mode))?;
+                    self.publish(&full, object.body(), file_perm(entry.mode))?;
                 }
             }
         }
@@ -833,8 +834,4 @@ impl Operation<'_> {
         }
         Ok(())
     }
-}
-
-fn exec_perm(mode: EntryMode) -> u32 {
-    if mode == EntryMode::Executable { 0o755 } else { 0o644 }
 }

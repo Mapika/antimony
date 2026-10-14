@@ -24,6 +24,7 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
     };
     let ctx = Ctx::from_cli(&cli)?;
     match cli.command {
+        // Handled above, before the client context is built.
         Command::Serve(_) | Command::Completions { .. } => Ok(Outcome::empty()),
         Command::Import(a) => import::run(a).await,
         Command::Ls { target } => query::ls(&ctx, &target).await,
@@ -57,5 +58,6 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
         Command::Mount { rev, mountpoint } => mount::run(&ctx, &rev, &mountpoint).await,
         Command::Admin { cmd: AdminCmd::ReindexAcl(a) } => admin::reindex_acl(a).await,
         Command::Admin { cmd: AdminCmd::Schema(a) } => admin::schema(a).await,
+        Command::Admin { cmd: AdminCmd::Gc(a) } => admin::gc(a).await,
     }
 }

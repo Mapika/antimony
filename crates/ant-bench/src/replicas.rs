@@ -24,10 +24,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Resident set size of a process from `/proc/<pid>/status` (`VmRSS`), in bytes.
 pub fn proc_rss_bytes(pid: u32) -> Option<u64> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
-    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kib * 1024)
+    crate::util::proc_status_bytes(&format!("/proc/{pid}/status"), "VmRSS")
 }
 
 /// One Postgres connection used to watch server connection counts.

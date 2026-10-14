@@ -8,13 +8,13 @@ use std::sync::Arc;
 use ant_auth::Policy;
 use ant_core::merge::{self, EntryMerge, TextMerge};
 use ant_core::{EncodedObject, EntryMode, Object, ObjectId, ObjectKind, RepoPath, Tree, TreeEntry};
-use ant_store::{Backend, ChangeKind, CommitNode, PathChange, StoreError};
+use ant_store::{Backend, CommitNode, PathChange, StoreError};
 
 use super::verify::Verified;
 use super::{LANDED_AS, LandOutcome, MAX_STACK};
 use crate::acl;
 use crate::ops::tree_edit::{
-    apply_write, deepest_first, entry, load_directories_with, prune_empty,
+    Directories, apply_write, deepest_first, entry, leaf_change, load_directories, prune_empty,
 };
 use crate::ops::{OpError, OpResult, cache};
 
@@ -90,14 +90,14 @@ impl BatchState {
     pub(super) async fn walk_nodes(&mut self, b: &Backend, ids: &[ObjectId]) -> OpResult<()> {
         if let [id] = ids
             && !self.nodes.contains_key(id)
-            && cache::meta(&b.meta).nodes.get(id).is_none()
         {
-            let chain = b.meta.first_parent_chain(*id, None, CHAIN_PREFETCH).await?;
-            cache::meta(&b.meta)
-                .nodes
-                .insert_many(chain.iter().map(|n| (n.id, n.clone(), cache::NODE_WEIGHT)));
-            for node in chain {
-                self.nodes.entry(node.id).or_insert(node);
+            let meta = cache::meta(&b.meta);
+            if meta.nodes.get(id).is_none() {
+                let chain = b.meta.first_parent_chain(*id, None, CHAIN_PREFETCH).await?;
+                meta.nodes.insert_many(chain.iter().map(|n| (n.id, n.clone(), cache::NODE_WEIGHT)));
+                for node in chain {
+                    self.nodes.entry(node.id).or_insert(node);
+                }
             }
         }
         self.nodes(b, ids).await
@@ -244,6 +244,40 @@ impl BatchState {
         Ok(LandOutcome::Landed { new_tip: onto, rebased: true })
     }
 
+    /// The blobs `ids`, from this batch's blobs or one `get_many`.
+    async fn blobs(
+        &self,
+        b: &Backend,
+        ids: BTreeSet<ObjectId>,
+    ) -> OpResult<BTreeMap<ObjectId, EncodedObject>> {
+        let mut blobs = BTreeMap::new();
+        let fetch: Vec<_> = ids
+            .into_iter()
+            .filter(|id| match self.blobs.get(id) {
+                Some(blob) => {
+                    blobs.insert(*id, blob.clone());
+                    false
+                }
+                None => true,
+            })
+            .collect();
+        if !fetch.is_empty() {
+            for (id, object) in fetch.iter().copied().zip(b.objects.get_many(&fetch).await?) {
+                let object = object.ok_or(StoreError::NotFound(id))?;
+                if object.kind() != ObjectKind::Blob {
+                    return Err(StoreError::WrongKind {
+                        id,
+                        expected: ObjectKind::Blob,
+                        actual: object.kind(),
+                    }
+                    .into());
+                }
+                blobs.insert(id, object);
+            }
+        }
+        Ok(blobs)
+    }
+
     /// Rebase `commit` onto `onto` in memory; on success the new trees,
     /// blobs and commit are queued in `self.writes` (see [`Self::flush`]).
     pub(super) async fn rebase(
@@ -269,7 +303,7 @@ impl BatchState {
             .ok_or_else(|| OpError::not_found_object(commit))?;
         let paths: Vec<_> = changes.iter().map(|c| c.path.clone()).collect();
         let [base_dirs, mut dirs] =
-            load_directories_with(b, &self.trees, [parent_tree, target.tree], &paths).await?;
+            load_directories(b, &self.trees, [parent_tree, target.tree], &paths).await?;
         let mut conflicts = BTreeSet::new();
         let mut edits = BTreeMap::new();
         let mut merges = Vec::new();
@@ -292,31 +326,7 @@ impl BatchState {
                 }
             }
         }
-        let mut blobs = BTreeMap::new();
-        let fetch: Vec<_> = blob_ids
-            .into_iter()
-            .filter(|id| match self.blobs.get(id) {
-                Some(blob) => {
-                    blobs.insert(*id, blob.clone());
-                    false
-                }
-                None => true,
-            })
-            .collect();
-        if !fetch.is_empty() {
-            for (id, object) in fetch.iter().copied().zip(b.objects.get_many(&fetch).await?) {
-                let object = object.ok_or(StoreError::NotFound(id))?;
-                if object.kind() != ObjectKind::Blob {
-                    return Err(StoreError::WrongKind {
-                        id,
-                        expected: ObjectKind::Blob,
-                        actual: object.kind(),
-                    }
-                    .into());
-                }
-                blobs.insert(id, object);
-            }
-        }
+        let blobs = self.blobs(b, blob_ids).await?;
         let mut objects = Vec::new();
         // (path, id) of every new blob/tree, for zone tagging.
         let mut written = Vec::new();
@@ -335,20 +345,9 @@ impl BatchState {
         }
         let recorded_changes: Vec<_> = edits
             .iter()
-            .filter_map(|(path, new)| {
-                // Changesets describe leaves; replacing a pruned directory adds
-                // a leaf here and records its children as separate deletions.
-                let old = entry(&dirs, path).filter(|(mode, _)| !mode.is_tree());
-                if old == *new {
-                    return None;
-                }
-                let kind = match (old, new) {
-                    (None, Some(_)) => ChangeKind::Added,
-                    (Some(_), None) => ChangeKind::Deleted,
-                    _ => ChangeKind::Modified,
-                };
-                Some(PathChange { path: path.clone(), kind, old, new: *new })
-            })
+            // Changesets describe leaves; replacing a pruned directory adds a
+            // leaf here and records its children as separate deletions.
+            .filter_map(|(path, new)| leaf_change(&dirs, path, *new))
             .collect();
         // Deleting first permits file/directory replacements within one changeset.
         for (path, value) in &edits {
@@ -371,31 +370,7 @@ impl BatchState {
             return Ok(Err(conflicts.into_iter().collect()));
         }
         let mut new_trees = Vec::new();
-        let mut root = target.tree;
-        for path in deepest_first(&dirs) {
-            let tree = dirs
-                .remove(&path)
-                .ok_or_else(|| OpError::InvalidArgument(format!("missing directory {path}")))?;
-            let object = EncodedObject::new(ObjectKind::Tree, &tree.encode());
-            let id = object.id();
-            if let Some((parent, name)) = path.split_last() {
-                let parent_tree = dirs.get_mut(&parent).ok_or_else(|| {
-                    OpError::InvalidArgument(format!("missing directory {parent}"))
-                })?;
-                if parent_tree.get(name).is_some_and(|e| e.id == id) {
-                    continue;
-                }
-                parent_tree.upsert(TreeEntry { name: name.into(), mode: EntryMode::Tree, id })?;
-            } else {
-                root = id;
-                if root == target.tree {
-                    continue;
-                }
-            }
-            objects.push(object);
-            written.push((path, id));
-            new_trees.push((id, Arc::new(tree)));
-        }
+        let root = encode_changed(dirs, target.tree, &mut objects, &mut written, &mut new_trees)?;
         let original = cache::read_commits(b, &[commit]).await?;
         let mut rebased = original
             .first()
@@ -473,4 +448,43 @@ impl BatchState {
         meta.changesets.insert_many(entries.into_iter().map(|(n, c, w)| (n.id, c, w)));
         Ok(())
     }
+}
+
+/// Encode the edited directories deepest first into a new root tree,
+/// skipping trees whose id did not change (`root` is the unedited root).
+/// New trees go to `objects`, `written` (with their path) and `new_trees`
+/// (decoded, for the caches); returns the new root.
+fn encode_changed(
+    mut dirs: Directories,
+    root: ObjectId,
+    objects: &mut Vec<EncodedObject>,
+    written: &mut Vec<(RepoPath, ObjectId)>,
+    new_trees: &mut Vec<(ObjectId, Arc<Tree>)>,
+) -> OpResult<ObjectId> {
+    let mut new_root = root;
+    for path in deepest_first(&dirs) {
+        let tree = dirs
+            .remove(&path)
+            .ok_or_else(|| OpError::InvalidArgument(format!("missing directory {path}")))?;
+        let object = EncodedObject::new(ObjectKind::Tree, &tree.encode());
+        let id = object.id();
+        if let Some((parent, name)) = path.split_last() {
+            let parent_tree = dirs
+                .get_mut(&parent)
+                .ok_or_else(|| OpError::InvalidArgument(format!("missing directory {parent}")))?;
+            if parent_tree.get(name).is_some_and(|e| e.id == id) {
+                continue;
+            }
+            parent_tree.upsert(TreeEntry { name: name.into(), mode: EntryMode::Tree, id })?;
+        } else {
+            new_root = id;
+            if new_root == root {
+                continue;
+            }
+        }
+        objects.push(object);
+        written.push((path, id));
+        new_trees.push((id, Arc::new(tree)));
+    }
+    Ok(new_root)
 }

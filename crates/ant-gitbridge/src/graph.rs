@@ -252,3 +252,13 @@ fn load_known_generations(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod gc_contract_tests {
+    /// Garbage collection keeps imported commits alive through this mapping
+    /// (a re-import resumes from it), so it must know the kind's name.
+    #[test]
+    fn gc_roots_include_the_import_mapping() {
+        assert!(ant_store::postgres::gc::DEFAULT_ROOT_KINDS.contains(&super::COMMIT_KIND));
+    }
+}

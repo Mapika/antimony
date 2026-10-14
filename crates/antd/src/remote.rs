@@ -21,7 +21,7 @@ use ant_proto::v1::ant_client::AntClient;
 use ant_store::{ObjectStore, Result, StoreError};
 use async_trait::async_trait;
 
-use crate::disk::par_map;
+use crate::par::par_map;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use tonic::metadata::{Ascii, MetadataValue};

@@ -1,28 +1,13 @@
-//! Lazy, read-only FUSE view of a tree. Nothing is downloaded until it is
-//! looked up or read, so an agent can "check out" a huge monorepo instantly
-//! and only pay for what it touches.
+//! Lazy FUSE views of a tree. Nothing is downloaded until it is looked up
+//! or read, so an agent can "check out" a huge monorepo instantly and only
+//! pay for what it touches.
 //!
-//! [`mount`] uses `fuser` without libfuse (mounting goes through
-//! `fusermount3`); [`mount_rw`] adds a copy-on-write layer (see [`rw`]).
+//! - [`mount`]: a read-only view (`filesystem`).
+//! - [`mount_rw`]: a persistent copy-on-write workspace on top of the same
+//!   view, with status, reset and update from its state directory ([`rw`]).
 //!
-//! - Inodes: root = 1; numbers are assigned on first lookup and stay stable
-//!   for the life of the mount. Identical objects at different paths get
-//!   different inodes (no hard-link semantics).
-//! - Directories 0o555, files 0o444, executables 0o555, symlinks 0o777,
-//!   gitlinks appear as empty directories. `nlink` is 1 for files and 2 for
-//!   directories; uid/gid are the mounting process's; mtime is UNIX_EPOCH or
-//!   the timestamp in [`MountOptions`].
-//! - `getattr` reports exact sizes; a blob is fetched (and its size cached)
-//!   to learn its size.
-//! - Read-only mounts answer every mutation, and opening for write, with
-//!   `EROFS`.
-//! - FUSE callbacks run on fuser's threads and block on the given Tokio
-//!   runtime handle, which must belong to a multi-thread runtime.
-//! - Caches: decoded trees (unbounded) and blob contents (LRU bounded by
-//!   `MountOptions::blob_cache_bytes`). Listing a directory prefetches its
-//!   subtrees with one `get_many`; `readdir` supports offsets.
-//! - Store errors become `EIO` (logged with tracing).
-//! - Dropping the returned `BackgroundSession` unmounts.
+//! Both use `fuser` without libfuse (mounting goes through `fusermount3`).
+//! Dropping the returned `BackgroundSession` unmounts.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -33,6 +18,8 @@ use ant_store::ObjectStore;
 
 mod filesystem;
 pub mod rw;
+#[cfg(test)]
+mod test_support;
 pub use rw::mount_rw;
 
 #[derive(Debug, Clone)]
@@ -100,6 +87,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::test_support::runtime;
     use ant_core::{EncodedObject, EntryMode, Object, ObjectKind, Tree, TreeEntry};
     use ant_store::ObjectStoreExt;
     use ant_store::graph::build_tree;
@@ -152,13 +140,9 @@ mod tests {
         (gate, tmp, mnt, sess)
     }
 
-    fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap()
-    }
-
     #[test]
     fn reads_files_dirs_links() {
-        let rt = rt();
+        let rt = runtime();
         let (_gate, _tmp, mnt, _sess) = mount_fixture(&rt);
         assert_eq!(std::fs::read_to_string(mnt.join("src/lib.rs")).unwrap(), "pub fn x() {}\n");
         assert_eq!(std::fs::read_to_string(mnt.join("src/deep/er/f")).unwrap(), "deep");
@@ -187,7 +171,7 @@ mod tests {
 
     #[test]
     fn large_file_and_wide_dir() {
-        let rt = rt();
+        let rt = runtime();
         let (_gate, _tmp, mnt, _sess) = mount_fixture(&rt);
         let big = std::fs::read(mnt.join("big.bin")).unwrap();
         assert_eq!(big.len(), 3_000_000);
@@ -197,7 +181,7 @@ mod tests {
 
     #[test]
     fn read_only() {
-        let rt = rt();
+        let rt = runtime();
         let (_gate, _tmp, mnt, _sess) = mount_fixture(&rt);
         let e = std::fs::write(mnt.join("new"), b"x").unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::EROFS));

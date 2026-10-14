@@ -1,13 +1,15 @@
 //! `import` subcommand: run `ant_gitbridge::import` with every store call timed.
 //!
-//! The import pipeline is a producer (gix reading + SHA-1 -> SHA-256 conversion
-//! on a blocking thread, with `get_derived` lookups) feeding a single async
-//! writer (`has_many`, `put_many`, `record_commit`, `put_derived`). Because the
-//! writer is strictly sequential, the sum of its store-call times versus wall
-//! time says which side is the bottleneck. Process CPU time disambiguates the
-//! producer (CPU-bound) from the store (waiting on I/O).
+//! The import pipeline (see `ant_gitbridge`) reads and converts history on
+//! blocking threads and feeds an async writer that stores objects
+//! (`has_many`, `put_many`) and records commits (`put_commits`,
+//! `put_derived_many`). The writer-side store time versus wall time says
+//! whether the store or the conversion is the bottleneck; process CPU time
+//! tells CPU-bound conversion from waiting on store I/O.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ant_gitbridge::{ImportOptions, ImportStats};
@@ -15,7 +17,9 @@ use ant_server::config::StoreArgs;
 use anyhow::Context as _;
 
 use crate::json::J;
-use crate::util::{Metrics, cpu_seconds, instrument, mib, peak_rss_bytes, write_json};
+use crate::util::{
+    Counter, Metrics, cpu_seconds, cpu_total, instrument, mib, peak_rss_bytes, write_json,
+};
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -64,43 +68,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let start = Instant::now();
     let cpu0 = cpu_seconds().unwrap_or((0.0, 0.0));
 
-    // Progress ticker: per-interval throughput and per-op store time.
-    let (po, pc, pm) = (put_objects.clone(), recorded.clone(), metrics.clone());
-    let ticker = tokio::spawn(async move {
-        let mut last = (0u64, 0u64, Instant::now());
-        let mut last_ops: std::collections::HashMap<String, (u64, f64)> = Default::default();
-        let mut last_cpu = cpu_seconds().map_or(0.0, |c| c.0 + c.1);
-        loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            let (o, c) = (po.items(), pc());
-            let dt = last.2.elapsed().as_secs_f64();
-            let cpu = cpu_seconds().map_or(0.0, |c| c.0 + c.1);
-            println!(
-                "  [{:>6.0}s] objects={o} commits={c}  (+{:.0} obj/s, +{:.0} commits/s; process cpu {:.0}%; rss {:.0} MiB)",
-                start.elapsed().as_secs_f64(),
-                (o - last.0) as f64 / dt,
-                (c - last.1) as f64 / dt,
-                100.0 * (cpu - last_cpu) / dt,
-                mib(peak_rss_bytes().unwrap_or(0))
-            );
-            let mut parts = Vec::new();
-            for (name, calls, secs, _) in pm.totals() {
-                let (pcalls, psecs) =
-                    last_ops.insert(name.clone(), (calls, secs)).unwrap_or((0, 0.0));
-                if calls > pcalls {
-                    parts.push(format!(
-                        "{}={}x/{:.2}s",
-                        name.trim_start_matches("store."),
-                        calls - pcalls,
-                        secs - psecs
-                    ));
-                }
-            }
-            println!("           ops in interval: {}", parts.join(" "));
-            last = (o, c, Instant::now());
-            last_cpu = cpu;
-        }
-    });
+    let ticker =
+        tokio::spawn(progress(start, put_objects.clone(), recorded.clone(), metrics.clone()));
 
     let import = ant_gitbridge::import(&args.git_dir, &timed, &opts);
     let (result, timed_out) = if args.max_seconds > 0 {
@@ -224,6 +193,48 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         )
         .with("store_calls", metrics.json());
     write_json(&args.json, &json)
+}
+
+/// Progress ticker (until aborted): every 10 s, the interval's throughput and
+/// per-op store time.
+async fn progress(
+    start: Instant,
+    put_objects: Arc<Counter>,
+    recorded: impl Fn() -> u64,
+    metrics: Metrics,
+) {
+    let mut last = (0u64, 0u64, Instant::now());
+    let mut last_ops: HashMap<String, (u64, f64)> = HashMap::new();
+    let mut last_cpu = cpu_total();
+    loop {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let (o, c) = (put_objects.items(), recorded());
+        let dt = last.2.elapsed().as_secs_f64();
+        let cpu = cpu_total();
+        println!(
+            "  [{:>6.0}s] objects={o} commits={c}  (+{:.0} obj/s, +{:.0} commits/s; process cpu {:.0}%; rss {:.0} MiB)",
+            start.elapsed().as_secs_f64(),
+            (o - last.0) as f64 / dt,
+            (c - last.1) as f64 / dt,
+            100.0 * (cpu - last_cpu) / dt,
+            mib(peak_rss_bytes().unwrap_or(0))
+        );
+        let mut parts = Vec::new();
+        for (name, calls, secs) in metrics.totals() {
+            let (pcalls, psecs) = last_ops.insert(name.clone(), (calls, secs)).unwrap_or((0, 0.0));
+            if calls > pcalls {
+                parts.push(format!(
+                    "{}={}x/{:.2}s",
+                    name.trim_start_matches("store."),
+                    calls - pcalls,
+                    secs - psecs
+                ));
+            }
+        }
+        println!("           ops in interval: {}", parts.join(" "));
+        last = (o, c, Instant::now());
+        last_cpu = cpu;
+    }
 }
 
 /// Total size of all tables (incl. indexes/TOAST) in `schema`, plus per-table breakdown.

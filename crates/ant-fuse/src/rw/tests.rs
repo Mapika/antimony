@@ -2,21 +2,18 @@ use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt, symlink};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-use ant_core::{EncodedObject, EntryMode, ObjectId};
+use ant_core::{EntryMode, ObjectId};
+use ant_store::ObjectStoreExt;
 use ant_store::graph::build_tree;
 use ant_store::memory::MemoryObjectStore;
-use ant_store::{ObjectStore, ObjectStoreExt};
 use antd::workspace::{LocalChange, LocalChangeKind};
 use fuser::*;
 
 use super::*;
+use crate::test_support::{RecordingStore, runtime};
 
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap()
-}
 struct Fixture {
     session: Option<BackgroundSession>,
     mount: PathBuf,
@@ -341,50 +338,11 @@ fn writes_are_visible_to_reads_stat_and_status_immediately() {
     assert_eq!(f.summary(), [("grow".into(), Added)]);
 }
 
-#[derive(Default)]
-pub(super) struct CountingStore {
-    pub(super) inner: MemoryObjectStore,
-    pub(super) reads: AtomicUsize,
-}
-type StoreFuture<'a, T> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = ant_store::Result<T>> + Send + 'a>>;
-impl ObjectStore for CountingStore {
-    fn get_many<'a, 'b, 'f>(
-        &'a self,
-        ids: &'b [ObjectId],
-    ) -> StoreFuture<'f, Vec<Option<EncodedObject>>>
-    where
-        'a: 'f,
-        'b: 'f,
-        Self: 'f,
-    {
-        Box::pin(async move {
-            self.reads.fetch_add(ids.len(), Ordering::Relaxed);
-            self.inner.get_many(ids).await
-        })
-    }
-    fn put_many<'a, 'b, 'f>(&'a self, objects: &'b [EncodedObject]) -> StoreFuture<'f, ()>
-    where
-        'a: 'f,
-        'b: 'f,
-        Self: 'f,
-    {
-        Box::pin(async move { self.inner.put_many(objects).await })
-    }
-    fn has_many<'a, 'b, 'f>(&'a self, ids: &'b [ObjectId]) -> StoreFuture<'f, Vec<bool>>
-    where
-        'a: 'f,
-        'b: 'f,
-        Self: 'f,
-    {
-        Box::pin(async move { self.inner.has_many(ids).await })
-    }
-}
 #[test]
 fn changes_only_reads_affected_branches_of_twenty_thousand_files() {
     let _gate = crate::KERNEL_GATE.lock();
     let rt = runtime();
-    let objects = Arc::new(CountingStore::default());
+    let objects = Arc::new(RecordingStore::default());
     let paths = (0..20_000).map(|i| format!("d{:03}/f{:03}", i / 100, i % 100)).collect::<Vec<_>>();
     let entries = paths.iter().map(|p| (p.as_str(), b"base".as_slice())).collect::<Vec<_>>();
     let tree = rt.block_on(build_tree(objects.as_ref(), &entries)).unwrap();
@@ -404,10 +362,10 @@ fn changes_only_reads_affected_branches_of_twenty_thousand_files() {
     .unwrap();
     fs::write(mount.join("d001/f001"), b"one").unwrap();
     fs::write(mount.join("d199/f099"), b"two").unwrap();
-    objects.reads.store(0, Ordering::Relaxed);
+    objects.forget_reads();
     let changes = rt.block_on(changes(objects.clone(), &state)).unwrap();
     assert_eq!(changes.len(), 2);
-    assert!(objects.reads.load(Ordering::Relaxed) <= 24, "too many base reads");
+    assert!(objects.ids_read() <= 24, "too many base reads");
     assert_eq!(&rt.block_on(objects.read_blob(&changes[0].new.unwrap().1)).unwrap()[..], b"one");
     session.umount_and_join().unwrap();
 }

@@ -1,23 +1,16 @@
+//! `ant mount`: read-only FUSE view of a commit, in the foreground.
+
 use std::path::Path;
 use std::sync::Arc;
 
-use ant_core::ObjectId;
-use ant_proto::v1 as pb;
 use ant_store::{ObjectStore, ObjectStoreExt};
 use anyhow::{Context as _, Result};
 
-use crate::ctx::{Ctx, Outcome, RpcResult, id_from};
+use crate::ctx::{Ctx, Outcome, resolve_commit};
 
 pub async fn run(ctx: &Ctx, rev: &str, mountpoint: &Path) -> Result<Outcome> {
     let (rt, remote) = ctx.read_through().await?;
-    let commit = remote
-        .client()
-        .resolve_rev(pb::ResolveRevRequest { rev: rev.into() })
-        .await
-        .rpc()?
-        .into_inner()
-        .commit;
-    let commit: ObjectId = id_from(&commit)?;
+    let commit = resolve_commit(&mut remote.client(), rev).await?;
     let tree = rt.read_commit(&commit).await?.tree;
 
     let mp = mountpoint.to_path_buf();

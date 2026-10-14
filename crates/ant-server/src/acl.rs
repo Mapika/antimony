@@ -27,12 +27,14 @@
 //!   has no tags yet and already existed before this write (it was public),
 //!   tag it with the root zone too; then tag it with its zone. Writes in the
 //!   root zone add the root tag only if the object already carries tags.
-//!   Call sites: `ops::changeset::create_changeset` (blobs + rewritten
-//!   trees), `ops::land` (rebased/merged objects), and after git import.
-//! - `reindex(backend, policy, commit)`: walk the commit's tree and tag every
-//!   object under a non-root zone (and objects also present in the root zone
-//!   with the root tag). Used after `ant import` and when the policy changes,
-//!   as `ant admin reindex-acl <rev>` (store flags like `ant import`).
+//!   Call sites: `ops::changeset::create_changeset_as` (blobs + rewritten
+//!   trees) and the land replay's flush (rebased/merged objects).
+//! - `reindex_with(backend, policy, commit, full)`: walk the commit's tree
+//!   and tag every object under a non-root zone (and objects also present in
+//!   the root zone with the root tag); `reindex_history` does that for every
+//!   recorded commit reachable from a tip. Used by `ant import --policy` and,
+//!   when the policy changes, `ant admin reindex-acl <rev>` (store flags like
+//!   `ant import`).
 //! - `readable(backend, policy, principal, ids) -> Vec<bool>`: index-aligned;
 //!   no lookups when `policy.can_read_everything(principal)`.
 //!
@@ -91,10 +93,10 @@ use futures::{StreamExt, stream};
 use crate::ops::{OpError, OpResult};
 
 /// Derived-data kind prefix of zone tags: `acl/zone/v1/<zone>`.
-pub const ZONE_KIND_PREFIX: &str = "acl/zone/v1/";
+const ZONE_KIND_PREFIX: &str = "acl/zone/v1/";
 /// Synthetic zone of freshly uploaded, not yet placed blobs. Policy prefixes
 /// are repo paths and can never start with `/`, so no rule can grant it.
-pub const PENDING_ZONE: &str = "/pending";
+const PENDING_ZONE: &str = "/pending";
 /// Derived-data kind prefix of uploader records: `acl/uploader/v1/<name>`.
 const UPLOADER_KIND_PREFIX: &str = "acl/uploader/v1/";
 /// Derived-data kind prefix of reindex markers (`<prefix><zone fingerprint>`).
@@ -105,7 +107,7 @@ const LOOKUP_CHUNK: usize = 8192;
 const PUT_CONCURRENCY: usize = 64;
 const TAG: &[u8] = b"1";
 
-pub fn zone_kind(zone: &str) -> String {
+fn zone_kind(zone: &str) -> String {
     format!("{ZONE_KIND_PREFIX}{zone}")
 }
 
@@ -177,7 +179,7 @@ impl Acl {
 
 /// The token carried by an `Authorization` header value: `Bearer <token>`,
 /// or `Basic base64(<user>:<token>)` (any user name).
-pub fn token_from_authorization(value: &str) -> Option<String> {
+fn token_from_authorization(value: &str) -> Option<String> {
     let (scheme, rest) = value.trim().split_once(' ')?;
     let rest = rest.trim();
     if scheme.eq_ignore_ascii_case("bearer") {
@@ -291,8 +293,7 @@ pub async fn check_update_ref(
     let Some(new) = new else { return Ok(()) };
     let ids: Vec<ObjectId> = std::iter::once(new).chain(expected).collect();
     let nodes = b.meta.get_commits(&ids).await?;
-    let new_tree =
-        nodes[0].as_ref().ok_or_else(|| OpError::NotFound(format!("commit {new}")))?.tree;
+    let new_tree = nodes[0].as_ref().ok_or_else(|| OpError::not_found_commit(new))?.tree;
     if expected.is_none() {
         return Ok(());
     }

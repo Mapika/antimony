@@ -51,7 +51,7 @@ pub async fn resolve_rev(b: &Backend, rev: &str) -> OpResult<ObjectId> {
     };
     let mut id = match base.parse::<ObjectId>() {
         Ok(id) => {
-            node(b, id).await?;
+            cache::get_node(b, id).await?;
             id
         }
         Err(_) => b
@@ -65,7 +65,7 @@ pub async fn resolve_rev(b: &Backend, rev: &str) -> OpResult<ObjectId> {
             .ok_or_else(|| OpError::NotFound(format!("ref {base}")))?,
     };
     for _ in 0..steps {
-        id = *node(b, id)
+        id = *cache::get_node(b, id)
             .await?
             .parents
             .first()
@@ -74,18 +74,9 @@ pub async fn resolve_rev(b: &Backend, rev: &str) -> OpResult<ObjectId> {
     Ok(id)
 }
 
-/// Through the node cache: recorded nodes are immutable.
-async fn node(b: &Backend, id: ObjectId) -> OpResult<CommitNode> {
-    cache::get_nodes(b, &[id])
-        .await?
-        .pop()
-        .flatten()
-        .ok_or_else(|| OpError::NotFound(format!("commit {id}")))
-}
-
 async fn rev_tree(b: &Backend, rev: &str) -> OpResult<ObjectId> {
     let id = resolve_rev(b, rev).await?;
-    Ok(node(b, id).await?.tree)
+    Ok(cache::get_node(b, id).await?.tree)
 }
 
 pub async fn read_path(
@@ -174,7 +165,7 @@ pub async fn log_as(
         let want = if path.is_some() { LOG_SCAN_CHUNK } else { limit - out.len() };
         let chain = b.meta.first_parent_chain(from, None, want.min(LOG_SCAN_CHUNK)).await?;
         let Some(last) = chain.last() else {
-            return Err(OpError::NotFound(format!("commit {from}")));
+            return Err(OpError::not_found_commit(from));
         };
         next = last.parents.first().copied();
         let mut picked: Vec<&CommitNode> = match path {
@@ -222,7 +213,7 @@ async fn indexed_path_log(
         return Some(log);
     }
     let ref_name = history::indexed_ref_for(b, rev, tip).await.ok()??;
-    let generation = node(b, tip).await.ok()?.generation;
+    let generation = cache::get_node(b, tip).await.ok()?.generation;
     history::path_log(b, &ref_name, generation, path, limit).await.ok()
 }
 

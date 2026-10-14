@@ -35,12 +35,17 @@ pub fn find_dead_mount(start: &Path) -> Option<PathBuf> {
     start.ancestors().filter(|d| is_dead(d)).last().map(Path::to_path_buf)
 }
 
-/// Like [`find_workspace`] with `-C` / cwd handling and an error on miss.
-pub fn require_workspace(override_dir: Option<&Path>) -> Result<PathBuf> {
-    let start = match override_dir {
+/// Where workspace discovery starts: `-C <dir>` (made absolute), else cwd.
+pub fn start_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
+    Ok(match override_dir {
         Some(d) => std::path::absolute(d)?,
         None => std::env::current_dir()?,
-    };
+    })
+}
+
+/// Like [`find_workspace`] with `-C` / cwd handling and an error on miss.
+pub fn require_workspace(override_dir: Option<&Path>) -> Result<PathBuf> {
+    let start = start_dir(override_dir)?;
     if let Some(root) = find_workspace(&start) {
         return Ok(root);
     }

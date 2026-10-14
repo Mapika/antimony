@@ -53,6 +53,11 @@ const WINDOW: usize = 10;
 const WINDOW_BYTES: usize = 16 << 20;
 /// zlib level of every entry (git's default `core.compression`).
 const LEVEL: u32 = 6;
+/// Pack entry types (git's `object_type`).
+const OBJ_COMMIT: u8 = 1;
+const OBJ_TREE: u8 = 2;
+const OBJ_BLOB: u8 = 3;
+const OBJ_OFS_DELTA: u8 = 6;
 
 struct PackWriter {
     tx: Sender<Chunk>,
@@ -248,14 +253,14 @@ fn encode_segment(work: Work) -> io::Result<Segment> {
         let (kind, size, base, depth) = match &best {
             Some((delta, base, depth)) => {
                 encoder.write_all(delta)?;
-                (6, delta.len(), Some(*base), *depth)
+                (OBJ_OFS_DELTA, delta.len(), Some(*base), *depth)
             }
             None => {
                 encoder.write_all(object.body())?;
                 let kind = match object.kind() {
-                    ObjectKind::Commit => 1,
-                    ObjectKind::Tree => 2,
-                    ObjectKind::Blob => 3,
+                    ObjectKind::Commit => OBJ_COMMIT,
+                    ObjectKind::Tree => OBJ_TREE,
+                    ObjectKind::Blob => OBJ_BLOB,
                 };
                 (kind, object.body().len(), None, 0)
             }
@@ -464,14 +469,7 @@ mod tests {
     }
 
     async fn git(dir: &std::path::Path, args: &[&str]) -> String {
-        let result = tokio::process::Command::new("git")
-            .current_dir(dir)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .args(args)
-            .output()
-            .await
-            .unwrap();
+        let result = support::git_command(dir).args(args).output().await.unwrap();
         assert!(
             result.status.success(),
             "git {args:?}: {}{}",
@@ -494,8 +492,8 @@ mod tests {
             git(dir.path(), &["config", "remote.origin.promisor", "true"]).await;
             git(dir.path(), &["config", "remote.origin.url", "/nonexistent-promisor"]).await;
         }
-        let mut command = tokio::process::Command::new("git");
-        command.current_dir(dir.path()).args(["index-pack", "--stdin", "--fix-thin"]);
+        let mut command = support::git_command(dir.path());
+        command.args(["index-pack", "--stdin", "--fix-thin"]);
         if promisor {
             command.arg("--promisor");
         }
@@ -523,38 +521,17 @@ mod tests {
         (dir, size)
     }
 
-    fn rss() -> u64 {
-        std::fs::read_to_string("/proc/self/status")
-            .unwrap_or_default()
-            .lines()
-            .find_map(|line| line.strip_prefix("VmRSS:")?.split_whitespace().next()?.parse().ok())
-            .unwrap_or(0)
-    }
-
     // This exercises the same planner and streaming encoder as HTTP, with real
     // git over stdin, so it also runs in sandboxes that prohibit listen sockets.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn synthetic_history_pack_size_time_and_peak_rss() {
-        use std::{
-            sync::{
-                Arc,
-                atomic::{AtomicU64, Ordering},
-            },
-            time::Instant,
-        };
+        use std::{sync::atomic::Ordering, time::Instant};
         let (b, expected_undeltified) = support::history(2000, 2000).await;
         let tip = b.refs.list_refs("").await.unwrap()[0].1;
         let mut sizes = Vec::new();
         for deltas in [false, true] {
-            let before = rss();
-            let peak = Arc::new(AtomicU64::new(before));
-            let monitor_peak = peak.clone();
-            let monitor = tokio::spawn(async move {
-                loop {
-                    monitor_peak.fetch_max(rss(), Ordering::Relaxed);
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            });
+            let before = support::rss_kib();
+            let (peak, monitor) = support::watch_peak_rss(before);
             let start = Instant::now();
             let selection = crate::select::select(
                 &b,
@@ -597,24 +574,10 @@ mod tests {
         let (dir, _) = receive(b.clone(), selection, true, false).await;
         git(dir.path(), &["update-ref", "refs/heads/main", &tip.to_string()]).await;
         git(dir.path(), &["fsck", "--full"]).await;
-        let mut trees = 0;
-        let mut blobs = 0;
-        let mut depth = 0;
-        for entry in std::fs::read_dir(dir.path().join("objects/pack")).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_some_and(|e| e == "idx") {
-                for line in
-                    git(dir.path(), &["verify-pack", "-v", path.to_str().unwrap()]).await.lines()
-                {
-                    let fields: Vec<_> = line.split_whitespace().collect();
-                    if fields.len() == 7 && fields[0].len() == 64 {
-                        depth = depth.max(fields[5].parse::<usize>().unwrap());
-                        trees += usize::from(fields[1] == "tree");
-                        blobs += usize::from(fields[1] == "blob");
-                    }
-                }
-            }
-        }
+        let packed = support::packed_objects(&dir.path().join("objects/pack")).await;
+        let deltas = |kind: &str| packed.iter().filter(|(k, d)| k == kind && d.is_some()).count();
+        let (trees, blobs) = (deltas("tree"), deltas("blob"));
+        let depth = packed.iter().filter_map(|(_, d)| *d).max().unwrap_or(0);
         assert!(trees > 50 && blobs > 50, "trees={trees} blobs={blobs}");
         // Bases fan out (see `best_delta`); the cap itself is pinned by
         // `appended_history_stops_at_the_depth_cap`.
@@ -646,14 +609,6 @@ mod tests {
         git(incremental.path(), &["fsck", "--full"]).await;
     }
 
-    fn pack_files(dir: &std::path::Path, extension: &str) -> Vec<std::path::PathBuf> {
-        std::fs::read_dir(dir.join("objects/pack"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().is_some_and(|e| e == extension))
-            .collect()
-    }
-
     /// Regression guard for real histories (git/git's blobless export once
     /// was 7.5x git's own pack): deep trees, a few hot directories, merged
     /// topic branches. The blobless pack must be no larger than what git's own
@@ -677,8 +632,7 @@ mod tests {
         git(dir.path(), &["update-ref", "refs/heads/main", &tip.to_string()]).await;
         git(dir.path(), &["fsck", "--full"]).await;
         git(dir.path(), &["repack", "-a", "-d", "-f", "-q"]).await;
-        let repacked: u64 =
-            pack_files(dir.path(), "pack").iter().map(|p| p.metadata().unwrap().len()).sum();
+        let repacked = support::pack_bytes(&dir.path().join("objects/pack"));
         eprintln!("merged history: undeltified={undeltified} pack={size} git repack={repacked}");
         // Measured 2026-10-14: pack 30% of undeltified, 0.5x git's repack. A
         // single previous-version base in traversal order (the old encoder)
@@ -770,28 +724,12 @@ mod tests {
         let mut objects: Vec<_> =
             (0_u32..520).map(|n| EncodedObject::new(ObjectKind::Blob, &n.to_be_bytes())).collect();
         // Incompressible payload crosses several maximum-size sidebands.
-        let mut state = 123456789_u32;
-        let data: Vec<_> = (0..200_000)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                state as u8
-            })
-            .collect();
-        objects.push(EncodedObject::new(ObjectKind::Blob, &data));
+        objects.push(EncodedObject::new(ObjectKind::Blob, &support::noise(123456789, 200_000)));
         let ids = objects.iter().map(EncodedObject::id).collect();
         b.objects.put_many(&objects).await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let init = tokio::process::Command::new("git")
-            .args(["init", "--bare", "--object-format=sha256"])
-            .arg(dir.path())
-            .output()
-            .await
-            .unwrap();
-        assert!(init.status.success());
-        let mut child = tokio::process::Command::new("git")
-            .current_dir(dir.path())
+        git(dir.path(), &["init", "--bare", "--object-format=sha256"]).await;
+        let mut child = support::git_command(dir.path())
             .args(["index-pack", "--stdin"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

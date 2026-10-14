@@ -1,20 +1,28 @@
 //! gRPC adapter over `ops`.
 //!
-//! [`AntService`] implements the generated `ant_proto::v1::ant_server::Ant`
-//! trait.
+//! `AntService` implements the generated `ant_proto::v1::ant_server::Ant`
+//! trait; [`serve_with_metrics`] serves it.
 //!
-//! - Every RPC is a thin translation layer: decode/validate request →
-//!   call `ops::*` / `Backend` → encode response. No business logic here.
+//! - Every RPC translates: decode/validate request → call `ops::*` /
+//!   `Backend` → encode response. The only rules enforced here are access
+//!   checks (`crate::acl`) and that non-admins upload blobs only.
 //! - Error mapping: `OpError::NotFound` → `Status::not_found`,
 //!   `InvalidArgument` (and malformed ids/paths/modes in the request) →
-//!   `invalid_argument`, `Aborted` → `aborted`, store/backend errors →
-//!   `internal`. Never panic on bad input.
+//!   `invalid_argument`, `Aborted` → `aborted`, `PermissionDenied` →
+//!   `permission_denied`. Store errors: `NotFound` → `not_found`,
+//!   `InvalidArgument`/`WrongKind`/`Core` → `invalid_argument`,
+//!   `NewerFormat`/`MigrationRequired` → `failed_precondition`, backend
+//!   failures → `internal`. Never panic on bad input.
 //! - `GetObjects`: stream results in request order; fetch from the store in
-//!   chunks of 256 ids (one `get_many` per chunk). Reject > 100_000 ids.
+//!   chunks of 256 ids (one `get_many` per chunk). `GetObjects` and
+//!   `HasObjects` reject > 100_000 ids.
 //! - `PutObjects`: parse each with `EncodedObject::from_bytes`, store with one
 //!   `put_many`, return ids in order.
-//! - `Log`/`Diff`/`ReadPath`/`ResolveRev`/`Land`/`CreateChangeset`: map 1:1
-//!   onto `ops::query`, `ops::land`, `ops::changeset`.
+//! - `Log`/`Diff`/`ReadPath`/`ResolveRev`/`Blame`/`Land`/`CreateChangeset`:
+//!   map 1:1 onto `ops::query`, `ops::history`, `ops::land`,
+//!   `ops::changeset`. A successful `Land`, or an `UpdateRef` to a new
+//!   target, schedules a background history-index catch-up
+//!   (`ops::history::schedule_catch_up`).
 //! - Max decoding/encoding message size is `ant_proto::MAX_MESSAGE_BYTES`.
 //!
 //! Access control (`crate::acl`): with a policy, every RPC authenticates the
@@ -22,14 +30,13 @@
 //! `unauthenticated`) and delegates to the `ops::*_as` variants; object
 //! RPCs report unreadable objects exactly like missing ones.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, RepoPath, Signature};
 use ant_proto::MAX_MESSAGE_BYTES;
 use ant_proto::v1 as pb;
 use ant_proto::v1::ant_server::{Ant, AntServer};
-use ant_store::{Backend, CasOutcome, ChangeKind, StoreError};
+use ant_store::{Backend, CasOutcome, ChangeKind, PathChange, StoreError};
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
 use tonic::{Request, Response, Status};
@@ -49,27 +56,13 @@ const OBJECT_CHUNK: usize = 256;
 const MAX_IDS: usize = 100_000;
 
 #[derive(Clone)]
-pub struct AntService {
-    pub backend: Backend,
+struct AntService {
+    backend: Backend,
     acl: Acl,
     metrics: Arc<Metrics>,
 }
 
 impl AntService {
-    /// Open mode (no access control).
-    pub fn new(backend: Backend) -> Self {
-        Self::with_acl(backend, Acl::open())
-    }
-
-    pub fn with_acl(backend: Backend, acl: Acl) -> Self {
-        Self::with_metrics(backend, acl, Metrics::new())
-    }
-
-    /// Report landing and history-index metrics to `metrics`.
-    pub fn with_metrics(backend: Backend, acl: Acl, metrics: Arc<Metrics>) -> Self {
-        Self { backend, acl, metrics }
-    }
-
     /// The caller of `request`: `None` in open mode.
     fn access<T>(&self, request: &Request<T>) -> Result<Option<Access>, Status> {
         if self.acl.is_open() {
@@ -80,28 +73,9 @@ impl AntService {
     }
 }
 
-/// Serve gRPC on `addr` until the future is dropped.
-pub async fn serve(backend: Backend, addr: SocketAddr) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    serve_on(backend, listener).await
-}
-
-/// Serve gRPC on an already-bound listener (tests bind port 0).
-pub async fn serve_on(backend: Backend, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
-    serve_with_acl(backend, Acl::open(), listener).await
-}
-
-/// [`serve_on`] enforcing `acl`.
-pub async fn serve_with_acl(
-    backend: Backend,
-    acl: Acl,
-    listener: tokio::net::TcpListener,
-) -> anyhow::Result<()> {
-    serve_with_metrics(backend, acl, listener, Metrics::new()).await
-}
-
-/// [`serve_with_acl`] recording gRPC, landing and history metrics, with
-/// request ids and slow-request logs (`crate::observe`), into `metrics`.
+/// Serve gRPC on `listener` until the future is dropped, enforcing `acl`
+/// and recording gRPC, landing and history metrics, with request ids and
+/// slow-request logs (`crate::observe`), into `metrics`.
 pub async fn serve_with_metrics(
     backend: Backend,
     acl: Acl,
@@ -109,7 +83,7 @@ pub async fn serve_with_metrics(
     metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
     let observe = GrpcObserveLayer::new(Observer::new(metrics.clone(), acl.clone()));
-    let svc = AntServer::new(AntService::with_metrics(backend, acl, metrics))
+    let svc = AntServer::new(AntService { backend, acl, metrics })
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
     // Without TCP_NODELAY, Nagle + delayed ACKs add ~40 ms to small RPCs.
@@ -172,7 +146,7 @@ fn parse_ids(raw: &[Vec<u8>]) -> Result<Vec<ObjectId>, Status> {
     raw.iter().map(|b| parse_id(b)).collect()
 }
 
-fn parse_rev_path(path: &str) -> Result<RepoPath, Status> {
+fn parse_path(path: &str) -> Result<RepoPath, Status> {
     RepoPath::new(path).map_err(|e| Status::invalid_argument(e.to_string()))
 }
 
@@ -196,7 +170,7 @@ fn kind_to_pb(k: ChangeKind) -> i32 {
 }
 
 fn file_op_from_pb(op: pb::FileOp) -> Result<FileOp, Status> {
-    let path = parse_rev_path(&op.path)?;
+    let path = parse_path(&op.path)?;
     match op.op {
         Some(pb::file_op::Op::Write(w)) => {
             let mode = mode_from_pb(w.mode)?;
@@ -230,8 +204,21 @@ fn commit_info_to_pb(e: query::LogEntry) -> pb::CommitInfo {
     }
 }
 
-fn to_ids(ids: impl IntoIterator<Item = ObjectId>) -> Vec<Vec<u8>> {
-    ids.into_iter().map(|i| i.0.to_vec()).collect()
+fn path_change_to_pb(c: PathChange) -> pb::PathChange {
+    let side = |s: Option<(EntryMode, ObjectId)>| match s {
+        Some((m, id)) => (mode_to_pb(m), id.0.to_vec()),
+        None => (pb::EntryMode::Unspecified as i32, Vec::new()),
+    };
+    let (old_mode, old_id) = side(c.old);
+    let (new_mode, new_id) = side(c.new);
+    pb::PathChange {
+        path: c.path.as_str().to_owned(),
+        kind: kind_to_pb(c.kind),
+        old_mode,
+        old_id,
+        new_mode,
+        new_id,
+    }
 }
 
 /// Index-aligned read access to objects by id (all true in open mode).
@@ -339,7 +326,7 @@ impl Ant for AntService {
             let kinds: Vec<_> = objects.iter().map(|o| (o.id(), o.kind())).collect();
             acl::record_uploads(&self.backend, access, &kinds).await.map_err(store_status)?;
         }
-        let ids = to_ids(objects.iter().map(EncodedObject::id));
+        let ids = objects.iter().map(|o| o.id().0.to_vec()).collect();
         self.backend.objects.put_many(&objects).await.map_err(store_status)?;
         Ok(Response::new(pb::PutObjectsResponse { ids }))
     }
@@ -392,11 +379,7 @@ impl Ant for AntService {
         Ok(Response::new(match outcome {
             CasOutcome::Updated => {
                 if new.is_some() {
-                    history::schedule_catch_up_observed(
-                        &self.backend,
-                        &req.name,
-                        Some(self.metrics.clone()),
-                    );
+                    history::schedule_catch_up(&self.backend, &req.name, Some(&self.metrics));
                 }
                 pb::UpdateRefResponse { updated: true, actual: None }
             }
@@ -449,11 +432,7 @@ impl Ant for AntService {
         if matches!(outcome, LandOutcome::Landed { .. }) {
             // Coalesced per ref, so a burst of lands in one leader batch (or
             // across batches) costs one background catch-up, not one each.
-            history::schedule_catch_up_observed(
-                &self.backend,
-                &req.ref_name,
-                Some(self.metrics.clone()),
-            );
+            history::schedule_catch_up(&self.backend, &req.ref_name, Some(&self.metrics));
         }
         let outcome = match outcome {
             LandOutcome::Landed { new_tip, rebased } => {
@@ -488,7 +467,7 @@ impl Ant for AntService {
     ) -> Result<Response<pb::ReadPathResponse>, Status> {
         let access = self.access(&request)?;
         let req = request.into_inner();
-        let path = parse_rev_path(&req.path)?;
+        let path = parse_path(&req.path)?;
         let info = query::read_path_as(
             &self.backend,
             access.as_ref(),
@@ -525,7 +504,7 @@ impl Ant for AntService {
     ) -> Result<Response<pb::LogResponse>, Status> {
         let access = self.access(&request)?;
         let req = request.into_inner();
-        let path = req.path.as_deref().map(parse_rev_path).transpose()?;
+        let path = req.path.as_deref().map(parse_path).transpose()?;
         let entries = query::log_as(
             &self.backend,
             access.as_ref(),
@@ -546,7 +525,7 @@ impl Ant for AntService {
     ) -> Result<Response<pb::BlameResponse>, Status> {
         let access = self.access(&request)?;
         let req = request.into_inner();
-        let path = parse_rev_path(&req.path)?;
+        let path = parse_path(&req.path)?;
         let lines = history::blame_as(&self.backend, access.as_ref(), &req.rev, &path)
             .await
             .map_err(op_status)?;
@@ -568,27 +547,7 @@ impl Ant for AntService {
         let changes = query::diff_as(&self.backend, access.as_ref(), from, &req.to_rev)
             .await
             .map_err(op_status)?;
-        let changes = changes
-            .into_iter()
-            .map(|c| {
-                let (old_mode, old_id) = match c.old {
-                    Some((m, id)) => (mode_to_pb(m), id.0.to_vec()),
-                    None => (pb::EntryMode::Unspecified as i32, Vec::new()),
-                };
-                let (new_mode, new_id) = match c.new {
-                    Some((m, id)) => (mode_to_pb(m), id.0.to_vec()),
-                    None => (pb::EntryMode::Unspecified as i32, Vec::new()),
-                };
-                pb::PathChange {
-                    path: c.path.as_str().to_owned(),
-                    kind: kind_to_pb(c.kind),
-                    old_mode,
-                    old_id,
-                    new_mode,
-                    new_id,
-                }
-            })
-            .collect();
+        let changes = changes.into_iter().map(path_change_to_pb).collect();
         Ok(Response::new(pb::DiffResponse { changes }))
     }
 }

@@ -20,14 +20,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ant_core::{EncodedObject, EntryMode, ObjectId, RepoPath};
-use ant_server::ops::changeset::{ChangesetRequest, FileOp, WriteContent, create_changeset};
+use ant_server::ops::changeset::{ChangesetRequest, create_changeset};
 use ant_server::ops::history;
 use ant_server::ops::land::{LandOutcome, land};
 use ant_server::ops::query;
-use ant_store::postgres::PgStore;
 use ant_store::{Backend, ChangeKind, ObjectStore};
 use async_trait::async_trait;
-use bytes::Bytes;
 use common::*;
 
 const SHARDS: usize = 32;
@@ -59,14 +57,6 @@ impl ObjectStore for CountingObjects {
 
 fn agent_dir(i: usize) -> String {
     format!("agents/{:02}/{i}", i % SHARDS)
-}
-
-fn write(path: &str, content: String) -> FileOp {
-    FileOp::Write {
-        path: RepoPath::new(path).unwrap(),
-        mode: EntryMode::File,
-        content: WriteContent::Inline(Bytes::from(content)),
-    }
 }
 
 /// Seed every agent directory, then land `lands` commits, each rewriting
@@ -212,11 +202,7 @@ async fn memory_status_diff_and_lagging_path_log() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs postgres: docker compose up -d"]
 async fn pg_status_diff_and_lagging_path_log() {
-    let url = std::env::var("ANT_TEST_PG_URL")
-        .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
-    let schema = format!("t_soak_queries_{}", rand::random::<u64>());
-    let pg = Arc::new(PgStore::connect_scratch(&url, &schema).await.unwrap());
-    let b = Backend { objects: pg.clone(), refs: pg.clone(), meta: pg };
+    let b = common::pg::scratch_backend("t_soak_queries").await;
     let t = Instant::now();
     let (tips, paths) = soak_history(&b, 1500, 200).await;
     eprintln!("setup: {} lands in {:?}", paths.len(), t.elapsed());

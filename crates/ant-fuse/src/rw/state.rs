@@ -18,26 +18,29 @@ use super::{metadata, other};
 pub(super) struct StateLock(File);
 impl StateLock {
     pub(super) fn take(dir: &Path) -> io::Result<Self> {
-        let f = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(dir.join("lock"))?;
-        // SAFETY: flock only consumes the valid descriptor, with no pointers.
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let f = open_lock_file(dir)?;
+        flock(&f, libc::LOCK_EX)?;
         Ok(Self(f))
     }
 }
 impl Drop for StateLock {
     fn drop(&mut self) {
-        // SAFETY: the file is still alive here.
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
+        let _ = flock(&self.0, libc::LOCK_UN);
     }
+}
+
+/// Open (creating) the state lock file, a new open file description.
+pub(super) fn open_lock_file(dir: &Path) -> io::Result<File> {
+    OpenOptions::new().create(true).truncate(false).read(true).write(true).open(dir.join("lock"))
+}
+
+/// `flock(2)` with `op` (`LOCK_EX` blocks until the lock is ours).
+pub(super) fn flock(f: &File, op: libc::c_int) -> io::Result<()> {
+    // SAFETY: flock only consumes the valid descriptor, with no pointers.
+    if unsafe { libc::flock(f.as_raw_fd(), op) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 // Exclusive "this state dir is mounted" marker. Within a process an exact

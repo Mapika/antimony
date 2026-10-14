@@ -1,5 +1,5 @@
 //! Strict pkt-line framing shared by requests and streamed responses.
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 
 pub fn packet(data: &[u8]) -> Vec<u8> {
     let mut out = format!("{:04x}", data.len() + 4).into_bytes();
@@ -49,7 +49,7 @@ pub fn parse(mut input: &[u8]) -> Result<Request<'_>> {
             _ => bail!("invalid packet length"),
         }
     }
-    Ok(Request { command: command.ok_or_else(|| anyhow::anyhow!("missing command"))?, args })
+    Ok(Request { command: command.ok_or_else(|| anyhow!("missing command"))?, args })
 }
 
 #[cfg(test)]

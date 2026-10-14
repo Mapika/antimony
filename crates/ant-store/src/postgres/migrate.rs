@@ -30,7 +30,7 @@ use super::{be, quote_ident};
 use crate::{Result, StoreError};
 
 /// The schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// One schema migration.
 pub struct Migration {
@@ -69,6 +69,13 @@ pub static MIGRATIONS: [Migration; SCHEMA_VERSION as usize] = [
         description: "out-of-line uncompressed storage for compressed columns; \
                       insert-only autovacuum thresholds",
         ddl: storage_tuning,
+    },
+    Migration {
+        version: 5,
+        name: "gc",
+        description: "write times of objects, packed-object index rows, commits and changesets; \
+                      garbage-collection state (condemned ids, mark working set, run state)",
+        ddl: gc,
     },
 ];
 
@@ -197,6 +204,53 @@ fn storage_tuning(qs: &str, ql: &str) -> Vec<String> {
              END $$"
         ),
     ]
+}
+
+/// Garbage collection (`super::gc`). Existing rows get the migration time
+/// as their write time (a column default added without rewriting the
+/// table), so nothing written before the upgrade is collectable until a
+/// full grace period after it. BRIN indexes make "written since" scans cheap
+/// on these insert-mostly tables and cost almost nothing on insert.
+fn gc(qs: &str, _ql: &str) -> Vec<String> {
+    let mut stmts = Vec::new();
+    for table in ["objects", "object_index", "commits", "changesets"] {
+        stmts.push(format!(
+            "ALTER TABLE {qs}.{table} \
+             ADD COLUMN IF NOT EXISTS written_at timestamptz NOT NULL DEFAULT now()"
+        ));
+        stmts.push(format!(
+            "CREATE INDEX IF NOT EXISTS {table}_written_at ON {qs}.{table} \
+             USING brin (written_at)"
+        ));
+    }
+    stmts.extend([
+        // Ids a garbage-collection run is about to delete: readers treat
+        // them as missing, writers that store them again take them back.
+        format!("CREATE TABLE IF NOT EXISTS {qs}.gc_condemned (id bytea PRIMARY KEY)"),
+        // Mark working set of the current run (rebuilt after a crash).
+        format!(
+            "CREATE UNLOGGED TABLE IF NOT EXISTS {qs}.gc_live (\
+                id bytea PRIMARY KEY, \
+                kind smallint NOT NULL, \
+                expanded boolean NOT NULL)"
+        ),
+        format!("CREATE INDEX IF NOT EXISTS gc_live_todo ON {qs}.gc_live (id) WHERE NOT expanded"),
+        // The current (or last) run: one row.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {qs}.gc_state (\
+                singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), \
+                phase text NOT NULL, \
+                started_at timestamptz NOT NULL, \
+                cutoff timestamptz NOT NULL, \
+                grace_secs double precision NOT NULL, \
+                quiesce_secs double precision NOT NULL, \
+                condemned_at timestamptz, \
+                remarked_at timestamptz, \
+                finished_at timestamptz, \
+                stats text NOT NULL DEFAULT '')"
+        ),
+    ]);
+    stmts
 }
 
 /// Version state of one schema ([`super::PgStore::schema_status`]).

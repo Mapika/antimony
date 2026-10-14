@@ -32,6 +32,11 @@
 //!   connection (synchronous commit).
 //! - Inside [`crate::deferred_durability`], object, changeset, commit and
 //!   derived writes commit with `SET LOCAL synchronous_commit = off`.
+//! - Garbage collection ([`gc`]): objects, packed-object index rows, commits
+//!   and changesets carry their write time (`written_at`). Readers treat ids
+//!   condemned by a collection run (`gc_condemned`) as missing; storing an
+//!   object that already exists refreshes an old write time and takes the id
+//!   back from `gc_condemned` (see [`gc`] for why that makes deletion safe).
 
 use std::collections::{HashMap, HashSet};
 
@@ -42,6 +47,7 @@ use sqlx::Row;
 
 use crate::changeset_codec;
 
+pub mod gc;
 mod migrate;
 pub use migrate::{MIGRATIONS, Migration, SCHEMA_VERSION, SchemaStatus};
 
@@ -304,28 +310,45 @@ impl PgStore {
         let packs: Vec<&[u8]> = sorted.iter().map(|e| e.pack.as_slice()).collect();
         let offs: Vec<i64> = sorted.iter().map(|e| e.off as i64).collect();
         let lens: Vec<i32> = sorted.iter().map(|e| e.len as i32).collect();
-        let insert = sqlx::query(
-            "INSERT INTO object_index (id, pack, off, len) \
-             SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::bigint[], $4::integer[]) \
-             ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(&ids)
-        .bind(&packs)
-        .bind(&offs)
-        .bind(&lens);
-        self.write(insert, self.objects_deferred()).await?;
-        Ok(())
+        // Like `put_many`: rows that already exist keep pointing at their
+        // pack, with their write time refreshed (`gc::refresh_existing`).
+        let mut pending: Vec<usize> = (0..sorted.len()).collect();
+        for _ in 0..gc::STORE_ATTEMPTS {
+            let ids: Vec<&[u8]> = pending.iter().map(|&i| ids[i]).collect();
+            let packs: Vec<&[u8]> = pending.iter().map(|&i| packs[i]).collect();
+            let offs: Vec<i64> = pending.iter().map(|&i| offs[i]).collect();
+            let lens: Vec<i32> = pending.iter().map(|&i| lens[i]).collect();
+            let insert = sqlx::query(
+                "INSERT INTO object_index (id, pack, off, len) \
+                 SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::bigint[], $4::integer[]) \
+                 ON CONFLICT (id) DO NOTHING RETURNING id",
+            )
+            .bind(&ids)
+            .bind(&packs)
+            .bind(&offs)
+            .bind(&lens);
+            let inserted = self.write(insert, self.objects_deferred()).await?;
+            let missing = self.refresh_existing(gc::Table::ObjectIndex, &ids, &inserted).await?;
+            if missing.is_empty() {
+                return Ok(());
+            }
+            pending.retain(|&i| missing.contains(sorted[i].id.as_bytes().as_slice()));
+        }
+        Err(gc::lost_race())
     }
 
     pub(crate) async fn lookup_index(
         &self,
         ids: &[ObjectId],
     ) -> Result<HashMap<ObjectId, IndexEntry>> {
-        let rows = sqlx::query("SELECT id, pack, off, len FROM object_index WHERE id = ANY($1)")
-            .bind(ids_to_vecs(ids))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(be)?;
+        let sql = if gc::hiding() {
+            "SELECT id, pack, off, len FROM object_index x WHERE id = ANY($1) \
+             AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = x.id)"
+        } else {
+            "SELECT id, pack, off, len FROM object_index WHERE id = ANY($1)"
+        };
+        let rows =
+            sqlx::query(sql).bind(ids_to_vecs(ids)).fetch_all(&self.pool).await.map_err(be)?;
         let mut out = HashMap::with_capacity(rows.len());
         for r in &rows {
             let id = object_id_col(r, "id")?;
@@ -626,11 +649,14 @@ impl ObjectStore for PgStore {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query("SELECT id, data FROM objects WHERE id = ANY($1)")
-            .bind(ids_to_vecs(ids))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(be)?;
+        let sql = if gc::hiding() {
+            "SELECT id, data FROM objects o WHERE id = ANY($1) \
+             AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = o.id)"
+        } else {
+            "SELECT id, data FROM objects WHERE id = ANY($1)"
+        };
+        let rows =
+            sqlx::query(sql).bind(ids_to_vecs(ids)).fetch_all(&self.pool).await.map_err(be)?;
         let raw: Vec<(ObjectId, Vec<u8>)> = rows
             .iter()
             .map(|r| Ok((object_id_col(r, "id")?, r.try_get("data").map_err(be)?)))
@@ -692,26 +718,41 @@ impl ObjectStore for PgStore {
         // the Linux kernel with concurrent writers).
         rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         rows.dedup_by(|a, b| a.0 == b.0);
-        let (ids, data): (Vec<Vec<u8>>, Vec<Vec<u8>>) = rows.into_iter().unzip();
-        let insert = sqlx::query(
-            "INSERT INTO objects (id, data) SELECT * FROM unnest($1::bytea[], $2::bytea[]) \
-             ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(&ids)
-        .bind(&data);
-        self.write(insert, self.objects_deferred()).await?;
-        Ok(())
+        // Objects that already exist are not rewritten, but an old write
+        // time is refreshed and a condemned id taken back, so a collection
+        // run cannot delete what this call reports stored; an object deleted
+        // meanwhile is inserted again (`gc::refresh_existing`).
+        for _ in 0..gc::STORE_ATTEMPTS {
+            let (ids, data): (Vec<&[u8]>, Vec<&[u8]>) =
+                rows.iter().map(|(id, data)| (id.as_slice(), data.as_slice())).unzip();
+            let insert = sqlx::query(
+                "INSERT INTO objects (id, data) SELECT * FROM unnest($1::bytea[], $2::bytea[]) \
+                 ON CONFLICT (id) DO NOTHING RETURNING id",
+            )
+            .bind(&ids)
+            .bind(&data);
+            let inserted = self.write(insert, self.objects_deferred()).await?;
+            let missing = self.refresh_existing(gc::Table::Objects, &ids, &inserted).await?;
+            if missing.is_empty() {
+                return Ok(());
+            }
+            rows.retain(|(id, _)| missing.contains(id.as_slice()));
+        }
+        Err(gc::lost_race())
     }
 
     async fn has_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query("SELECT id FROM objects WHERE id = ANY($1)")
-            .bind(ids_to_vecs(ids))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(be)?;
+        let sql = if gc::hiding() {
+            "SELECT id FROM objects o WHERE id = ANY($1) \
+             AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = o.id)"
+        } else {
+            "SELECT id FROM objects WHERE id = ANY($1)"
+        };
+        let rows =
+            sqlx::query(sql).bind(ids_to_vecs(ids)).fetch_all(&self.pool).await.map_err(be)?;
         let present: HashSet<ObjectId> =
             rows.iter().map(|r| object_id_col(r, "id")).collect::<Result<_>>()?;
         Ok(ids.iter().map(|id| present.contains(id)).collect())
@@ -748,26 +789,36 @@ impl RefStore for PgStore {
         new: Option<ObjectId>,
     ) -> Result<CasOutcome> {
         validate_ref_name(name)?;
+        // Moves take the collector's fence (shared): a sweep batch holds it
+        // exclusively while it checks that no ref points at a condemned id
+        // and deletes (see `gc`), so a move commits either before that check
+        // or after the batch.
+        let fence = gc::fence_key(&self.schema);
         let affected = match (expected, new) {
             (None, Some(n)) => sqlx::query(
-                "INSERT INTO refs (name, target) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
+                "WITH fence AS (SELECT pg_advisory_xact_lock_shared(hashtextextended($3, 0))) \
+                 INSERT INTO refs (name, target) SELECT $1, $2 FROM fence \
+                 ON CONFLICT (name) DO NOTHING",
             )
             .bind(name)
             .bind(n.as_bytes().as_slice())
+            .bind(&fence)
             .execute(&self.pool)
             .await
             .map_err(be)?
             .rows_affected(),
-            (Some(e), Some(n)) => {
-                sqlx::query("UPDATE refs SET target = $3 WHERE name = $1 AND target = $2")
-                    .bind(name)
-                    .bind(e.as_bytes().as_slice())
-                    .bind(n.as_bytes().as_slice())
-                    .execute(&self.pool)
-                    .await
-                    .map_err(be)?
-                    .rows_affected()
-            }
+            (Some(e), Some(n)) => sqlx::query(
+                "WITH fence AS (SELECT pg_advisory_xact_lock_shared(hashtextextended($4, 0))) \
+                 UPDATE refs SET target = $3 FROM fence WHERE name = $1 AND target = $2",
+            )
+            .bind(name)
+            .bind(e.as_bytes().as_slice())
+            .bind(n.as_bytes().as_slice())
+            .bind(&fence)
+            .execute(&self.pool)
+            .await
+            .map_err(be)?
+            .rows_affected(),
             (Some(e), None) => sqlx::query("DELETE FROM refs WHERE name = $1 AND target = $2")
                 .bind(name)
                 .bind(e.as_bytes().as_slice())
@@ -1005,7 +1056,20 @@ impl MetaStore for PgStore {
     ) -> Result<Vec<CommitNode>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let stop = stop.map(|s| s.as_bytes().to_vec());
-        let rows = sqlx::query(
+        // A condemned commit ends the chain, like an unrecorded one.
+        let sql = if gc::hiding() {
+            "WITH RECURSIVE chain(id, tree, parents, generation, committer_time, depth) AS ( \
+                 SELECT id, tree, parents, generation, committer_time, 1::bigint \
+                   FROM commits c WHERE id = $1 AND id IS DISTINCT FROM $2::bytea AND $3 > 0 \
+                    AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = c.id) \
+                 UNION ALL \
+                 SELECT c.id, c.tree, c.parents, c.generation, c.committer_time, ch.depth + 1 \
+                   FROM chain ch JOIN commits c ON c.id = substring(ch.parents from 1 for 32) \
+                  WHERE ch.depth < $3 \
+                    AND c.id IS DISTINCT FROM $2::bytea \
+                    AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = c.id)) \
+             SELECT id, tree, parents, generation, committer_time FROM chain ORDER BY depth"
+        } else {
             "WITH RECURSIVE chain(id, tree, parents, generation, committer_time, depth) AS ( \
                  SELECT id, tree, parents, generation, committer_time, 1::bigint \
                    FROM commits WHERE id = $1 AND id IS DISTINCT FROM $2::bytea AND $3 > 0 \
@@ -1014,14 +1078,15 @@ impl MetaStore for PgStore {
                    FROM chain ch JOIN commits c ON c.id = substring(ch.parents from 1 for 32) \
                   WHERE ch.depth < $3 \
                     AND c.id IS DISTINCT FROM $2::bytea) \
-             SELECT id, tree, parents, generation, committer_time FROM chain ORDER BY depth",
-        )
-        .bind(tip.as_bytes().as_slice())
-        .bind(stop)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(be)?;
+             SELECT id, tree, parents, generation, committer_time FROM chain ORDER BY depth"
+        };
+        let rows = sqlx::query(sql)
+            .bind(tip.as_bytes().as_slice())
+            .bind(stop)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(be)?;
         rows.iter()
             .map(|r| {
                 let parents: Vec<u8> = r.try_get("parents").map_err(be)?;
@@ -1041,15 +1106,18 @@ impl MetaStore for PgStore {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query(
+        let sql = if gc::hiding() {
             "SELECT c.id AS id, cs.data AS data \
              FROM commits c LEFT JOIN changesets cs ON cs.commit_id = c.id \
-             WHERE c.id = ANY($1)",
-        )
-        .bind(ids_to_vecs(ids))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(be)?;
+             WHERE c.id = ANY($1) \
+               AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = c.id)"
+        } else {
+            "SELECT c.id AS id, cs.data AS data \
+             FROM commits c LEFT JOIN changesets cs ON cs.commit_id = c.id \
+             WHERE c.id = ANY($1)"
+        };
+        let rows =
+            sqlx::query(sql).bind(ids_to_vecs(ids)).fetch_all(&self.pool).await.map_err(be)?;
         let mut map: HashMap<ObjectId, Vec<PathChange>> = HashMap::with_capacity(rows.len());
         // Commits recorded before changesets were stored as one blob keep
         // their per-path rows in `changes`.
@@ -1177,13 +1245,14 @@ impl MetaStore for PgStore {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query(
-            "SELECT id, tree, parents, generation, committer_time FROM commits WHERE id = ANY($1)",
-        )
-        .bind(ids_to_vecs(ids))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(be)?;
+        let sql = if gc::hiding() {
+            "SELECT id, tree, parents, generation, committer_time FROM commits c \
+             WHERE id = ANY($1) AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = c.id)"
+        } else {
+            "SELECT id, tree, parents, generation, committer_time FROM commits WHERE id = ANY($1)"
+        };
+        let rows =
+            sqlx::query(sql).bind(ids_to_vecs(ids)).fetch_all(&self.pool).await.map_err(be)?;
         let mut map: HashMap<ObjectId, CommitNode> = HashMap::with_capacity(rows.len());
         for r in &rows {
             let id = object_id_col(r, "id")?;

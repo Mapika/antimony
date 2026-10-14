@@ -7,6 +7,8 @@
 //! `reader` is an agent without security access, `writer` an agent with it,
 //! `admin` bypasses everything.
 
+mod common;
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -25,6 +27,7 @@ use ant_server::serve::spawn_local;
 use ant_store::Backend;
 use ant_store::graph::{build_tree, write_commit};
 use bytes::Bytes;
+use common::wire::{blob_file, delete_file, write_file};
 use tonic::Code;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::Interceptor;
@@ -152,30 +155,6 @@ impl Server {
         }
         req.send().await.unwrap()
     }
-}
-
-fn write_op(path: &str, content: &str) -> pb::FileOp {
-    pb::FileOp {
-        path: path.into(),
-        op: Some(pb::file_op::Op::Write(pb::WriteOp {
-            mode: pb::EntryMode::File as i32,
-            content: Some(pb::write_op::Content::Inline(content.as_bytes().to_vec())),
-        })),
-    }
-}
-
-fn blob_op(path: &str, id: ObjectId) -> pb::FileOp {
-    pb::FileOp {
-        path: path.into(),
-        op: Some(pb::file_op::Op::Write(pb::WriteOp {
-            mode: pb::EntryMode::File as i32,
-            content: Some(pb::write_op::Content::BlobId(id.0.to_vec())),
-        })),
-    }
-}
-
-fn delete_op(path: &str) -> pb::FileOp {
-    pb::FileOp { path: path.into(), op: Some(pb::file_op::Op::Delete(pb::DeleteOp {})) }
 }
 
 fn pb_sig() -> pb::Signature {
@@ -316,10 +295,10 @@ async fn seeded() -> (Server, ObjectId) {
         &mut w,
         None,
         vec![
-            write_op("src/a.rs", "pub fn a() {}\n"),
-            write_op("README", "readme\n"),
-            write_op("secrets/key", SECRET),
-            write_op("secrets/dir/x", "nested secret\n"),
+            write_file("src/a.rs", "pub fn a() {}\n"),
+            write_file("README", "readme\n"),
+            write_file("secrets/key", SECRET),
+            write_file("secrets/dir/x", "nested secret\n"),
         ],
     )
     .await
@@ -352,7 +331,7 @@ async fn unauthenticated_and_unknown_tokens() {
         assert_eq!(e.code(), Code::Unauthenticated);
         let e = read_path(&mut c, "main", "README").await.unwrap_err();
         assert_eq!(e.code(), Code::Unauthenticated);
-        let e = changeset(&mut c, Some(tip), vec![write_op("f", "x")]).await.unwrap_err();
+        let e = changeset(&mut c, Some(tip), vec![write_file("f", "x")]).await.unwrap_err();
         assert_eq!(e.code(), Code::Unauthenticated);
         let e = land_rpc(&mut c, "main", tip).await.unwrap_err();
         assert_eq!(e.code(), Code::Unauthenticated);
@@ -470,15 +449,15 @@ async fn same_bytes_at_public_path_become_readable() {
     let secret = blob_id(SECRET);
     assert_eq!(found(&mut r, &[secret]).await, [false]);
     // Someone who can read it copies it to a public path by id.
-    let c = changeset(&mut w, Some(tip), vec![blob_op("src/leaked", secret)]).await.unwrap();
+    let c = changeset(&mut w, Some(tip), vec![blob_file("src/leaked", secret)]).await.unwrap();
     landed_tip(&mut w, "main", c).await;
     assert_eq!(found(&mut r, &[secret]).await, [true]);
 
     // Same for inline bytes: a reader who already knows content makes it public.
     let other = "another secret\n";
-    let c = changeset(&mut w, Some(tip), vec![write_op("secrets/other", other)]).await.unwrap();
+    let c = changeset(&mut w, Some(tip), vec![write_file("secrets/other", other)]).await.unwrap();
     assert_eq!(found(&mut r, &[blob_id(other)]).await, [false]);
-    changeset(&mut r, Some(c), vec![write_op("src/guess", other)]).await.unwrap();
+    changeset(&mut r, Some(c), vec![write_file("src/guess", other)]).await.unwrap();
     assert_eq!(found(&mut r, &[blob_id(other)]).await, [true]);
 }
 
@@ -492,10 +471,11 @@ async fn read_path_log_diff_blame_filtering() {
     let mut r = s.client(Some(READER));
     let mut w = s.client(Some(WRITER));
     // c2 touches only secrets, c3 only src.
-    let c2 = changeset(&mut w, Some(c1), vec![write_op("secrets/key", "rotated\n")]).await.unwrap();
+    let c2 =
+        changeset(&mut w, Some(c1), vec![write_file("secrets/key", "rotated\n")]).await.unwrap();
     let c2 = landed_tip(&mut w, "main", c2).await;
     let c3 =
-        changeset(&mut r, Some(c2), vec![write_op("src/a.rs", "pub fn b() {}\n")]).await.unwrap();
+        changeset(&mut r, Some(c2), vec![write_file("src/a.rs", "pub fn b() {}\n")]).await.unwrap();
     let c3 = landed_tip(&mut r, "main", c3).await;
 
     // ReadPath: denied == missing.
@@ -562,31 +542,32 @@ async fn create_changeset_path_and_blob_checks() {
     let mut w = s.client(Some(WRITER));
     let mut a = s.client(Some(ADMIN));
     for ops in [
-        vec![write_op("secrets/new", "x")],
-        vec![delete_op("secrets/key")],
-        vec![write_op("src/ok", "x"), write_op("secrets/dir/y", "x")],
-        vec![write_op("secrets", "file over dir")],
+        vec![write_file("secrets/new", "x")],
+        vec![delete_file("secrets/key")],
+        vec![write_file("src/ok", "x"), write_file("secrets/dir/y", "x")],
+        vec![write_file("secrets", "file over dir")],
     ] {
         let e = changeset(&mut r, Some(tip), ops.clone()).await.unwrap_err();
         assert_eq!(e.code(), Code::PermissionDenied, "{ops:?}");
     }
-    changeset(&mut r, Some(tip), vec![write_op("src/ok", "x")]).await.unwrap();
-    changeset(&mut w, Some(tip), vec![write_op("secrets/new", "x")]).await.unwrap();
-    changeset(&mut a, Some(tip), vec![write_op("secrets/admin", "x")]).await.unwrap();
+    changeset(&mut r, Some(tip), vec![write_file("src/ok", "x")]).await.unwrap();
+    changeset(&mut w, Some(tip), vec![write_file("secrets/new", "x")]).await.unwrap();
+    changeset(&mut a, Some(tip), vec![write_file("secrets/admin", "x")]).await.unwrap();
     // Base containing hidden content is fine.
-    changeset(&mut r, Some(tip), vec![delete_op("README")]).await.unwrap();
+    changeset(&mut r, Some(tip), vec![delete_file("README")]).await.unwrap();
 
     // Read-by-copy: referencing a restricted blob by id is reported exactly
     // like referencing a blob that does not exist.
     let secret = blob_id(SECRET);
-    let e1 = changeset(&mut r, Some(tip), vec![blob_op("src/copy", secret)]).await.unwrap_err();
-    let e2 =
-        changeset(&mut r, Some(tip), vec![blob_op("src/copy", blob_id("nope"))]).await.unwrap_err();
+    let e1 = changeset(&mut r, Some(tip), vec![blob_file("src/copy", secret)]).await.unwrap_err();
+    let e2 = changeset(&mut r, Some(tip), vec![blob_file("src/copy", blob_id("nope"))])
+        .await
+        .unwrap_err();
     assert_eq!(e1.code(), Code::NotFound);
     assert_eq!(e2.code(), Code::NotFound);
     // Tree ids are no way around it either.
     let tree = path_id(&mut w, "main", "secrets").await;
-    let e = changeset(&mut r, Some(tip), vec![blob_op("src/copy", tree)]).await.unwrap_err();
+    let e = changeset(&mut r, Some(tip), vec![blob_file("src/copy", tree)]).await.unwrap_err();
     assert_eq!(e.code(), Code::NotFound);
     assert_eq!(found(&mut r, &[secret]).await, [false]);
 }
@@ -602,26 +583,26 @@ async fn uploads_stay_hidden_until_placed() {
     assert_eq!(found(&mut r, &[up]).await, [false]);
     assert_eq!(has(&mut r, &[up]).await, [false]);
     // Nobody else can reference the pending upload by id.
-    let e = changeset(&mut r, Some(tip), vec![blob_op("src/steal", up)]).await.unwrap_err();
+    let e = changeset(&mut r, Some(tip), vec![blob_file("src/steal", up)]).await.unwrap_err();
     assert_eq!(e.code(), Code::NotFound);
-    let c = changeset(&mut w, Some(tip), vec![blob_op("secrets/up", up)]).await.unwrap();
+    let c = changeset(&mut w, Some(tip), vec![blob_file("secrets/up", up)]).await.unwrap();
     landed_tip(&mut w, "main", c).await;
     assert_eq!(found(&mut r, &[up]).await, [false]);
     assert_eq!(found(&mut w, &[up]).await, [true]);
-    let e = changeset(&mut r, Some(tip), vec![blob_op("src/steal", up)]).await.unwrap_err();
+    let e = changeset(&mut r, Some(tip), vec![blob_file("src/steal", up)]).await.unwrap_err();
     assert_eq!(e.code(), Code::NotFound);
 
     // A reader's own upload placed at a public path becomes public.
     let mine = put_blob(&mut r, "public upload\n").await.unwrap();
     assert_eq!(found(&mut r, &[mine]).await, [false]);
-    changeset(&mut r, Some(tip), vec![blob_op("src/mine", mine)]).await.unwrap();
+    changeset(&mut r, Some(tip), vec![blob_file("src/mine", mine)]).await.unwrap();
     assert_eq!(found(&mut r, &[mine]).await, [true]);
 
     // Re-uploading a secret's bytes proves knowledge of them and allows
     // referencing (but the secret stays hidden until placed publicly).
     let known = put_blob(&mut r, SECRET).await.unwrap();
     assert_eq!(found(&mut r, &[known]).await, [false]);
-    changeset(&mut r, Some(tip), vec![blob_op("src/known", known)]).await.unwrap();
+    changeset(&mut r, Some(tip), vec![blob_file("src/known", known)]).await.unwrap();
     assert_eq!(found(&mut r, &[known]).await, [true]);
 
     // Re-uploading an existing public blob keeps it public.
@@ -694,9 +675,9 @@ async fn update_ref_checks() {
     let mut r = s.client(Some(READER));
     let mut w = s.client(Some(WRITER));
     let mut a = s.client(Some(ADMIN));
-    let src = changeset(&mut r, Some(tip), vec![write_op("src/x", "x")]).await.unwrap();
+    let src = changeset(&mut r, Some(tip), vec![write_file("src/x", "x")]).await.unwrap();
     let sec =
-        changeset(&mut w, Some(tip), vec![write_op("secrets/key", "changed\n")]).await.unwrap();
+        changeset(&mut w, Some(tip), vec![write_file("secrets/key", "changed\n")]).await.unwrap();
 
     // No update rule for main except admins.
     for c in [&mut r, &mut w] {
@@ -733,17 +714,17 @@ async fn land_checks() {
     let (s, tip) = seeded().await;
     let mut r = s.client(Some(READER));
     let mut w = s.client(Some(WRITER));
-    let mine = changeset(&mut r, Some(tip), vec![write_op("src/r", "r")]).await.unwrap();
+    let mine = changeset(&mut r, Some(tip), vec![write_file("src/r", "r")]).await.unwrap();
     let e = land_rpc(&mut r, "release", mine).await.unwrap_err();
     assert_eq!(e.code(), Code::PermissionDenied);
 
     // A writer's unlanded secret change cannot be landed by the reader,
     // neither alone nor underneath the reader's own commit.
     let theirs =
-        changeset(&mut w, Some(tip), vec![write_op("secrets/key", "rotated\n")]).await.unwrap();
+        changeset(&mut w, Some(tip), vec![write_file("secrets/key", "rotated\n")]).await.unwrap();
     let e = land_rpc(&mut r, "main", theirs).await.unwrap_err();
     assert_eq!(e.code(), Code::PermissionDenied);
-    let stacked = changeset(&mut r, Some(theirs), vec![write_op("src/s", "s")]).await.unwrap();
+    let stacked = changeset(&mut r, Some(theirs), vec![write_file("src/s", "s")]).await.unwrap();
     let e = land_rpc(&mut r, "main", stacked).await.unwrap_err();
     assert_eq!(e.code(), Code::PermissionDenied);
     assert_eq!(s.backend.refs.get_ref("main").await.unwrap(), Some(tip));
@@ -751,7 +732,7 @@ async fn land_checks() {
     // Fast-forward and rebase of the reader's own work are fine.
     let t1 = landed_tip(&mut r, "main", mine).await;
     assert_eq!(t1, mine);
-    let other = changeset(&mut r, Some(tip), vec![write_op("src/o", "o")]).await.unwrap();
+    let other = changeset(&mut r, Some(tip), vec![write_file("src/o", "o")]).await.unwrap();
     let t2 = landed_tip(&mut r, "main", other).await;
     assert_ne!(t2, other);
     // Once the writer landed theirs, the reader's stacked commit only
@@ -768,11 +749,13 @@ async fn denied_land_does_not_affect_its_batch() {
     let (s, tip) = seeded().await;
     let mut r = s.client(Some(READER));
     let mut w = s.client(Some(WRITER));
-    let bad = changeset(&mut w, Some(tip), vec![write_op("secrets/bad", "x")]).await.unwrap();
+    let bad = changeset(&mut w, Some(tip), vec![write_file("secrets/bad", "x")]).await.unwrap();
     let mut good = Vec::new();
     for i in 0..16 {
         good.push(
-            changeset(&mut r, Some(tip), vec![write_op(&format!("src/g{i}"), "g")]).await.unwrap(),
+            changeset(&mut r, Some(tip), vec![write_file(&format!("src/g{i}"), "g")])
+                .await
+                .unwrap(),
         );
     }
     let mut tasks = Vec::new();
@@ -855,14 +838,14 @@ async fn land_replays_tag_merged_objects() {
     let mut r = s.client(Some(READER));
     let mut w = s.client(Some(WRITER));
     let text = "l1\nl2\nl3\nl4\nl5\nl6\n";
-    let base = changeset(&mut w, Some(tip), vec![write_op("secrets/doc", text)]).await.unwrap();
+    let base = changeset(&mut w, Some(tip), vec![write_file("secrets/doc", text)]).await.unwrap();
     let base = landed_tip(&mut w, "main", base).await;
     let x =
-        changeset(&mut w, Some(base), vec![write_op("secrets/doc", "L1\nl2\nl3\nl4\nl5\nl6\n")])
+        changeset(&mut w, Some(base), vec![write_file("secrets/doc", "L1\nl2\nl3\nl4\nl5\nl6\n")])
             .await
             .unwrap();
     let y =
-        changeset(&mut w, Some(base), vec![write_op("secrets/doc", "l1\nl2\nl3\nl4\nl5\nL6\n")])
+        changeset(&mut w, Some(base), vec![write_file("secrets/doc", "l1\nl2\nl3\nl4\nl5\nL6\n")])
             .await
             .unwrap();
     landed_tip(&mut w, "main", x).await;
@@ -951,7 +934,7 @@ async fn git_clone_requires_full_read() {
 async fn open_mode_is_unchanged() {
     let s = Server::start(Acl::open()).await;
     let mut c = s.client(None);
-    let commit = changeset(&mut c, None, vec![write_op("secrets/key", SECRET)]).await.unwrap();
+    let commit = changeset(&mut c, None, vec![write_file("secrets/key", SECRET)]).await.unwrap();
     landed_tip(&mut c, "main", commit).await;
     assert_eq!(found(&mut c, &[blob_id(SECRET)]).await, [true]);
     assert!(read_path(&mut c, "main", "secrets/key").await.unwrap().found);
@@ -1075,20 +1058,7 @@ async fn reindex_tags_imported_history() {
 #[tokio::test]
 #[ignore = "needs docker compose"]
 async fn acl_postgres() {
-    use std::sync::Arc;
-    let url = std::env::var("ANT_TEST_PG_URL")
-        .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
-    let schema = format!(
-        "acl_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-    );
-    let pg = Arc::new(
-        ant_store::postgres::PgStore::connect_scratch(&url, &schema)
-            .await
-            .expect("is docker compose up?"),
-    );
-    let b = Backend { objects: pg.clone(), refs: pg.clone(), meta: pg };
+    let b = common::pg::scratch_backend("acl").await;
     let result = tokio::spawn({
         let b = b.clone();
         async move {
@@ -1101,14 +1071,14 @@ async fn acl_postgres() {
             let c = changeset(
                 &mut w,
                 None,
-                vec![blob_op("secrets/pg", up), write_op("src/pg", "pub\n")],
+                vec![blob_file("secrets/pg", up), write_file("src/pg", "pub\n")],
             )
             .await
             .unwrap();
             landed_tip(&mut w, "ws/pg", c).await;
             assert_eq!(found(&mut r, &[up, blob_id("pub\n")]).await, [false, true]);
             assert_eq!(found(&mut w, &[up, blob_id("pub\n")]).await, [true, true]);
-            let e = changeset(&mut r, Some(c), vec![blob_op("src/steal", up)]).await.unwrap_err();
+            let e = changeset(&mut r, Some(c), vec![blob_file("src/steal", up)]).await.unwrap_err();
             assert_eq!(e.code(), Code::NotFound);
         }
     })

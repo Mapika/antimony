@@ -61,7 +61,11 @@ struct Request {
 // Include all backend identities: independent repositories named "main" must
 // never share requests. The worker owns the Backend while the key is live.
 #[derive(Clone, Hash, PartialEq, Eq)]
-struct QueueKey(usize, usize, usize, String);
+struct QueueKey {
+    /// Store identities (`Arc` addresses) of the backend.
+    stores: [usize; 3],
+    ref_name: String,
+}
 type Queues = HashMap<QueueKey, VecDeque<Request>>;
 static QUEUES: LazyLock<Mutex<Queues>> = LazyLock::new(Default::default);
 
@@ -75,7 +79,7 @@ impl Drop for Worker {
         if self.active {
             // Panic/runtime shutdown closes every queued reply. In-flight
             // replies are owned by the task and close when its future drops.
-            QUEUES.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.key);
+            crate::lock(&QUEUES).remove(&self.key);
         }
     }
 }
@@ -86,7 +90,7 @@ impl Worker {
         tokio::task::yield_now().await;
         loop {
             {
-                let mut queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+                let mut queues = crate::lock(&QUEUES);
                 match queues.get(&self.key) {
                     None => return,
                     Some(queue) if queue.is_empty() => {
@@ -101,10 +105,10 @@ impl Worker {
             // after the lock is granted lets requests that arrived during the
             // wait join the first batch. Without the lock (store error,
             // timeout) the CAS still keeps the ref correct.
-            let mut lock = match b.refs.lock_ref(&self.key.3).await {
+            let mut lock = match b.refs.lock_ref(&self.key.ref_name).await {
                 Ok(lock) => lock,
                 Err(error) => {
-                    tracing::warn!(%error, ref_name = self.key.3, "ref lock unavailable; landing with CAS only");
+                    tracing::warn!(%error, ref_name = self.key.ref_name, "ref lock unavailable; landing with CAS only");
                     RefLock::unheld()
                 }
             };
@@ -112,7 +116,7 @@ impl Worker {
             // Every batch of the turn is published (mappings included) or
             // failed, so the next holder sees all of it.
             if let Err(error) = lock.release().await {
-                tracing::warn!(%error, ref_name = self.key.3, "releasing ref lock failed");
+                tracing::warn!(%error, ref_name = self.key.ref_name, "releasing ref lock failed");
             }
         }
     }
@@ -120,7 +124,7 @@ impl Worker {
     /// Land batches under one hold of `lock` (see the module docs). Returns
     /// with no batch prepared and unpublished.
     async fn turn(&self, b: &Backend, lock: &mut RefLock) {
-        let ref_name = self.key.3.as_str();
+        let ref_name = self.key.ref_name.as_str();
         let started = Instant::now();
         let deferred = lock.can_publish();
         // The ref's value, when this turn knows it (it published it).
@@ -211,7 +215,7 @@ impl Worker {
 
     /// Up to [`MAX_BATCH`] queued requests, in arrival order.
     fn drain(&self) -> Option<Vec<Request>> {
-        let mut queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queues = crate::lock(&QUEUES);
         let queue = queues.get_mut(&self.key)?;
         if queue.is_empty() {
             return None;
@@ -222,7 +226,7 @@ impl Worker {
 
     /// Put drained but unanswered requests back at the front of the queue.
     fn requeue(&self, requests: Vec<Request>) {
-        let mut queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queues = crate::lock(&QUEUES);
         // The queue lives as long as this worker is active.
         if let Some(queue) = queues.get_mut(&self.key) {
             for request in requests.into_iter().rev() {
@@ -397,16 +401,16 @@ impl Batch {
 
 /// Live land queues and the requests waiting in them (process-wide).
 pub(crate) fn queue_stats() -> (usize, usize) {
-    let queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+    let queues = crate::lock(&QUEUES);
     (queues.len(), queues.values().map(VecDeque::len).sum())
 }
 
 /// Waiting requests per ref name, summed over backends (for metrics).
 pub(crate) fn queue_depths() -> Vec<(String, usize)> {
-    let queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+    let queues = crate::lock(&QUEUES);
     let mut by_ref: HashMap<&str, usize> = HashMap::new();
     for (key, queue) in queues.iter() {
-        *by_ref.entry(key.3.as_str()).or_default() += queue.len();
+        *by_ref.entry(key.ref_name.as_str()).or_default() += queue.len();
     }
     by_ref.into_iter().map(|(r, n)| (r.to_owned(), n)).collect()
 }
@@ -429,14 +433,16 @@ pub(super) fn enqueue_checked(
     policy: Option<Arc<Policy>>,
     metrics: Option<Arc<Metrics>>,
 ) -> oneshot::Receiver<OpResult<LandOutcome>> {
-    let key = QueueKey(
-        Arc::as_ptr(&b.objects) as *const () as usize,
-        Arc::as_ptr(&b.refs) as *const () as usize,
-        Arc::as_ptr(&b.meta) as *const () as usize,
-        ref_name.to_owned(),
-    );
+    let key = QueueKey {
+        stores: [
+            Arc::as_ptr(&b.objects).cast::<()>() as usize,
+            Arc::as_ptr(&b.refs).cast::<()>() as usize,
+            Arc::as_ptr(&b.meta).cast::<()>() as usize,
+        ],
+        ref_name: ref_name.to_owned(),
+    };
     let (reply, receiver) = oneshot::channel();
-    let mut queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut queues = crate::lock(&QUEUES);
     let lead = !queues.contains_key(&key);
     queues.entry(key.clone()).or_default().push_back(Request {
         commit,

@@ -1,13 +1,14 @@
+//! `ant ref get / list / init / set`.
+
+use std::collections::HashSet;
 use std::fmt::Write as _;
 
-use ant_proto::v1 as pb;
-use std::collections::HashSet;
-
 use ant_core::ObjectId;
+use ant_proto::v1 as pb;
 use antd::remote::AntRpcClient as Client;
 use anyhow::{Result, anyhow, bail};
 
-use crate::ctx::{Ctx, Outcome, RpcResult, id_from};
+use crate::ctx::{Ctx, Outcome, RpcResult, id_from, resolve_commit};
 
 /// First-parent commits fetched per `Log` call while checking ancestry.
 const LOG_PAGE: u32 = 1000;
@@ -93,12 +94,12 @@ pub async fn init(ctx: &Ctx, name: &str, message: &str) -> Result<Outcome> {
     if let Some(target) = current.target {
         bail!("ref {name} already exists (at {})", id_from(&target)?);
     }
-    let author = tokio::task::spawn_blocking(crate::author::current_author).await?;
+    let author = crate::author::author_signature().await?;
     let commit = client
         .create_changeset(pb::CreateChangesetRequest {
             base: None,
             ops: Vec::new(),
-            author: Some(pb::Signature::from(&author)),
+            author: Some(author),
             committer: None,
             message: message.to_string(),
         })
@@ -127,31 +128,26 @@ pub async fn set(
     force: bool,
 ) -> Result<Outcome> {
     let mut client = ctx.remote().await?.client();
-    let new = client
-        .resolve_rev(pb::ResolveRevRequest { rev: rev.into() })
-        .await
-        .rpc()?
-        .into_inner()
-        .commit;
+    let new = resolve_commit(&mut client, rev).await?;
     // Without --expect/--create, compare-and-swap against the current value.
     let expected = if create {
         None
     } else if let Some(hex) = expect {
-        Some(hex.parse::<ant_core::ObjectId>()?.as_bytes().to_vec())
+        Some(hex.parse::<ObjectId>()?.as_bytes().to_vec())
     } else {
         client.get_ref(pb::GetRefRequest { name: name.into() }).await.rpc()?.into_inner().target
     };
     if let (Some(old), false) = (&expected, force) {
-        let (old, target) = (id_from(old)?, id_from(&new)?);
-        if !is_ancestor(&mut client, old, target).await? {
-            bail!("non-fast-forward update of ref {name}: {target} does not descend from {old}");
+        let old = id_from(old)?;
+        if !is_ancestor(&mut client, old, new).await? {
+            bail!("non-fast-forward update of ref {name}: {new} does not descend from {old}");
         }
     }
     let r = client
         .update_ref(pb::UpdateRefRequest {
             name: name.into(),
             expected,
-            new_target: Some(new.clone()),
+            new_target: Some(new.as_bytes().to_vec()),
         })
         .await
         .rpc()?
@@ -167,5 +163,5 @@ pub async fn set(
         }
         bail!("ref {name} changed concurrently; actual value is {actual}");
     }
-    Ok(Outcome::ok(format!("{}\n", id_from(&new)?)))
+    Ok(Outcome::ok(format!("{new}\n")))
 }

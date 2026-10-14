@@ -17,6 +17,7 @@ ant-fuse.workspace = true
 ant-server.workspace = true
 antd.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 tokio.workspace = true

@@ -1,4 +1,4 @@
-//! ls / cat / log / diff via RPCs (no checkout).
+//! ls / cat / blame / log / diff via RPCs (no checkout).
 
 use std::fmt::Write as _;
 
@@ -26,7 +26,8 @@ pub async fn ls(ctx: &Ctx, target: &str) -> Result<Outcome> {
         bail!("{target}: no such path");
     }
     let mut out = String::new();
-    if mode_from_pb(r.mode)? == EntryMode::Tree {
+    let mode = mode_from_pb(r.mode)?;
+    if mode == EntryMode::Tree {
         for e in r.entries {
             let mode = mode_from_pb(e.mode)?;
             writeln!(
@@ -39,7 +40,6 @@ pub async fn ls(ctx: &Ctx, target: &str) -> Result<Outcome> {
             )?;
         }
     } else {
-        let mode = mode_from_pb(r.mode)?;
         let name = path.rsplit('/').next().unwrap_or(path);
         writeln!(out, "{} {} {}\t{}", mode.as_octal(), kind_name(mode), id_from(&r.id)?, name)?;
     }

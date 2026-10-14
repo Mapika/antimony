@@ -1,6 +1,8 @@
 //! Metrics, request ids and slow-request logs end to end (`ant_server::metrics`,
 //! `ant_server::observe`), against in-memory backends on ephemeral ports.
 
+mod common;
+
 use std::collections::HashSet;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -13,6 +15,7 @@ use ant_server::metrics::Metrics;
 use ant_server::observe::{Observer, http_observe};
 use ant_server::serve::{LocalServer, spawn_local_with_metrics};
 use ant_store::Backend;
+use common::wire::{hex, sig, write_file};
 use prometheus_parse::{Scrape, Value};
 use tonic::transport::Channel;
 
@@ -32,25 +35,6 @@ async fn spawn_server() -> Server {
         addrs,
         http: reqwest::Client::new(),
         metrics,
-    }
-}
-
-fn sig(name: &str) -> pb::Signature {
-    pb::Signature {
-        name: name.into(),
-        email: format!("{name}@example.com").into_bytes(),
-        time: 1_700_000_000,
-        tz_offset_minutes: 0,
-    }
-}
-
-fn write_file(path: &str, content: &str) -> pb::FileOp {
-    pb::FileOp {
-        path: path.into(),
-        op: Some(pb::file_op::Op::Write(pb::WriteOp {
-            mode: pb::EntryMode::File as i32,
-            content: Some(pb::write_op::Content::Inline(content.as_bytes().to_vec())),
-        })),
     }
 }
 
@@ -99,7 +83,7 @@ async fn scripted_session(s: &mut Server) {
         .unwrap()
         .into_inner()
         .commit;
-    let hex: String = tip.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = hex(&tip);
     let url = s.addrs.http_url();
     assert_eq!(s.http.get(format!("{url}/o/{hex}")).send().await.unwrap().status(), 200);
     assert_eq!(s.http.get(format!("{url}/healthz")).send().await.unwrap().status(), 200);

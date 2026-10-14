@@ -2,8 +2,9 @@
 
 ## Planning
 
-The fetch planner keeps object IDs, 64-bit path fingerprints and (for trees,
-which it reads anyway) body sizes; it deduplicates before enqueueing trees.
+The fetch planner keeps object IDs, 64-bit path fingerprints and body sizes
+where it reads the body anyway (trees and directly wanted blobs); it
+deduplicates before enqueueing trees.
 The tree walk keeps several store reads in flight while the previous batch is
 parsed on the blocking pool, with a zero-copy entry parser. Shared objects are
 sent once. Known historical objects are still subtracted for incremental
@@ -22,7 +23,8 @@ entry in the same pack. Each object tries the previous `WINDOW` (10) objects of
 its path, newest first, and keeps the smallest delta, with git's depth-scaled
 size limit (a deeper base must beat the current best proportionally) so chains
 fan out instead of running to the cap. Chains are capped at depth 50. A delta
-must be below half the target size. Kinds are checked, including
+must be below about half the target size (half less 32 bytes, scaled down for
+deeper bases). Kinds are checked, including
 file/directory transitions. The encoder builds one block index per base (sized
 to the base, at most 2^20 slots, high bits of a mixed rolling hash), reuses it
 for every target, and extends matches backwards and forwards. No REF_DELTA or
@@ -47,11 +49,6 @@ Memory is bounded by these constants (reads in flight, about ten segments,
 windows of at most 16 MiB each), not by history size; no complete pack or
 history of object bodies is retained. Planning memory is O(number of distinct
 objects): 48 bytes per planned object plus transient reachability sets.
-
-The S3 packed store coalesces nearby objects of one pack into single ranged
-reads and bounds range bytes in flight per store (`ant-store/src/packed.rs`):
-SeaweedFS answers 429 above 64 MiB of in-flight chunk reads, and the SDK then
-backs off for seconds.
 
 ## Measurements
 

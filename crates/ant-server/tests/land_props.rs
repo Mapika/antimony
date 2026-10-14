@@ -18,7 +18,6 @@ use ant_server::ops::OpError;
 use ant_server::ops::changeset::{ChangesetRequest, FileOp, WriteContent, create_changeset};
 use ant_server::ops::land::{LandOutcome, land};
 use ant_store::graph::is_ancestor;
-use ant_store::postgres::PgStore;
 use ant_store::{Backend, ObjectStoreExt};
 use bytes::Bytes;
 use common::*;
@@ -838,25 +837,11 @@ proptest! {
     }
 }
 
-fn pg_url() -> String {
-    std::env::var("ANT_TEST_PG_URL")
-        .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into())
-}
-
 #[test]
 #[ignore = "needs docker compose"]
 fn concurrent_lands_postgres() {
     let rt = runtime();
-    let schema = format!(
-        "props_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-    );
-    let pg = Arc::new(
-        rt.block_on(PgStore::connect_scratch(&pg_url(), &schema))
-            .expect("connect (is `docker compose up -d` running?)"),
-    );
-    let backend = Backend { objects: pg.clone(), refs: pg.clone(), meta: pg };
+    let backend = rt.block_on(pg::scratch_backend("props"));
     let counter = std::sync::atomic::AtomicUsize::new(0);
 
     let mut runner = proptest::test_runner::TestRunner::new(config(12));

@@ -28,14 +28,14 @@
 //! Cost: O(changed paths × depth) object reads/writes, independent of repo
 //! size.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ant_core::{
     Commit, EncodedObject, EntryMode, Object, ObjectId, ObjectKind, RepoPath, Signature, Tree,
     TreeEntry,
 };
-use ant_store::{Backend, ChangeKind, CommitNode, PathChange};
+use ant_store::{Backend, CommitNode, PathChange};
 use bytes::Bytes;
 
 use super::{OpError, OpResult, cache};
@@ -89,54 +89,13 @@ pub async fn create_changeset_as(
         access.check_writable(req.ops.iter().map(FileOp::path))?;
     }
     let base = match req.base {
-        Some(id) => {
-            let node = cache::get_nodes(b, &[id]).await?.pop().flatten();
-            Some(node.ok_or_else(|| OpError::NotFound(format!("commit {id}")))?)
-        }
+        Some(id) => Some(cache::get_node(b, id).await?),
         None => None,
     };
     let base_tree = base.as_ref().map(|n| n.tree);
 
-    // Validate ops and resolve their content into (mode, blob id).
-    let mut seen = HashSet::new();
-    let mut new_objects = Vec::new();
-    let mut referenced = Vec::new();
-    let mut blob_writes = Vec::new();
-    let mut edits: Vec<(Vec<&str>, Edit)> = Vec::with_capacity(req.ops.len());
-    for op in &req.ops {
-        let path = op.path();
-        if path.is_root() {
-            return Err(OpError::InvalidArgument("op on repository root".into()));
-        }
-        if !seen.insert(path.clone()) {
-            return Err(OpError::InvalidArgument(format!("duplicate op for {path}")));
-        }
-        let edit = match op {
-            FileOp::Delete { .. } => Edit::Delete,
-            FileOp::Write { mode, content, .. } => {
-                if !mode.is_blob() {
-                    return Err(OpError::InvalidArgument(format!(
-                        "{path}: cannot write mode {mode:?}"
-                    )));
-                }
-                let id = match content {
-                    WriteContent::Inline(data) => {
-                        let obj = EncodedObject::new(ObjectKind::Blob, data);
-                        let id = obj.id();
-                        new_objects.push(obj);
-                        id
-                    }
-                    WriteContent::Blob(id) => {
-                        referenced.push(*id);
-                        *id
-                    }
-                };
-                blob_writes.push((path.clone(), id));
-                Edit::Write(*mode, id)
-            }
-        };
-        edits.push((path.components().collect(), edit));
-    }
+    let ResolvedOps { mut new_objects, referenced, blob_writes, mut edits } =
+        resolve_ops(&req.ops)?;
     if let Some(access) = access
         && !access.is_admin()
         && !referenced.is_empty()
@@ -151,7 +110,8 @@ pub async fn create_changeset_as(
     let mut directories = match base_tree {
         Some(root) => {
             let paths: Vec<_> = req.ops.iter().map(|op| op.path().clone()).collect();
-            let [dirs] = super::tree_edit::load_directories(b, [root], &paths).await?;
+            let [dirs] =
+                super::tree_edit::load_directories(b, &HashMap::new(), [root], &paths).await?;
             dirs
         }
         None => Default::default(),
@@ -164,20 +124,11 @@ pub async fn create_changeset_as(
         .iter()
         .zip(&edits)
         .filter_map(|(op, (_, edit))| {
-            let path = op.path();
-            let old =
-                super::tree_edit::entry(&directories, path).filter(|(mode, _)| !mode.is_tree());
             let new = match *edit {
                 Edit::Write(mode, id) => Some((mode, id)),
                 Edit::Delete => None,
             };
-            let kind = match (old, new) {
-                _ if old == new => return None,
-                (None, _) => ChangeKind::Added,
-                (_, None) => ChangeKind::Deleted,
-                _ => ChangeKind::Modified,
-            };
-            Some(PathChange { path: path.clone(), kind, old, new })
+            super::tree_edit::leaf_change(&directories, op.path(), new)
         })
         .collect();
     changes.sort_by(|a, b| a.path.cmp(&b.path));
@@ -241,6 +192,61 @@ pub async fn create_changeset_as(
     meta.nodes.insert(id, node, cache::NODE_WEIGHT);
     meta.changesets.insert(id, recorded, changes_weight);
     Ok(id)
+}
+
+/// Ops validated and resolved into edits by path components, plus the
+/// inline blobs to store, the blob ids referenced by id and every
+/// `(path, blob)` written.
+struct ResolvedOps<'a> {
+    new_objects: Vec<EncodedObject>,
+    referenced: Vec<ObjectId>,
+    blob_writes: Vec<(RepoPath, ObjectId)>,
+    edits: Vec<(Vec<&'a str>, Edit)>,
+}
+
+/// Validate `ops` (no root, no duplicates, blob modes only) and resolve
+/// their content into (mode, blob id).
+fn resolve_ops(ops: &[FileOp]) -> OpResult<ResolvedOps<'_>> {
+    let mut seen = HashSet::new();
+    let mut new_objects = Vec::new();
+    let mut referenced = Vec::new();
+    let mut blob_writes = Vec::new();
+    let mut edits: Vec<(Vec<&str>, Edit)> = Vec::with_capacity(ops.len());
+    for op in ops {
+        let path = op.path();
+        if path.is_root() {
+            return Err(OpError::InvalidArgument("op on repository root".into()));
+        }
+        if !seen.insert(path.clone()) {
+            return Err(OpError::InvalidArgument(format!("duplicate op for {path}")));
+        }
+        let edit = match op {
+            FileOp::Delete { .. } => Edit::Delete,
+            FileOp::Write { mode, content, .. } => {
+                if !mode.is_blob() {
+                    return Err(OpError::InvalidArgument(format!(
+                        "{path}: cannot write mode {mode:?}"
+                    )));
+                }
+                let id = match content {
+                    WriteContent::Inline(data) => {
+                        let obj = EncodedObject::new(ObjectKind::Blob, data);
+                        let id = obj.id();
+                        new_objects.push(obj);
+                        id
+                    }
+                    WriteContent::Blob(id) => {
+                        referenced.push(*id);
+                        *id
+                    }
+                };
+                blob_writes.push((path.clone(), id));
+                Edit::Write(*mode, id)
+            }
+        };
+        edits.push((path.components().collect(), edit));
+    }
+    Ok(ResolvedOps { new_objects, referenced, blob_writes, edits })
 }
 
 #[derive(Debug, Clone, Copy)]

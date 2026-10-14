@@ -9,22 +9,20 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use ant_core::ObjectId;
-use ant_proto::MAX_MESSAGE_BYTES;
 use ant_proto::v1 as pb;
-use ant_proto::v1::ant_client::AntClient;
 use ant_server::acl::Acl;
 use ant_server::config::StoreArgs;
 use ant_server::serve::spawn_local_with_metrics;
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
+use rand::Rng;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
-use tonic::transport::Channel;
 
 use crate::json::J;
-use crate::util::{Lat, Metrics, cpu_seconds, instrument, peak_rss_bytes, write_json};
+use crate::rpc::{Client, agent_rng, connect, hex, read_back, seed_ref, sig, write_op};
+use crate::util::{Lat, Metrics, cpu_seconds, instrument, mib, peak_rss_bytes, write_json};
 
 const HOT_PATH: &str = "hot/counter.txt";
 const HOT_LINES: usize = 50;
@@ -58,39 +56,6 @@ pub struct Args {
     pub store: StoreArgs,
 }
 
-type Client = AntClient<Channel>;
-
-async fn connect(url: &str) -> Result<Client> {
-    let channel = Channel::from_shared(url.to_owned())?
-        .connect()
-        .await
-        .with_context(|| format!("connecting to {url}"))?;
-    Ok(AntClient::new(channel)
-        .max_decoding_message_size(MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_MESSAGE_BYTES))
-}
-
-fn sig() -> pb::Signature {
-    let time =
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    pb::Signature {
-        name: "bench".into(),
-        email: "bench@example.com".into(),
-        time,
-        tz_offset_minutes: 0,
-    }
-}
-
-fn write_op(path: String, content: Vec<u8>) -> pb::FileOp {
-    pb::FileOp {
-        path,
-        op: Some(pb::file_op::Op::Write(pb::WriteOp {
-            mode: pb::EntryMode::File as i32,
-            content: Some(pb::write_op::Content::Inline(content)),
-        })),
-    }
-}
-
 /// Create `ref_name` with a small initial tree when it does not exist.
 async fn seed_if_missing(client: &mut Client, ref_name: &str) -> Result<()> {
     let existing =
@@ -99,37 +64,16 @@ async fn seed_if_missing(client: &mut Client, ref_name: &str) -> Result<()> {
         return Ok(());
     }
     let hot: String = (0..HOT_LINES).map(|i| format!("line {i} init\n")).collect();
-    let commit = client
-        .create_changeset(pb::CreateChangesetRequest {
-            base: None,
-            ops: vec![
-                write_op(HOT_PATH.into(), hot.into_bytes()),
-                write_op("README.md".into(), b"ant-bench seed\n".to_vec()),
-            ],
-            author: Some(sig()),
-            committer: None,
-            message: "bench seed".into(),
-        })
-        .await?
-        .into_inner()
-        .commit;
-    let r = client
-        .update_ref(pb::UpdateRefRequest {
-            name: ref_name.into(),
-            expected: None,
-            new_target: Some(commit),
-        })
-        .await?
-        .into_inner();
-    if !r.updated {
+    let ops = vec![
+        write_op(HOT_PATH.into(), hot.into_bytes()),
+        write_op("README.md".into(), b"ant-bench seed\n".to_vec()),
+    ];
+    let (_, created) = seed_ref(client, ref_name, ops, "bench", "bench seed").await?;
+    if !created {
         // Someone else seeded concurrently; that's fine.
-        tracing_note("seed raced with another seeder");
+        eprintln!("note: seed raced with another seeder");
     }
     Ok(())
-}
-
-fn tracing_note(msg: &str) {
-    eprintln!("note: {msg}");
 }
 
 #[derive(Default)]
@@ -153,13 +97,82 @@ struct AgentOut {
     last: HashMap<String, Vec<u8>>,
 }
 
+impl AgentOut {
+    fn error(&mut self, msg: String) {
+        self.errors += 1;
+        self.first_error.get_or_insert(msg);
+    }
+
+    /// Add `o`'s counts and samples to `self` (the first error seen wins).
+    fn merge(&mut self, o: AgentOut) {
+        self.get_ref.extend(o.get_ref);
+        self.read.extend(o.read);
+        self.create.extend(o.create);
+        self.land.extend(o.land);
+        self.land_ff.extend(o.land_ff);
+        self.land_rebased.extend(o.land_rebased);
+        self.landed += o.landed;
+        self.rebased += o.rebased;
+        self.conflicts += o.conflicts;
+        self.aborts += o.aborts;
+        self.errors += o.errors;
+        self.hot_attempts += o.hot_attempts;
+        self.hot_landed += o.hot_landed;
+        self.first_error = self.first_error.take().or(o.first_error);
+        self.last.extend(o.last);
+    }
+}
+
 fn micros(start: Instant) -> u64 {
     start.elapsed().as_micros() as u64
 }
 
+#[derive(Clone)]
+struct AgentCfg {
+    ref_name: String,
+    files: usize,
+    hot_rate: f64,
+    seed: u64,
+}
+
+/// Read the hot file at `tip` and return a write op rewriting one random line
+/// of it (`None` when the file is missing or empty).
+async fn hot_rewrite(
+    client: &mut Client,
+    rng: &mut StdRng,
+    out: &mut AgentOut,
+    tip: &[u8],
+    agent: usize,
+    seq: u64,
+) -> Result<Option<pb::FileOp>, tonic::Status> {
+    let t = Instant::now();
+    let rd = client
+        .read_path(pb::ReadPathRequest {
+            rev: hex(tip),
+            path: HOT_PATH.into(),
+            include_content: true,
+        })
+        .await;
+    out.read.push(micros(t));
+    let r = rd?.into_inner();
+    if !r.found {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&r.content).into_owned();
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    let k = rng.random_range(0..lines.len());
+    lines[k] = format!("line {k} agent={agent} seq={seq}");
+    let mut new = lines.join("\n");
+    new.push('\n');
+    Ok(Some(write_op(HOT_PATH.into(), new.into_bytes())))
+}
+
 async fn agent(i: usize, url: String, a: AgentCfg, deadline: Instant) -> Result<AgentOut> {
     let mut client = connect(&url).await?;
-    let mut rng = StdRng::seed_from_u64(a.seed.wrapping_mul(1_000_003).wrapping_add(i as u64));
+    let mut rng = agent_rng(a.seed, i);
     let mut out = AgentOut::default();
     let mut seq = 0u64;
     while Instant::now() < deadline {
@@ -168,8 +181,7 @@ async fn agent(i: usize, url: String, a: AgentCfg, deadline: Instant) -> Result<
         let tip = match client.get_ref(pb::GetRefRequest { name: a.ref_name.clone() }).await {
             Ok(r) => r.into_inner().target,
             Err(e) => {
-                out.errors += 1;
-                out.first_error.get_or_insert(format!("get_ref: {e}"));
+                out.error(format!("get_ref: {e}"));
                 continue;
             }
         };
@@ -190,33 +202,10 @@ async fn agent(i: usize, url: String, a: AgentCfg, deadline: Instant) -> Result<
         let hot = a.hot_rate > 0.0 && rng.random_bool(a.hot_rate.clamp(0.0, 1.0));
         if hot {
             out.hot_attempts += 1;
-            let t = Instant::now();
-            let rd = client
-                .read_path(pb::ReadPathRequest {
-                    rev: hex(&tip),
-                    path: HOT_PATH.into(),
-                    include_content: true,
-                })
-                .await;
-            out.read.push(micros(t));
-            match rd {
-                Ok(r) => {
-                    let r = r.into_inner();
-                    if r.found {
-                        let text = String::from_utf8_lossy(&r.content).into_owned();
-                        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
-                        if !lines.is_empty() {
-                            let k = rng.random_range(0..lines.len());
-                            lines[k] = format!("line {k} agent={i} seq={seq}");
-                            let mut new = lines.join("\n");
-                            new.push('\n');
-                            ops.push(write_op(HOT_PATH.into(), new.into_bytes()));
-                        }
-                    }
-                }
+            match hot_rewrite(&mut client, &mut rng, &mut out, &tip, i, seq).await {
+                Ok(op) => ops.extend(op),
                 Err(e) => {
-                    out.errors += 1;
-                    out.first_error.get_or_insert(format!("read_path: {e}"));
+                    out.error(format!("read_path: {e}"));
                     continue;
                 }
             }
@@ -228,7 +217,7 @@ async fn agent(i: usize, url: String, a: AgentCfg, deadline: Instant) -> Result<
             .create_changeset(pb::CreateChangesetRequest {
                 base: Some(tip),
                 ops,
-                author: Some(sig()),
+                author: Some(sig("bench")),
                 committer: None,
                 message: format!("agent {i} change {seq}"),
             })
@@ -239,8 +228,7 @@ async fn agent(i: usize, url: String, a: AgentCfg, deadline: Instant) -> Result<
                 r.into_inner().commit
             }
             Err(e) => {
-                out.errors += 1;
-                out.first_error.get_or_insert(format!("create_changeset: {e}"));
+                out.error(format!("create_changeset: {e}"));
                 continue;
             }
         };
@@ -262,39 +250,112 @@ async fn agent(i: usize, url: String, a: AgentCfg, deadline: Instant) -> Result<
                     if has_hot_op {
                         out.hot_landed += 1;
                     }
-                    for (p, c) in written {
-                        out.last.insert(p, c);
-                    }
+                    out.last.extend(written);
                 }
                 Some(pb::land_response::Outcome::Conflict(_)) => out.conflicts += 1,
-                None => {
-                    out.errors += 1;
-                    out.first_error.get_or_insert("land: empty outcome".to_string());
-                }
+                None => out.error("land: empty outcome".to_string()),
             },
             Err(e) if e.code() == tonic::Code::Aborted => {
                 out.aborts += 1;
                 out.first_error.get_or_insert(format!("land: {e}"));
             }
-            Err(e) => {
-                out.errors += 1;
-                out.first_error.get_or_insert(format!("land: {e}"));
-            }
+            Err(e) => out.error(format!("land: {e}")),
         }
     }
     Ok(out)
 }
 
-#[derive(Clone)]
-struct AgentCfg {
-    ref_name: String,
-    files: usize,
-    hot_rate: f64,
-    seed: u64,
+/// Outcome of the post-run invariant checks.
+struct Verified {
+    failures: Vec<String>,
+    history_growth: Option<usize>,
+    files_checked: usize,
+    secs: f64,
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+/// Check the invariants against the final tip: history grew by exactly the
+/// successful lands, every landed agent file holds its last landed content,
+/// and the hot file still has all its lines.
+async fn verify(
+    admin: &mut Client,
+    ref_name: &str,
+    start_tip: ObjectId,
+    tot: &AgentOut,
+    items: Vec<(String, Vec<u8>)>,
+    mut failures: Vec<String>,
+) -> Result<Verified> {
+    let final_tip = admin
+        .get_ref(pb::GetRefRequest { name: ref_name.into() })
+        .await?
+        .into_inner()
+        .target
+        .ok_or_else(|| anyhow!("ref vanished"))?;
+    let final_hex = hex(&final_tip);
+    let log = admin
+        .log(pb::LogRequest {
+            rev: final_hex.clone(),
+            path: None,
+            limit: (tot.landed + 2).min(u32::MAX as u64) as u32,
+        })
+        .await?
+        .into_inner()
+        .commits;
+    let history_growth = log.iter().position(|c| c.id == start_tip.0.to_vec());
+    match history_growth {
+        Some(n) if n as u64 == tot.landed => {}
+        Some(n) => failures.push(format!("first-parent history grew by {n}, expected {} successful lands", tot.landed)),
+        None => failures.push(format!(
+            "start tip {start_tip} not found within {} first-parent commits of the final tip (expected growth {})",
+            log.len(),
+            tot.landed
+        )),
+    }
+    let mut missing = 0u64;
+    let mut wrong = 0u64;
+    let start = Instant::now();
+    read_back(admin, &final_hex, &items, |path, expected, r| match r {
+        Ok(r) if r.found && r.content == expected => {}
+        Ok(r) if r.found => {
+            wrong += 1;
+            if wrong <= 3 {
+                failures.push(format!("{path}: content differs from last landed"));
+            }
+        }
+        Ok(_) => {
+            missing += 1;
+            if missing <= 3 {
+                failures.push(format!("{path}: missing at final tip"));
+            }
+        }
+        Err(e) => failures.push(format!("{path}: read failed: {e}")),
+    })
+    .await?;
+    if missing + wrong > 0 {
+        failures.push(format!(
+            "{missing} agent files missing, {wrong} with wrong content (of {} checked)",
+            items.len()
+        ));
+    }
+    if tot.hot_attempts > 0 {
+        let hot = admin
+            .read_path(pb::ReadPathRequest {
+                rev: final_hex.clone(),
+                path: HOT_PATH.into(),
+                include_content: true,
+            })
+            .await?
+            .into_inner();
+        let lines = String::from_utf8_lossy(&hot.content).lines().count();
+        if !hot.found || lines != HOT_LINES {
+            failures.push(format!("hot file has {lines} lines, expected {HOT_LINES}"));
+        }
+    }
+    Ok(Verified {
+        failures,
+        history_growth,
+        files_checked: items.len(),
+        secs: start.elapsed().as_secs_f64(),
+    })
 }
 
 pub async fn run(args: Args) -> Result<i32> {
@@ -342,11 +403,11 @@ pub async fn run(args: Args) -> Result<i32> {
     let handles: Vec<_> = (0..args.agents)
         .map(|i| tokio::spawn(agent(i, url.clone(), cfg.clone(), deadline)))
         .collect();
-    let mut outs = Vec::with_capacity(handles.len());
+    let mut tot = AgentOut::default();
     let mut agent_failures = Vec::new();
     for (i, h) in handles.into_iter().enumerate() {
         match h.await {
-            Ok(Ok(o)) => outs.push(o),
+            Ok(Ok(o)) => tot.merge(o),
             Ok(Err(e)) => agent_failures.push(format!("agent {i}: {e:#}")),
             Err(e) => agent_failures.push(format!("agent {i} panicked: {e}")),
         }
@@ -354,118 +415,8 @@ pub async fn run(args: Args) -> Result<i32> {
     let wall = start.elapsed().as_secs_f64();
     let cpu1 = cpu_seconds().unwrap_or((0.0, 0.0));
 
-    // ---- aggregate ----
-    let mut tot = AgentOut::default();
-    let mut last: HashMap<String, Vec<u8>> = HashMap::new();
-    let mut first_error = None;
-    for o in outs {
-        tot.get_ref.extend(o.get_ref);
-        tot.read.extend(o.read);
-        tot.create.extend(o.create);
-        tot.land.extend(o.land);
-        tot.land_ff.extend(o.land_ff);
-        tot.land_rebased.extend(o.land_rebased);
-        tot.landed += o.landed;
-        tot.rebased += o.rebased;
-        tot.conflicts += o.conflicts;
-        tot.aborts += o.aborts;
-        tot.errors += o.errors;
-        tot.hot_attempts += o.hot_attempts;
-        tot.hot_landed += o.hot_landed;
-        first_error = first_error.or(o.first_error);
-        last.extend(o.last);
-    }
-
-    // ---- invariants ----
-    let mut failures: Vec<String> = agent_failures;
-    let final_tip = admin
-        .get_ref(pb::GetRefRequest { name: args.ref_name.clone() })
-        .await?
-        .into_inner()
-        .target
-        .ok_or_else(|| anyhow!("ref vanished"))?;
-    let final_hex = hex(&final_tip);
-    let log = admin
-        .log(pb::LogRequest {
-            rev: final_hex.clone(),
-            path: None,
-            limit: (tot.landed + 2).min(u32::MAX as u64) as u32,
-        })
-        .await?
-        .into_inner()
-        .commits;
-    let history_growth = log.iter().position(|c| c.id == start_tip.0.to_vec());
-    match history_growth {
-        Some(n) if n as u64 == tot.landed => {}
-        Some(n) => failures.push(format!("first-parent history grew by {n}, expected {} successful lands", tot.landed)),
-        None => failures.push(format!(
-            "start tip {start_tip} not found within {} first-parent commits of the final tip (expected growth {})",
-            log.len(),
-            tot.landed
-        )),
-    }
-    let mut missing = 0u64;
-    let mut wrong = 0u64;
-    let verify_start = Instant::now();
-    let items: Vec<(String, Vec<u8>)> = last.into_iter().collect();
-    let checked = items.len();
-    for chunk in items.chunks(64) {
-        let mut set = tokio::task::JoinSet::new();
-        for (path, content) in chunk.iter().cloned() {
-            let mut c = admin.clone();
-            let rev = final_hex.clone();
-            set.spawn(async move {
-                let r = c
-                    .read_path(pb::ReadPathRequest {
-                        rev,
-                        path: path.clone(),
-                        include_content: true,
-                    })
-                    .await
-                    .map(|r| r.into_inner());
-                (path, content, r)
-            });
-        }
-        while let Some(joined) = set.join_next().await {
-            let (path, expected, r) = joined?;
-            match r {
-                Ok(r) if r.found && r.content == expected => {}
-                Ok(r) if r.found => {
-                    wrong += 1;
-                    if wrong <= 3 {
-                        failures.push(format!("{path}: content differs from last landed"));
-                    }
-                }
-                Ok(_) => {
-                    missing += 1;
-                    if missing <= 3 {
-                        failures.push(format!("{path}: missing at final tip"));
-                    }
-                }
-                Err(e) => failures.push(format!("{path}: read failed: {e}")),
-            }
-        }
-    }
-    if missing + wrong > 0 {
-        failures.push(format!(
-            "{missing} agent files missing, {wrong} with wrong content (of {checked} checked)"
-        ));
-    }
-    if tot.hot_attempts > 0 {
-        let hot = admin
-            .read_path(pb::ReadPathRequest {
-                rev: final_hex.clone(),
-                path: HOT_PATH.into(),
-                include_content: true,
-            })
-            .await?
-            .into_inner();
-        let lines = String::from_utf8_lossy(&hot.content).lines().count();
-        if !hot.found || lines != HOT_LINES {
-            failures.push(format!("hot file has {lines} lines, expected {HOT_LINES}"));
-        }
-    }
-    let verify_s = verify_start.elapsed().as_secs_f64();
+    let last: Vec<(String, Vec<u8>)> = std::mem::take(&mut tot.last).into_iter().collect();
+    let v = verify(&mut admin, &args.ref_name, start_tip, &tot, last, agent_failures).await?;
 
     // ---- report ----
     let create = Lat::from_micros(tot.create);
@@ -476,17 +427,17 @@ pub async fn run(args: Args) -> Result<i32> {
     let read = Lat::from_micros(tot.read);
     let lands_per_s = tot.landed as f64 / wall;
     let rebased_frac = if tot.landed == 0 { 0.0 } else { tot.rebased as f64 / tot.landed as f64 };
-    let pass = failures.is_empty();
+    let pass = v.failures.is_empty();
 
     println!();
     println!("== fleet summary ({mode}) ==");
-    println!("wall            {wall:.2}s   (verification {verify_s:.2}s)");
+    println!("wall            {wall:.2}s   (verification {:.2}s)", v.secs);
     println!("lands           {} ({lands_per_s:.1}/s)", tot.landed);
     println!("rebased         {} ({:.1}%)", tot.rebased, rebased_frac * 100.0);
     println!("conflicts       {}", tot.conflicts);
     println!("aborts          {}", tot.aborts);
     println!("errors          {}", tot.errors);
-    if let Some(e) = &first_error {
+    if let Some(e) = &tot.first_error {
         println!("first error     {e}");
     }
     println!("hot edits       {} attempted, {} landed", tot.hot_attempts, tot.hot_landed);
@@ -500,14 +451,14 @@ pub async fn run(args: Args) -> Result<i32> {
     println!("{}", land_ff.line("land(ff)"));
     println!("{}", land_rb.line("land(reb)"));
     if let Some(r) = peak_rss_bytes() {
-        println!("peak RSS        {:.1} MiB (client + embedded server)", r as f64 / 1048576.0);
+        println!("peak RSS        {:.1} MiB (client + embedded server)", mib(r));
     }
     println!("cpu             user {:.1}s sys {:.1}s", cpu1.0 - cpu0.0, cpu1.1 - cpu0.1);
     if mode == "embedded" {
         metrics.print("server-side store timing (calls from all RPCs)");
     }
     println!("invariants: {}", if pass { "PASS" } else { "FAIL" });
-    for f in &failures {
+    for f in &v.failures {
         println!("  - {f}");
     }
 
@@ -526,7 +477,7 @@ pub async fn run(args: Args) -> Result<i32> {
         .with("conflicts", tot.conflicts)
         .with("aborts", tot.aborts)
         .with("errors", tot.errors)
-        .with("first_error", first_error)
+        .with("first_error", tot.first_error)
         .with("hot_attempts", tot.hot_attempts)
         .with("hot_landed", tot.hot_landed)
         .with("latency_get_ref", get_ref.json())
@@ -538,10 +489,13 @@ pub async fn run(args: Args) -> Result<i32> {
         .with("peak_rss_bytes", peak_rss_bytes())
         .with("cpu_user_s", cpu1.0 - cpu0.0)
         .with("cpu_sys_s", cpu1.1 - cpu0.1)
-        .with("history_growth", history_growth.map(|n| n as u64))
-        .with("files_checked", checked)
+        .with("history_growth", v.history_growth.map(|n| n as u64))
+        .with("files_checked", v.files_checked)
         .with("invariants_pass", pass)
-        .with("invariant_failures", J::Arr(failures.iter().map(|f| J::from(f.as_str())).collect()))
+        .with(
+            "invariant_failures",
+            J::Arr(v.failures.iter().map(|f| J::from(f.as_str())).collect()),
+        )
         .with("server_store_calls", metrics.json());
     write_json(&args.json, &json)?;
     Ok(if pass { 0 } else { 1 })

@@ -10,9 +10,9 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use common::{KillOnDrop, PG_URL, free_ports};
+use common::{KillOnDrop, PG_URL, free_ports, unique_suffix};
 
 const S3_ENDPOINT: &str = "http://localhost:9009";
 const S3_BUCKET: &str = "ant-e2e";
@@ -229,8 +229,7 @@ fn cli_lazy_end_to_end() {
 }
 
 fn run_end_to_end(lazy: bool) {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
-    let uniq = format!("{}_{}", std::process::id(), nanos);
+    let uniq = unique_suffix();
     let schema = format!("e2e_{uniq}");
     // Declared first, so it drops last (after the server) and also on panic.
     let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
@@ -600,8 +599,7 @@ fn check_bytes(ctx: &Ctx, what: &str, actual: &[u8], expected: &[u8]) {
 #[test]
 #[ignore = "needs docker compose up -d"]
 fn cli_schema_versions() {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
-    let schema = format!("e2e_schema_{}_{nanos}", std::process::id());
+    let schema = format!("e2e_schema_{}", unique_suffix());
     let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
     let tmp = tempfile::tempdir().expect("tempdir");
     let ctx = Ctx {
@@ -682,5 +680,40 @@ fn cli_schema_versions() {
         {
             r.fail("newer schema: error + upgrade hint");
         }
+    }
+}
+
+#[test]
+#[ignore = "needs docker compose up -d"]
+fn cli_gc() {
+    let schema = format!("e2e_gc_{}", unique_suffix());
+    let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ctx = Ctx {
+        ant: PathBuf::from(env!("CARGO_BIN_EXE_ant")),
+        env: vec![("ANT_CACHE".into(), tmp.path().join("cache").display().to_string())],
+    };
+    let run = |args: &[&str]| {
+        let mut all: Vec<&str> = args.to_vec();
+        all.extend(["--pg-url", PG_URL, "--pg-schema", &schema]);
+        ctx.run(None, &all)
+    };
+    let counts = "live 0\ncondemned 0\nobjects 0 0\nlarge-objects 0 0\ncommits 0\nchangesets 0 0\n";
+    let r = run(&["admin", "gc", "--dry-run"]).ok();
+    let out = r.stdout();
+    if !out.starts_with("dry-run\ncutoff ") || !out.ends_with(counts) {
+        r.fail("dry run report");
+    }
+    let r = run(&["admin", "gc", "--quiesce", "0s"]).ok();
+    let out = r.stdout();
+    let tail = format!("{counts}legacy-changes 0\nderived 0\nkept 0\n");
+    if !out.starts_with("done\ncutoff ") || !out.ends_with(&tail) {
+        r.fail("run report");
+    }
+    let r = run(&["admin", "gc", "--abort"]).ok();
+    check_eq(&r, "abort", r.stdout(), "nothing to abort\n".to_string());
+    let r = run(&["admin", "gc", "--grace", "1h"]).expect_code(1);
+    if !r.stderr().contains("grace period must be at least 24 hours") {
+        r.fail("short grace refused");
     }
 }

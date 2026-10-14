@@ -8,9 +8,9 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use common::{KillOnDrop, PG_URL, free_ports};
+use common::{KillOnDrop, PG_URL, ant, free_ports, unique_suffix};
 
 const READER: &str = "reader-token";
 const WRITER: &str = "writer-token";
@@ -69,15 +69,10 @@ impl Env {
     /// Run `ant` as the principal owning `token` (None = no token), with a
     /// per-principal object cache.
     fn ant(&self, token: Option<&str>, dir: Option<&Path>, args: &[&str]) -> Output {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ant"));
+        let cache = self.root.join(format!("cache-{}", token.unwrap_or("anon")));
+        let mut cmd = ant(self.grpc, &cache);
         cmd.args(args)
-            .stdin(Stdio::null())
-            .env("ANT_SERVER", format!("http://127.0.0.1:{}", self.grpc))
             .env("ANT_HTTP", format!("http://127.0.0.1:{}", self.http))
-            .env("ANT_CACHE", self.root.join(format!("cache-{}", token.unwrap_or("anon"))))
-            .env("ANT_AUTHOR_NAME", "Agent")
-            .env("ANT_AUTHOR_EMAIL", "agent@example.com")
-            .env_remove("ANT_TOKEN")
             .env_remove("ANT_POLICY");
         if let Some(t) = token {
             cmd.env("ANT_TOKEN", t);
@@ -310,8 +305,7 @@ fn git(repo: &Path, args: &[&str]) {
 #[test]
 #[ignore = "needs docker compose up -d"]
 fn import_and_reindex_with_policy_postgres() {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
-    let schema = format!("acl_e2e_{}_{nanos}", std::process::id());
+    let schema = format!("acl_e2e_{}", unique_suffix());
     // Declared first, so it drops last (after the server) and also on panic.
     let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
     let tmp = tempfile::tempdir().expect("tempdir");

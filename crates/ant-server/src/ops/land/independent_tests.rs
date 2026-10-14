@@ -149,7 +149,7 @@ async fn concurrent_disjoint_lands() {
     for task in tasks {
         assert!(matches!(task.await.unwrap().unwrap(), LandOutcome::Landed { .. }));
     }
-    let tip = b.refs.get_ref("main").await.unwrap().unwrap();
+    let tip = crate::ops::test_support::tip(&b).await;
     for i in 0..24 {
         assert_eq!(contents(&b, tip, &format!("agent{i}/out")).await.unwrap(), b"done");
     }

@@ -4,6 +4,8 @@
 //!
 //! The test using live services runs with `--run-ignored all`.
 
+mod common;
+
 use std::sync::Arc;
 
 use ant_auth::{Policy, hash_token};
@@ -115,10 +117,8 @@ async fn unreachable_s3_is_not_ready() {
 #[tokio::test]
 #[ignore = "needs postgres and s3: docker compose up -d"]
 async fn ready_with_postgres_and_s3() {
-    let url = std::env::var("ANT_TEST_PG_URL")
-        .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
-    let schema = format!("health_{}", ulid::Ulid::new().to_string().to_lowercase());
-    let pg = PgStore::connect_scratch(&url, &schema).await.unwrap();
+    let schema = common::pg::scratch_schema("health");
+    let pg = PgStore::connect_scratch(&common::pg::pg_url(), &schema).await.unwrap();
     let s3 = S3ObjectStore::connect(&S3Config::for_tests("health")).await.unwrap();
     s3.ensure_bucket().await.unwrap();
     let probes = Probes { pg: Some(Arc::new(pg)), s3: Some(s3) };

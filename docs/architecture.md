@@ -41,8 +41,19 @@ implementations:
 `TieredObjectStore` sends objects ≤ 4 KiB (encoded) to Postgres and larger ones
 to S3, so the many tiny trees and files avoid S3's per-request latency. Batch
 writes are key-ordered so concurrent writers never deadlock. There are no
-packfiles and no repository maintenance: objects are written once and never
-rewritten.
+packfiles: objects are written once and never rewritten.
+
+**Garbage collection** (`ant admin gc`, `ant_store::postgres::gc`) deletes
+data unreachable from refs, the history index, landed-as and import
+mappings, and everything written within a grace period (rows carry their
+write time). It runs beside live servers: unreachable rows are first
+*condemned* (readers report them missing), then, after a wait longer than
+any server's cache lifetime and operation, marked again from everything
+written meanwhile, and only then deleted. Storing an object that already
+exists refreshes an old write time, and the delete re-checks it under the
+row lock, so a writer's deduplicated `put_many` never loses its objects.
+S3 packs get random ids and are deleted once no index row points into
+them.
 
 ## Write path (`ant-server::ops`)
 
@@ -100,8 +111,8 @@ cache hit can never hide a missing object.
   `Blame` over gRPC.
 - **Path history:** each ref has an index (`history` table) of which commits
   touched which paths along its first-parent chain. It is maintained in the
-  background after lands (`ops/history.rs`, coalesced per ref) and makes
-  `log --path` and blame independent of history length. On a busy ref the
+  background after lands and ref updates (`ops/history.rs`, coalesced per
+  ref) and makes `log --path` and blame independent of history length. On a busy ref the
   index trails the tip by the commits landed since the last catch-up; a path
   log scans only that lag and takes the rest from the index.
 - **Diff:** tree diffs walk both trees breadth first with one batched read
@@ -115,7 +126,8 @@ cache hit can never hide a missing object.
 
 - **Shared disk cache:** one content-addressed store per machine
   (`antd::disk`), safe for many concurrent processes (write-temp-then-rename),
-  with LRU eviction. A read-through layer fetches misses from the server in
+  with LRU eviction (`DiskObjectStore::gc`; nothing runs it automatically
+  yet, so the cache is unbounded in practice). A read-through layer fetches misses from the server in
   batches, de-duplicates in-flight fetches and verifies hashes.
 - **Sparse workspaces:** real files on disk for the paths matching sparse
   patterns. `status` compares against an index of stat data, so only changed
@@ -154,8 +166,8 @@ and an axum middleware around the HTTP router assign the request id (incoming
 `x-request-id` or a ULID, a tracing span field, echoed on the response),
 record `ant_rpc_*` / `ant_http_*` and log slow requests. Stores are wrapped
 once by `Metrics::instrument` (per-op timing and error counts). Landing and
-history report through `Option<Arc<Metrics>>` parameters (`land_observed`,
-`catch_up_observed`); state that lives in process-wide statics (cache sizes
+history report through `Option<&Arc<Metrics>>` parameters (`land_observed`,
+`schedule_catch_up`); state that lives in process-wide statics (cache sizes
 and lookup counters, land queues) is read at scrape time. See
 `operations.md` for the exposed series.
 

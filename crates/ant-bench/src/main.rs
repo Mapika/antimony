@@ -7,13 +7,15 @@
 //!   soak     --replicas N ... multi-replica long run: leaks, drift, errors
 //!
 //! Every subcommand prints a human summary and, with `--json <file>`, writes one
-//! JSON object with all metrics.
+//! JSON object with all metrics. Exit code: 0 on success, 1 when `fleet` or
+//! `soak` invariants fail, 2 on an error (`error: ...` on stderr).
 
 mod checkout;
 mod fleet;
 mod import;
 mod json;
 mod replicas;
+mod rpc;
 mod s3clean;
 mod soak;
 mod synth;

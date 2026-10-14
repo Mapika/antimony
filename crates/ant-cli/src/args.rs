@@ -1,6 +1,7 @@
 //! Command-line definition (clap derive).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use ant_server::config::StoreArgs;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -166,6 +167,53 @@ pub enum AdminCmd {
     /// Show the Postgres schema version and pending migrations; `--migrate`
     /// applies them.
     Schema(SchemaArgs),
+    /// Delete data nothing can reach any more (garbage collection): objects,
+    /// commit records and S3 packs of aborted lands, abandoned changesets
+    /// and failed imports. Safe while servers run; interrupted runs resume.
+    Gc(GcArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct GcArgs {
+    /// Count what would be deleted; change nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Keep everything written within this period, with all it reaches
+    /// (unlanded changesets, uploads, imports in progress). `7d`, `36h`, ...;
+    /// at least `1d`.
+    #[arg(long, default_value = "7d", value_parser = parse_duration)]
+    pub grace: Duration,
+    /// Wait between condemning data and deleting it. Must exceed the
+    /// servers' cache lifetime (10m) plus their longest request.
+    #[arg(long, default_value = "30m", value_parser = parse_duration)]
+    pub quiesce: Duration,
+    /// Stop after this many delete batches (run again to resume).
+    #[arg(long)]
+    pub max_batches: Option<usize>,
+    /// Forget an interrupted run (its condemned data becomes visible again)
+    /// instead of resuming it.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub abort: bool,
+    #[command(flatten)]
+    pub store: StoreArgs,
+}
+
+/// `<n>[s|m|h|d]` (no unit: seconds).
+pub fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    let (num, unit) = match s.find(|c: char| !c.is_ascii_digit() && c != '.') {
+        Some(i) => s.split_at(i),
+        None => (s, "s"),
+    };
+    let n: f64 = num.parse().map_err(|_| format!("invalid duration {s:?} (e.g. 7d, 36h, 30m)"))?;
+    let scale = match unit {
+        "s" => 1.0,
+        "m" => 60.0,
+        "h" => 3600.0,
+        "d" => 86400.0,
+        _ => return Err(format!("invalid duration unit in {s:?} (use s, m, h or d)")),
+    };
+    Duration::try_from_secs_f64(n * scale).map_err(|e| format!("invalid duration {s:?}: {e}"))
 }
 
 #[derive(Args, Debug)]
@@ -306,6 +354,26 @@ pub enum WsCmd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durations_parse() {
+        assert_eq!(parse_duration("7d"), Ok(Duration::from_secs(7 * 86400)));
+        assert_eq!(parse_duration("36h"), Ok(Duration::from_secs(36 * 3600)));
+        assert_eq!(parse_duration("30m"), Ok(Duration::from_secs(1800)));
+        assert_eq!(parse_duration("1.5s"), Ok(Duration::from_millis(1500)));
+        assert_eq!(parse_duration("90"), Ok(Duration::from_secs(90)));
+        assert!(parse_duration("7w").is_err());
+        assert!(parse_duration("d").is_err());
+        assert!(parse_duration("-1d").is_err());
+        let cli = Cli::try_parse_from(["ant", "admin", "gc", "--dry-run", "--memory"]).unwrap();
+        let Command::Admin { cmd: AdminCmd::Gc(a) } = cli.command else { panic!() };
+        assert!(a.dry_run && !a.abort);
+        assert_eq!(
+            (a.grace, a.quiesce),
+            (Duration::from_secs(7 * 86400), Duration::from_secs(1800))
+        );
+        assert!(Cli::try_parse_from(["ant", "admin", "gc", "--dry-run", "--abort"]).is_err());
+    }
 
     #[test]
     fn lazy_workspace_commands() {

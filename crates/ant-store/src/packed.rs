@@ -10,16 +10,20 @@
 //!
 //! - Order of writes: packs first, index rows after. An index row never points
 //!   at a missing pack; a crash in between leaves an unreferenced pack.
-//! - Pack keys are content-addressed, so retries are idempotent.
+//! - Pack ids are random (earlier versions hashed the content), so a pack is
+//!   only ever indexed by the upload that wrote it: garbage collection can
+//!   delete an unindexed old pack without racing a writer re-uploading the
+//!   same bytes under the same key (`postgres::gc`). A retried upload writes
+//!   a new pack; the one it replaces becomes garbage.
 //! - Objects that are not in the index are looked up under their own S3 key
 //!   (`S3ObjectStore`'s layout), so stores written before packs existed stay
-//!   readable.
+//!   readable; ids condemned by a collection run are not.
 //! - An object stored twice (concurrent writers) occupies space in two packs;
 //!   the index keeps the first. Packs are never rewritten here.
 
 use std::{collections::HashSet, sync::Arc};
 
-use ant_core::{EncodedObject, ObjectId, ObjectKind, hash_object};
+use ant_core::{EncodedObject, ObjectId};
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, stream};
 use tokio::sync::Semaphore;
@@ -153,8 +157,12 @@ impl ObjectStore for PackedS3Store {
         let mut got: std::collections::HashMap<ObjectId, EncodedObject> =
             fetched.into_iter().flatten().collect();
         // Objects stored one per key (before packs existed).
-        let legacy_ids: Vec<ObjectId> =
+        let mut legacy_ids: Vec<ObjectId> =
             wanted.iter().filter(|id| !got.contains_key(id)).copied().collect();
+        if !legacy_ids.is_empty() {
+            let condemned = self.index.condemned_among(&legacy_ids).await?;
+            legacy_ids.retain(|id| !condemned.contains(id));
+        }
         if !legacy_ids.is_empty() {
             for (id, obj) in legacy_ids.iter().zip(self.s3.get_many(&legacy_ids).await?) {
                 if let Some(obj) = obj {
@@ -218,9 +226,7 @@ impl ObjectStore for PackedS3Store {
         let uploads: Vec<(String, Vec<u8>)> = packs
             .into_iter()
             .map(|p| {
-                let digest = hash_object(ObjectKind::Blob, &p.body);
-                let mut pack = [0u8; 16];
-                pack.copy_from_slice(&digest.as_bytes()[..16]);
+                let pack: [u8; 16] = rand::random();
                 entries.extend(p.entries.into_iter().map(|(id, off, len)| IndexEntry {
                     id,
                     pack,
@@ -246,8 +252,9 @@ impl ObjectStore for PackedS3Store {
             out.iter().enumerate().filter(|(_, p)| !**p).map(|(i, _)| i).collect();
         if !misses.is_empty() {
             let miss_ids: Vec<ObjectId> = misses.iter().map(|&i| ids[i]).collect();
+            let condemned = self.index.condemned_among(&miss_ids).await?;
             for (i, present) in misses.into_iter().zip(self.s3.has_many(&miss_ids).await?) {
-                out[i] = present;
+                out[i] = present && !condemned.contains(&ids[i]);
             }
         }
         Ok(out)
@@ -261,6 +268,7 @@ mod tests {
     use super::*;
     use crate::s3::S3Config;
     use crate::{ObjectStoreExt, conformance};
+    use ant_core::ObjectKind;
 
     async fn fresh() -> (PackedS3Store, S3ObjectStore) {
         let url = std::env::var("ANT_TEST_PG_URL")

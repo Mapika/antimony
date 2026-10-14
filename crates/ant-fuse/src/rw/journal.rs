@@ -29,7 +29,6 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,7 +37,7 @@ use ant_core::{ObjectId, RepoPath};
 use parking_lot::{Condvar, Mutex};
 
 use super::other;
-use super::state::{base, save_base, save_whiteouts, snapshot_whiteouts};
+use super::state::{base, flock, open_lock_file, save_base, save_whiteouts, snapshot_whiteouts};
 
 pub(super) const JOURNAL: &str = "ops.log";
 /// Compact when the journal grows past this size.
@@ -367,10 +366,7 @@ pub(super) struct Journal {
 pub(super) struct Flock<'a>(&'a File);
 impl Drop for Flock<'_> {
     fn drop(&mut self) {
-        // SAFETY: the descriptor is valid for the guard's lifetime.
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
+        let _ = flock(self.0, libc::LOCK_UN);
     }
 }
 
@@ -378,12 +374,7 @@ impl Journal {
     pub(super) fn open(state: &Path) -> io::Result<Self> {
         let file =
             OpenOptions::new().create(true).read(true).append(true).open(state.join(JOURNAL))?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(state.join("lock"))?;
+        let lock = open_lock_file(state)?;
         Ok(Self {
             file,
             lock,
@@ -401,10 +392,7 @@ impl Journal {
     /// Take the state lock through this mount's own descriptor (a separate
     /// open file description from `StateLock`, so the two exclude each other).
     pub(super) fn lock(&self) -> io::Result<Flock<'_>> {
-        // SAFETY: flock only consumes the valid descriptor.
-        if unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        flock(&self.lock, libc::LOCK_EX)?;
         Ok(Flock(&self.lock))
     }
 

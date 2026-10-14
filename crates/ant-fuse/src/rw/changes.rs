@@ -4,12 +4,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self};
 use std::io::{self};
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, RepoPath, Tree};
+use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, RepoPath};
 use ant_store::ObjectStore;
+use antd::files::read_body;
+use antd::walk::{BATCH, Visit, WalkError, walk};
 use antd::workspace::{LocalChange, LocalChangeKind};
 
 use super::journal::{Persisted, Record, append_durably, load};
@@ -39,11 +40,7 @@ pub(super) fn scan_upper(state: &Path) -> io::Result<Upper> {
                 out.dirs.insert(path.clone());
                 todo.push(path);
             } else {
-                let data = if m.file_type().is_symlink() {
-                    fs::read_link(entry.path())?.as_os_str().as_bytes().to_vec()
-                } else {
-                    fs::read(entry.path())?
-                };
+                let data = read_body(&entry.path(), &m)?;
                 let blob = EncodedObject::new(ObjectKind::Blob, &data);
                 out.files.insert(path, (mode(&m), blob.id()));
                 out.blobs.push(blob);
@@ -53,8 +50,9 @@ pub(super) fn scan_upper(state: &Path) -> io::Result<Upper> {
     Ok(out)
 }
 
-// Walk only branches intersecting upper entries or whiteouts, breadth-first.
-// All trees at a depth are fetched together. Never fetch base blobs.
+/// The base entries on paths intersecting upper entries or whiteouts (all
+/// of them below upper files and whiteouts). Walks only those branches,
+/// breadth-first, one batched read per depth; never fetches base blobs.
 pub(super) async fn affected_base(
     objects: &dyn ObjectStore,
     root: ObjectId,
@@ -73,44 +71,24 @@ pub(super) async fn affected_base(
             branches.insert(path[..i].to_string());
         }
     }
-    let mut out = BTreeMap::new();
-    let mut todo = vec![(String::new(), root, false)];
-    while !todo.is_empty() {
-        let mut next = Vec::new();
-        for batch in todo.chunks(512) {
-            let ids = batch.iter().map(|(_, id, _)| *id).collect::<Vec<_>>();
-            let found = objects.get_many(&ids).await.map_err(other)?;
-            if found.len() != ids.len() {
-                return Err(other("misaligned tree batch"));
-            }
-            for ((prefix, _, inherited), object) in batch.iter().zip(found) {
-                let object = object.ok_or_else(|| other("missing base tree"))?;
-                if object.kind() != ObjectKind::Tree {
-                    return Err(other("base object is not a tree"));
-                }
-                let tree = Tree::decode(object.body()).map_err(other)?;
-                for e in tree.entries() {
-                    let path = if prefix.is_empty() {
-                        e.name.clone()
-                    } else {
-                        format!("{prefix}/{}", e.name)
-                    };
-                    let all =
-                        *inherited || deleted.contains(&path) || upper.files.contains_key(&path);
-                    if !all && !exact.contains(&path) && !branches.contains(&path) {
-                        continue;
-                    }
-                    if e.mode.is_tree() {
-                        next.push((path, e.id, all));
-                    } else {
-                        out.insert(path, (e.mode.class(), e.id));
-                    }
-                }
-            }
+    walk(objects, root, |path, e, inherited| {
+        let all = inherited || deleted.contains(path) || upper.files.contains_key(path);
+        if !all && !exact.contains(path) && !branches.contains(path) {
+            Visit::Skip
+        } else if e.mode.is_tree() {
+            Visit::Descend(all)
+        } else {
+            Visit::Leaf
         }
-        todo = next;
-    }
-    Ok(out)
+    })
+    .await
+    .map_err(|e| match e {
+        WalkError::Store(e) => other(e),
+        WalkError::Misaligned => other("misaligned tree batch"),
+        WalkError::Missing(_) => other("missing base tree"),
+        WalkError::NotTree(_) => other("base object is not a tree"),
+        WalkError::Decode(e) => other(e),
+    })
 }
 
 pub(super) fn compare(
@@ -146,6 +124,36 @@ pub(super) fn compare(
     Ok(out)
 }
 
+/// A workspace's local changes, from a state directory the caller has
+/// locked and recovered.
+pub(super) struct Local {
+    /// The old base tree (as persisted).
+    pub(super) tree: ObjectId,
+    pub(super) deleted: BTreeSet<String>,
+    pub(super) upper: Upper,
+    /// Sorted changes against the base.
+    pub(super) changes: Vec<LocalChange>,
+}
+
+/// Compute [`Local`] and store the new blobs of changed files into `objects`
+/// in batches, so later readers (submit, `update`'s plan) find them by id.
+pub(super) fn local_changes(
+    state: &Path,
+    objects: &dyn ObjectStore,
+    rt: &tokio::runtime::Handle,
+) -> io::Result<Local> {
+    let Persisted { tree, deleted, .. } = load(state)?;
+    let upper = scan_upper(state)?;
+    let lower = rt.block_on(affected_base(objects, tree, &upper, &deleted))?;
+    let changes = compare(&upper, &deleted, &lower)?;
+    let changed: BTreeSet<_> = changes.iter().filter_map(|c| c.new.map(|(_, id)| id)).collect();
+    let blobs: Vec<_> = upper.blobs.iter().filter(|b| changed.contains(&b.id())).cloned().collect();
+    for batch in blobs.chunks(BATCH) {
+        rt.block_on(objects.put_many(batch)).map_err(other)?;
+    }
+    Ok(Local { tree, deleted, upper, changes })
+}
+
 /// Compute sorted changes without walking untouched base subtrees. Blocking
 /// filesystem work and state locking run on a blocking thread. New blobs are
 /// inserted in batches into `objects`.
@@ -158,17 +166,7 @@ pub async fn changes(
     tokio::task::spawn_blocking(move || {
         let _lock = StateLock::take(&state)?;
         recover(&state)?;
-        let Persisted { tree: root, deleted, .. } = load(&state)?;
-        let upper = scan_upper(&state)?;
-        let lower = rt.block_on(affected_base(objects.as_ref(), root, &upper, &deleted))?;
-        let result = compare(&upper, &deleted, &lower)?;
-        let changed: BTreeSet<_> = result.iter().filter_map(|c| c.new.map(|(_, id)| id)).collect();
-        let blobs =
-            upper.blobs.into_iter().filter(|b| changed.contains(&b.id())).collect::<Vec<_>>();
-        for batch in blobs.chunks(512) {
-            rt.block_on(objects.put_many(batch)).map_err(other)?;
-        }
-        Ok(result)
+        Ok(local_changes(&state, objects.as_ref(), &rt)?.changes)
     })
     .await
     .map_err(other)?

@@ -1,7 +1,117 @@
-use ant_core::{Commit, EncodedObject, EntryMode, ObjectKind, Signature, TreeEntry};
+// Fixtures and git helpers shared by the integration tests (`tests/*.rs`) and,
+// through `include!`, by the pack unit tests (`src/pack.rs`); every item is
+// used in both, so neither sees dead code.
+
+use ant_core::{Commit, EncodedObject, EntryMode, ObjectId, ObjectKind, Signature, TreeEntry};
 use ant_store::{Backend, ObjectStoreExt, graph::write_commit};
 use flate2::{Compression, write::ZlibEncoder};
 use std::io::Write;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+/// A commit of `tree` by `who` (name, email) as author and committer.
+pub fn commit_of(
+    tree: ObjectId,
+    parents: Vec<ObjectId>,
+    who: (&str, &str),
+    time: i64,
+    message: String,
+) -> Commit {
+    let sig = Signature { name: who.0.into(), email: who.1.into(), time, tz_offset_minutes: 0 };
+    Commit {
+        tree,
+        parents,
+        author: sig.clone(),
+        committer: sig,
+        extra_headers: vec![],
+        message: message.into_bytes(),
+    }
+}
+
+/// `len` deterministic, incompressible bytes (xorshift32 from `seed`).
+pub fn noise(seed: u32, len: usize) -> Vec<u8> {
+    let mut state = seed;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect()
+}
+
+/// `git` in `dir`, isolated from the user's and system configuration.
+pub fn git_command(dir: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
+/// Kind and delta depth (`None`: stored whole) of every object in the packs
+/// under `pack_dir`, from `git verify-pack -v`.
+pub async fn packed_objects(pack_dir: &Path) -> Vec<(String, Option<usize>)> {
+    let mut objects = Vec::new();
+    for entry in std::fs::read_dir(pack_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "idx") {
+            continue;
+        }
+        let output = git_command(pack_dir)
+            .args(["verify-pack", "-v", path.to_str().unwrap()])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        for line in String::from_utf8(output.stdout).unwrap().lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.first().is_some_and(|id| id.len() == 64) {
+                let depth = (fields.len() == 7).then(|| fields[5].parse().unwrap());
+                objects.push((fields[1].to_owned(), depth));
+            }
+        }
+    }
+    objects
+}
+
+/// Total size of the `.pack` files under `pack_dir`.
+pub fn pack_bytes(pack_dir: &Path) -> u64 {
+    std::fs::read_dir(pack_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "pack"))
+        .map(|p| std::fs::metadata(p).unwrap().len())
+        .sum()
+}
+
+/// This process's resident set size in KiB (0 when unknown).
+pub fn rss_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:")?.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Sample [`rss_kib`] every 5 ms into a running maximum, starting at `before`,
+/// until the returned task is aborted.
+pub fn watch_peak_rss(before: u64) -> (Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+    let peak = Arc::new(AtomicU64::new(before));
+    let monitor_peak = peak.clone();
+    let monitor = tokio::spawn(async move {
+        loop {
+            monitor_peak.fetch_max(rss_kib(), Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    (peak, monitor)
+}
 
 pub async fn history(revisions: usize, width: usize) -> (Backend, u64) {
     let b = Backend::in_memory();
@@ -27,20 +137,13 @@ pub async fn history(revisions: usize, width: usize) -> (Backend, u64) {
         entries[index].id = b.objects.put(blob).await.unwrap();
         let tree = ant_core::Tree::new(entries.clone()).unwrap();
         let tree = EncodedObject::new(ObjectKind::Tree, &tree.encode());
-        let sig = Signature {
-            name: "bench".into(),
-            email: "bench@test".into(),
-            time: revision as i64,
-            tz_offset_minutes: 0,
-        };
-        let commit = Commit {
-            tree: tree.id(),
-            parents: parent.into_iter().collect(),
-            author: sig.clone(),
-            committer: sig,
-            extra_headers: vec![],
-            message: format!("revision {revision}\n").into_bytes(),
-        };
+        let commit = commit_of(
+            tree.id(),
+            parent.into_iter().collect(),
+            ("bench", "bench@test"),
+            revision as i64,
+            format!("revision {revision}\n"),
+        );
         let encoded = EncodedObject::new(ObjectKind::Commit, &commit.encode());
         // Exactly the encoder's undeltified entries: zlib level 6 (`pack::LEVEL`,
         // git's default) and the pack object header size.
@@ -64,9 +167,9 @@ pub async fn history(revisions: usize, width: usize) -> (Backend, u64) {
 
 pub async fn revisions(
     b: &Backend,
-    mut parent: Option<ant_core::ObjectId>,
+    mut parent: Option<ObjectId>,
     range: std::ops::Range<usize>,
-) -> ant_core::ObjectId {
+) -> ObjectId {
     use ant_store::graph::{build_tree, write_tree};
     let fixed: Vec<_> = (0..64).map(|n| (format!("fixed{n:03}"), format!("file {n}"))).collect();
     let root = build_tree(
@@ -77,15 +180,7 @@ pub async fn revisions(
     .unwrap();
     let tree = b.objects.get(&root).await.unwrap().unwrap();
     let fixed = ant_core::Tree::decode(tree.body()).unwrap();
-    let mut state = 123456789_u32;
-    let content: Vec<_> = (0..100_000)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect();
+    let content = noise(123456789, 100_000);
     for n in range {
         let mut content = content.clone();
         content[1000..1008].copy_from_slice(&(n as u64).to_le_bytes());
@@ -106,27 +201,14 @@ pub async fn revisions(
         let mut entries = fixed.entries().to_vec();
         entries.push(TreeEntry { name: "changing".into(), mode, id });
         let tree = write_tree(b.objects.as_ref(), entries).await.unwrap();
-        let sig = Signature {
-            name: "test".into(),
-            email: "test@test".into(),
-            time: n as i64,
-            tz_offset_minutes: 0,
-        };
-        parent = Some(
-            write_commit(
-                b,
-                &Commit {
-                    tree,
-                    parents: parent.into_iter().collect(),
-                    author: sig.clone(),
-                    committer: sig,
-                    extra_headers: vec![],
-                    message: format!("{n}\n").into_bytes(),
-                },
-            )
-            .await
-            .unwrap(),
+        let commit = commit_of(
+            tree,
+            parent.into_iter().collect(),
+            ("test", "test@test"),
+            n as i64,
+            format!("{n}\n"),
         );
+        parent = Some(write_commit(b, &commit).await.unwrap());
     }
     parent.unwrap()
 }
@@ -140,23 +222,23 @@ const ROOT_FILES: usize = 40;
 /// `top/mid/leaf/file` directories `FAN` wide, `LEAF_FILES` per leaf.
 #[derive(Clone)]
 struct Snapshot {
-    root_files: Vec<ant_core::ObjectId>,
-    files: Vec<ant_core::ObjectId>,
-    leaves: Vec<ant_core::ObjectId>,
-    mids: Vec<ant_core::ObjectId>,
-    tops: Vec<ant_core::ObjectId>,
-    root: ant_core::ObjectId,
+    root_files: Vec<ObjectId>,
+    files: Vec<ObjectId>,
+    leaves: Vec<ObjectId>,
+    mids: Vec<ObjectId>,
+    tops: Vec<ObjectId>,
+    root: ObjectId,
 }
 
 fn tree_of(entries: Vec<TreeEntry>) -> EncodedObject {
     EncodedObject::new(ObjectKind::Tree, &ant_core::Tree::new(entries).unwrap().encode())
 }
 
-fn file(name: String, id: ant_core::ObjectId) -> TreeEntry {
+fn file(name: String, id: ObjectId) -> TreeEntry {
     TreeEntry { mode: EntryMode::File, name, id }
 }
 
-fn dir(name: String, id: ant_core::ObjectId) -> TreeEntry {
+fn dir(name: String, id: ObjectId) -> TreeEntry {
     TreeEntry { mode: EntryMode::Tree, name, id }
 }
 
@@ -192,7 +274,7 @@ impl Snapshot {
 /// short topic branch forked 40 commits back and merged every 8 commits.
 /// Branch interleaving is what defeats "delta against the previous version
 /// seen": consecutive versions of a directory come from different branches.
-pub async fn merge_history(b: &Backend, revisions: usize) -> ant_core::ObjectId {
+pub async fn merge_history(b: &Backend, revisions: usize) -> ObjectId {
     let leaves = FAN * FAN * FAN;
     let mut state = 0x2545_f491_u32;
     let mut random = move |n: usize| {
@@ -224,24 +306,11 @@ pub async fn merge_history(b: &Backend, revisions: usize) -> ant_core::ObjectId 
         objects.extend(main.rehash(leaf));
     }
     let mut history = std::collections::VecDeque::new();
-    let mut parent: Option<ant_core::ObjectId> = None;
+    let mut parent: Option<ObjectId> = None;
     let mut time = 0;
-    let mut commit = |tree, parents: Vec<ant_core::ObjectId>| {
+    let mut commit = |tree, parents: Vec<ObjectId>| {
         time += 1;
-        let sig = Signature {
-            name: "dev".into(),
-            email: "dev@example.com".into(),
-            time,
-            tz_offset_minutes: 0,
-        };
-        Commit {
-            tree,
-            parents,
-            author: sig.clone(),
-            committer: sig,
-            extra_headers: vec![],
-            message: format!("change {time}\n").into_bytes(),
-        }
+        commit_of(tree, parents, ("dev", "dev@example.com"), time, format!("change {time}\n"))
     };
     for revision in 0..revisions {
         // Most work happens in a few hot directories.

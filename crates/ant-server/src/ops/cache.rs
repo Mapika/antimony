@@ -9,18 +9,32 @@
 //! Scoping holds a `Weak` to the store, which pins its allocation: a store
 //! dropped and replaced by another at the same address can never inherit the
 //! old store's cache.
+//!
+//! Entries live at most [`cache_max_age`] (default [`DEFAULT_MAX_AGE`]) after
+//! they were read or written, however often they are hit. Garbage collection
+//! (`ant_store::postgres::gc`) relies on it: once an object is condemned,
+//! stores report it missing, and after this long no cache here still knows
+//! it, so no new write can build on it (the collector's quiesce wait must
+//! exceed this plus the longest operation).
 
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use ant_core::{Commit, Object, ObjectId, ObjectKind, Tree};
 use ant_store::graph::TreeSource;
 use ant_store::{Backend, CommitNode, MetaStore, ObjectStore, PathChange, StoreError};
 
+use super::{OpError, OpResult};
+
 /// Cache names, indexed by [`Cache`] slot.
 pub(crate) const CACHE_NAMES: [&str; 4] = ["trees", "commits", "nodes", "changesets"];
+const TREES: usize = 0;
+const COMMITS: usize = 1;
+const NODES: usize = 2;
+const CHANGESETS: usize = 3;
 
 /// Process-wide lookup counters per cache slot (all store instances). Plain
 /// relaxed atomics: the metrics endpoint reads them on scrape.
@@ -28,6 +42,21 @@ static HITS: [AtomicU64; 4] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static MISSES: [AtomicU64; 4] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Default lifetime of a cache entry.
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(600);
+
+static MAX_AGE_MS: AtomicU64 = AtomicU64::new(DEFAULT_MAX_AGE.as_millis() as u64);
+
+/// Lifetime of cache entries (process-wide).
+pub fn cache_max_age() -> Duration {
+    Duration::from_millis(MAX_AGE_MS.load(Ordering::Relaxed))
+}
+
+/// Change the lifetime of cache entries (process-wide; tests use short ones).
+pub fn set_cache_max_age(age: Duration) {
+    MAX_AGE_MS.store(u64::try_from(age.as_millis()).unwrap_or(u64::MAX), Ordering::Relaxed);
+}
 
 fn count(slot: usize, hits: usize, misses: usize) {
     if hits > 0 {
@@ -46,10 +75,10 @@ pub(crate) fn lookup_counters() -> [(u64, u64); 4] {
 /// Two-generation cache: inserts go to `cur`; when `cur` exceeds its budget it
 /// becomes `prev` (dropping the old `prev`). Hits in `prev` are promoted.
 /// Approximates LRU with O(1) operations and a hard memory bound of roughly
-/// twice the budget.
+/// twice the budget. Entries older than [`cache_max_age`] are misses.
 struct Generations<K, V> {
-    cur: HashMap<K, (V, usize)>,
-    prev: HashMap<K, (V, usize)>,
+    cur: HashMap<K, (V, usize, Instant)>,
+    prev: HashMap<K, (V, usize, Instant)>,
     weight: usize,
     budget: usize,
 }
@@ -63,17 +92,33 @@ impl<K: Hash + Eq, V: Clone> Generations<K, V> {
     where
         K: Clone,
     {
-        if let Some((v, _)) = self.cur.get(key) {
-            return Some(v.clone());
+        let max_age = cache_max_age();
+        if let Some((v, w, at)) = self.cur.get(key) {
+            if at.elapsed() < max_age {
+                return Some(v.clone());
+            }
+            let w = *w;
+            self.cur.remove(key);
+            self.weight -= w;
+            return None;
         }
-        let (v, w) = self.prev.remove(key)?;
-        self.insert(key.clone(), v.clone(), w);
+        let (v, w, at) = self.prev.remove(key)?;
+        if at.elapsed() >= max_age {
+            return None;
+        }
+        // Promoted with its original age.
+        self.insert_at(key.clone(), v.clone(), w, at);
         Some(v)
     }
 
     fn insert(&mut self, key: K, value: V, weight: usize) {
-        if self.cur.insert(key, (value, weight)).is_none() {
-            self.weight += weight;
+        self.insert_at(key, value, weight, Instant::now());
+    }
+
+    fn insert_at(&mut self, key: K, value: V, weight: usize, at: Instant) {
+        match self.cur.insert(key, (value, weight, at)) {
+            None => self.weight += weight,
+            Some((_, old, _)) => self.weight = self.weight - old + weight,
         }
         if self.weight > self.budget {
             self.prev = std::mem::take(&mut self.cur);
@@ -83,7 +128,7 @@ impl<K: Hash + Eq, V: Clone> Generations<K, V> {
 
     /// `(entries, weight)` over both generations.
     fn stats(&self) -> (usize, usize) {
-        let prev_weight: usize = self.prev.values().map(|(_, w)| *w).sum();
+        let prev_weight: usize = self.prev.values().map(|(_, w, _)| *w).sum();
         (self.cur.len() + self.prev.len(), self.weight + prev_weight)
     }
 }
@@ -100,7 +145,7 @@ impl<K: Hash + Eq + Clone, V: Clone> Cache<K, V> {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Generations<K, V>> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        crate::lock(&self.inner)
     }
 
     pub(crate) fn get(&self, key: &K) -> Option<V> {
@@ -195,7 +240,7 @@ fn scoped<S: ?Sized, C>(
     store: &Arc<S>,
     make: impl FnOnce() -> C,
 ) -> Arc<C> {
-    let mut entries = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let mut entries = crate::lock(registry);
     entries.retain(|(weak, _)| weak.strong_count() > 0);
     let weak = Arc::downgrade(store);
     if let Some((_, caches)) = entries.iter().find(|(w, _)| Weak::ptr_eq(w, &weak)) {
@@ -208,21 +253,21 @@ fn scoped<S: ?Sized, C>(
 
 pub(crate) fn objects(store: &Arc<dyn ObjectStore>) -> Arc<ObjectCaches> {
     scoped(&OBJECTS, store, || ObjectCaches {
-        trees: Cache::new(TREE_BUDGET, 0),
-        commits: Cache::new(COMMIT_BUDGET, 1),
+        trees: Cache::new(TREE_BUDGET, TREES),
+        commits: Cache::new(COMMIT_BUDGET, COMMITS),
     })
 }
 
 pub(crate) fn meta(store: &Arc<dyn MetaStore>) -> Arc<MetaCaches> {
     scoped(&META, store, || MetaCaches {
-        nodes: Cache::new(NODE_BUDGET, 2),
-        changesets: Cache::new(CHANGESET_BUDGET, 3),
+        nodes: Cache::new(NODE_BUDGET, NODES),
+        changesets: Cache::new(CHANGESET_BUDGET, CHANGESETS),
     })
 }
 
 /// Clones the caches of every live registration, releasing the lock first.
 fn live<S: ?Sized, C>(registry: &Registry<S, C>) -> Vec<Arc<C>> {
-    let entries = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let entries = crate::lock(registry);
     entries.iter().filter(|(w, _)| w.strong_count() > 0).map(|(_, c)| c.clone()).collect()
 }
 
@@ -242,15 +287,14 @@ pub fn cache_stats() -> (Vec<CacheStat>, usize, usize) {
     let metas = live(&META);
     let mut totals = [(0, 0, 0); 4];
     for c in &objects {
-        add(&mut totals[0], &c.trees);
-        add(&mut totals[1], &c.commits);
+        add(&mut totals[TREES], &c.trees);
+        add(&mut totals[COMMITS], &c.commits);
     }
     for c in &metas {
-        add(&mut totals[2], &c.nodes);
-        add(&mut totals[3], &c.changesets);
+        add(&mut totals[NODES], &c.nodes);
+        add(&mut totals[CHANGESETS], &c.changesets);
     }
-    const NAMES: [&str; 4] = CACHE_NAMES;
-    let stats = NAMES
+    let stats = CACHE_NAMES
         .iter()
         .zip(totals)
         .map(|(name, (entries, weight_bytes, budget_bytes))| CacheStat {
@@ -286,6 +330,11 @@ pub(crate) async fn get_nodes(
         }
     }
     Ok(out)
+}
+
+/// One recorded commit node through the node cache; unrecorded → `NotFound`.
+pub(crate) async fn get_node(b: &Backend, id: ObjectId) -> OpResult<CommitNode> {
+    get_nodes(b, &[id]).await?.pop().flatten().ok_or_else(|| OpError::not_found_commit(id))
 }
 
 /// Index-aligned `get_changesets` through the changeset cache.
@@ -416,6 +465,25 @@ mod tests {
         // The un-promoted old entries are gone; memory stays bounded.
         assert_eq!(g.get(&2), None);
         assert!(g.cur.len() + g.prev.len() <= 8);
+    }
+
+    #[test]
+    fn entries_expire_after_the_max_age() {
+        let mut g = Generations::new(100);
+        g.insert(1, 1, 1);
+        let old = Instant::now().checked_sub(DEFAULT_MAX_AGE + Duration::from_secs(1)).unwrap();
+        g.insert_at(2, 2, 1, old);
+        g.prev.insert(3, (3, 1, old));
+        g.prev.insert(4, (4, 1, Instant::now()));
+        assert_eq!(g.get(&1), Some(1));
+        // Expired entries are misses in either generation, and leave.
+        assert_eq!(g.get(&2), None);
+        assert_eq!(g.get(&3), None);
+        assert!(!g.cur.contains_key(&2) && !g.prev.contains_key(&3));
+        assert_eq!(g.weight, 1);
+        // Promotion keeps the entry's age.
+        assert_eq!(g.get(&4), Some(4));
+        assert!(g.cur[&4].2 <= Instant::now());
     }
 
     #[test]
