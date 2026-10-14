@@ -300,6 +300,43 @@ async fn gc_collects_aborted_and_abandoned_data_and_keeps_all_history() {
     assert!(matches!(land(b, "main", garbage[0]).await, Err(OpError::NotFound(_))));
 }
 
+/// Blame values (keyed by the last commit changing the path) go with that
+/// commit: those of collected changesets are deleted, those of history kept.
+#[tokio::test]
+#[ignore = "needs postgres: docker compose up -d"]
+async fn gc_deletes_blame_values_with_their_commits() {
+    let r = repo().await;
+    let b = &r.b;
+    let (tip, _) = history(b, 6).await;
+    let f = RepoPath::new("src/m0/f0.rs").unwrap();
+    let kept = history::blame(b, "main", &f).await.unwrap();
+    // An abandoned changeset changing the file, blamed by commit id.
+    let junk = changeset(b, Some(tip), &[("src/m0/f0.rs", b"fn f0() {}\nfn junk() {}\n")]).await;
+    let at_junk = history::blame(b, &junk.to_hex(), &f).await.unwrap();
+    assert_eq!(at_junk[1].commit, junk);
+    let rows = |id: ObjectId| {
+        let schema = r.schema.clone();
+        async move {
+            count(
+                &schema,
+                &format!(
+                    "SELECT count(*) FROM derived WHERE kind = 'blame/v2' \
+                     AND substring(key from 1 for 32) = '\\x{}'::bytea",
+                    id.to_hex()
+                ),
+            )
+            .await
+        }
+    };
+    let owner = kept[0].commit;
+    assert_eq!((rows(junk).await, rows(owner).await), (1, 1));
+    age(&r.schema, 30).await;
+    let report = gc(&r, &opts()).await;
+    assert!(report.finished && report.derived >= 1, "{report:?}");
+    assert_eq!((rows(junk).await, rows(owner).await), (0, 1));
+    assert_eq!(history::blame(b, "main", &f).await.unwrap(), kept);
+}
+
 #[tokio::test]
 #[ignore = "needs postgres: docker compose up -d"]
 async fn gc_keeps_everything_written_within_the_grace_period() {

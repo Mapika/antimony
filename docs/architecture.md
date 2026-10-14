@@ -143,7 +143,26 @@ gets one coalesced event instead of unbounded buffering.
   background after lands and ref updates (`ops/history.rs`, coalesced per
   ref) and makes `log --path` and blame independent of history length. On a busy ref the
   index trails the tip by the commits landed since the last catch-up; a path
-  log scans only that lag and takes the rest from the index.
+  log (and blame) scans only that lag and takes the rest from the index.
+- **Derived data** (`ant_store::derive`, the `derived` table): values
+  computed from the commit graph and stored by kind and key. A
+  `Derivation` names a versioned kind (a format change is a new kind; old
+  rows are ignored, then collected), its key and codec, and a recursive
+  rule: the value at a node from its predecessor's value plus the node's
+  change. Callers evaluate it iteratively, walking predecessors newest first
+  in batches with one `get_derived_many` per batch, stopping at the first
+  stored value, never one round trip per node. Policy per kind: *eager*
+  kinds store every value along a filled chain, *deferred* kinds only the
+  queried one. The skip index `graph/skip/v1` is filled the eager way
+  (bottom-up along first-parent chains, lazily and after imports; its rule
+  reads a second entry, so it keeps its own fill loop rather than the
+  trait). Commit-keyed kinds are deleted by GC with their commit.
+- **Blame** (`ops/history.rs`, kind `blame/v2`, deferred): keyed by
+  `(L, path)`, `L` the last commit on the revision's first-parent chain that
+  changed the path, so every revision since `L` shares one value. A new
+  change is derived from the previous version's stored value plus one line
+  diff; with nothing stored the walk diffs older versions until all lines
+  are owned or a stored value covers the rest.
 - **Diff:** tree diffs walk both trees breadth first with one batched read
   per depth, through the tree cache, so a `Diff` spanning hundreds of lands
   costs a few round trips, not one per changed directory.

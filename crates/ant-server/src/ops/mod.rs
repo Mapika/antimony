@@ -63,6 +63,8 @@ mod gc_contract_tests {
     fn gc_knows_the_server_derived_kinds() {
         assert!(gc::DEFAULT_ROOT_KINDS.contains(&super::land::LANDED_AS));
         assert!(gc::DEFAULT_COMMIT_KEYED_KINDS.contains(&super::history::BLAME_KIND));
+        // Rows older servers wrote (blame per queried revision).
+        assert!(gc::DEFAULT_COMMIT_KEYED_KINDS.contains(&"blame/v1"));
         assert!(gc::DEFAULT_COMMIT_KEYED_KINDS.contains(&ant_store::graph::SKIP_KIND));
         // Condemned data must outlive every cache entry before deletion.
         assert!(gc::DEFAULT_QUIESCE >= super::CACHE_MAX_AGE * 2);

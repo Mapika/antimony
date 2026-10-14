@@ -10,6 +10,7 @@
 
 mod changeset_codec;
 pub mod conformance;
+pub mod derive;
 pub mod feed;
 pub mod graph;
 pub mod memory;
