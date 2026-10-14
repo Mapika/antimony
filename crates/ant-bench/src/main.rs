@@ -4,6 +4,7 @@
 //!   import   <git-dir> ...   git -> antimony import throughput + per-phase store timings
 //!   fleet    --agents N ...  concurrent agent simulation with correctness invariants
 //!   checkout --server URL    cold/warm sparse workspace materialization
+//!   soak     --replicas N ... multi-replica long run: leaks, drift, errors
 //!
 //! Every subcommand prints a human summary and, with `--json <file>`, writes one
 //! JSON object with all metrics.
@@ -12,6 +13,9 @@ mod checkout;
 mod fleet;
 mod import;
 mod json;
+mod replicas;
+mod s3clean;
+mod soak;
 mod synth;
 mod util;
 
@@ -33,6 +37,11 @@ enum Cmd {
     Fleet(fleet::Args),
     /// Time sparse workspace materialization cold and warm.
     Checkout(checkout::Args),
+    /// Drive N server replicas with many agents for a long time; report per window.
+    Soak(soak::Args),
+    /// Run a server (same as `ant serve`); used by `soak` to spawn replicas.
+    #[command(hide = true)]
+    Serve(ant_server::serve::ServeArgs),
 }
 
 #[tokio::main]
@@ -57,5 +66,7 @@ async fn run() -> anyhow::Result<i32> {
         Cmd::Import(args) => import::run(args).await.map(|()| 0),
         Cmd::Fleet(args) => fleet::run(args).await,
         Cmd::Checkout(args) => checkout::run(args).await.map(|()| 0),
+        Cmd::Soak(args) => soak::run(args).await,
+        Cmd::Serve(args) => ant_server::serve::run(args).await.map(|()| 0),
     }
 }

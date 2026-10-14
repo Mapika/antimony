@@ -2,7 +2,7 @@
 //! adapters over these functions; tests exercise them directly against
 //! `Backend::in_memory()`.
 
-mod cache;
+pub(crate) mod cache;
 pub mod changeset;
 pub mod history;
 pub mod land;

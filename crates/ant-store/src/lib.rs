@@ -134,6 +134,59 @@ pub trait RefStore: Send + Sync + 'static {
 
     /// All refs whose name starts with `prefix`, sorted by name.
     async fn list_refs(&self, prefix: &str) -> Result<Vec<(String, ObjectId)>>;
+
+    /// Wait for exclusive write access to `name` among every user of the
+    /// same underlying store (all processes sharing one database), so that
+    /// batched writers of one ref take turns instead of racing their CAS.
+    /// Advisory only: `cas_ref` stays the correctness guarantee, and nothing
+    /// stops a writer that does not take the lock. Hold the returned
+    /// [`RefLock`] across "read tip → compute → CAS", then
+    /// [`RefLock::release`] it. The default (stores that are never shared
+    /// between processes) returns an unheld lock immediately.
+    async fn lock_ref(&self, name: &str) -> Result<RefLock> {
+        validate_ref_name(name)?;
+        Ok(RefLock::unheld())
+    }
+}
+
+/// Releases a held [`RefLock`]; implemented by stores with real locks.
+#[async_trait]
+pub trait RefLockRelease: Send + Sync {
+    async fn release(self: Box<Self>) -> Result<()>;
+}
+
+/// Exclusive write access to one ref, from [`RefStore::lock_ref`]. Dropping
+/// it without [`RefLock::release`] also releases it, possibly later (e.g.
+/// when the store closes the connection that held it).
+pub struct RefLock(Option<Box<dyn RefLockRelease>>);
+
+impl RefLock {
+    /// A lock that excludes nobody (stores without cross-process locking).
+    pub fn unheld() -> Self {
+        Self(None)
+    }
+
+    pub fn held(release: impl RefLockRelease + 'static) -> Self {
+        Self(Some(Box::new(release)))
+    }
+
+    /// Whether this lock actually excludes other writers.
+    pub fn is_held(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub async fn release(self) -> Result<()> {
+        match self.0 {
+            Some(lock) => lock.release().await,
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::fmt::Debug for RefLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RefLock").field(&self.is_held()).finish()
+    }
 }
 
 /// Ref names: `/`-separated, each component non-empty, no `.`/`..`, no

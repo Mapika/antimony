@@ -24,8 +24,13 @@
 //! descendant of the tip fast-forwards; anything else is rebased (with its
 //! whole unlanded first-parent stack, up to [`MAX_STACK`] commits).
 //!
-//! Concurrent requests are queued per backend and ref (`queue`). A detached
-//! worker replays up to 64 of them in arrival order in memory (`replay`),
+//! Concurrent requests are queued per backend and ref (`queue`). Before each
+//! batch the worker takes the store's writer lock for the ref
+//! (`RefStore::lock_ref`: a Postgres advisory lock, so server replicas on
+//! one database take turns instead of racing their CAS; requests arriving
+//! during the wait join the batch) and releases it after the CAS and the
+//! landed-as mappings; when the lock is unavailable it lands with CAS only.
+//! The detached worker replays up to 64 queued requests in arrival order in memory (`replay`),
 //! writes the new objects and commit records, then publishes the final tip
 //! with one CAS. Conflicts do not advance the tentative tip; each reply
 //! carries the request's own resulting commit (or the tip it conflicted
@@ -46,6 +51,7 @@ use ant_store::Backend;
 use super::{OpError, OpResult};
 use crate::acl::Access;
 use queue::enqueue_checked;
+pub(crate) use queue::queue_stats;
 use replay::BatchState;
 use verify::{Verified, verify_land};
 

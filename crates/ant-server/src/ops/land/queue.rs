@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use ant_auth::Policy;
 use ant_core::ObjectId;
-use ant_store::{Backend, CasOutcome};
+use ant_store::{Backend, CasOutcome, RefLock};
 use tokio::sync::oneshot;
 
 use super::replay::BatchState;
@@ -50,20 +50,44 @@ impl Worker {
         // Coalesce callers that became runnable together, without a timer.
         tokio::task::yield_now().await;
         loop {
+            {
+                let mut queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+                match queues.get(&self.key) {
+                    None => return,
+                    Some(queue) if queue.is_empty() => {
+                        queues.remove(&self.key);
+                        self.active = false;
+                        return;
+                    }
+                    Some(_) => {}
+                }
+            }
+            // Take turns with other processes landing on this ref. Draining
+            // after the lock is granted lets requests that arrived during the
+            // wait join this batch. Without the lock (store error, timeout)
+            // the CAS below still keeps the ref correct.
+            let lock = match b.refs.lock_ref(&self.key.3).await {
+                Ok(lock) => lock,
+                Err(error) => {
+                    tracing::warn!(%error, ref_name = self.key.3, "ref lock unavailable; landing with CAS only");
+                    RefLock::unheld()
+                }
+            };
             let batch: Vec<_> = {
                 let mut queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(queue) = queues.get_mut(&self.key) else {
                     return;
                 };
-                if queue.is_empty() {
-                    queues.remove(&self.key);
-                    self.active = false;
-                    return;
-                }
                 let count = queue.len().min(MAX_BATCH);
                 queue.drain(..count).collect()
             };
-            match land_batch(&b, &self.key.3, &batch).await {
+            let result = land_batch(&b, &self.key.3, &batch).await;
+            // Mappings are durable before land_batch returns, so the next
+            // holder sees everything this batch published.
+            if let Err(error) = lock.release().await {
+                tracing::warn!(%error, ref_name = self.key.3, "releasing ref lock failed");
+            }
+            match result {
                 Ok(outcomes) => {
                     for (request, outcome) in batch.into_iter().zip(outcomes) {
                         let _ = request.reply.send(outcome);
@@ -78,6 +102,12 @@ impl Worker {
             }
         }
     }
+}
+
+/// Live land queues and the requests waiting in them (process-wide).
+pub(crate) fn queue_stats() -> (usize, usize) {
+    let queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+    (queues.len(), queues.values().map(VecDeque::len).sum())
 }
 
 #[cfg(test)]

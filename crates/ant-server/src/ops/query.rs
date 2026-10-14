@@ -19,7 +19,7 @@ use ant_core::{Commit, EntryMode, ObjectId, RepoPath, TreeEntry};
 use ant_store::{Backend, CommitNode, ObjectStoreExt, PathChange, StoreError, graph};
 use bytes::Bytes;
 
-use super::{OpError, OpResult, history};
+use super::{OpError, OpResult, cache, history};
 use crate::acl::Access;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,26 +164,48 @@ pub async fn log_as(
     let limit = if limit == 0 { usize::MAX } else { limit };
     let mut out = Vec::new();
     let mut next = Some(tip);
-    while let Some(id) = next {
+    // Chunked walk: one chain read, one changeset read (with a path) and one
+    // commit read per chunk instead of round trips per commit.
+    while let Some(from) = next {
         if out.len() >= limit {
             break;
         }
-        let n = node(b, id).await?;
-        next = n.parents.first().copied();
-        if let Some(path) = path {
-            let changes = b.meta.get_changeset(&id).await?.unwrap_or_default();
-            if !changes.iter().any(|c| {
-                c.path.starts_with(path)
-                    && (!restricted || access.is_none_or(|a| a.can_read(&c.path)))
-            }) {
-                continue;
+        let want = if path.is_some() { LOG_SCAN_CHUNK } else { limit - out.len() };
+        let chain = b.meta.first_parent_chain(from, None, want.min(LOG_SCAN_CHUNK)).await?;
+        let Some(last) = chain.last() else {
+            return Err(OpError::NotFound(format!("commit {from}")));
+        };
+        next = last.parents.first().copied();
+        let mut picked: Vec<&CommitNode> = match path {
+            None => chain.iter().collect(),
+            Some(path) => {
+                let ids: Vec<ObjectId> = chain.iter().map(|n| n.id).collect();
+                let sets = b.meta.get_changesets(&ids).await?;
+                chain
+                    .iter()
+                    .zip(sets)
+                    .filter(|(_, changes)| {
+                        changes.as_deref().unwrap_or_default().iter().any(|c| {
+                            c.path.starts_with(path)
+                                && (!restricted || access.is_none_or(|a| a.can_read(&c.path)))
+                        })
+                    })
+                    .map(|(n, _)| n)
+                    .collect()
             }
+        };
+        picked.truncate(limit - out.len());
+        let ids: Vec<ObjectId> = picked.iter().map(|n| n.id).collect();
+        // Through the commit cache: recent commits are read by every log.
+        for (n, commit) in picked.into_iter().zip(cache::read_commits(b, &ids).await?) {
+            out.push(LogEntry { id: n.id, generation: n.generation, commit: (*commit).clone() });
         }
-        let commit = b.objects.read_commit(&id).await?;
-        out.push(LogEntry { id, generation: n.generation, commit });
     }
     Ok(out)
 }
+
+/// First-parent commits read per round trip by the log scan.
+const LOG_SCAN_CHUNK: usize = 256;
 
 /// Serve `log --path` from the history index when `tip` is on an indexed
 /// ref's first-parent chain. Any failure falls back to the changeset scan.
@@ -194,9 +216,12 @@ async fn indexed_path_log(
     path: &RepoPath,
     limit: usize,
 ) -> Option<Vec<LogEntry>> {
-    let ref_name = history::indexed_ref_for(b, rev, tip).await.ok()??;
-    let generation = node(b, tip).await.ok()?.generation;
-    history::path_log(b, &ref_name, generation, path, limit).await.ok()
+    if let Some(ref_name) = history::indexed_ref_for(b, rev, tip).await.ok()? {
+        let generation = node(b, tip).await.ok()?.generation;
+        return history::path_log(b, &ref_name, generation, path, limit).await.ok();
+    }
+    // A busy ref's index trails its tip: scan just the unindexed commits.
+    history::lagging_path_log(b, rev, tip, path, limit).await.ok()?
 }
 
 pub async fn diff(b: &Backend, from: Option<&str>, to: &str) -> OpResult<Vec<PathChange>> {

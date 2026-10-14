@@ -2,6 +2,7 @@
 //! behavioral reference for the persistent stores.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use ant_core::{EncodedObject, ObjectId};
 use async_trait::async_trait;
@@ -11,8 +12,8 @@ use parking_lot::Mutex;
 use ant_core::RepoPath;
 
 use crate::{
-    CasOutcome, CommitNode, HistoryRow, MetaStore, ObjectStore, PathChange, RefStore, Result,
-    validate_ref_name,
+    CasOutcome, CommitNode, HistoryRow, MetaStore, ObjectStore, PathChange, RefLock,
+    RefLockRelease, RefStore, Result, validate_ref_name,
 };
 
 #[derive(Default)]
@@ -51,9 +52,39 @@ impl ObjectStore for MemoryObjectStore {
     }
 }
 
+/// Per-ref writer locks of a [`MemoryRefStore`]: in-process only, since a
+/// memory store is never shared between processes. Entries exist only while
+/// a lock is held or awaited.
+type RefLocks = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+
 #[derive(Default)]
 pub struct MemoryRefStore {
     refs: Mutex<BTreeMap<String, ObjectId>>,
+    locks: RefLocks,
+}
+
+struct MemoryRefLock {
+    locks: RefLocks,
+    name: String,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for MemoryRefLock {
+    fn drop(&mut self) {
+        let mut locks = self.locks.lock();
+        drop(self.guard.take());
+        // Waiters hold clones of the entry; remove it only when none remain.
+        if locks.get(&self.name).is_some_and(|m| Arc::strong_count(m) == 1) {
+            locks.remove(&self.name);
+        }
+    }
+}
+
+#[async_trait]
+impl RefLockRelease for MemoryRefLock {
+    async fn release(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -90,6 +121,16 @@ impl RefStore for MemoryRefStore {
             .take_while(|(k, _)| k.starts_with(prefix))
             .map(|(k, v)| (k.clone(), *v))
             .collect())
+    }
+
+    async fn lock_ref(&self, name: &str) -> Result<RefLock> {
+        validate_ref_name(name)?;
+        let mutex = self.locks.lock().entry(name.to_string()).or_default().clone();
+        let mut lock =
+            MemoryRefLock { locks: self.locks.clone(), name: name.to_string(), guard: None };
+        // `lock` owns the entry from here, so a cancelled wait still cleans up.
+        lock.guard = Some(mutex.lock_owned().await);
+        Ok(RefLock::held(lock))
     }
 }
 
@@ -220,6 +261,8 @@ mod tests {
     #[tokio::test]
     async fn memory_ref_store_conforms() {
         conformance::ref_store(Arc::new(MemoryRefStore::default())).await;
+        let s: Arc<dyn RefStore> = Arc::new(MemoryRefStore::default());
+        conformance::ref_lock(s.clone(), s).await;
     }
 
     #[tokio::test]

@@ -18,7 +18,14 @@
 //! - Pool: `sqlx::postgres::PgPoolOptions`, max 64 connections (raised from
 //!   16: with 64 concurrent agents the write path queued on the pool; fleet
 //!   bench 64 agents ~790 → ~1270 lands/s), with `search_path` set to the
-//!   schema on every connection (`after_connect`).
+//!   schema on every connection (`after_connect`). [`PgStore::connect_with`]
+//!   sets the limits ([`PgOptions`]) so several server processes fit under
+//!   the database's `max_connections`.
+//! - `lock_ref`: a session-level `pg_advisory_lock` on a hash of
+//!   (schema, ref) held by a connection of a separate, small, lazily opened
+//!   lock pool (holders never compete with the queries they lock for).
+//!   Waits are bounded by `lock_timeout`; an unreleased lock closes its
+//!   connection, which releases it server-side.
 
 use std::collections::{HashMap, HashSet};
 
@@ -38,6 +45,37 @@ const ZSTD_LEVEL: i32 = 3;
 #[derive(Clone)]
 pub struct PgStore {
     pool: sqlx::PgPool,
+    /// Connections that hold (or wait for) ref locks, separate from `pool`
+    /// so lock holders can never starve the work they lock for. `None`
+    /// (`lock_connections: 0`): no ref locks, for a single server process.
+    locks: Option<sqlx::PgPool>,
+    schema: String,
+}
+
+/// Connection limits of a [`PgStore`]. Every process connected to one
+/// database adds up to `max_connections + lock_connections` connections.
+#[derive(Debug, Clone)]
+pub struct PgOptions {
+    /// Query pool size.
+    pub max_connections: u32,
+    /// Ref-lock pool size: refs that can be locked (or awaited) at once by
+    /// this process. Connections close after a minute idle. 0 disables ref
+    /// locks (fine for a single server process: its land queue already
+    /// serializes each ref).
+    pub lock_connections: u32,
+    /// Longest wait for a ref lock before `lock_ref` fails (callers then
+    /// fall back to plain CAS).
+    pub lock_timeout: std::time::Duration,
+}
+
+impl Default for PgOptions {
+    fn default() -> Self {
+        Self {
+            max_connections: 64,
+            lock_connections: 8,
+            lock_timeout: std::time::Duration::from_secs(10),
+        }
+    }
 }
 
 /// Quote a SQL identifier, doubling any embedded double quotes.
@@ -129,6 +167,11 @@ impl<'a> ChangeRows<'a> {
 impl PgStore {
     /// Connect and ensure `schema` and all tables exist.
     pub async fn connect(url: &str, schema: &str) -> Result<Self> {
+        Self::connect_with(url, schema, &PgOptions::default()).await
+    }
+
+    /// [`Self::connect`] with explicit connection limits.
+    pub async fn connect_with(url: &str, schema: &str, options: &PgOptions) -> Result<Self> {
         use sqlx::Connection;
 
         let qs = quote_ident(schema);
@@ -217,7 +260,7 @@ impl PgStore {
 
         let search_path = format!("SET search_path TO {qs}");
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(64)
+            .max_connections(options.max_connections)
             .after_connect(move |conn, _meta| {
                 let stmt = search_path.clone();
                 Box::pin(async move {
@@ -229,7 +272,68 @@ impl PgStore {
             .await
             .map_err(be)?;
 
-        Ok(Self { pool })
+        // Lock waits are bounded server-side; a failed wait leaves the
+        // connection clean.
+        let lock_timeout = format!("SET lock_timeout = {}", options.lock_timeout.as_millis());
+        let locks = (options.lock_connections > 0)
+            .then(|| {
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(options.lock_connections)
+                    .min_connections(0)
+                    .idle_timeout(Some(std::time::Duration::from_secs(60)))
+                    .acquire_timeout(options.lock_timeout)
+                    .after_connect(move |conn, _meta| {
+                        let stmt = lock_timeout.clone();
+                        Box::pin(async move {
+                            sqlx::query(sqlx::AssertSqlSafe(stmt.as_str()))
+                                .execute(&mut *conn)
+                                .await?;
+                            Ok(())
+                        })
+                    })
+                    .connect_lazy(url)
+                    .map_err(be)
+            })
+            .transpose()?;
+
+        Ok(Self { pool, locks, schema: schema.to_owned() })
+    }
+}
+
+/// A held session-level advisory lock (`pg_advisory_lock`) and the
+/// connection holding it. Released with `pg_advisory_unlock`, after which the
+/// connection goes back to the lock pool; a lock dropped unreleased (or a
+/// failed release) closes its connection instead, which makes the server drop
+/// the lock, so a locked connection is never reused.
+struct PgRefLock {
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    key: String,
+}
+
+impl Drop for PgRefLock {
+    fn drop(&mut self) {
+        if let Some(conn) = &mut self.conn {
+            conn.close_on_drop();
+        }
+    }
+}
+
+#[async_trait]
+impl crate::RefLockRelease for PgRefLock {
+    async fn release(mut self: Box<Self>) -> Result<()> {
+        let Some(conn) = self.conn.as_mut() else { return Ok(()) };
+        let released: bool =
+            sqlx::query_scalar("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+                .bind(&self.key)
+                .fetch_one(&mut **conn)
+                .await
+                .map_err(be)?;
+        if !released {
+            return Err(StoreError::InvalidArgument(format!("ref lock {} was not held", self.key)));
+        }
+        // Unlocked: return the connection to the pool (Drop sees None).
+        drop(self.conn.take());
+        Ok(())
     }
 }
 
@@ -382,6 +486,26 @@ impl RefStore for PgStore {
         }
         let actual = read_ref(&self.pool, name).await?;
         Ok(CasOutcome::Mismatch { actual })
+    }
+
+    /// A session-level advisory lock keyed by a 64-bit hash of (schema, ref):
+    /// advisory locks are database-wide, so the schema keeps independent
+    /// repositories apart (a hash collision only serializes two refs).
+    async fn lock_ref(&self, name: &str) -> Result<crate::RefLock> {
+        validate_ref_name(name)?;
+        let Some(locks) = &self.locks else { return Ok(crate::RefLock::unheld()) };
+        let conn = locks.acquire().await.map_err(be)?;
+        // Owned by the guard before the lock query: an error or cancellation
+        // mid-wait closes the connection rather than pooling it.
+        let mut lock = PgRefLock { conn: Some(conn), key: format!("ant/{}/{name}", self.schema) };
+        if let Some(conn) = lock.conn.as_mut() {
+            sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+                .bind(&lock.key)
+                .execute(&mut **conn)
+                .await
+                .map_err(be)?;
+        }
+        Ok(crate::RefLock::held(lock))
     }
 
     async fn list_refs(&self, prefix: &str) -> Result<Vec<(String, ObjectId)>> {
@@ -899,6 +1023,48 @@ mod tests {
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_ref_store_conforms() {
         conformance::ref_store(Arc::new(fresh().await)).await;
+    }
+
+    /// Two stores on one schema stand for two server processes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_ref_lock_conforms() {
+        let url = std::env::var("ANT_TEST_PG_URL")
+            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let schema = format!("t_{}", rand::random::<u64>());
+        let opts =
+            PgOptions { lock_timeout: std::time::Duration::from_secs(120), ..PgOptions::default() };
+        let a = PgStore::connect_with(&url, &schema, &opts).await.unwrap();
+        let b = PgStore::connect_with(&url, &schema, &opts).await.unwrap();
+        conformance::ref_lock(Arc::new(a), Arc::new(b)).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_ref_locks_are_per_schema_and_time_out() {
+        let url = std::env::var("ANT_TEST_PG_URL")
+            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let opts = PgOptions {
+            lock_timeout: std::time::Duration::from_millis(300),
+            ..PgOptions::default()
+        };
+        let schema = format!("t_{}", rand::random::<u64>());
+        let a = PgStore::connect_with(&url, &schema, &opts).await.unwrap();
+        let b = PgStore::connect_with(&url, &schema, &opts).await.unwrap();
+        let other = fresh().await;
+        let held = a.lock_ref("main").await.unwrap();
+        // Same ref name in another schema (repository) is independent.
+        other.lock_ref("main").await.unwrap().release().await.unwrap();
+        // A wait longer than lock_timeout fails instead of hanging.
+        assert!(matches!(b.lock_ref("main").await, Err(StoreError::Backend(_))));
+        held.release().await.unwrap();
+        b.lock_ref("main").await.unwrap().release().await.unwrap();
+        // lock_connections 0: no locks at all.
+        let opts = PgOptions { lock_connections: 0, ..PgOptions::default() };
+        let c = PgStore::connect_with(&url, &schema, &opts).await.unwrap();
+        let held = a.lock_ref("main").await.unwrap();
+        assert!(!c.lock_ref("main").await.unwrap().is_held());
+        held.release().await.unwrap();
     }
 
     #[tokio::test]

@@ -6,7 +6,10 @@
 //! - `ops::query::log` with a path uses `path_log` when the rev is on an
 //!   indexed ref's first-parent chain (rev resolved from a ref name, or a
 //!   commit id that `is_first_parent_ancestor` of that ref's watermark), else
-//!   it scans recorded changesets.
+//!   it scans recorded changesets. When the watermark merely trails the tip
+//!   (a busy ref between catch-ups), `lagging_path_log` scans only the
+//!   unindexed commits and takes the rest from the index; without this every
+//!   path log on a ref under constant landing scanned its whole history.
 //! - Exposed as the `Blame` RPC and `ant blame <rev>:<path>` (output per
 //!   line: `<commit-id> <line-no>\t<line>`).
 //!
@@ -58,6 +61,8 @@ const BLAME_KIND: &str = "blame/v1";
 const BLAME_CHUNK: usize = 64;
 /// Cap on LCS table cells for one line diff; larger middles count as replaced.
 const MAX_LCS_CELLS: usize = 4_000_000;
+/// Unindexed commits `lagging_path_log` scans before giving up on the index.
+const MAX_LAG: usize = 4096;
 /// Refs examined when looking for an index that covers a commit id.
 const MAX_REFS_PROBED: usize = 16;
 
@@ -107,12 +112,22 @@ pub async fn is_first_parent_ancestor(
     if ancestor == descendant {
         return Ok(true);
     }
-    let Some(target) = b.meta.get_commits(&[ancestor]).await?.pop().flatten() else {
+    let [Some(target), Some(desc)] =
+        <[_; 2]>::try_from(b.meta.get_commits(&[ancestor, descendant]).await?)
+            .unwrap_or([None, None])
+    else {
         return Ok(false);
     };
+    // Generations strictly decrease along a chain: a newer `ancestor` (the
+    // common case of a tip ahead of a lagging watermark) needs no walk, and
+    // otherwise the walk is at most the generation gap long.
+    if desc.generation <= target.generation {
+        return Ok(false);
+    }
+    let gap = usize::try_from(desc.generation - target.generation).unwrap_or(usize::MAX);
     let mut from = descendant;
     loop {
-        let chunk = b.meta.first_parent_chain(from, Some(ancestor), CHUNK).await?;
+        let chunk = b.meta.first_parent_chain(from, Some(ancestor), CHUNK.min(gap)).await?;
         let Some(last) = chunk.last() else { return Ok(false) };
         match last.parents.first() {
             Some(p) if *p == ancestor => return Ok(true),
@@ -185,6 +200,11 @@ type CatchUpKey = (usize, String);
 /// Running background catch-ups; the flag means "run once more when done".
 static CATCH_UPS: LazyLock<Mutex<HashMap<CatchUpKey, bool>>> = LazyLock::new(Default::default);
 
+/// Number of (backend, ref) catch-ups currently running in the background.
+pub(crate) fn running_catch_ups() -> usize {
+    CATCH_UPS.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
 /// Fire-and-forget `catch_up`, coalesced per (backend, ref): if one is already
 /// running it is told to run once more instead of starting a second. Errors
 /// are logged; queries fall back to changeset scans.
@@ -248,6 +268,11 @@ pub async fn path_log(
 ) -> OpResult<Vec<LogEntry>> {
     let limit = if limit == 0 { usize::MAX } else { limit };
     let hits = b.meta.query_history(ref_name, path, max_generation, limit).await?;
+    log_entries(b, hits).await
+}
+
+/// Read the commit objects of `(generation, id)` hits in one round trip.
+async fn log_entries(b: &Backend, hits: Vec<(u64, ObjectId)>) -> OpResult<Vec<LogEntry>> {
     let ids: Vec<ObjectId> = hits.iter().map(|(_, id)| *id).collect();
     let objects = b.objects.get_many(&ids).await?;
     hits.into_iter()
@@ -257,6 +282,53 @@ pub async fn path_log(
             Ok(LogEntry { id, generation, commit: Commit::decode(o.body())? })
         })
         .collect()
+}
+
+/// `log --path` for a `tip` the index has not caught up with yet: the usual
+/// case on a busy ref, where the watermark trails the tip by the commits
+/// landed since the last catch-up. When `rev` names a ref whose watermark is
+/// on `tip`'s first-parent chain at most [`MAX_LAG`] commits back, the
+/// unindexed commits are scanned (one chain read and one changeset read) and
+/// the rest comes from the index. `None` when that does not apply.
+pub async fn lagging_path_log(
+    b: &Backend,
+    rev: &str,
+    tip: ObjectId,
+    path: &RepoPath,
+    limit: usize,
+) -> OpResult<Option<Vec<LogEntry>>> {
+    let base = rev.rsplit_once('~').map_or(rev, |(base, _)| base);
+    if base.parse::<ObjectId>().is_ok() || ant_store::validate_ref_name(base).is_err() {
+        return Ok(None);
+    }
+    let Some(wm) = b.meta.history_watermark(base).await? else { return Ok(None) };
+    let chain = b.meta.first_parent_chain(tip, Some(wm), MAX_LAG).await?;
+    if chain.last().and_then(|n| n.parents.first()) != Some(&wm) {
+        return Ok(None);
+    }
+    let Some(wm_node) = b.meta.get_commits(&[wm]).await?.pop().flatten() else {
+        return Ok(None);
+    };
+    let limit = if limit == 0 { usize::MAX } else { limit };
+    let ids: Vec<ObjectId> = chain.iter().map(|n| n.id).collect();
+    let sets = b.meta.get_changesets(&ids).await?;
+    let mut hits = Vec::new();
+    for (node, set) in chain.iter().zip(sets) {
+        if hits.len() >= limit {
+            break;
+        }
+        let set = set.ok_or_else(|| OpError::NotFound(format!("changeset of {}", node.id)))?;
+        if set.iter().any(|c| c.path.starts_with(path)) {
+            hits.push((node.generation, node.id));
+        }
+    }
+    if hits.len() < limit {
+        // Bounded by the watermark's generation: rows a concurrent catch-up
+        // adds for the commits just scanned are not returned twice.
+        let rest = limit - hits.len();
+        hits.extend(b.meta.query_history(base, path, wm_node.generation, rest).await?);
+    }
+    log_entries(b, hits).await.map(Some)
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +703,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(path_log(&b, "main", u64::MAX, &a, 0).await.unwrap().len(), before.len());
+    }
+
+    #[tokio::test]
+    async fn first_parent_ancestry() {
+        let b = Backend::in_memory();
+        let c0 = commit(&b, None, vec![write("f", "0")]).await.unwrap();
+        land(&b, "main", c0).await.unwrap();
+        let mut chain = vec![c0];
+        for i in 1..6 {
+            chain.push(landed(&b, chain[i - 1], vec![write("f", &i.to_string())]).await);
+        }
+        let side = commit(&b, Some(chain[2]), vec![write("g", "x")]).await.unwrap();
+        for (i, a) in chain.iter().enumerate() {
+            for (j, d) in chain.iter().enumerate() {
+                assert_eq!(is_first_parent_ancestor(&b, *a, *d).await.unwrap(), i <= j, "{i} {j}");
+            }
+        }
+        assert!(is_first_parent_ancestor(&b, chain[2], side).await.unwrap());
+        assert!(!is_first_parent_ancestor(&b, chain[3], side).await.unwrap());
+        assert!(!is_first_parent_ancestor(&b, side, chain[5]).await.unwrap());
+        let unknown = ObjectId([9; 32]);
+        assert!(!is_first_parent_ancestor(&b, unknown, chain[5]).await.unwrap());
+        assert!(!is_first_parent_ancestor(&b, chain[0], unknown).await.unwrap());
+    }
+
+    /// A watermark trailing the tip (normal on a busy ref) still uses the
+    /// index for everything before it and scans only the lag.
+    #[tokio::test]
+    async fn lagging_index_scans_only_the_lag() {
+        let b = Backend::in_memory();
+        let c0 = commit(&b, None, vec![write("a/x", "init")]).await.unwrap();
+        land(&b, "main", c0).await.unwrap();
+        let mut tip = c0;
+        for i in 0..6 {
+            let path = if i % 2 == 0 { "a/x" } else { "b/y" };
+            tip = landed(&b, tip, vec![write(path, &i.to_string())]).await;
+        }
+        catch_up(&b, "main").await.unwrap();
+        let wm = b.meta.history_watermark("main").await.unwrap();
+        for i in 6..10 {
+            let path = if i % 2 == 0 { "a/x" } else { "b/y" };
+            tip = landed(&b, tip, vec![write(path, &i.to_string())]).await;
+        }
+        let a = RepoPath::new("a").unwrap();
+        // The scan's answer (bare commit ids never use the index).
+        let scan = query::log(&b, &tip.to_hex(), Some(&a), 0).await.unwrap();
+        assert_eq!(scan.len(), 6);
+        let lagging = lagging_path_log(&b, "main", tip, &a, 0).await.unwrap().unwrap();
+        assert_eq!(lagging, scan);
+        assert_eq!(query::log(&b, "main", Some(&a), 0).await.unwrap(), scan);
+        for limit in 1..=6 {
+            let got = lagging_path_log(&b, "main", tip, &a, limit).await.unwrap().unwrap();
+            assert_eq!(got, scan[..limit], "limit {limit}");
+        }
+        // Not applicable: unknown ref, or no watermark on the chain.
+        assert_eq!(lagging_path_log(&b, "other", tip, &a, 0).await.unwrap(), None);
+        assert_eq!(lagging_path_log(&b, &tip.to_hex(), tip, &a, 0).await.unwrap(), None);
+        // The older part really comes from the index: a poisoned row (c0
+        // claimed again under `b`) shows up; the scanned lag does not repeat.
+        let wm_gen = b.meta.get_commits(&[wm.unwrap()]).await.unwrap()[0].clone().unwrap();
+        let bpath = RepoPath::new("b").unwrap();
+        b.meta
+            .index_history(
+                "main",
+                &[HistoryRow { path: bpath.clone(), generation: wm_gen.generation, commit: c0 }],
+            )
+            .await
+            .unwrap();
+        let got = lagging_path_log(&b, "main", tip, &bpath, 0).await.unwrap().unwrap();
+        assert!(got.iter().any(|e| e.id == c0), "index rows are used below the watermark");
     }
 
     #[tokio::test]
