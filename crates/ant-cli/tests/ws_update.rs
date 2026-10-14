@@ -3,15 +3,13 @@
 //! comment in `src/main.rs`). The sparse variant runs in the fast tier; the
 //! lazy one needs FUSE.
 
-#[allow(dead_code)] // PG_URL is for the Postgres-backed tests.
 mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Output;
 
-use common::{KillOnDrop, free_ports};
+use common::{KillOnDrop, ant, spawn_memory_server, wait_until};
 
 const A: &str = "a1\na2\na3\na4\na5\n";
 const B: &str = "b1\nb2\nb3\n";
@@ -54,15 +52,8 @@ impl Run {
 
 impl Env {
     fn run(&self, dir: Option<&Path>, args: &[&str]) -> Run {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ant"));
-        cmd.args(args)
-            .env("ANT_SERVER", format!("http://127.0.0.1:{}", self.grpc))
-            .env("ANT_CACHE", &self.cache)
-            .env("ANT_AUTHOR_NAME", "Agent")
-            .env("ANT_AUTHOR_EMAIL", "agent@example.com")
-            .env_remove("ANT_TOKEN")
-            .env_remove("ANT_HTTP")
-            .stdin(Stdio::null());
+        let mut cmd = ant(self.grpc, &self.cache);
+        cmd.args(args);
         if let Some(d) = dir {
             cmd.current_dir(d);
         }
@@ -98,26 +89,9 @@ impl Env {
 
 fn start() -> (tempfile::TempDir, Env, KillOnDrop) {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (grpc, http) = free_ports();
-    let server = KillOnDrop(
-        Command::new(env!("CARGO_BIN_EXE_ant"))
-            .args(["serve", "--memory", "--grpc-listen"])
-            .arg(format!("127.0.0.1:{grpc}"))
-            .arg("--http-listen")
-            .arg(format!("127.0.0.1:{http}"))
-            .env_remove("ANT_POLICY")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawning ant serve"),
-    );
+    let (grpc, server) = spawn_memory_server();
     let env = Env { grpc, cache: tmp.path().join("cache") };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while env.run(None, &["ref", "list"]).code() != Some(0) {
-        assert!(Instant::now() < deadline, "server not ready");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_until(|| env.run(None, &["ref", "list"]).code() == Some(0));
     seed(grpc);
     (tmp, env, server)
 }

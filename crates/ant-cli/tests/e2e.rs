@@ -10,9 +10,9 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use common::{KillOnDrop, PG_URL, free_ports};
+use common::{KillOnDrop, PG_URL, free_ports, unique_suffix};
 
 const S3_ENDPOINT: &str = "http://localhost:9009";
 const S3_BUCKET: &str = "ant-e2e";
@@ -229,8 +229,7 @@ fn cli_lazy_end_to_end() {
 }
 
 fn run_end_to_end(lazy: bool) {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
-    let uniq = format!("{}_{}", std::process::id(), nanos);
+    let uniq = unique_suffix();
     let schema = format!("e2e_{uniq}");
     // Declared first, so it drops last (after the server) and also on panic.
     let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
@@ -600,8 +599,7 @@ fn check_bytes(ctx: &Ctx, what: &str, actual: &[u8], expected: &[u8]) {
 #[test]
 #[ignore = "needs docker compose up -d"]
 fn cli_schema_versions() {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
-    let schema = format!("e2e_schema_{}_{nanos}", std::process::id());
+    let schema = format!("e2e_schema_{}", unique_suffix());
     let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
     let tmp = tempfile::tempdir().expect("tempdir");
     let ctx = Ctx {

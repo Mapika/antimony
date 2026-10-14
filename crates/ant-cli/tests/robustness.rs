@@ -2,15 +2,14 @@
 //! `ant ref init`, and recovering a lazy workspace whose FUSE daemon was
 //! killed (`ant ws remount`; needs FUSE, so ignored in the fast tier).
 
-#[allow(dead_code)] // PG_URL is for the Postgres-backed tests.
 mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use common::{KillOnDrop, free_ports};
+use common::{KillOnDrop, ant, spawn_memory_server, wait_until};
 
 struct Env {
     grpc: u16,
@@ -28,17 +27,7 @@ fn stderr(o: &Output) -> String {
 
 impl Env {
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_ant"))
-            .args(args)
-            .env("ANT_SERVER", format!("http://127.0.0.1:{}", self.grpc))
-            .env("ANT_CACHE", &self.cache)
-            .env("ANT_AUTHOR_NAME", "Agent")
-            .env("ANT_AUTHOR_EMAIL", "agent@example.com")
-            .env_remove("ANT_TOKEN")
-            .env_remove("ANT_HTTP")
-            .stdin(Stdio::null())
-            .output()
-            .expect("spawning ant")
+        ant(self.grpc, &self.cache).args(args).output().expect("spawning ant")
     }
 
     fn ok(&self, args: &[&str]) -> String {
@@ -51,26 +40,9 @@ impl Env {
 /// An empty in-memory server.
 fn start() -> Env {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (grpc, http) = free_ports();
-    let server = KillOnDrop(
-        Command::new(env!("CARGO_BIN_EXE_ant"))
-            .args(["serve", "--memory", "--grpc-listen"])
-            .arg(format!("127.0.0.1:{grpc}"))
-            .arg("--http-listen")
-            .arg(format!("127.0.0.1:{http}"))
-            .env_remove("ANT_POLICY")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawning ant serve"),
-    );
+    let (grpc, server) = spawn_memory_server();
     let env = Env { grpc, cache: tmp.path().join("cache"), _server: server, _tmp: tmp };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !env.run(&["ref", "list"]).status.success() {
-        assert!(Instant::now() < deadline, "server not ready");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_until(|| env.run(&["ref", "list"]).status.success());
     env
 }
 
