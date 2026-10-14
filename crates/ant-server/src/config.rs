@@ -28,7 +28,8 @@ pub struct StoreArgs {
     #[arg(long, env = "ANT_PG_MAX_CONNECTIONS", default_value_t = 64)]
     pg_max_connections: u32,
 
-    /// Postgres connections for per-ref land locks (refs landed on at once).
+    /// Postgres connections for per-ref land locks (refs landed on at once;
+    /// 0 disables the locks, fine for a single server process).
     #[arg(long, env = "ANT_PG_LOCK_CONNECTIONS", default_value_t = 8)]
     pg_lock_connections: u32,
 

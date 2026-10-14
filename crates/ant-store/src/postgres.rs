@@ -46,8 +46,9 @@ const ZSTD_LEVEL: i32 = 3;
 pub struct PgStore {
     pool: sqlx::PgPool,
     /// Connections that hold (or wait for) ref locks, separate from `pool`
-    /// so lock holders can never starve the work they lock for.
-    locks: sqlx::PgPool,
+    /// so lock holders can never starve the work they lock for. `None`
+    /// (`lock_connections: 0`): no ref locks, for a single server process.
+    locks: Option<sqlx::PgPool>,
     schema: String,
 }
 
@@ -58,7 +59,9 @@ pub struct PgOptions {
     /// Query pool size.
     pub max_connections: u32,
     /// Ref-lock pool size: refs that can be locked (or awaited) at once by
-    /// this process. Connections close after a minute idle.
+    /// this process. Connections close after a minute idle. 0 disables ref
+    /// locks (fine for a single server process: its land queue already
+    /// serializes each ref).
     pub lock_connections: u32,
     /// Longest wait for a ref lock before `lock_ref` fails (callers then
     /// fall back to plain CAS).
@@ -272,20 +275,26 @@ impl PgStore {
         // Lock waits are bounded server-side; a failed wait leaves the
         // connection clean.
         let lock_timeout = format!("SET lock_timeout = {}", options.lock_timeout.as_millis());
-        let locks = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(options.lock_connections.max(1))
-            .min_connections(0)
-            .idle_timeout(Some(std::time::Duration::from_secs(60)))
-            .acquire_timeout(options.lock_timeout)
-            .after_connect(move |conn, _meta| {
-                let stmt = lock_timeout.clone();
-                Box::pin(async move {
-                    sqlx::query(sqlx::AssertSqlSafe(stmt.as_str())).execute(&mut *conn).await?;
-                    Ok(())
-                })
+        let locks = (options.lock_connections > 0)
+            .then(|| {
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(options.lock_connections)
+                    .min_connections(0)
+                    .idle_timeout(Some(std::time::Duration::from_secs(60)))
+                    .acquire_timeout(options.lock_timeout)
+                    .after_connect(move |conn, _meta| {
+                        let stmt = lock_timeout.clone();
+                        Box::pin(async move {
+                            sqlx::query(sqlx::AssertSqlSafe(stmt.as_str()))
+                                .execute(&mut *conn)
+                                .await?;
+                            Ok(())
+                        })
+                    })
+                    .connect_lazy(url)
+                    .map_err(be)
             })
-            .connect_lazy(url)
-            .map_err(be)?;
+            .transpose()?;
 
         Ok(Self { pool, locks, schema: schema.to_owned() })
     }
@@ -484,7 +493,8 @@ impl RefStore for PgStore {
     /// repositories apart (a hash collision only serializes two refs).
     async fn lock_ref(&self, name: &str) -> Result<crate::RefLock> {
         validate_ref_name(name)?;
-        let conn = self.locks.acquire().await.map_err(be)?;
+        let Some(locks) = &self.locks else { return Ok(crate::RefLock::unheld()) };
+        let conn = locks.acquire().await.map_err(be)?;
         // Owned by the guard before the lock query: an error or cancellation
         // mid-wait closes the connection rather than pooling it.
         let mut lock = PgRefLock { conn: Some(conn), key: format!("ant/{}/{name}", self.schema) };
@@ -1047,6 +1057,12 @@ mod tests {
         assert!(matches!(b.lock_ref("main").await, Err(StoreError::Backend(_))));
         held.release().await.unwrap();
         b.lock_ref("main").await.unwrap().release().await.unwrap();
+        // lock_connections 0: no locks at all.
+        let opts = PgOptions { lock_connections: 0, ..PgOptions::default() };
+        let c = PgStore::connect_with(&url, &schema, &opts).await.unwrap();
+        let held = a.lock_ref("main").await.unwrap();
+        assert!(!c.lock_ref("main").await.unwrap().is_held());
+        held.release().await.unwrap();
     }
 
     #[tokio::test]

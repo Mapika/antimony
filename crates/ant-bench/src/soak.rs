@@ -88,7 +88,8 @@ pub struct Args {
     /// Postgres connections all replicas together may open.
     #[arg(long, default_value_t = 400)]
     pub pg_budget: u32,
-    /// Ref-lock connections per replica (part of the budget).
+    /// Ref-lock connections per replica (part of the budget; 0 = no ref
+    /// locks, CAS only, for comparison).
     #[arg(long, default_value_t = 4)]
     pub pg_lock_connections: u32,
     /// S3 endpoint for large objects (optional).
@@ -541,7 +542,7 @@ pub async fn run(args: Args) -> Result<i32> {
         bail!("--pg-schema must start with soak_ (it is dropped afterwards)");
     }
     let per_replica = args.pg_budget / args.replicas as u32;
-    let lock_conns = args.pg_lock_connections.max(1);
+    let lock_conns = args.pg_lock_connections;
     let max_conns = per_replica.saturating_sub(lock_conns).min(64);
     if max_conns < 4 {
         bail!("--pg-budget {} is too small for {} replicas", args.pg_budget, args.replicas);
