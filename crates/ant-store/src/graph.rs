@@ -515,7 +515,6 @@ pub async fn first_parent_range_end(
 /// Helper for tests and tools: build a tree from `(path, content)` pairs of
 /// regular files, storing all blobs and trees. Returns the root tree id.
 pub async fn build_tree(objects: &dyn ObjectStore, files: &[(&str, &[u8])]) -> Result<ObjectId> {
-    use std::collections::BTreeMap;
     #[derive(Default)]
     struct Dir {
         files: BTreeMap<String, ObjectId>,
@@ -527,7 +526,7 @@ pub async fn build_tree(objects: &dyn ObjectStore, files: &[(&str, &[u8])]) -> R
         let p = RepoPath::new(*path)?;
         let (parent, name) =
             p.split_last().ok_or_else(|| StoreError::InvalidArgument("empty path".into()))?;
-        let obj = EncodedObject::new(ant_core::ObjectKind::Blob, content);
+        let obj = EncodedObject::new(ObjectKind::Blob, content);
         let mut d = &mut root;
         for c in parent.components() {
             d = d.dirs.entry(c.to_string()).or_default();
@@ -617,39 +616,11 @@ mod tests {
         );
     }
 
-    /// Counts `get_many` calls and the ids they asked for.
-    struct Counting {
-        inner: crate::memory::MemoryObjectStore,
-        calls: std::sync::atomic::AtomicUsize,
-        ids: std::sync::atomic::AtomicUsize,
-    }
-
-    #[async_trait]
-    impl ObjectStore for Counting {
-        async fn get_many(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
-            use std::sync::atomic::Ordering::Relaxed;
-            self.calls.fetch_add(1, Relaxed);
-            self.ids.fetch_add(ids.len(), Relaxed);
-            self.inner.get_many(ids).await
-        }
-        async fn put_many(&self, objects: &[EncodedObject]) -> Result<()> {
-            self.inner.put_many(objects).await
-        }
-        async fn has_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {
-            self.inner.has_many(ids).await
-        }
-    }
-
     /// Many changed directories cost one batched read per depth, and only
     /// the differing trees are read (each distinct tree once).
     #[tokio::test]
     async fn diff_reads_one_batch_per_depth() {
-        use std::sync::atomic::Ordering::Relaxed;
-        let o = Counting {
-            inner: Default::default(),
-            calls: Default::default(),
-            ids: Default::default(),
-        };
+        let o = crate::testing::CountingStore::default();
         let paths: Vec<String> =
             (0..256).map(|i| format!("agents/{:02}/{i}/f.txt", i % 16)).collect();
         // Distinct content per file: no two agent directories share a tree.
@@ -671,11 +642,11 @@ mod tests {
         let old_t2 = build_tree(&o, &with_file).await.unwrap();
         new.push(("p/q", b"nested"));
         let new_t = build_tree(&o, &new).await.unwrap();
-        o.calls.store(0, Relaxed);
+        o.reset();
 
         let d = diff_trees(&o, Some(old_t), Some(new_t)).await.unwrap();
         // root, agents, shards, agent dirs (`p` adds one level below root).
-        assert_eq!(o.calls.load(Relaxed), 4);
+        assert_eq!(o.calls(), 4);
         let mut want: Vec<(String, ChangeKind)> =
             paths[..100].iter().map(|p| (p.clone(), ChangeKind::Modified)).collect();
         want.push((paths[200].clone(), ChangeKind::Deleted));
@@ -688,7 +659,7 @@ mod tests {
         // Differing trees only: 2 roots, 2 `agents`, 2 × 16 shards (all
         // touched), 2 × 100 changed agent dirs, the emptied (so removed)
         // agent dir's old side, 1 new shard, 1 new agent dir, and `p`.
-        assert_eq!(o.ids.load(Relaxed), 2 + 2 + 32 + 200 + 1 + 1 + 1 + 1);
+        assert_eq!(o.ids(), 2 + 2 + 32 + 200 + 1 + 1 + 1 + 1);
 
         let d = diff_trees(&o, Some(old_t2), Some(new_t)).await.unwrap();
         let p: Vec<_> = d.iter().filter(|c| c.path.as_str().starts_with('p')).collect();

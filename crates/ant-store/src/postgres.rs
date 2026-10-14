@@ -11,16 +11,17 @@
 //!   NOTHING`, `DELETE ... WHERE target=$2`) and reports
 //!   `Mismatch { actual }` by re-reading when 0 rows were affected.
 //! - Log sequence numbers come from an identity column (gaps are fine).
-//!   `put_commit` inserts the node row and changeset in one atomic statement
-//!   (a single round trip); for an existing commit it returns the existing
-//!   seq.
-//! - Changesets: one `changes` row per path, read back in written order.
+//!   `put_commits` records nodes, log rows and changesets in one atomic
+//!   statement (a single round trip; large batches store their changesets
+//!   just before it); an existing commit keeps its seq.
+//! - Changesets: one `changesets` row per commit (`changeset_codec`).
+//!   Commits recorded by earlier versions keep one `changes` row per path,
+//!   read when a commit has no `changesets` row.
 //! - Objects: `bytea` keyed by the 32-byte id, zstd-compressed.
 //! - `get_many`/`has_many` are one round trip each (`WHERE id = ANY($1)`).
-//! - Pool: `sqlx::postgres::PgPoolOptions`, max 64 connections (raised from
-//!   16: with 64 concurrent agents the write path queued on the pool; fleet
-//!   bench 64 agents ~790 → ~1270 lands/s), with `search_path` set to the
-//!   schema on every connection (`after_connect`). [`PgStore::connect_with`]
+//! - Pool: `sqlx::postgres::PgPoolOptions` (default 64 connections; with
+//!   fewer, 64 concurrent agents queue on it), with `search_path` set to
+//!   the schema on every connection (`after_connect`). [`PgStore::connect_with`]
 //!   sets the limits ([`PgOptions`]) so several server processes fit under
 //!   the database's `max_connections`.
 //! - `lock_ref`: a session-level `pg_advisory_lock` on a hash of
@@ -60,12 +61,48 @@ use crate::{
 
 type PgQuery<'q> = sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>;
 
-/// Compression level for stored object bodies (matches the S3 store).
-const ZSTD_LEVEL: i32 = 3;
+/// Readers' clause hiding object or packed-index rows of table alias `$t`
+/// that a collection run condemned while they are older than its cutoff
+/// (`gc`, *Read your writes*).
+macro_rules! not_condemned_old {
+    ($t:literal) => {
+        concat!(
+            " AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = ",
+            $t,
+            ".id AND ",
+            $t,
+            ".written_at < (SELECT coalesce(max(cutoff), 'infinity') FROM gc_state))"
+        )
+    };
+}
 
-/// Environment switch for bulk loads: object inserts commit without waiting for
-/// the WAL flush (see [`PgStore::with_async_object_commit`]).
-pub const BULK_ENV: &str = "ANT_PG_BULK";
+/// Readers' clause hiding commit records (table alias `$t`) that a
+/// collection run condemned.
+macro_rules! not_condemned {
+    ($t:literal) => {
+        concat!(" AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = ", $t, ".id)")
+    };
+}
+
+/// A reader's statement: `$sql`, followed by the clause `$hide` while
+/// readers hide condemned ids ([`gc::hiding`]).
+macro_rules! live {
+    ($sql:literal, $($hide:tt)*) => {
+        if gc::hiding() { concat!($sql, $($hide)*) } else { $sql }
+    };
+}
+
+/// Environment switch for bulk loads, read at connect time: object inserts
+/// commit with `synchronous_commit = off`.
+///
+/// Objects are immutable and content-addressed, so a crash can at worst
+/// lose objects whose insert returned a moment ago; Postgres flushes WAL in
+/// order, so any later synchronous commit (the commit records and ref
+/// updates that reference those objects) makes them durable first. A writer
+/// that records commits only after storing their objects (as the importer
+/// and the server do) therefore keeps its guarantees while bulk loads skip
+/// one fsync per batch.
+const BULK_ENV: &str = "ANT_PG_BULK";
 
 /// Location of a packed object: `len` bytes at `off` of pack `pack`.
 #[derive(Debug, Clone, Copy)]
@@ -76,9 +113,6 @@ pub(crate) struct IndexEntry {
     pub len: u32,
 }
 
-/// Uncompressed bytes of objects hashed and compressed per blocking task.
-const COMPRESS_CHUNK_BYTES: usize = 512 * 1024;
-
 #[derive(Clone)]
 pub struct PgStore {
     pool: sqlx::PgPool,
@@ -87,6 +121,7 @@ pub struct PgStore {
     /// (`lock_connections: 0`): no ref locks, for a single server process.
     locks: Option<sqlx::PgPool>,
     schema: String,
+    /// Object inserts commit without waiting for the WAL flush ([`BULK_ENV`]).
     async_object_commit: bool,
     /// Drops the schema with the last clone of the store (scratch stores only).
     _cleanup: Option<std::sync::Arc<SchemaGuard>>,
@@ -114,22 +149,11 @@ impl Drop for SchemaGuard {
     fn drop(&mut self) {
         let (url, schema) = (self.url.clone(), self.schema.clone());
         let work = move || -> std::result::Result<(), String> {
-            use sqlx::Connection;
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())?;
-            rt.block_on(async {
-                let mut conn =
-                    sqlx::PgConnection::connect(&url).await.map_err(|e| e.to_string())?;
-                let stmt = format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(&schema));
-                sqlx::query(sqlx::AssertSqlSafe(stmt))
-                    .execute(&mut conn)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let _ = conn.close().await;
-                Ok(())
-            })
+            rt.block_on(PgStore::drop_schema(&url, &schema)).map_err(|e| e.to_string())
         };
         match std::thread::Builder::new().name("drop-schema".into()).spawn(work) {
             Ok(h) => {
@@ -211,6 +235,24 @@ fn change_side(
     }
 }
 
+/// A `commits` row (`id, tree, parents, generation, committer_time`).
+fn commit_node(row: &sqlx::postgres::PgRow) -> Result<CommitNode> {
+    let parents: Vec<u8> = row.try_get("parents").map_err(be)?;
+    let generation: i64 = row.try_get("generation").map_err(be)?;
+    Ok(CommitNode {
+        id: object_id_col(row, "id")?,
+        tree: object_id_col(row, "tree")?,
+        parents: decode_ids(&parents)?,
+        generation: generation as u64,
+        committer_time: row.try_get("committer_time").map_err(be)?,
+    })
+}
+
+/// A `log` row (`commit_id, seq`).
+fn log_entry(row: &sqlx::postgres::PgRow) -> Result<(ObjectId, u64)> {
+    Ok((object_id_col(row, "commit_id")?, row.try_get::<i64, _>("seq").map_err(be)? as u64))
+}
+
 fn decode_ids(bytes: &[u8]) -> Result<Vec<ObjectId>> {
     bytes.chunks_exact(ObjectId::LEN).map(|c| Ok(ObjectId::from_bytes(c)?)).collect()
 }
@@ -237,21 +279,6 @@ impl PoolStats {
 }
 
 impl PgStore {
-    /// Commit object inserts with `synchronous_commit = off` (also enabled by the
-    /// `ANT_PG_BULK` environment variable at connect time).
-    ///
-    /// Objects are immutable and content-addressed, so a crash can at worst
-    /// lose objects whose insert returned a moment ago; Postgres flushes WAL in
-    /// order, so any later synchronous commit (the commit records and ref
-    /// updates that reference those objects) makes them durable first. A
-    /// writer that records commits only after storing their objects (as the
-    /// importer and the server do) therefore keeps its guarantees while bulk
-    /// loads skip one fsync per batch.
-    pub fn with_async_object_commit(mut self, on: bool) -> Self {
-        self.async_object_commit = on;
-        self
-    }
-
     /// Store changeset blobs ahead of the commit rows that make them reachable.
     /// They are the bulkiest part of recording commits, so large batches are
     /// inserted by several statements at once. A crash in between leaves
@@ -279,7 +306,7 @@ impl PgStore {
 
     /// Run one write statement and return its rows. `deferred`: commit it
     /// with `synchronous_commit = off` (acknowledged before the WAL flush;
-    /// see [`crate::deferred_durability`] and [`Self::with_async_object_commit`]).
+    /// see [`crate::deferred_durability`] and [`BULK_ENV`]).
     async fn write(
         &self,
         query: PgQuery<'_>,
@@ -367,13 +394,10 @@ impl PgStore {
         &self,
         ids: &[ObjectId],
     ) -> Result<HashMap<ObjectId, IndexEntry>> {
-        let sql = if gc::hiding() {
-            "SELECT id, pack, off, len FROM object_index x WHERE id = ANY($1) \
-             AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = x.id \
-                 AND x.written_at < (SELECT coalesce(max(cutoff), 'infinity') FROM gc_state))"
-        } else {
-            "SELECT id, pack, off, len FROM object_index WHERE id = ANY($1)"
-        };
+        let sql = live!(
+            "SELECT id, pack, off, len FROM object_index x WHERE id = ANY($1)",
+            not_condemned_old!("x")
+        );
         let rows =
             sqlx::query(sql).bind(ids_to_vecs(ids)).fetch_all(&self.pool).await.map_err(be)?;
         let mut out = HashMap::with_capacity(rows.len());
@@ -453,6 +477,19 @@ impl PgStore {
         let applied = migrate::migrate(&mut conn, schema).await?;
         conn.close().await.map_err(be)?;
         Ok(applied)
+    }
+
+    /// Drop `schema` with everything in it (`DROP SCHEMA ... CASCADE`; a
+    /// missing schema is fine). For tools and tests that create throw-away
+    /// schemas; see also [`SchemaGuard`].
+    pub async fn drop_schema(url: &str, schema: &str) -> Result<()> {
+        use sqlx::Connection;
+        let mut conn = sqlx::PgConnection::connect(url).await.map_err(be)?;
+        let stmt = format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(schema));
+        sqlx::query(sqlx::AssertSqlSafe(stmt)).execute(&mut conn).await.map_err(be)?;
+        // Dropped; a failed goodbye changes nothing.
+        let _ = conn.close().await;
+        Ok(())
     }
 
     /// Connect, creating `schema` or migrating it to [`SCHEMA_VERSION`].
@@ -676,13 +713,8 @@ impl ObjectStore for PgStore {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = if gc::hiding() {
-            "SELECT id, data FROM objects o WHERE id = ANY($1) \
-             AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = o.id \
-                 AND o.written_at < (SELECT coalesce(max(cutoff), 'infinity') FROM gc_state))"
-        } else {
-            "SELECT id, data FROM objects WHERE id = ANY($1)"
-        };
+        let sql =
+            live!("SELECT id, data FROM objects o WHERE id = ANY($1)", not_condemned_old!("o"));
         let rows =
             sqlx::query(sql).bind(ids_to_vecs(ids)).fetch_all(&self.pool).await.map_err(be)?;
         let raw: Vec<(ObjectId, Vec<u8>)> = rows
@@ -710,24 +742,11 @@ impl ObjectStore for PgStore {
             return Ok(());
         }
         // Hash and compress on the blocking pool, in parallel chunks.
-        let mut chunks: Vec<Vec<EncodedObject>> = Vec::new();
-        let (mut current, mut bytes) = (Vec::new(), 0usize);
-        for o in objects {
-            bytes += o.as_bytes().len();
-            current.push(o.clone());
-            if bytes >= COMPRESS_CHUNK_BYTES {
-                chunks.push(std::mem::take(&mut current));
-                bytes = 0;
-            }
-        }
-        if !current.is_empty() {
-            chunks.push(current);
-        }
-        let tasks = chunks.into_iter().map(|chunk| {
+        let tasks = crate::compress_chunks(objects).into_iter().map(|chunk| {
             tokio::task::spawn_blocking(move || -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
                 // One compression context per chunk: creating one per object
                 // costs more than compressing a small object.
-                let mut zstd = zstd::bulk::Compressor::new(ZSTD_LEVEL).map_err(be)?;
+                let mut zstd = zstd::bulk::Compressor::new(crate::ZSTD_LEVEL).map_err(be)?;
                 chunk
                     .into_iter()
                     .map(|raw| {
@@ -780,13 +799,7 @@ impl ObjectStore for PgStore {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = if gc::hiding() {
-            "SELECT id FROM objects o WHERE id = ANY($1) \
-             AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = o.id \
-                 AND o.written_at < (SELECT coalesce(max(cutoff), 'infinity') FROM gc_state))"
-        } else {
-            "SELECT id FROM objects WHERE id = ANY($1)"
-        };
+        let sql = live!("SELECT id FROM objects o WHERE id = ANY($1)", not_condemned_old!("o"));
         let rows =
             sqlx::query(sql).bind(ids_to_vecs(ids)).fetch_all(&self.pool).await.map_err(be)?;
         let present: HashSet<ObjectId> =
@@ -1093,29 +1106,24 @@ impl MetaStore for PgStore {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let stop = stop.map(|s| s.as_bytes().to_vec());
         // A condemned commit ends the chain, like an unrecorded one.
-        let sql = if gc::hiding() {
-            "WITH RECURSIVE chain(id, tree, parents, generation, committer_time, depth) AS ( \
-                 SELECT id, tree, parents, generation, committer_time, 1::bigint \
-                   FROM commits c WHERE id = $1 AND id IS DISTINCT FROM $2::bytea AND $3 > 0 \
-                    AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = c.id) \
-                 UNION ALL \
-                 SELECT c.id, c.tree, c.parents, c.generation, c.committer_time, ch.depth + 1 \
-                   FROM chain ch JOIN commits c ON c.id = substring(ch.parents from 1 for 32) \
-                  WHERE ch.depth < $3 \
-                    AND c.id IS DISTINCT FROM $2::bytea \
-                    AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = c.id)) \
-             SELECT id, tree, parents, generation, committer_time FROM chain ORDER BY depth"
-        } else {
-            "WITH RECURSIVE chain(id, tree, parents, generation, committer_time, depth) AS ( \
-                 SELECT id, tree, parents, generation, committer_time, 1::bigint \
-                   FROM commits WHERE id = $1 AND id IS DISTINCT FROM $2::bytea AND $3 > 0 \
-                 UNION ALL \
-                 SELECT c.id, c.tree, c.parents, c.generation, c.committer_time, ch.depth + 1 \
-                   FROM chain ch JOIN commits c ON c.id = substring(ch.parents from 1 for 32) \
-                  WHERE ch.depth < $3 \
-                    AND c.id IS DISTINCT FROM $2::bytea) \
-             SELECT id, tree, parents, generation, committer_time FROM chain ORDER BY depth"
-        };
+        macro_rules! chain {
+            ($($hide:tt)*) => {
+                concat!(
+                    "WITH RECURSIVE chain(id, tree, parents, generation, committer_time, depth) AS ( \
+                         SELECT id, tree, parents, generation, committer_time, 1::bigint \
+                           FROM commits c WHERE id = $1 AND id IS DISTINCT FROM $2::bytea AND $3 > 0",
+                    $($hide)*,
+                    " UNION ALL \
+                         SELECT c.id, c.tree, c.parents, c.generation, c.committer_time, ch.depth + 1 \
+                           FROM chain ch JOIN commits c ON c.id = substring(ch.parents from 1 for 32) \
+                          WHERE ch.depth < $3 \
+                            AND c.id IS DISTINCT FROM $2::bytea",
+                    $($hide)*,
+                    ") SELECT id, tree, parents, generation, committer_time FROM chain ORDER BY depth"
+                )
+            };
+        }
+        let sql = if gc::hiding() { chain!(not_condemned!("c")) } else { chain!("") };
         let rows = sqlx::query(sql)
             .bind(tip.as_bytes().as_slice())
             .bind(stop)
@@ -1123,35 +1131,19 @@ impl MetaStore for PgStore {
             .fetch_all(&self.pool)
             .await
             .map_err(be)?;
-        rows.iter()
-            .map(|r| {
-                let parents: Vec<u8> = r.try_get("parents").map_err(be)?;
-                let generation: i64 = r.try_get("generation").map_err(be)?;
-                Ok(CommitNode {
-                    id: object_id_col(r, "id")?,
-                    tree: object_id_col(r, "tree")?,
-                    parents: decode_ids(&parents)?,
-                    generation: generation as u64,
-                    committer_time: r.try_get("committer_time").map_err(be)?,
-                })
-            })
-            .collect()
+        rows.iter().map(commit_node).collect()
     }
 
     async fn get_changesets(&self, ids: &[ObjectId]) -> Result<Vec<Option<Vec<PathChange>>>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = if gc::hiding() {
+        let sql = live!(
             "SELECT c.id AS id, cs.data AS data \
              FROM commits c LEFT JOIN changesets cs ON cs.commit_id = c.id \
-             WHERE c.id = ANY($1) \
-               AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = c.id)"
-        } else {
-            "SELECT c.id AS id, cs.data AS data \
-             FROM commits c LEFT JOIN changesets cs ON cs.commit_id = c.id \
-             WHERE c.id = ANY($1)"
-        };
+             WHERE c.id = ANY($1)",
+            not_condemned!("c")
+        );
         let rows =
             sqlx::query(sql).bind(ids_to_vecs(ids)).fetch_all(&self.pool).await.map_err(be)?;
         let mut map: HashMap<ObjectId, Vec<PathChange>> = HashMap::with_capacity(rows.len());
@@ -1240,13 +1232,8 @@ impl MetaStore for PgStore {
         .bind(if inline { &changesets[..] } else { &[] })
         .bind(inline);
         let result = self.write(query, crate::durability_deferred()).await?;
-        let mut seqs: HashMap<ObjectId, u64> = HashMap::with_capacity(ids.len());
-        for r in &result {
-            seqs.insert(
-                object_id_col(r, "commit_id")?,
-                r.try_get::<i64, _>("seq").map_err(be)? as u64,
-            );
-        }
+        let mut seqs: HashMap<ObjectId, u64> =
+            result.iter().map(log_entry).collect::<Result<_>>()?;
         // A commit recorded concurrently by another transaction is invisible
         // to this statement's snapshot; read its seq with a fresh one.
         let late: Vec<&[u8]> = ids
@@ -1261,10 +1248,8 @@ impl MetaStore for PgStore {
                 .await
                 .map_err(be)?;
             for r in &rows {
-                seqs.insert(
-                    object_id_col(r, "commit_id")?,
-                    r.try_get::<i64, _>("seq").map_err(be)? as u64,
-                );
+                let (id, seq) = log_entry(r)?;
+                seqs.insert(id, seq);
             }
         }
         commits
@@ -1281,30 +1266,17 @@ impl MetaStore for PgStore {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = if gc::hiding() {
+        let sql = live!(
             "SELECT id, tree, parents, generation, committer_time FROM commits c \
-             WHERE id = ANY($1) AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = c.id)"
-        } else {
-            "SELECT id, tree, parents, generation, committer_time FROM commits WHERE id = ANY($1)"
-        };
+             WHERE id = ANY($1)",
+            not_condemned!("c")
+        );
         let rows =
             sqlx::query(sql).bind(ids_to_vecs(ids)).fetch_all(&self.pool).await.map_err(be)?;
         let mut map: HashMap<ObjectId, CommitNode> = HashMap::with_capacity(rows.len());
         for r in &rows {
-            let id = object_id_col(r, "id")?;
-            let parents_bytes: Vec<u8> = r.try_get("parents").map_err(be)?;
-            let generation: i64 = r.try_get("generation").map_err(be)?;
-            let committer_time: i64 = r.try_get("committer_time").map_err(be)?;
-            map.insert(
-                id,
-                CommitNode {
-                    id,
-                    tree: object_id_col(r, "tree")?,
-                    parents: decode_ids(&parents_bytes)?,
-                    generation: generation as u64,
-                    committer_time,
-                },
-            );
+            let node = commit_node(r)?;
+            map.insert(node.id, node);
         }
         Ok(ids.iter().map(|id| map.get(id).cloned()).collect())
     }
@@ -1394,8 +1366,7 @@ mod tests {
 
     /// Fresh store in a unique schema. Requires `docker compose up -d`.
     async fn fresh() -> PgStore {
-        let url = std::env::var("ANT_TEST_PG_URL")
-            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let url = crate::testing::pg_url();
         let schema = format!("t_{}", rand::random::<u64>());
         PgStore::connect_scratch(&url, &schema)
             .await
@@ -1418,8 +1389,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_ref_lock_conforms() {
-        let url = std::env::var("ANT_TEST_PG_URL")
-            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let url = crate::testing::pg_url();
         let schema = format!("t_{}", rand::random::<u64>());
         let opts =
             PgOptions { lock_timeout: std::time::Duration::from_secs(120), ..PgOptions::default() };
@@ -1431,8 +1401,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_ref_locks_are_per_schema_and_time_out() {
-        let url = std::env::var("ANT_TEST_PG_URL")
-            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let url = crate::testing::pg_url();
         let opts = PgOptions {
             lock_timeout: std::time::Duration::from_millis(300),
             ..PgOptions::default()
@@ -1497,8 +1466,7 @@ mod tests {
         assert_eq!(s.get_derived("k", b"b").await.unwrap().as_deref(), Some(&b"2"[..]));
         lock.release().await.unwrap();
         // Without a lock session there is nothing to publish with.
-        let url = std::env::var("ANT_TEST_PG_URL")
-            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let url = crate::testing::pg_url();
         let opts = PgOptions { lock_connections: 0, ..PgOptions::default() };
         let unlocked = PgStore::connect_with(&url, &s.schema, &opts).await.unwrap();
         let mut lock = unlocked.lock_ref("main").await.unwrap();
@@ -1623,8 +1591,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_scratch_schema_is_dropped() {
-        let url = std::env::var("ANT_TEST_PG_URL")
-            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let url = crate::testing::pg_url();
         let schema = format!("t_{}", rand::random::<u64>());
         let store = PgStore::connect_scratch(&url, &schema).await.unwrap();
         let clone = store.clone();
@@ -1646,8 +1613,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_connect_is_idempotent() {
-        let url = std::env::var("ANT_TEST_PG_URL")
-            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let url = crate::testing::pg_url();
         let schema = format!("t_{}", rand::random::<u64>());
         let a = PgStore::connect_scratch(&url, &schema).await.unwrap();
         a.cas_ref("main", None, Some(ObjectId([1; 32]))).await.unwrap();

@@ -43,7 +43,6 @@ use ant_store::s3::S3Config;
 use anyhow::{Context as _, Result, anyhow, bail};
 use rand::Rng;
 use rand::rngs::StdRng;
-use sqlx::Connection as _;
 use tonic::transport::Channel;
 
 use crate::json::J;
@@ -663,7 +662,7 @@ pub async fn run(args: Args) -> Result<i32> {
 
     if !args.keep {
         let schema = &plan.schema;
-        if let Err(e) = drop_schema(&args.pg_url, schema).await {
+        if let Err(e) = PgStore::drop_schema(&args.pg_url, schema).await {
             eprintln!("warning: dropping schema {schema}: {e:#}");
         }
         if let Some(cfg) = &plan.s3 {
@@ -676,14 +675,6 @@ pub async fn run(args: Args) -> Result<i32> {
         }
     }
     result
-}
-
-async fn drop_schema(url: &str, schema: &str) -> Result<()> {
-    let mut conn = sqlx::PgConnection::connect(url).await?;
-    let stmt = format!("DROP SCHEMA IF EXISTS \"{}\" CASCADE", schema.replace('"', "\"\""));
-    sqlx::query(sqlx::AssertSqlSafe(stmt)).execute(&mut conn).await?;
-    conn.close().await?;
-    Ok(())
 }
 
 /// Run totals over all windows plus the operations finishing after the last.

@@ -1,7 +1,8 @@
 //! Cleanup helper for soak runs: deletes everything a run wrote to S3.
 //!
-//! The client is built exactly like `ant_store::s3::S3ObjectStore::connect`
-//! (static credentials, region, endpoint, path-style addressing).
+//! The client uses the store's SDK configuration (`S3Config::sdk_config`:
+//! static credentials, region, endpoint, path-style addressing) with the
+//! SDK's own timeouts and retries.
 
 use anyhow::{Context, Result, bail};
 use aws_sdk_s3::error::ProvideErrorMetadata;
@@ -12,29 +13,11 @@ use ant_store::s3::S3Config;
 /// Maximum keys per `DeleteObjects` request (S3 limit).
 const DELETE_BATCH: usize = 1000;
 
-fn client(cfg: &S3Config) -> aws_sdk_s3::Client {
-    let credentials = aws_sdk_s3::config::Credentials::new(
-        &cfg.access_key,
-        &cfg.secret_key,
-        None,
-        None,
-        "ant-static",
-    );
-    let conf = aws_sdk_s3::Config::builder()
-        .behavior_version_latest()
-        .region(aws_sdk_s3::config::Region::new(cfg.region.clone()))
-        .endpoint_url(&cfg.endpoint)
-        .credentials_provider(credentials)
-        .force_path_style(true)
-        .build();
-    aws_sdk_s3::Client::from_conf(conf)
-}
-
 /// Delete every object under `cfg.prefix` in `cfg.bucket` (every object in
 /// the bucket when the prefix is empty) and return how many were deleted. A
 /// missing bucket counts as empty; the bucket itself is kept.
 pub async fn delete_prefix(cfg: &S3Config) -> Result<u64> {
-    let client = client(cfg);
+    let client = aws_sdk_s3::Client::from_conf(cfg.sdk_config().build());
     // Trailing slash so that prefix "run" does not also match sibling "run2/...".
     let prefix = match cfg.prefix.trim_end_matches('/') {
         "" => String::new(),

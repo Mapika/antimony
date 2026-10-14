@@ -17,6 +17,7 @@ pub mod postgres;
 pub mod s3;
 #[cfg(test)]
 mod s3_fake;
+pub mod testing;
 pub mod tiered;
 
 use std::sync::Arc;
@@ -84,6 +85,33 @@ pub fn compat_hint<'a>(
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// zstd level of stored object bodies (Postgres rows, S3 objects and packs).
+pub(crate) const ZSTD_LEVEL: i32 = 3;
+/// Bodies larger than this are (de)compressed and hashed on the blocking
+/// pool instead of an async worker thread.
+pub(crate) const BLOCKING_THRESHOLD: usize = 64 * 1024;
+/// Uncompressed bytes of objects hashed and compressed per blocking task.
+const COMPRESS_CHUNK_BYTES: usize = 512 * 1024;
+
+/// `objects` cut into runs of about [`COMPRESS_CHUNK_BYTES`], one per
+/// blocking task that hashes and compresses them.
+pub(crate) fn compress_chunks(objects: &[EncodedObject]) -> Vec<Vec<EncodedObject>> {
+    let mut chunks: Vec<Vec<EncodedObject>> = Vec::new();
+    let (mut current, mut bytes) = (Vec::new(), 0usize);
+    for o in objects {
+        bytes += o.as_bytes().len();
+        current.push(o.clone());
+        if bytes >= COMPRESS_CHUNK_BYTES {
+            chunks.push(std::mem::take(&mut current));
+            bytes = 0;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
 
 // ---------------------------------------------------------------------------
 // ObjectStore
@@ -299,7 +327,7 @@ pub async fn deferred_durability<F: std::future::Future>(fut: F) -> F::Output {
 }
 
 /// Whether the current task runs inside [`deferred_durability`].
-pub fn durability_deferred() -> bool {
+pub(crate) fn durability_deferred() -> bool {
     DEFERRED.try_with(|_| ()).is_ok()
 }
 

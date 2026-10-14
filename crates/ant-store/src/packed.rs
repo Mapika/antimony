@@ -30,17 +30,12 @@ use tokio::sync::Semaphore;
 
 use crate::postgres::{IndexEntry, PgStore};
 use crate::s3::S3ObjectStore;
-use crate::{ObjectStore, Result, StoreError};
+use crate::{BLOCKING_THRESHOLD, ObjectStore, Result, StoreError, ZSTD_LEVEL};
 
-/// Target size of one pack, before compression.
+/// Target size of one pack, after compression.
 const PACK_BYTES: usize = 24 * 1024 * 1024;
-/// Uncompressed bytes hashed and compressed per blocking task.
-const COMPRESS_CHUNK_BYTES: usize = 512 * 1024;
 /// Concurrent S3 requests per call.
 const FANOUT: usize = 32;
-const ZSTD_LEVEL: i32 = 3;
-/// Bodies larger than this are decompressed on the blocking pool.
-const BLOCKING_THRESHOLD: usize = 64 * 1024;
 /// Objects of one pack at most this far apart are read with one ranged GET
 /// (the gap is downloaded and dropped)...
 const COALESCE_GAP: u64 = 256 * 1024;
@@ -131,6 +126,7 @@ impl PackedS3Store {
 }
 
 /// One pack under construction.
+#[derive(Default)]
 struct Pack {
     body: Vec<u8>,
     entries: Vec<(ObjectId, u64, u32)>,
@@ -178,20 +174,7 @@ impl ObjectStore for PackedS3Store {
             return Ok(());
         }
         // Hash and compress in parallel on the blocking pool.
-        let mut chunks: Vec<Vec<EncodedObject>> = Vec::new();
-        let (mut current, mut bytes) = (Vec::new(), 0usize);
-        for o in objects {
-            bytes += o.as_bytes().len();
-            current.push(o.clone());
-            if bytes >= COMPRESS_CHUNK_BYTES {
-                chunks.push(std::mem::take(&mut current));
-                bytes = 0;
-            }
-        }
-        if !current.is_empty() {
-            chunks.push(current);
-        }
-        let tasks = chunks.into_iter().map(|chunk| {
+        let tasks = crate::compress_chunks(objects).into_iter().map(|chunk| {
             tokio::task::spawn_blocking(move || -> Result<Vec<(ObjectId, Vec<u8>)>> {
                 chunk
                     .into_iter()
@@ -204,22 +187,23 @@ impl ObjectStore for PackedS3Store {
             })
         });
         let mut seen: HashSet<ObjectId> = HashSet::with_capacity(objects.len());
-        let mut packs: Vec<Pack> = vec![Pack { body: Vec::new(), entries: Vec::new() }];
+        let mut packs: Vec<Pack> = Vec::new();
+        let mut cur = Pack::default();
         for part in futures::future::try_join_all(tasks).await.map_err(StoreError::backend)? {
             for (id, z) in part? {
                 if !seen.insert(id) {
                     continue;
                 }
-                let last = packs.last_mut().expect("at least one pack");
-                if last.body.len() + z.len() > PACK_BYTES && !last.body.is_empty() {
-                    packs.push(Pack { body: Vec::new(), entries: Vec::new() });
+                if cur.body.len() + z.len() > PACK_BYTES && !cur.body.is_empty() {
+                    packs.push(std::mem::take(&mut cur));
                 }
-                let cur = packs.last_mut().expect("at least one pack");
                 cur.entries.push((id, cur.body.len() as u64, z.len() as u32));
                 cur.body.extend_from_slice(&z);
             }
         }
-        packs.retain(|p| !p.body.is_empty());
+        if !cur.body.is_empty() {
+            packs.push(cur);
+        }
 
         // Packs first, then the index rows that point into them.
         let mut entries: Vec<IndexEntry> = Vec::new();
@@ -271,8 +255,7 @@ mod tests {
     use ant_core::ObjectKind;
 
     async fn fresh() -> (PackedS3Store, S3ObjectStore) {
-        let url = std::env::var("ANT_TEST_PG_URL")
-            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let url = crate::testing::pg_url();
         let pg =
             PgStore::connect_scratch(&url, &format!("t_{}", rand::random::<u64>())).await.unwrap();
         let cfg = S3Config::for_tests(&format!("p{}", rand::random::<u64>()));
@@ -370,8 +353,7 @@ mod tests {
         attempts: u32,
     ) -> (PackedS3Store, crate::s3_fake::Fake) {
         use crate::s3_fake::{config, fast_timeouts, spawn};
-        let url = std::env::var("ANT_TEST_PG_URL")
-            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let url = crate::testing::pg_url();
         let pg =
             PgStore::connect_scratch(&url, &format!("t_{}", rand::random::<u64>())).await.unwrap();
         let fake = spawn(script).await;

@@ -36,7 +36,7 @@ use aws_sdk_s3::{
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 
-use crate::{ObjectStore, Result, StoreError};
+use crate::{BLOCKING_THRESHOLD, ObjectStore, Result, StoreError, ZSTD_LEVEL};
 
 /// Maximum number of concurrent S3 requests per batch call.
 const FANOUT: usize = 64;
@@ -46,11 +46,6 @@ const UNKNOWN_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 type HttpResponse = aws_sdk_s3::config::http::HttpResponse;
-/// zstd level for stored object bodies.
-const ZSTD_LEVEL: i32 = 3;
-/// Bodies larger than this are compressed/decompressed/hashed on the blocking
-/// pool instead of an async worker thread.
-const BLOCKING_THRESHOLD: usize = 64 * 1024;
 
 /// Timeout and retry policy of the S3 client (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +78,7 @@ impl Default for S3Timeouts {
 
 impl S3Timeouts {
     /// Time one attempt moving `bytes` bytes may take.
-    pub fn attempt_for(&self, bytes: u64) -> Duration {
+    fn attempt_for(&self, bytes: u64) -> Duration {
         self.attempt + Duration::from_secs_f64(bytes as f64 / self.min_throughput.max(1) as f64)
     }
 }
@@ -100,6 +95,27 @@ pub struct S3Config {
 }
 
 impl S3Config {
+    /// An SDK client configuration for this endpoint, bucket region and
+    /// credentials (static credentials, path-style addressing, which
+    /// SeaweedFS and MinIO need). [`S3ObjectStore::connect`] adds its
+    /// timeouts and retry policy; tools that talk to the same store (e.g.
+    /// to clean up after a benchmark) build their client from it as is.
+    pub fn sdk_config(&self) -> aws_sdk_s3::config::Builder {
+        let credentials = aws_sdk_s3::config::Credentials::new(
+            &self.access_key,
+            &self.secret_key,
+            None,
+            None,
+            "ant-static",
+        );
+        aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new(self.region.clone()))
+            .endpoint_url(&self.endpoint)
+            .credentials_provider(credentials)
+            .force_path_style(true)
+    }
+
     /// Local S3 (SeaweedFS) from docker-compose.yml, overridable via `ANT_TEST_S3_*`.
     pub fn for_tests(prefix: &str) -> Self {
         let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
@@ -178,29 +194,14 @@ fn backoff(n: u32) -> Duration {
     cap.mul_f64(0.5 + 0.5 * rand::random::<f64>())
 }
 
-fn hex_string(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 fn corrupt(msg: impl Into<String>) -> StoreError {
     StoreError::Backend(msg.into().into())
 }
 
 impl S3ObjectStore {
     pub async fn connect(cfg: &S3Config) -> Result<Self> {
-        let credentials = aws_sdk_s3::config::Credentials::new(
-            &cfg.access_key,
-            &cfg.secret_key,
-            None,
-            None,
-            "ant-static",
-        );
-        let conf = aws_sdk_s3::Config::builder()
-            .behavior_version_latest()
-            .region(aws_sdk_s3::config::Region::new(cfg.region.clone()))
-            .endpoint_url(&cfg.endpoint)
-            .credentials_provider(credentials)
-            .force_path_style(true)
+        let conf = cfg
+            .sdk_config()
             // Timeouts and retries are ours (`retrying`), around the body read.
             .retry_config(RetryConfig::disabled())
             .timeout_config(TimeoutConfig::builder().connect_timeout(cfg.timeouts.connect).build())
@@ -311,7 +312,7 @@ impl S3ObjectStore {
 
     /// Key of pack `pack` (see [`crate::packed`]).
     pub(crate) fn pack_key(&self, pack: &[u8; 16]) -> String {
-        format!("{}{}", self.packs_prefix(), hex_string(pack))
+        format!("{}{}", self.packs_prefix(), hex::encode(pack))
     }
 
     /// Prefix of every pack key.
@@ -496,13 +497,7 @@ impl S3ObjectStore {
             return Ok(None);
         };
         let compressed_len = compressed.len();
-        let decode = move || -> Result<EncodedObject> {
-            let raw = zstd::stream::decode_all(&compressed[..]).map_err(StoreError::backend)?;
-            let obj = EncodedObject::from_bytes(Bytes::from(raw))
-                .map_err(|e| corrupt(format!("object {id}: {e}")))?;
-            obj.verify(&id).map_err(|e| corrupt(format!("object {id}: {e}")))?;
-            Ok(obj)
-        };
+        let decode = move || Self::decode_object(id, &compressed);
         // Large bodies are CPU-heavy to decompress and hash; keep them off the
         // async worker threads.
         let obj = if compressed_len > BLOCKING_THRESHOLD {

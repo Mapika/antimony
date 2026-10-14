@@ -431,10 +431,7 @@ mod tests {
     use crate::RefStore;
     use ant_core::ObjectId;
 
-    fn url() -> String {
-        std::env::var("ANT_TEST_PG_URL")
-            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into())
-    }
+    use crate::testing::pg_url as url;
 
     async fn sql(stmt: &str) {
         let mut conn = PgConnection::connect(&url()).await.unwrap();

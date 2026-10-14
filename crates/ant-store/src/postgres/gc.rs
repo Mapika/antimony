@@ -370,6 +370,11 @@ fn secs(d: Duration) -> f64 {
     d.as_secs_f64()
 }
 
+/// The raw `id` column of `rows`.
+fn id_set(rows: &[PgRow]) -> Result<HashSet<Vec<u8>>> {
+    rows.iter().map(|r| r.try_get::<Vec<u8>, _>("id").map_err(be)).collect()
+}
+
 /// Child ids of an encoded tree body, with their mark kinds. Parsed without
 /// the canonical-order checks of `Tree::decode`: the collector must see the
 /// children of whatever is stored. Gitlinks (other repositories) are skipped.
@@ -446,39 +451,37 @@ impl PgStore {
         if settled.len() >= ids.len() {
             return Ok(HashSet::new());
         }
-        let settled: HashSet<Vec<u8>> = settled
-            .iter()
-            .map(|r| r.try_get::<Vec<u8>, _>("id"))
-            .collect::<std::result::Result<_, _>>()
-            .map_err(be)?;
+        let settled = id_set(settled)?;
         let existing: Vec<&[u8]> =
             ids.iter().copied().filter(|id| !settled.contains(*id)).collect();
         if existing.is_empty() {
             return Ok(HashSet::new());
         }
+        // Refresh old rows; return those and the young ones (the ids that exist).
+        macro_rules! refresh {
+            ($table:literal) => {
+                concat!(
+                    "WITH old AS (SELECT id FROM ",
+                    $table,
+                    " WHERE id = ANY($1) \
+                         AND written_at < now() - make_interval(secs => $2) \
+                         ORDER BY id FOR UPDATE), \
+                     upd AS (UPDATE ",
+                    $table,
+                    " o SET written_at = now() FROM old \
+                         WHERE o.id = old.id RETURNING o.id) \
+                     SELECT id FROM upd \
+                     UNION ALL \
+                     SELECT id FROM ",
+                    $table,
+                    " WHERE id = ANY($1) \
+                       AND written_at >= now() - make_interval(secs => $2)"
+                )
+            };
+        }
         let sql = match table {
-            Table::Objects => {
-                "WITH old AS (SELECT id FROM objects WHERE id = ANY($1) \
-                         AND written_at < now() - make_interval(secs => $2) \
-                         ORDER BY id FOR UPDATE), \
-                 upd AS (UPDATE objects o SET written_at = now() FROM old \
-                         WHERE o.id = old.id RETURNING o.id) \
-                 SELECT id FROM upd \
-                 UNION ALL \
-                 SELECT id FROM objects WHERE id = ANY($1) \
-                   AND written_at >= now() - make_interval(secs => $2)"
-            }
-            Table::ObjectIndex => {
-                "WITH old AS (SELECT id FROM object_index WHERE id = ANY($1) \
-                         AND written_at < now() - make_interval(secs => $2) \
-                         ORDER BY id FOR UPDATE), \
-                 upd AS (UPDATE object_index o SET written_at = now() FROM old \
-                         WHERE o.id = old.id RETURNING o.id) \
-                 SELECT id FROM upd \
-                 UNION ALL \
-                 SELECT id FROM object_index WHERE id = ANY($1) \
-                   AND written_at >= now() - make_interval(secs => $2)"
-            }
+            Table::Objects => refresh!("objects"),
+            Table::ObjectIndex => refresh!("object_index"),
         };
         // Refresh and take-back commit together, so no reader ever sees the
         // refreshed row still condemned. The take-back is a statement of its
@@ -494,11 +497,7 @@ impl PgStore {
             .fetch_all(&mut *tx)
             .await
             .map_err(be)?;
-        let present: HashSet<Vec<u8>> = present
-            .iter()
-            .map(|r| r.try_get::<Vec<u8>, _>("id"))
-            .collect::<std::result::Result<_, _>>()
-            .map_err(be)?;
+        let present = id_set(&present)?;
         self.count_write();
         sqlx::query("DELETE FROM gc_condemned WHERE id = ANY($1)")
             .bind(&existing)
@@ -667,15 +666,21 @@ impl Run<'_> {
 
     // -- marking ----------------------------------------------------------
 
+    /// CTE taking the ids newly marked by `ins` back from `gc_condemned`
+    /// (none in a dry run).
+    fn uncondemn(&self) -> &'static str {
+        if self.opts.dry_run {
+            ""
+        } else {
+            ", unc AS (DELETE FROM gc_condemned g USING ins WHERE g.id = ins.id)"
+        }
+    }
+
     /// Insert the ids `source` selects into the mark set (taking newly
     /// marked ids back from `gc_condemned` in a real run). Returns how many
     /// were new.
     async fn add_roots(&mut self, source: &str, since: f64) -> Result<u64> {
-        let uncondemn = if self.opts.dry_run {
-            ""
-        } else {
-            ", unc AS (DELETE FROM gc_condemned g USING ins WHERE g.id = ins.id)"
-        };
+        let uncondemn = self.uncondemn();
         let stmt = format!(
             "WITH src(id, kind) AS ({source}), \
              ins AS (INSERT INTO gc_live (id, kind, expanded) \
@@ -767,11 +772,7 @@ impl Run<'_> {
         if children.is_empty() {
             return Ok(());
         }
-        let uncondemn = if self.opts.dry_run {
-            ""
-        } else {
-            ", unc AS (DELETE FROM gc_condemned g USING ins WHERE g.id = ins.id)"
-        };
+        let uncondemn = self.uncondemn();
         let stmt = format!(
             "WITH ins AS (INSERT INTO gc_live (id, kind, expanded) \
                  SELECT * FROM unnest($1::bytea[], $2::smallint[], $3::bool[]) \
@@ -1375,10 +1376,7 @@ pub(super) mod tests {
             .await
     }
 
-    fn url() -> String {
-        std::env::var("ANT_TEST_PG_URL")
-            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into())
-    }
+    use crate::testing::pg_url as url;
 
     async fn scratch() -> PgStore {
         PgStore::connect_scratch(&url(), &format!("t_gc_{}", rand::random::<u64>())).await.unwrap()
