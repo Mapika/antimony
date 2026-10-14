@@ -1637,3 +1637,42 @@ async fn tree_bundles_when_the_root_zone_is_restricted() {
     let trees = [root.id(), docs.id(), src.id(), shared.id()];
     check_bundle_invariants(&s, &policy, &trees, &["t-outsider", "t-insider"]).await;
 }
+
+// ---------------------------------------------------------------------------
+// ref events
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn watching_a_ref_needs_read_access_to_it() {
+    let (s, tip) = seeded().await;
+    let watch = |name: &str| pb::WatchRefRequest { name: name.into(), from: None };
+    for token in [None, Some("bogus")] {
+        let e = s.client(token).watch_ref(watch("main")).await.unwrap_err();
+        assert_eq!(e.code(), Code::Unauthenticated, "{token:?}");
+    }
+    // No ref rule names the reader for `release` (nor any rule at all).
+    let mut r = s.client(Some(READER));
+    let e = r.watch_ref(watch("release")).await.unwrap_err();
+    assert_eq!(e.code(), Code::PermissionDenied);
+    let e = r
+        .watch_ref(pb::WatchRefRequest { name: "release".into(), from: Some(tip.0.to_vec()) })
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Code::PermissionDenied);
+    // `land` on main implies reading its events, which carry commit ids only.
+    let mut w = s.client(Some(WRITER));
+    let mut events = r.watch_ref(watch("main")).await.unwrap().into_inner();
+    let c = changeset(&mut w, Some(tip), vec![write_file("secrets/key", "v2\n")]).await.unwrap();
+    let new_tip = landed_tip(&mut w, "main", c).await;
+    let e = tokio::time::timeout(Duration::from_secs(20), events.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(e.old_tip, Some(tip.0.to_vec()));
+    assert_eq!(e.new_tip, Some(new_tip.0.to_vec()));
+    assert_eq!(e.landed, vec![new_tip.0.to_vec()]);
+    // Admins read every ref.
+    let mut a = s.client(Some(ADMIN));
+    a.watch_ref(watch("release")).await.unwrap();
+}

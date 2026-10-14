@@ -50,6 +50,18 @@ CAS replays the batch from the new tip (counted in
 `ant_land_cas_retries_total`) and after 32 attempts the requests are aborted.
 Conflicts between replicas therefore cost latency, never correctness.
 
+**Ref events across replicas.** `WatchRef` (`ant ref watch`) streams a
+ref's moves to CI without polling. After a ref move commits, its replica
+notifies on the Postgres channel `ant_ref_moves` (a small non-durable
+statement from the query pool, batched under load); each replica that has
+watchers keeps one extra `LISTEN` connection (application name
+`ant-refs/<schema>`, outside both pools) and relays every replica's moves
+to its own watchers, so a watcher may connect to any replica.
+Notifications lost while that connection is down, or never sent (a replica
+crashing right after a move), are found when the connection comes back, at
+the ref's next move, or by the 30 s re-read: the ref is re-read and the gap
+sent as one coalesced event. See section 5 for the metrics.
+
 **What is stateless.** A replica holds only caches of immutable data
 (trees, commits, commit-graph nodes, changesets; each cache has a fixed byte
 budget, see sizing) and in-flight land queues. You can kill, add or replace
@@ -145,6 +157,9 @@ The rule:
 ```
 replicas x (pg-max-connections + pg-lock-connections)  <  Postgres max_connections - headroom
 ```
+
+A replica with at least one `WatchRef` stream open adds one `LISTEN`
+connection to that sum.
 
 The defaults need 72 connections per replica, so a stock Postgres
 (`max_connections = 100`) fits exactly one replica. The dev services run with
@@ -456,7 +471,7 @@ harness should treat it like `aborted`).
 
 | class | methods / routes | rate bucket | default concurrency (P = `--pg-max-connections`) |
 |---|---|---|---|
-| `read` | `GetObjects HasObjects GetRef ListRefs ResolveRev ReadPath Log Diff Blame MergeBase IsAncestor LogRange LandedAs`, `/o/`, `/t/`, `/repo.git` | read | 4P |
+| `read` | `GetObjects HasObjects GetRef ListRefs ResolveRev ReadPath Log Diff Blame MergeBase IsAncestor LogRange LandedAs WatchRef` (a watch gives its slot back once its stream starts), `/o/`, `/t/`, `/repo.git` | read | 4P |
 | `write` | `PutObjects UpdateRef CreateChangeset` | write | 2P |
 | `land` | `Land` | write | 16P |
 | `admin` | `/debug/stats` | admin | 8 |
@@ -549,6 +564,8 @@ Families (all names verified in `crates/ant-server/src/metrics.rs`):
 | `ant_cache_hits_total`, `ant_cache_misses_total`, `ant_cache_bytes` | `cache` = `trees`/`commits`/`nodes`/`changesets` | in-process caches (counters since process start) |
 | `ant_history_lag_commits` | `ref` | commits the path-history index is behind the ref |
 | `ant_history_catch_up_seconds` | histogram | catch-ups that indexed commits |
+| `ant_ref_watchers` | | open `WatchRef` streams (CI watchers) |
+| `ant_ref_watch_events_total`, `ant_ref_watch_coalesced_events_total` | | ref events sent; of those, coalesced ones (catch-ups, gap fills, slow watchers) |
 | `ant_pg_pool_size`, `_idle`, `_in_use`, `_max` | | query pool (the lock pool is not included) |
 | `ant_build_info` | `version`, `git` | always 1 |
 
@@ -560,6 +577,38 @@ store failure surfacing as `internal`) are not in that family; they show in
 always has a `ref="other"` series, plus one per recently active ref; alert on
 `max`. Counters per histogram family also export `_bucket`, `_sum` and
 `_count`.
+
+### Ref events for CI
+
+`WatchRef` is how post-merge CI learns about lands without polling: `ant ref
+watch main` (or the RPC) prints one line per move, `land <old>..<new> <n>
+landed` for a group-commit batch of `n` lands, `update` for other
+fast-forwards, `force` for rewinds. Run CI on each new tip, or on each
+landed commit. A CI runner that restarts passes `--from <last tip it
+handled>` and first gets one catch-up event covering what it missed.
+
+- **Cost.** One hub per replica and watched ref builds each event once (one
+  first-parent chain read per land publish) and shares it with all its
+  watchers. Every ref move costs one small non-durable `pg_notify`
+  statement after its commit (batched under load) whether or not anyone
+  watches. Measured on the dev machine (64-agent Postgres+S3 fleet, 8
+  interleaved 20 s pairs on a busy host): median 2,081 lands/s before,
+  2,138 after; with 4 `ant ref watch` streams attached to the server, the
+  same as with none (every watcher saw all ~70,000 lands, chained, without
+  coalescing).
+- **Backpressure.** Each hub keeps the last 256 events. A watcher that reads
+  slower than lands publish (a stalled CI runner, a slow network) falls
+  behind that window and then gets one coalesced event covering everything
+  it missed (`landed` stays complete), so a slow watcher never costs
+  unbounded server memory; it just sees fewer, larger events.
+- **Access.** Watching needs `read` (new), `update` or `land` on the ref in
+  the policy's `[[ref]]` rules (`read = ["group:ci"]` for a read-only CI
+  principal); events carry commit ids only.
+- **Metrics.** `ant_ref_watchers` (open streams),
+  `ant_ref_watch_events_total` and `ant_ref_watch_coalesced_events_total`
+  (catch-ups, gap fills after a lost `LISTEN` connection, and slow
+  watchers' coalesced backlogs). A steadily rising coalesced share means
+  watchers cannot keep up.
 
 ### Suggested alerts (PromQL)
 

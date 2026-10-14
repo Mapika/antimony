@@ -10,6 +10,7 @@ pub mod land;
 pub mod patch;
 pub mod query;
 mod tree_edit;
+pub mod watch;
 
 #[cfg(test)]
 mod test_support;

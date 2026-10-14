@@ -164,4 +164,8 @@ impl RefStore for GatedRefs {
     async fn list_refs(&self, prefix: &str) -> ant_store::Result<Vec<(String, ObjectId)>> {
         self.inner.list_refs(prefix).await
     }
+
+    fn watch_refs(&self) -> Option<tokio::sync::broadcast::Receiver<ant_store::feed::RefNotice>> {
+        self.inner.watch_refs()
+    }
 }

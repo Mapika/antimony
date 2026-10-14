@@ -27,6 +27,9 @@
 //!   `invalid_argument`). A successful `Land`, or an `UpdateRef` to a new
 //!   target, schedules a background history-index catch-up
 //!   (`ops::history::schedule_catch_up`).
+//! - `WatchRef`: `ops::watch::watch_ref` (ref read access under a policy),
+//!   streamed until the client goes away; ids map 1:1, kinds to
+//!   `RefEventKind`.
 //! - Max decoding/encoding message size is `ant_proto::MAX_MESSAGE_BYTES`.
 //!
 //! Access control (`crate::acl`): with a policy, every RPC authenticates the
@@ -53,6 +56,7 @@ use crate::ops::OpError;
 use crate::ops::changeset::{self, ChangesetRequest, FileOp, WriteContent};
 use crate::ops::history;
 use crate::ops::land::{self, LandOutcome};
+use crate::ops::watch::{self, EventKind, RefEvent, WatchOptions};
 use crate::ops::{ancestry, patch, query};
 
 /// Ids per `get_many` call when serving `GetObjects`.
@@ -223,6 +227,21 @@ fn commit_info_to_pb(e: query::LogEntry) -> pb::CommitInfo {
     }
 }
 
+fn ref_event_to_pb(e: RefEvent) -> pb::RefEvent {
+    let kind = match e.kind {
+        EventKind::Land => pb::RefEventKind::Land,
+        EventKind::Update => pb::RefEventKind::Update,
+        EventKind::Force => pb::RefEventKind::Force,
+    };
+    pb::RefEvent {
+        old_tip: e.old.map(|id| id.0.to_vec()),
+        new_tip: e.new.map(|id| id.0.to_vec()),
+        landed: e.landed.iter().map(|id| id.0.to_vec()).collect(),
+        kind: kind as i32,
+        coalesced: e.coalesced,
+    }
+}
+
 fn patch_to_pb(p: patch::FilePatch) -> pb::FilePatch {
     pb::FilePatch {
         binary: p.binary,
@@ -278,6 +297,27 @@ async fn readable_ids(
 #[tonic::async_trait]
 impl Ant for AntService {
     type GetObjectsStream = BoxStream<'static, Result<pb::ObjectResult, Status>>;
+    type WatchRefStream = BoxStream<'static, Result<pb::RefEvent, Status>>;
+
+    async fn watch_ref(
+        &self,
+        request: Request<pb::WatchRefRequest>,
+    ) -> Result<Response<Self::WatchRefStream>, Status> {
+        let access = self.access(&request)?;
+        let req = request.into_inner();
+        let from = parse_opt_id(req.from.as_ref())?;
+        let events = watch::watch_ref(
+            &self.backend,
+            access.as_ref(),
+            &req.name,
+            from,
+            WatchOptions::default(),
+            Some(self.metrics.clone()),
+        )
+        .await
+        .map_err(op_status)?;
+        Ok(Response::new(events.map(|e| e.map(ref_event_to_pb).map_err(op_status)).boxed()))
+    }
 
     async fn get_objects(
         &self,

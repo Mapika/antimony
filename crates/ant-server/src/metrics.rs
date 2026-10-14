@@ -42,6 +42,10 @@
 //! - `ant_history_lag_commits{ref}` (commits the path-history index is behind
 //!   the ref, as of the last catch-up step) and `ant_history_catch_up_seconds`
 //!   (histogram, catch-ups that indexed something).
+//! - `ant_ref_watchers` (open `WatchRef` streams), `ant_ref_watch_events_total`
+//!   (events sent to them) and `ant_ref_watch_coalesced_events_total` (of
+//!   those, events covering an unknown number of moves: catch-ups, gap fills
+//!   and slow watchers' coalesced backlogs; see `ops::watch`).
 //! - `ant_build_info{version,git}` = 1 and, with Postgres,
 //!   `ant_pg_pool_size`, `ant_pg_pool_idle`, `ant_pg_pool_in_use`,
 //!   `ant_pg_pool_max` (0 for the in-memory backend).
@@ -65,6 +69,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ant_core::{EncodedObject, ObjectId, RepoPath};
+use ant_store::feed::RefNotice;
 use ant_store::{
     Backend, CasOutcome, CommitNode, HistoryRow, MetaStore, ObjectStore, PathChange, RefLock,
     RefStore, Result as StoreResult,
@@ -220,6 +225,9 @@ pub struct Metrics {
     cache_bytes: Family<CacheLabels, Gauge>,
     history_lag: Family<RefLabels, Gauge>,
     history_catch_up: Histogram,
+    watchers: Gauge,
+    watch_events: Counter,
+    watch_coalesced: Counter,
     ratelimit_rejected: Family<RejectLabels, Counter>,
     inflight: Family<ClassLabels, Gauge>,
     queued: Family<ClassLabels, Gauge>,
@@ -334,6 +342,20 @@ impl Metrics {
             Histogram::new(exponential_buckets(0.001, 2.0, 16)),
         );
 
+        let watchers =
+            register(&mut registry, "ant_ref_watchers", "Open WatchRef streams", Gauge::default());
+        let watch_events = register(
+            &mut registry,
+            "ant_ref_watch_events",
+            "Ref events sent to watchers",
+            Counter::default(),
+        );
+        let watch_coalesced = register(
+            &mut registry,
+            "ant_ref_watch_coalesced_events",
+            "Ref events sent to watchers that cover an unknown number of moves",
+            Counter::default(),
+        );
         let ratelimit_rejected = register(
             &mut registry,
             "ant_ratelimit_rejected",
@@ -434,6 +456,9 @@ impl Metrics {
             cache_bytes,
             history_lag,
             history_catch_up,
+            watchers,
+            watch_events,
+            watch_coalesced,
             ratelimit_rejected,
             inflight,
             queued,
@@ -531,6 +556,20 @@ impl Metrics {
 
     pub(crate) fn record_catch_up(&self, secs: f64) {
         self.history_catch_up.observe(secs);
+    }
+
+    // -- ref watches ------------------------------------------------------
+
+    /// A `WatchRef` stream opened (`+1`) or closed (`-1`).
+    pub(crate) fn record_watcher(&self, delta: i64) {
+        self.watchers.inc_by(delta);
+    }
+
+    pub(crate) fn record_watch_event(&self, coalesced: bool) {
+        self.watch_events.inc();
+        if coalesced {
+            self.watch_coalesced.inc();
+        }
     }
 
     // -- stores -----------------------------------------------------------
@@ -715,6 +754,10 @@ impl RefStore for TimedRefs {
 
     async fn lock_ref(&self, name: &str) -> StoreResult<RefLock> {
         self.lock_ref.time(self.inner.lock_ref(name)).await
+    }
+
+    fn watch_refs(&self) -> Option<tokio::sync::broadcast::Receiver<RefNotice>> {
+        self.inner.watch_refs()
     }
 }
 

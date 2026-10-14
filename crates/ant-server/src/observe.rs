@@ -10,7 +10,8 @@
 //!   [`http_observe`] (see `crate::metrics`).
 //! - **Slow requests**: anything taking at least [`SLOW_REQUEST`] is logged at
 //!   WARN (`slow request`) with the method or route, duration and, when the
-//!   request carried valid credentials under a policy, the principal.
+//!   request carried valid credentials under a policy, the principal;
+//!   except `WatchRef`, whose stream stays open by design.
 //!
 //! gRPC durations and status codes are taken when the response body ends:
 //! the status of a successful unary call only arrives in the trailers, and
@@ -45,7 +46,7 @@ const MAX_REQUEST_ID_LEN: usize = 128;
 
 /// gRPC methods of `ant.v1.Ant` (kept equal to `proto/ant.proto` by a test);
 /// any other path is recorded as `unknown` to keep label cardinality closed.
-const GRPC_METHODS: [&str; 17] = [
+const GRPC_METHODS: [&str; 18] = [
     "GetObjects",
     "HasObjects",
     "PutObjects",
@@ -63,7 +64,11 @@ const GRPC_METHODS: [&str; 17] = [
     "IsAncestor",
     "LogRange",
     "LandedAs",
+    "WatchRef",
 ];
+
+/// Streams that stay open by design (never logged as slow).
+const LONG_LIVED: [&str; 1] = ["WatchRef"];
 
 const GRPC_PREFIX: &str = "/ant.v1.Ant/";
 
@@ -95,7 +100,7 @@ impl Observer {
         elapsed: Duration,
         outcome: &str,
     ) {
-        if elapsed < self.slow {
+        if elapsed < self.slow || LONG_LIVED.contains(&what) {
             return;
         }
         let principal = if self.acl.is_open() {

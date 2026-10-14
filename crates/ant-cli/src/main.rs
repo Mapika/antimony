@@ -64,6 +64,18 @@
 //!       descend from the current (or `--expect`ed) target is refused
 //!       (exit 1) unless `--force` (checked with IsAncestor; against servers
 //!       without it, by walking Log pages). stdout: `<id>`
+//!   ant ref watch <name> [--from <rev>]
+//!       Follows the ref's moves (WatchRef) until SIGINT/SIGTERM (exit 0),
+//!       one line per event as it happens: `<kind> <old>..<new> <n> landed`
+//!       with kind `land` (one land publish: a group-commit batch, every
+//!       land of it counted), `update` (a fast-forward by anything else, or
+//!       several moves coalesced into one event) or `force` (<old> is not an
+//!       ancestor of <new>, or a deletion; 0 landed); <n> = commits the move
+//!       added (first parents, as `ant log <old>..<new>`). A missing side
+//!       (ref created / deleted) prints as 64 zeros. Lines chain: each
+//!       <old> is the previous line's <new>. `--from <rev>`: first one line
+//!       catching up from <rev> to the current tip (none if equal). A watch
+//!       the server ends: exit 1.
 //!   ant ref init [<name>] [-m <msg>]
 //!       Creates ref <name> (default `main`) at a new root commit with the empty
 //!       tree: the first commit of an empty server. stdout: `<commit-id>`.

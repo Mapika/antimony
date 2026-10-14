@@ -252,7 +252,7 @@ async fn publish(
         // durable (or fails if the database lost them).
         return Ok(lock.publish(start, tip, LANDED_AS, mappings).await?);
     }
-    let cas = b.refs.cas_ref(ref_name, start, Some(tip)).await?;
+    let cas = ant_store::feed::landing(b.refs.cas_ref(ref_name, start, Some(tip))).await?;
     if cas == CasOutcome::Updated {
         b.meta.put_derived_many(LANDED_AS, mappings).await?;
     }

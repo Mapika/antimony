@@ -49,6 +49,7 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
             RefCmd::Set { name, rev, expect, create, force } => {
                 refs::set(&ctx, &name, &rev, expect, create, force).await
             }
+            RefCmd::Watch { name, from } => refs::watch(&ctx, &name, from.as_deref()).await,
         },
         Command::Ws { cmd: WsCmd::New { dir, at, sparse, lazy } } => {
             if lazy {

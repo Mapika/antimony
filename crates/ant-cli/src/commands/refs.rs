@@ -1,4 +1,4 @@
-//! `ant ref get / list / init / set`.
+//! `ant ref get / list / init / set / watch`.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -187,4 +187,55 @@ pub async fn set(
         bail!("ref {name} changed concurrently; actual value is {actual}");
     }
     Ok(Outcome::ok(format!("{new}\n")))
+}
+
+/// `<kind> <old>..<new> <n> landed` for one event; a missing side (the ref
+/// did not exist / was deleted) prints as 64 zeros.
+fn event_line(e: &pb::RefEvent) -> Result<String> {
+    let side = |id: &Option<Vec<u8>>| -> Result<String> {
+        Ok(match id {
+            Some(id) => id_from(id)?.to_string(),
+            None => "0".repeat(64),
+        })
+    };
+    let kind = match pb::RefEventKind::try_from(e.kind) {
+        Ok(pb::RefEventKind::Land) => "land",
+        Ok(pb::RefEventKind::Update) => "update",
+        Ok(pb::RefEventKind::Force) => "force",
+        _ => "unknown",
+    };
+    Ok(format!("{kind} {}..{} {} landed\n", side(&e.old_tip)?, side(&e.new_tip)?, e.landed.len()))
+}
+
+/// Stream `name`'s events to stdout (flushed per line) until SIGINT /
+/// SIGTERM (exit 0) or the stream fails (exit 1).
+pub async fn watch(ctx: &Ctx, name: &str, from: Option<&str>) -> Result<Outcome> {
+    use std::io::Write as _;
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut client = ctx.remote().await?.client();
+    let from = match from {
+        Some(rev) => Some(resolve_commit(&mut client, rev).await?.as_bytes().to_vec()),
+        None => None,
+    };
+    let mut term = signal(SignalKind::terminate())?;
+    let mut events = tokio::select! {
+        r = client.watch_ref(pb::WatchRefRequest { name: name.into(), from }) => {
+            r.rpc()?.into_inner()
+        }
+        r = tokio::signal::ctrl_c() => { r?; return Ok(Outcome::empty()) }
+        _ = term.recv() => return Ok(Outcome::empty()),
+    };
+    loop {
+        let event = tokio::select! {
+            m = events.message() => m.rpc()?,
+            r = tokio::signal::ctrl_c() => { r?; break }
+            _ = term.recv() => break,
+        };
+        let Some(event) = event else { bail!("the server ended the watch of ref {name}") };
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(event_line(&event)?.as_bytes())?;
+        stdout.flush()?;
+    }
+    Ok(Outcome::empty())
 }

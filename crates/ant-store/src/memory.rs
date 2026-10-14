@@ -59,6 +59,8 @@ type RefLocks = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 pub struct MemoryRefStore {
     refs: Mutex<BTreeMap<String, ObjectId>>,
     locks: RefLocks,
+    /// Every committed move, sent under the `refs` lock (in commit order).
+    feed: crate::feed::RefFeed,
 }
 
 struct MemoryRefLock {
@@ -108,6 +110,15 @@ impl RefStore for MemoryRefStore {
             Some(id) => m.insert(name.to_string(), id),
             None => m.remove(name),
         };
+        if actual != new {
+            self.feed.moved(crate::feed::RefMove {
+                name: name.to_string(),
+                old: actual,
+                new,
+                cause: crate::feed::move_cause(),
+                nonce: crate::feed::nonce(),
+            });
+        }
         Ok(CasOutcome::Updated)
     }
 
@@ -129,6 +140,10 @@ impl RefStore for MemoryRefStore {
         // `lock` owns the entry from here, so a cancelled wait still cleans up.
         lock.guard = Some(mutex.lock_owned().await);
         Ok(RefLock::held(lock))
+    }
+
+    fn watch_refs(&self) -> Option<tokio::sync::broadcast::Receiver<crate::feed::RefNotice>> {
+        Some(self.feed.subscribe())
     }
 }
 

@@ -31,6 +31,10 @@
 //!   connection, which releases it server-side. `RefLock::publish` runs the
 //!   ref CAS and the derived-row inserts as one statement on that same
 //!   connection (synchronous commit).
+//! - Committed ref moves (`cas_ref`, `RefLock::publish`) are announced
+//!   in-process and with a `pg_notify` on [`crate::feed::PG_CHANNEL`] sent
+//!   after the commit by a notifier task; `watch_refs` relays every
+//!   replica's announcements from a `LISTEN` connection (`notify`).
 //! - Inside [`crate::deferred_durability`], object, changeset, commit and
 //!   derived writes commit with `SET LOCAL synchronous_commit = off`.
 //! - Garbage collection ([`gc`]): objects, packed-object index rows, commits
@@ -49,10 +53,13 @@ use bytes::Bytes;
 use sqlx::Row;
 
 use crate::changeset_codec;
+use crate::feed::{MoveCause, RefMove};
 
 pub mod gc;
 mod migrate;
+mod notify;
 pub use migrate::{MIGRATIONS, Migration, SCHEMA_VERSION, SchemaStatus};
+pub use notify::listener_application_name;
 
 use crate::{
     CasOutcome, ChangeKind, CommitNode, MetaStore, ObjectStore, PathChange, RefStore, Result,
@@ -123,6 +130,8 @@ pub struct PgStore {
     schema: String,
     /// Object inserts commit without waiting for the WAL flush ([`BULK_ENV`]).
     async_object_commit: bool,
+    /// Ref-move notifications (`notify`).
+    feed: std::sync::Arc<notify::PgFeed>,
     /// Drops the schema with the last clone of the store (scratch stores only).
     _cleanup: Option<std::sync::Arc<SchemaGuard>>,
 }
@@ -534,6 +543,7 @@ impl PgStore {
             .connect_lazy(url)
             .map_err(be)?;
         Ok(Self {
+            feed: notify::PgFeed::new(url, schema, pool.clone()),
             pool,
             locks: None,
             schema: schema.to_owned(),
@@ -594,7 +604,14 @@ impl PgStore {
             .transpose()?;
 
         let async_object_commit = std::env::var(BULK_ENV).is_ok_and(|v| !v.is_empty() && v != "0");
-        Ok(Self { pool, locks, schema: schema.to_owned(), async_object_commit, _cleanup: None })
+        Ok(Self {
+            feed: notify::PgFeed::new(url, schema, pool.clone()),
+            pool,
+            locks,
+            schema: schema.to_owned(),
+            async_object_commit,
+            _cleanup: None,
+        })
     }
 }
 
@@ -613,6 +630,7 @@ struct PgRefLock {
     name: String,
     /// Quoted schema identifier.
     schema: String,
+    feed: std::sync::Arc<notify::PgFeed>,
 }
 
 impl Drop for PgRefLock {
@@ -693,6 +711,14 @@ impl crate::RefLockRelease for PgRefLock {
             .await
             .map_err(be)?;
         if moved == 1 {
+            // Only a land publishes through a ref lock.
+            self.feed.committed(RefMove {
+                name: self.name.clone(),
+                old: expected,
+                new: Some(new),
+                cause: MoveCause::Land,
+                nonce: crate::feed::nonce(),
+            });
             return Ok(CasOutcome::Updated);
         }
         let row = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -885,6 +911,15 @@ impl RefStore for PgStore {
             }
         };
         if affected == 1 {
+            if expected != new {
+                self.feed.committed(RefMove {
+                    name: name.to_owned(),
+                    old: expected,
+                    new,
+                    cause: crate::feed::move_cause(),
+                    nonce: crate::feed::nonce(),
+                });
+            }
             return Ok(CasOutcome::Updated);
         }
         let actual = read_ref(&self.pool, name).await?;
@@ -905,6 +940,7 @@ impl RefStore for PgStore {
             key: format!("ant/{}/{name}", self.schema),
             name: name.to_owned(),
             schema: quote_ident(&self.schema),
+            feed: self.feed.clone(),
         };
         if let Some(conn) = lock.conn.as_mut() {
             sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
@@ -930,6 +966,9 @@ impl RefStore for PgStore {
                 Ok((name, object_id_col(r, "target")?))
             })
             .collect()
+    }
+    fn watch_refs(&self) -> Option<tokio::sync::broadcast::Receiver<crate::feed::RefNotice>> {
+        Some(self.feed.subscribe())
     }
 }
 
@@ -1473,6 +1512,76 @@ mod tests {
         assert!(!lock.can_publish());
         assert!(lock.publish(Some(id(2)), id(3), "k", vec![]).await.is_err());
         assert_eq!(s.get_ref("main").await.unwrap(), Some(id(2)));
+    }
+
+    /// Ref moves are announced in-process and relayed by every replica's
+    /// listener (`notify`); mismatching CASes announce nothing.
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_ref_moves_are_announced_to_every_replica() {
+        use crate::feed::{MoveCause, RefMove, RefNotice};
+        use tokio::sync::broadcast::Receiver;
+
+        async fn next(rx: &mut Receiver<RefNotice>) -> RefNotice {
+            let wait = std::time::Duration::from_secs(20);
+            tokio::time::timeout(wait, rx.recv()).await.expect("no notice in time").unwrap()
+        }
+        async fn moved(rx: &mut Receiver<RefNotice>) -> RefMove {
+            match next(rx).await {
+                RefNotice::Moved(m) => (*m).clone(),
+                other => panic!("{other:?}"),
+            }
+        }
+        let url = std::env::var("ANT_TEST_PG_URL")
+            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let schema = format!("t_{}", rand::random::<u64>());
+        let a = PgStore::connect_scratch(&url, &schema).await.unwrap();
+        let b = PgStore::connect(&url, &schema).await.unwrap();
+        let other = fresh().await;
+        let (mut ra, mut rb, mut ro) =
+            (a.watch_refs().unwrap(), b.watch_refs().unwrap(), other.watch_refs().unwrap());
+        // Every listener announces that it (re)connected.
+        for rx in [&mut ra, &mut rb, &mut ro] {
+            assert_eq!(next(rx).await, RefNotice::Resync);
+        }
+        let expect = |old, new, cause| (old, new, cause);
+        let seen = |m: &RefMove| (m.old, m.new, m.cause);
+
+        assert!(matches!(
+            a.cas_ref("main", Some(id(9)), Some(id(1))).await.unwrap(),
+            CasOutcome::Mismatch { .. }
+        ));
+        assert_eq!(a.cas_ref("main", None, Some(id(1))).await.unwrap(), CasOutcome::Updated);
+        // The other replica: relayed once. This one: in-process and relayed.
+        let m = moved(&mut rb).await;
+        assert_eq!(seen(&m), expect(None, Some(id(1)), MoveCause::Update));
+        assert_eq!(moved(&mut ra).await, m);
+        assert_eq!(moved(&mut ra).await, m);
+        // Land moves, by CAS or by a lock publish.
+        crate::feed::landing(a.cas_ref("main", Some(id(1)), Some(id(2)))).await.unwrap();
+        assert_eq!(seen(&moved(&mut rb).await), expect(Some(id(1)), Some(id(2)), MoveCause::Land));
+        let mut lock = b.lock_ref("main").await.unwrap();
+        assert_eq!(
+            lock.publish(Some(id(2)), id(3), "k", vec![]).await.unwrap(),
+            CasOutcome::Updated
+        );
+        assert_eq!(
+            lock.publish(Some(id(2)), id(4), "k", vec![]).await.unwrap(),
+            CasOutcome::Mismatch { actual: Some(id(3)) }
+        );
+        lock.release().await.unwrap();
+        // Deleting the ref.
+        assert_eq!(a.cas_ref("main", Some(id(3)), None).await.unwrap(), CasOutcome::Updated);
+        let m = moved(&mut rb).await; // b's own publish: in-process ...
+        assert_eq!(seen(&m), expect(Some(id(2)), Some(id(3)), MoveCause::Land));
+        let mut rest = vec![moved(&mut rb).await, moved(&mut rb).await];
+        rest.retain(|r| r.nonce != m.nonce); // ... and relayed, in either order
+        assert_eq!(rest.len(), 1);
+        assert_eq!(seen(&rest[0]), expect(Some(id(3)), None, MoveCause::Update));
+        // Another schema hears nothing of it.
+        other.cas_ref("x", None, Some(id(5))).await.unwrap();
+        let m = moved(&mut ro).await;
+        assert_eq!((m.name.as_str(), m.new), ("x", Some(id(5))));
     }
 
     /// The crash witness: deferred writes followed by the loss of the lock's

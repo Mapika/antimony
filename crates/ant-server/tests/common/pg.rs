@@ -132,6 +132,10 @@ impl RefStore for CountingRefs {
         }
         Ok(RefLock::held(CountingLock { inner: lock, counts: self.counts.clone() }))
     }
+
+    fn watch_refs(&self) -> Option<tokio::sync::broadcast::Receiver<ant_store::feed::RefNotice>> {
+        self.inner.watch_refs()
+    }
 }
 
 /// A held lock, forwarding publishes and counting their outcomes.

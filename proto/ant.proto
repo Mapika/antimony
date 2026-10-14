@@ -43,6 +43,11 @@ service Ant {
   rpc LogRange(LogRangeRequest) returns (LogRangeResponse);
   // Whether (and as which commit) a commit was landed onto a ref.
   rpc LandedAs(LandedAsRequest) returns (LandedAsResponse);
+
+  // ---- events ----
+  // The ref's moves as they are published, gapless (each event's old_tip
+  // is the previous event's new_tip), until the client cancels.
+  rpc WatchRef(WatchRefRequest) returns (stream RefEvent);
 }
 
 message GetObjectsRequest { repeated bytes ids = 1; }
@@ -283,4 +288,30 @@ message LandedAsResponse {
   string ref_name = 2;
   bytes landed_commit = 3;
   bool rebased = 4; // landed_commit != commit
+}
+
+message WatchRefRequest {
+  string name = 1;
+  // Start with one catch-up event from this commit to the ref's current
+  // tip (none if equal); absent = live events only. Unknown: NOT_FOUND.
+  optional bytes from = 2;
+}
+enum RefEventKind {
+  REF_EVENT_KIND_UNSPECIFIED = 0;
+  REF_EVENT_KIND_LAND = 1;   // one Land publish (a group-commit batch)
+  REF_EVENT_KIND_UPDATE = 2; // a fast-forward by anything else, or coalesced
+  REF_EVENT_KIND_FORCE = 3;  // old_tip is not an ancestor (or a deletion)
+}
+message RefEvent {
+  optional bytes old_tip = 1; // absent: the ref did not exist
+  optional bytes new_tip = 2; // absent: the ref was deleted
+  // Commits the move added, oldest first: new_tip's first-parent chain
+  // down to (excluding) the newest commit reachable from old_tip, as
+  // LogRange. Empty for FORCE. A long move is split into consecutive
+  // events of at most 4096 commits.
+  repeated bytes landed = 3;
+  RefEventKind kind = 4;
+  // Covers an unknown number of moves: the catch-up from `from`, a gap the
+  // server filled from the ref, or a slow watcher's coalesced backlog.
+  bool coalesced = 5;
 }
