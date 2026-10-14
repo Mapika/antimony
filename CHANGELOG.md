@@ -56,6 +56,10 @@ release of the 0.x series may change.
   `rev~N` resolves in O(log N) lookups. On rust-lang/rust (343k commits),
   `merge-base main main~2000` went from 170 s to 10 ms, and `ref set`
   fast-forward checks across 40k merges take about 12 ms.
+- Postgres store connections run with `jit = off`. The planner cannot size
+  the recursive ancestry walk and estimates it far above the JIT thresholds,
+  so servers built with LLVM (such as the official Docker image) compiled
+  every walk first: about 80 ms per call instead of 0.5 ms.
 
 - First (uncached) `blame` of a long-lived file is 10-25x faster, with
   byte-identical output: changes between versions are diffed on the changed
