@@ -12,6 +12,8 @@ mod tree_edit;
 #[cfg(test)]
 mod test_support;
 
+pub use cache::{DEFAULT_MAX_AGE as CACHE_MAX_AGE, cache_max_age, set_cache_max_age};
+
 use ant_core::ObjectId;
 use ant_store::StoreError;
 
@@ -44,3 +46,18 @@ impl OpError {
 }
 
 pub type OpResult<T> = std::result::Result<T, OpError>;
+
+#[cfg(test)]
+mod gc_contract_tests {
+    use ant_store::postgres::gc;
+
+    /// Garbage collection keeps these derived kinds' ids alive and deletes
+    /// these commit-keyed rows with their commits; it must know their names.
+    #[test]
+    fn gc_knows_the_server_derived_kinds() {
+        assert!(gc::DEFAULT_ROOT_KINDS.contains(&super::land::LANDED_AS));
+        assert!(gc::DEFAULT_COMMIT_KEYED_KINDS.contains(&super::history::BLAME_KIND));
+        // Condemned data must outlive every cache entry before deletion.
+        assert!(gc::DEFAULT_QUIESCE >= super::CACHE_MAX_AGE * 2);
+    }
+}

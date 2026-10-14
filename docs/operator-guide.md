@@ -167,10 +167,58 @@ the Postgres-resident part and grows linearly with commits and the paths they
 touch; objects up to 4 KiB also live in Postgres. For an agent fleet the
 growth driver is lands x average change size, since every land is a commit
 with its own tree objects. A land stores new trees along every edited path,
-so deep paths cost more. There is no packing or garbage collection of
-unreferenced objects (see failure modes: crashed batches leave unreachable
-rows, which are harmless). Under sustained bulk loads autovacuum on `objects`
-becomes visible; give Postgres I/O headroom.
+so deep paths cost more. Aborted land batches, abandoned changesets,
+failed imports and retried uploads leave unreachable data behind (harmless,
+see failure modes); `ant admin gc` deletes it (next section). Under
+sustained bulk loads autovacuum on `objects` becomes visible; give Postgres
+I/O headroom.
+
+### Garbage collection
+
+`ant admin gc <store flags>` deletes what nothing can reach any more:
+objects, commit records, changesets and S3 packs. It runs against the stores
+directly (like `ant import`), at most one run per schema, while servers keep
+serving. What is kept: everything reachable from every ref, from the
+history index, from landed-as mappings (retries of a land) and from the
+git-import mapping (re-imports), plus everything written within the
+**grace period** (`--grace`, default `7d`, at least `1d`). The grace
+period is the promise to agents: a changeset can be landed, and an
+uploaded blob used, for that long after it was created; an unlanded
+changeset older than that may be gone (`land` then reports not found).
+
+A run marks reachable data (in a working table in Postgres, so memory use is
+flat), condemns the rest (servers then report it as missing), waits
+`--quiesce` (default `30m`; it must exceed the servers' 10 minute cache
+lifetime plus your longest request), marks again, then deletes in small
+transactions, and finally deletes S3 packs without live objects. Packs that
+are only partly dead are kept (there is no repacking); the report shows
+their dead bytes. The module docs of `ant_store::postgres::gc` give the
+safety argument. A run can be interrupted at any time (Ctrl-C, crash,
+`--max-batches N`); the next run resumes it. `--abort` drops a pending run
+instead (its condemned data becomes visible again). Operations that touch
+condemned data during a run fail with not found or `aborted` (retryable),
+never with lost data.
+
+```sh
+ant admin gc --dry-run --pg-url ... --pg-schema ant --s3-...   # count only
+# dry-run
+# cutoff 2026-10-07 09:12:44.12+00     rows written before this were candidates
+# live 1843202                          ids reachable
+# condemned 5310                        ids to delete
+# objects 4821 9113204                  small objects: count, stored bytes
+# large-objects 12 81733120             packed objects: count, bytes
+# commits 402
+# changesets 402 380122
+# packs 3 70112333                      S3 packs that would be deleted
+# packs-kept 812 19400113321 412233 0.0%   kept packs: count, bytes, dead bytes, dead share
+ant admin gc --pg-url ... --pg-schema ant --s3-...             # collect
+```
+
+Schedule it daily or weekly. A run reads every reachable tree once, so on a
+kernel-sized store the mark takes a while and reads from S3; run it off-peak.
+Postgres gets the space back through autovacuum (or `VACUUM` after a large
+first run).
+
 
 ### Client cache
 
@@ -577,9 +625,12 @@ safe first step.
   (`pg_basebackup` plus WAL archiving, or the managed equivalent). `pg_dump`
   of the antimony schema also works for smaller deployments; the schema name
   is the `--pg-schema` value.
-- *S3* holds the large objects. Objects are immutable and content-addressed,
-  never rewritten, so bucket versioning is not required; cross-region
-  replication or periodic bucket copies are enough.
+- *S3* holds the large objects. Objects are immutable and never rewritten;
+  only garbage collection deletes packs. Cross-region replication or periodic
+  bucket copies are enough, but keep deleted packs (bucket versioning with a
+  noncurrent-version expiry, or copies) at least as long as your Postgres
+  backups: a Postgres backup taken before a collection can refer to packs it
+  deleted.
 - **Consistency.** Take the Postgres backup *before or together with* S3: a
   restored Postgres must not reference objects missing from the restored
   bucket, while extra objects in S3 are harmless. A point-in-time restore of

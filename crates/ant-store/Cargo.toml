@@ -10,11 +10,11 @@ async-trait.workspace = true
 aws-sdk-s3.workspace = true
 bytes.workspace = true
 futures.workspace = true
+hex.workspace = true
 parking_lot.workspace = true
+rand.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 zstd.workspace = true
-
-[dev-dependencies]
-rand.workspace = true

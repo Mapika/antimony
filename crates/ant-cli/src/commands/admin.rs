@@ -5,10 +5,12 @@ use std::fmt::Write as _;
 use ant_server::acl::{self, Acl};
 use ant_server::ops::query;
 use ant_store::StoreError;
+use ant_store::postgres::gc::GcOptions;
 use ant_store::postgres::{MIGRATIONS, PgStore};
-use anyhow::{Result, anyhow};
+use ant_store::s3::S3ObjectStore;
+use anyhow::{Context, Result, anyhow};
 
-use crate::args::{ReindexArgs, SchemaArgs};
+use crate::args::{GcArgs, ReindexArgs, SchemaArgs};
 use crate::ctx::Outcome;
 
 /// `ant admin reindex-acl <rev> --policy <file> [--full] [--history] <store flags>`.
@@ -58,6 +60,66 @@ pub async fn schema(a: SchemaArgs) -> Result<Outcome> {
     writeln!(out, "supported {}", status.supported)?;
     for m in &status.pending {
         writeln!(out, "pending {} {}", m.version, m.name)?;
+    }
+    Ok(Outcome::ok(out))
+}
+
+/// `ant admin gc [--dry-run] [--grace <dur>] [--quiesce <dur>] [--max-batches <n>]
+/// [--abort] <store flags>`. Progress goes to stderr (`gc: ...`); stdout is
+/// the report (see the output contract in `main.rs`).
+pub async fn gc(a: GcArgs) -> Result<Outcome> {
+    let (backend, pg) = a.store.backend_with_pg().await?;
+    let pg = pg.ok_or_else(|| anyhow!("admin gc needs a Postgres store (--pg-url)"))?;
+    if a.abort {
+        let pending = pg.gc_abort().await?;
+        let out = if pending { "aborted\n" } else { "nothing to abort\n" };
+        return Ok(Outcome::ok(out.to_string()));
+    }
+    let s3 = match a.store.s3_config()? {
+        Some(cfg) => Some(S3ObjectStore::connect(&cfg).await.context("configuring S3")?),
+        None => None,
+    };
+    let opts = GcOptions {
+        grace: a.grace,
+        quiesce: a.quiesce,
+        dry_run: a.dry_run,
+        s3,
+        stop_after_batches: a.max_batches,
+        ..GcOptions::default()
+    };
+    let r = pg.gc(backend.objects.as_ref(), &opts, &|line| eprintln!("gc: {line}")).await?;
+    let state = match (r.dry_run, r.finished) {
+        (true, _) => "dry-run",
+        (false, true) => "done",
+        (false, false) => "stopped",
+    };
+    let mut out = String::new();
+    writeln!(out, "{state}{}", if r.resumed { " resumed" } else { "" })?;
+    writeln!(out, "cutoff {}", r.cutoff)?;
+    writeln!(out, "live {}", r.live)?;
+    writeln!(out, "condemned {}", r.condemned)?;
+    writeln!(out, "objects {} {}", r.objects, r.object_bytes)?;
+    writeln!(out, "large-objects {} {}", r.large_objects, r.large_object_bytes)?;
+    writeln!(out, "commits {}", r.commits)?;
+    writeln!(out, "changesets {} {}", r.changesets, r.changeset_bytes)?;
+    if !r.dry_run {
+        writeln!(out, "legacy-changes {}", r.legacy_changes)?;
+        writeln!(out, "derived {}", r.derived)?;
+        writeln!(out, "kept {}", r.kept)?;
+    }
+    if opts.s3.is_some() {
+        writeln!(out, "packs {} {}", r.packs, r.pack_bytes)?;
+        writeln!(
+            out,
+            "packs-kept {} {} {} {:.1}%",
+            r.packs_kept,
+            r.packs_kept_bytes,
+            r.packs_dead_bytes,
+            100.0 * r.pack_dead_ratio()
+        )?;
+    }
+    if r.missing > 0 {
+        eprintln!("gc: warning: {} reachable objects are missing from the store", r.missing);
     }
     Ok(Outcome::ok(out))
 }

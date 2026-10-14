@@ -261,11 +261,13 @@ dependencies = [
  "aws-sdk-s3",
  "bytes",
  "futures",
+ "hex",
  "parking_lot",
  "rand 0.9.5",
  "sqlx",
  "thiserror",
  "tokio",
+ "tracing",
  "zstd",
 ]
 

@@ -62,7 +62,7 @@ const CHAIN_CHUNK: usize = 8192;
 /// Attempts before `catch_up` gives up on a ref that keeps moving.
 const MAX_ROUNDS: usize = 4;
 /// Derived-data kind for cached blame results.
-const BLAME_KIND: &str = "blame/v1";
+pub(crate) const BLAME_KIND: &str = "blame/v1";
 /// Commits whose changesets/blobs are fetched per blame step.
 const BLAME_CHUNK: usize = 64;
 /// Cap on LCS table cells for one line diff; larger middles count as replaced.
