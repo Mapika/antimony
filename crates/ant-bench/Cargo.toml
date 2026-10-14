@@ -20,6 +20,7 @@ async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tonic.workspace = true
