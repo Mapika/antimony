@@ -686,8 +686,7 @@ fn cli_schema_versions() {
 #[test]
 #[ignore = "needs docker compose up -d"]
 fn cli_gc() {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
-    let schema = format!("e2e_gc_{}_{nanos}", std::process::id());
+    let schema = format!("e2e_gc_{}", unique_suffix());
     let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
     let tmp = tempfile::tempdir().expect("tempdir");
     let ctx = Ctx {

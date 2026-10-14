@@ -68,8 +68,8 @@ pub async fn schema(a: SchemaArgs) -> Result<Outcome> {
 /// [--abort] <store flags>`. Progress goes to stderr (`gc: ...`); stdout is
 /// the report (see the output contract in `main.rs`).
 pub async fn gc(a: GcArgs) -> Result<Outcome> {
-    let (backend, pg) = a.store.backend_with_pg().await?;
-    let pg = pg.ok_or_else(|| anyhow!("admin gc needs a Postgres store (--pg-url)"))?;
+    let (backend, probes) = a.store.backend_with_probes().await?;
+    let pg = probes.pg.ok_or_else(|| anyhow!("admin gc needs a Postgres store (--pg-url)"))?;
     if a.abort {
         let pending = pg.gc_abort().await?;
         let out = if pending { "aborted\n" } else { "nothing to abort\n" };
