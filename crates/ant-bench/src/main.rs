@@ -12,6 +12,7 @@ mod checkout;
 mod fleet;
 mod import;
 mod json;
+mod synth;
 mod util;
 
 use clap::{Parser, Subcommand};

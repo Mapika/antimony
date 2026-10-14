@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use ant_core::{EntryMode, ObjectId};
 use ant_proto::v1 as pb;
-use ant_store::ObjectStore;
 use antd::disk::DiskObjectStore;
 use antd::readthrough::ReadThrough;
 use antd::remote::RemoteObjectStore;
@@ -76,7 +75,7 @@ impl Ctx {
     /// `ReadThrough(DiskObjectStore, RemoteObjectStore)` plus the remote itself.
     pub async fn read_through(&self) -> Result<(Arc<ReadThrough>, RemoteObjectStore)> {
         let remote = self.remote().await?;
-        let rt = ReadThrough::new(self.disk()? as Arc<dyn ObjectStore>, Arc::new(remote.clone()));
+        let rt = ReadThrough::over_disk(self.disk()?, Arc::new(remote.clone())).verified_upstream();
         Ok((Arc::new(rt), remote))
     }
 }

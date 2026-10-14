@@ -19,14 +19,18 @@
 //!   `get_many` call. Skips subtrees that cannot contain a match (`Sparse::may_contain_under(dir_path)`: true if any prefix pattern
 //!   starts with or is under that dir, or any glob pattern exists — globs are
 //!   not pruned).
-//! - Fetches blobs in batches of 512 ids per `get_many`. Files get the
-//!   right mode (0o755 for Executable, 0o644 otherwise), symlinks via
+//! - Fetches blobs in batches of 512 ids per `get_many`, several batches in
+//!   flight at once (fetch, decode and file writes overlap). Tree levels are
+//!   decoded in parallel and all needed directories are created up front,
+//!   level by level in parallel. Each file is one `open` (mode set at
+//!   creation), one `write` and one `fstat`. Files get the right mode (0o755 for Executable, 0o644 otherwise), symlinks via
 //!   `std::os::unix::fs::symlink`, gitlinks as empty directories (not
 //!   indexed).
 //! - Every written entry is indexed with its post-write stat.
 //!
 //! `status` (no network; uses only the index + local hashing):
-//! - Walks the workspace (skipping `.ant`). For each file/symlink:
+//! - Walks the workspace (skipping `.ant`), listing and stat'ing directories
+//!   on several threads, one tree level at a time. For each file/symlink:
 //!   indexed and (size, mtime_ns, ino, mode) unchanged → unchanged, without
 //!   reading the file; otherwise read + hash as a blob and compare ids/mode.
 //! - Indexed paths missing on disk → `Deleted`.
@@ -49,19 +53,24 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, RepoPath, Tree, hash_object};
 use ant_store::ObjectStore;
 use ant_store::graph::diff_trees;
+
+use crate::disk::par_map;
 use anyhow::{Context, anyhow, bail};
 use bytes::Bytes;
+use futures::StreamExt;
 use globset::GlobBuilder;
-use walkdir::WalkDir;
 
 /// Objects fetched or stored per `get_many` / `put_many` call.
 const BATCH: usize = 512;
+/// Batches fetched and written concurrently.
+const WRITE_CONCURRENCY: usize = 8;
 const STATE_DIR: &str = ".ant";
 const CONFIG_FILE: &str = "workspace";
 const INDEX_FILE: &str = "index";
@@ -372,6 +381,51 @@ fn prepare_empty_dir(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Directories that must exist for `leaves`: every parent plus its ancestors,
+/// as repo-relative paths grouped by depth (parents before children), each
+/// level sorted so siblings are adjacent.
+fn leaf_dirs(leaves: &[(RepoPath, EntryMode, ObjectId)]) -> Vec<Vec<String>> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut levels: Vec<Vec<String>> = Vec::new();
+    for (path, _, _) in leaves {
+        let mut cur = path.as_str().rsplit_once('/').map(|(parent, _)| parent);
+        while let Some(d) = cur {
+            if !seen.insert(d) {
+                break; // it and all its ancestors are already listed
+            }
+            let depth = d.matches('/').count();
+            if levels.len() <= depth {
+                levels.resize_with(depth + 1, Vec::new);
+            }
+            levels[depth].push(d.to_string());
+            cur = d.rsplit_once('/').map(|(parent, _)| parent);
+        }
+    }
+    for level in &mut levels {
+        level.sort_unstable();
+    }
+    levels
+}
+
+/// Blocking: create `levels` of directories under `dir`, one level at a time,
+/// each level in parallel (siblings stay on one thread, so their shared
+/// parent directory is not contended).
+fn create_dirs(dir: &Path, levels: &[Vec<String>]) -> anyhow::Result<()> {
+    for level in levels {
+        let results = par_map(level, 64, |d| {
+            let full = dir.join(d);
+            match fs::create_dir(&full) {
+                Err(e) if e.kind() != ErrorKind::AlreadyExists => {
+                    Err(e).with_context(|| format!("creating {}", full.display()))
+                }
+                _ => Ok(()),
+            }
+        });
+        results.into_iter().collect::<anyhow::Result<()>>()?;
+    }
+    Ok(())
+}
+
 /// Remove whatever occupies `full` so a new entry can be created there.
 /// Never follows symlinks.
 fn remove_existing(full: &Path) -> io::Result<()> {
@@ -412,18 +466,71 @@ struct WriteItem {
     body: Bytes,
 }
 
+/// Index entry per written path (`None`: not indexed, e.g. a gitlink).
+type Written = Vec<(String, Option<Entry>)>;
+
+/// The process umask, if it can be read (Linux: `/proc/self/status`).
+fn umask() -> Option<u32> {
+    static UMASK: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *UMASK.get_or_init(|| {
+        let status = fs::read_to_string("/proc/self/status").ok()?;
+        let v = status.lines().find_map(|l| l.strip_prefix("Umask:"))?;
+        u32::from_str_radix(v.trim(), 8).ok()
+    })
+}
+
+/// Create `parent` (and missing ancestors) unless `*last` says it exists.
+/// Items arrive grouped by directory, so this is one `mkdir` per directory
+/// rather than a stat-per-component walk per file.
+fn ensure_dir(parent: &Path, last: &mut Option<PathBuf>) -> io::Result<()> {
+    if last.as_deref() == Some(parent) {
+        return Ok(());
+    }
+    match fs::create_dir(parent) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::AlreadyExists && parent.is_dir() => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => fs::create_dir_all(parent)?,
+        Err(e) => return Err(e),
+    }
+    *last = Some(parent.to_path_buf());
+    Ok(())
+}
+
+/// Create the file at `full` with `body`: one `open` (permissions set at
+/// creation), one `write`, one `fstat`.
+fn write_file(full: &Path, mode: EntryMode, body: &[u8]) -> anyhow::Result<fs::Metadata> {
+    use std::io::Write;
+    let perm = if mode == EntryMode::Executable { 0o755 } else { 0o644 };
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(perm)
+        .open(full)
+        .with_context(|| format!("writing {}", full.display()))?;
+    f.write_all(body).with_context(|| format!("writing {}", full.display()))?;
+    // `mode` at creation is filtered by the umask; fix up only if it matters.
+    if umask().is_none_or(|u| u & perm != 0) {
+        f.set_permissions(fs::Permissions::from_mode(perm))?;
+    }
+    Ok(f.metadata()?)
+}
+
 /// Blocking: write items under `dir`. Returns the index entry per item;
-/// gitlinks produce `None` (empty directory, not indexed).
-fn write_items(dir: &Path, items: Vec<WriteItem>) -> anyhow::Result<Vec<(String, Option<Entry>)>> {
+/// gitlinks produce `None` (empty directory, not indexed). `fresh`: nothing
+/// can exist at the destinations (new workspace), so skip clearing them.
+fn write_items(dir: &Path, items: Vec<WriteItem>, fresh: bool) -> anyhow::Result<Written> {
     let mut out = Vec::with_capacity(items.len());
+    let mut last_dir: Option<PathBuf> = None;
     for it in items {
         let key = it.path.as_str().to_string();
         let full = dir.join(&key);
-        if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent)?;
+        if let (false, Some(parent)) = (fresh, full.parent()) {
+            ensure_dir(parent, &mut last_dir)?;
         }
-        remove_existing(&full).with_context(|| format!("clearing {}", full.display()))?;
-        match it.mode {
+        if !fresh {
+            remove_existing(&full).with_context(|| format!("clearing {}", full.display()))?;
+        }
+        let meta = match it.mode {
             EntryMode::Gitlink => {
                 fs::create_dir_all(&full)?;
                 out.push((key, None));
@@ -432,16 +539,11 @@ fn write_items(dir: &Path, items: Vec<WriteItem>) -> anyhow::Result<Vec<(String,
             EntryMode::Symlink => {
                 symlink(OsStr::from_bytes(&it.body), &full)
                     .with_context(|| format!("creating symlink {}", full.display()))?;
+                fs::symlink_metadata(&full)?
             }
-            EntryMode::File | EntryMode::Executable => {
-                fs::write(&full, &it.body)
-                    .with_context(|| format!("writing {}", full.display()))?;
-                let perm = if it.mode == EntryMode::Executable { 0o755 } else { 0o644 };
-                fs::set_permissions(&full, fs::Permissions::from_mode(perm))?;
-            }
+            EntryMode::File | EntryMode::Executable => write_file(&full, it.mode, &it.body)?,
             EntryMode::Tree => bail!("tree entry {key} passed as a leaf"),
-        }
-        let meta = fs::symlink_metadata(&full)?;
+        };
         out.push((key, Some(Entry { mode: it.mode, id: it.id, stat: stat_of(&meta) })));
     }
     Ok(out)
@@ -455,40 +557,75 @@ fn blob_body(obj: &EncodedObject, id: &ObjectId) -> anyhow::Result<Bytes> {
     Ok(all.slice(all.len() - obj.body().len()..))
 }
 
-/// Fetch the blobs for `leaves` in batches of `BATCH` ids and write them.
-/// Gitlinks are written without fetching anything.
+/// Fetch the blobs for `leaves` in batches of `BATCH` ids and write them,
+/// several batches in flight at once (fetch, decompress and file writes of
+/// different batches overlap). Gitlinks are written without fetching anything.
 async fn write_leaves(
     objects: &dyn ObjectStore,
     dir: &Path,
     leaves: &[(RepoPath, EntryMode, ObjectId)],
-) -> anyhow::Result<Vec<(String, Option<Entry>)>> {
+    fresh: bool,
+) -> anyhow::Result<Written> {
+    let batches: Vec<anyhow::Result<Written>> = futures::stream::iter(leaves.chunks(BATCH))
+        .map(|chunk| async move {
+            let ids: Vec<ObjectId> = chunk
+                .iter()
+                .filter(|(_, mode, _)| *mode != EntryMode::Gitlink)
+                .map(|(_, _, id)| *id)
+                .collect();
+            let fetched: Vec<Option<EncodedObject>> =
+                if ids.is_empty() { Vec::new() } else { objects.get_many(&ids).await? };
+            let mut fetched = fetched.into_iter();
+            let mut items = Vec::with_capacity(chunk.len());
+            for (path, mode, id) in chunk {
+                let body = if *mode == EntryMode::Gitlink {
+                    Bytes::new()
+                } else {
+                    let obj = fetched
+                        .next()
+                        .flatten()
+                        .ok_or_else(|| anyhow!("missing blob {id} for {path}"))?;
+                    blob_body(&obj, id)?
+                };
+                items.push(WriteItem { path: path.clone(), mode: *mode, id: *id, body });
+            }
+            let d = dir.to_path_buf();
+            tokio::task::spawn_blocking(move || write_items(&d, items, fresh)).await?
+        })
+        .buffer_unordered(WRITE_CONCURRENCY)
+        .collect()
+        .await;
     let mut out = Vec::with_capacity(leaves.len());
-    for chunk in leaves.chunks(BATCH) {
-        let ids: Vec<ObjectId> = chunk
-            .iter()
-            .filter(|(_, mode, _)| *mode != EntryMode::Gitlink)
-            .map(|(_, _, id)| *id)
-            .collect();
-        let fetched: Vec<Option<EncodedObject>> =
-            if ids.is_empty() { Vec::new() } else { objects.get_many(&ids).await? };
-        let mut fetched = fetched.into_iter();
-        let mut items = Vec::with_capacity(chunk.len());
-        for (path, mode, id) in chunk {
-            let body = if *mode == EntryMode::Gitlink {
-                Bytes::new()
-            } else {
-                let obj = fetched
-                    .next()
-                    .flatten()
-                    .ok_or_else(|| anyhow!("missing blob {id} for {path}"))?;
-                blob_body(&obj, id)?
-            };
-            items.push(WriteItem { path: path.clone(), mode: *mode, id: *id, body });
-        }
-        let d = dir.to_path_buf();
-        out.extend(tokio::task::spawn_blocking(move || write_items(&d, items)).await??);
+    for b in batches {
+        out.extend(b?);
     }
     Ok(out)
+}
+
+type Expanded = (Vec<(RepoPath, ObjectId)>, Vec<(RepoPath, EntryMode, ObjectId)>);
+
+/// Decode the tree `id` at `parent`: the subtrees worth descending into and
+/// the leaves inside the sparse scope.
+fn expand_tree(
+    matcher: &Matcher,
+    parent: &RepoPath,
+    id: &ObjectId,
+    obj: Option<EncodedObject>,
+) -> anyhow::Result<Expanded> {
+    let tree = decode_tree(id, obj)?;
+    let mut subtrees = Vec::new();
+    let mut leaves = Vec::new();
+    for e in tree.entries() {
+        let child = parent.join(&e.name)?;
+        if e.mode.is_tree() {
+            if matcher.may_contain_under(&child) {
+                subtrees.push((child, e.id));
+            }
+        } else if matcher.matches(&child) {
+            leaves.push((child, e.mode, e.id));
+        }
+    }
+    Ok((subtrees, leaves))
 }
 
 fn decode_tree(id: &ObjectId, obj: Option<EncodedObject>) -> anyhow::Result<Tree> {
@@ -506,8 +643,78 @@ async fn put_blobs(objects: &dyn ObjectStore, blobs: &[EncodedObject]) -> anyhow
     Ok(())
 }
 
+/// What one directory contributed to a [`scan`].
+#[derive(Default)]
+struct DirScan<'a> {
+    subdirs: Vec<String>,
+    changes: Vec<LocalChange>,
+    blobs: Vec<EncodedObject>,
+    /// Index keys found on disk.
+    seen: Vec<&'a str>,
+}
+
+/// Blocking: list the directory `rel` (relative to `dir`, "" for the root)
+/// and compare its files against `index`.
+fn scan_dir<'a>(
+    dir: &Path,
+    rel: &str,
+    index: &'a Index,
+    index_mtime: Option<i64>,
+) -> anyhow::Result<DirScan<'a>> {
+    let mut out = DirScan::default();
+    let full_dir = if rel.is_empty() { dir.to_path_buf() } else { dir.join(rel) };
+    let listing =
+        fs::read_dir(&full_dir).with_context(|| format!("walking {}", full_dir.display()))?;
+    for entry in listing {
+        let entry = entry.with_context(|| format!("walking {}", full_dir.display()))?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| anyhow!("non-UTF-8 path {}", full_dir.join(&name).display()))?;
+        if rel.is_empty() && name == STATE_DIR {
+            continue;
+        }
+        let ft = entry.file_type()?;
+        let rel_str = if rel.is_empty() { name.to_string() } else { format!("{rel}/{name}") };
+        if ft.is_dir() {
+            // Directories (including empty ones) are not tracked themselves.
+            out.subdirs.push(rel_str);
+            continue;
+        }
+        if !(ft.is_file() || ft.is_symlink()) {
+            continue;
+        }
+        let meta = entry.metadata()?;
+        let (kind, new) = match index.get_key_value(rel_str.as_str()) {
+            Some((key, rec)) => {
+                out.seen.push(key.as_str());
+                let racy = index_mtime.is_some_and(|im| rec.stat.mtime_ns >= im);
+                if !racy && rec.stat == stat_of(&meta) {
+                    continue;
+                }
+                let (mode, body) = hash_disk(&entry.path(), &meta)?;
+                let id = hash_object(ObjectKind::Blob, &body);
+                if id == rec.id && mode == rec.mode {
+                    continue;
+                }
+                out.blobs.push(EncodedObject::new(ObjectKind::Blob, &body));
+                (LocalChangeKind::Modified, Some((mode, id)))
+            }
+            None => {
+                let (mode, body) = hash_disk(&entry.path(), &meta)?;
+                let id = hash_object(ObjectKind::Blob, &body);
+                out.blobs.push(EncodedObject::new(ObjectKind::Blob, &body));
+                (LocalChangeKind::Added, Some((mode, id)))
+            }
+        };
+        out.changes.push(LocalChange { path: RepoPath::new(rel_str.as_str())?, kind, new });
+    }
+    Ok(out)
+}
+
 /// Blocking: walk `dir` and compare it against `index`. Returns the changes
-/// plus the encoded blobs for every Added/Modified entry.
+/// plus the encoded blobs for every Added/Modified entry. Directories are
+/// listed and their files stat'ed in parallel, one tree level at a time.
 fn scan(
     dir: &Path,
     index: &Index,
@@ -515,52 +722,31 @@ fn scan(
 ) -> anyhow::Result<(Vec<LocalChange>, Vec<EncodedObject>)> {
     let mut changes = Vec::new();
     let mut blobs = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
-    let walker = WalkDir::new(dir)
-        .follow_links(false)
-        .min_depth(1)
-        .into_iter()
-        .filter_entry(|e| !(e.depth() == 1 && e.file_name() == STATE_DIR));
-    for entry in walker {
-        let entry = entry.with_context(|| format!("walking {}", dir.display()))?;
-        let ft = entry.file_type();
-        if !(ft.is_file() || ft.is_symlink()) {
-            continue; // directories (including empty ones) are not tracked
+    let mut seen: Vec<&str> = Vec::with_capacity(index.len());
+    let mut level: Vec<String> = vec![String::new()];
+    while !level.is_empty() {
+        let results = par_map(&level, 8, |rel| scan_dir(dir, rel, index, index_mtime));
+        let mut next = Vec::new();
+        for r in results {
+            let r = r?;
+            next.extend(r.subdirs);
+            changes.extend(r.changes);
+            blobs.extend(r.blobs);
+            seen.extend(r.seen);
         }
-        let rel = entry.path().strip_prefix(dir)?;
-        let rel_str = rel.to_str().ok_or_else(|| anyhow!("non-UTF-8 path {}", rel.display()))?;
-        let meta = entry.metadata()?;
-        let (kind, new) = match index.get_key_value(rel_str) {
-            Some((key, rec)) => {
-                seen.insert(key.as_str());
-                let racy = index_mtime.is_some_and(|im| rec.stat.mtime_ns >= im);
-                if !racy && rec.stat == stat_of(&meta) {
-                    continue;
-                }
-                let (mode, body) = hash_disk(entry.path(), &meta)?;
-                let id = hash_object(ObjectKind::Blob, &body);
-                if id == rec.id && mode == rec.mode {
-                    continue;
-                }
-                blobs.push(EncodedObject::new(ObjectKind::Blob, &body));
-                (LocalChangeKind::Modified, Some((mode, id)))
-            }
-            None => {
-                let (mode, body) = hash_disk(entry.path(), &meta)?;
-                let id = hash_object(ObjectKind::Blob, &body);
-                blobs.push(EncodedObject::new(ObjectKind::Blob, &body));
-                (LocalChangeKind::Added, Some((mode, id)))
-            }
-        };
-        changes.push(LocalChange { path: RepoPath::new(rel_str)?, kind, new });
+        level = next;
     }
-    for key in index.keys() {
-        if !seen.contains(key.as_str()) {
-            changes.push(LocalChange {
-                path: RepoPath::new(key.as_str())?,
-                kind: LocalChangeKind::Deleted,
-                new: None,
-            });
+    // Every indexed path is on disk exactly once iff the counts agree.
+    if seen.len() < index.len() {
+        let seen: HashSet<&str> = seen.into_iter().collect();
+        for key in index.keys() {
+            if !seen.contains(key.as_str()) {
+                changes.push(LocalChange {
+                    path: RepoPath::new(key.as_str())?,
+                    kind: LocalChangeKind::Deleted,
+                    new: None,
+                });
+            }
         }
     }
     changes.sort_by(|a, b| a.path.cmp(&b.path));
@@ -577,34 +763,39 @@ impl Workspace {
     ) -> anyhow::Result<Self> {
         let matcher = sparse.compile()?;
 
-        // Breadth-first walk: one get_many per level for the subtrees we need.
+        // Breadth-first walk: one get_many per level for the subtrees we need;
+        // the trees of a level are decoded in parallel.
+        let matcher = Arc::new(matcher);
         let mut leaves: Vec<(RepoPath, EntryMode, ObjectId)> = Vec::new();
         let mut frontier = vec![(RepoPath::root(), base_tree)];
         while !frontier.is_empty() {
             let ids: Vec<ObjectId> = frontier.iter().map(|(_, id)| *id).collect();
             let level = objects.get_many(&ids).await?;
+            let m = matcher.clone();
+            let expanded = tokio::task::spawn_blocking(move || {
+                let work: Vec<_> = frontier.into_iter().zip(level).collect();
+                par_map(&work, 64, |((parent, id), obj)| expand_tree(&m, parent, id, obj.clone()))
+            })
+            .await?;
             let mut next = Vec::new();
-            for ((parent, id), obj) in frontier.iter().zip(level) {
-                let tree = decode_tree(id, obj)?;
-                for e in tree.entries() {
-                    let child = parent.join(&e.name)?;
-                    if e.mode.is_tree() {
-                        if matcher.may_contain_under(&child) {
-                            next.push((child, e.id));
-                        }
-                    } else if matcher.matches(&child) {
-                        leaves.push((child, e.mode, e.id));
-                    }
-                }
+            for r in expanded {
+                let (subtrees, found) = r?;
+                next.extend(subtrees);
+                leaves.extend(found);
             }
             frontier = next;
         }
 
         let d = dir.to_path_buf();
-        tokio::task::spawn_blocking(move || prepare_empty_dir(&d)).await??;
+        let levels = leaf_dirs(&leaves);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            prepare_empty_dir(&d)?;
+            create_dirs(&d, &levels)
+        })
+        .await??;
 
         let mut index = Index::new();
-        for (key, entry) in write_leaves(objects, dir, &leaves).await? {
+        for (key, entry) in write_leaves(objects, dir, &leaves, true).await? {
             if let Some(e) = entry {
                 index.insert(key, e);
             }
@@ -738,7 +929,7 @@ impl Workspace {
         })
         .await??;
 
-        for (key, entry) in write_leaves(objects, &self.dir, &writes).await? {
+        for (key, entry) in write_leaves(objects, &self.dir, &writes, false).await? {
             match entry {
                 Some(e) => {
                     index.insert(key, e);
@@ -930,6 +1121,33 @@ mod tests {
         assert_eq!(keep.new.unwrap().0, EntryMode::Executable);
         let m = st.iter().find(|c| c.path.as_str() == "mod").unwrap();
         assert_eq!(&objs.read_blob(&m.new.unwrap().1).await.unwrap()[..], b"m2");
+    }
+
+    #[tokio::test]
+    async fn parallel_scan_many_dirs_and_deletions() {
+        let objs = MemoryObjectStore::default();
+        let files: Vec<(String, Vec<u8>)> = (0..400)
+            .map(|i| (format!("d{}/s{}/f{i}", i % 20, i % 7), vec![b'x'; i % 50]))
+            .collect();
+        let refs: Vec<(&str, &[u8])> =
+            files.iter().map(|(a, b)| (a.as_str(), b.as_slice())).collect();
+        let t = build_tree(&objs, &refs).await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ws");
+        let ws = Workspace::materialize(&objs, &dir, C, t, Sparse::all()).await.unwrap();
+        assert!(ws.status(&objs).await.unwrap().is_empty());
+        std::fs::remove_file(dir.join(&files[3].0)).unwrap();
+        std::fs::remove_file(dir.join(&files[399].0)).unwrap();
+        std::fs::write(dir.join("d1/new"), b"n").unwrap();
+        let st = ws.status(&objs).await.unwrap();
+        let summary: Vec<_> = st.iter().map(|c| (c.path.as_str().to_string(), c.kind)).collect();
+        let mut expect = vec![
+            (files[3].0.clone(), LocalChangeKind::Deleted),
+            (files[399].0.clone(), LocalChangeKind::Deleted),
+            ("d1/new".to_string(), LocalChangeKind::Added),
+        ];
+        expect.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(summary, expect);
     }
 
     #[tokio::test]
