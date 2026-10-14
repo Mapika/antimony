@@ -84,7 +84,9 @@ const RECORD_QUEUE: usize = 64;
 /// Commits recorded per `put_commits`: batches are merged up to this size.
 const RECORD_COMMITS: usize = 1500;
 /// Resident file-backed memory above which mapped packs are released.
-const PACK_RSS_LIMIT: usize = 192 << 20;
+const PACK_RSS_LIMIT: usize = 64 << 20;
+/// Delta-base cache per git handle (one per worker thread).
+const DELTA_CACHE_BYTES: usize = 24 << 20;
 /// Largest memo, in objects (56 bytes each).
 const MEMO_MAX_ENTRIES: usize = 1 << 23;
 
@@ -351,7 +353,11 @@ fn produce(
     tx: mpsc::Sender<Msg>,
     tuning: &Tuning,
 ) -> anyhow::Result<()> {
-    let repo = gix::open(repo_path)
+    // Every thread has its own handle, each with a delta-base cache that
+    // defaults to ~100 MiB: bound it so memory does not scale with threads.
+    let options = gix::open::Options::default()
+        .config_overrides([format!("gitoxide.core.deltaBaseCacheLimit={DELTA_CACHE_BYTES}")]);
+    let repo = gix::open_opts(repo_path, options)
         .with_context(|| format!("opening git repo {}", repo_path.display()))?;
     if repo.object_hash() != gix::hash::Kind::Sha1 {
         bail!("only SHA-1 source repositories are supported");
@@ -385,7 +391,7 @@ fn produce(
                         conv.convert(prep)?;
                     }
                     chunks += 1;
-                    if chunks % 64 == 0 {
+                    if chunks.is_multiple_of(8) {
                         rss::trim_mapped_packs(PACK_RSS_LIMIT);
                         rss::release_heap();
                     }

@@ -241,7 +241,7 @@ mod tests {
         }
         // An object stored the old way (one key) is still found.
         let old = EncodedObject::new(ObjectKind::Blob, b"stored before packs");
-        s3.put_many(&[old.clone()]).await.unwrap();
+        s3.put_many(std::slice::from_ref(&old)).await.unwrap();
         assert_eq!(store.get_many(&[old.id()]).await.unwrap(), vec![Some(old.clone())]);
         assert_eq!(store.has_many(&[old.id(), ids[0]]).await.unwrap(), vec![true, true]);
         assert_eq!(store.get(&old.id()).await.unwrap(), Some(old));

@@ -155,6 +155,7 @@ pub(crate) fn discover(
             }
         }
         let mut heads = read_heads(repo, &unknown, threads)?.into_iter();
+        crate::rss::trim_mapped_packs(64 << 20);
         for i in next..end {
             par_off.push(par.len() as u32);
             if known.contains_key(&(i as u32)) {

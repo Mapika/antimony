@@ -32,6 +32,10 @@ impl Reader {
     }
 
     fn find(&mut self, id: &Oid) -> anyhow::Result<&[u8]> {
+        // Do not let one huge object pin its buffer for the rest of the run.
+        if self.buf.capacity() > 4 << 20 {
+            self.buf = Vec::new();
+        }
         let data = self
             .repo
             .objects
