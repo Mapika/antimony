@@ -215,18 +215,11 @@ async fn pg_status_diff_and_lagging_path_log() {
     let url = std::env::var("ANT_TEST_PG_URL")
         .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
     let schema = format!("t_soak_queries_{}", rand::random::<u64>());
-    let pg = Arc::new(PgStore::connect(&url, &schema).await.unwrap());
+    let pg = Arc::new(PgStore::connect_scratch(&url, &schema).await.unwrap());
     let b = Backend { objects: pg.clone(), refs: pg.clone(), meta: pg };
     let t = Instant::now();
     let (tips, paths) = soak_history(&b, 1500, 200).await;
     eprintln!("setup: {} lands in {:?}", paths.len(), t.elapsed());
     check_status_diffs(&b, &tips, &paths).await;
     check_path_logs(&b, &tips, 200).await;
-
-    use sqlx::Connection;
-    if let Ok(mut c) = sqlx::PgConnection::connect(&url).await {
-        let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA \"{schema}\" CASCADE")))
-            .execute(&mut c)
-            .await;
-    }
 }

@@ -232,6 +232,8 @@ fn run_end_to_end(lazy: bool) {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
     let uniq = format!("{}_{}", std::process::id(), nanos);
     let schema = format!("e2e_{uniq}");
+    // Declared first, so it drops last (after the server) and also on panic.
+    let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
     let prefix = format!("e2e/{uniq}/");
 
     let tmp = tempfile::tempdir().expect("tempdir");

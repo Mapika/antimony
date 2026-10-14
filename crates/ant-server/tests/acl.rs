@@ -1075,7 +1075,6 @@ async fn reindex_tags_imported_history() {
 #[tokio::test]
 #[ignore = "needs docker compose"]
 async fn acl_postgres() {
-    use sqlx::Connection;
     use std::sync::Arc;
     let url = std::env::var("ANT_TEST_PG_URL")
         .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
@@ -1085,7 +1084,9 @@ async fn acl_postgres() {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     );
     let pg = Arc::new(
-        ant_store::postgres::PgStore::connect(&url, &schema).await.expect("is docker compose up?"),
+        ant_store::postgres::PgStore::connect_scratch(&url, &schema)
+            .await
+            .expect("is docker compose up?"),
     );
     let b = Backend { objects: pg.clone(), refs: pg.clone(), meta: pg };
     let result = tokio::spawn({
@@ -1112,9 +1113,8 @@ async fn acl_postgres() {
         }
     })
     .await;
-    let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
-    let stmt = format!("DROP SCHEMA \"{schema}\" CASCADE");
-    sqlx::query(sqlx::AssertSqlSafe(stmt.as_str())).execute(&mut conn).await.unwrap();
+    // The scratch store drops the schema with the last handle to it.
+    drop(b);
     if let Err(e) = result {
         std::panic::resume_unwind(e.into_panic());
     }

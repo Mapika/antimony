@@ -846,7 +846,6 @@ fn pg_url() -> String {
 #[test]
 #[ignore = "needs docker compose"]
 fn concurrent_lands_postgres() {
-    use sqlx::Connection;
     let rt = runtime();
     let schema = format!(
         "props_{}_{}",
@@ -854,7 +853,7 @@ fn concurrent_lands_postgres() {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     );
     let pg = Arc::new(
-        rt.block_on(PgStore::connect(&pg_url(), &schema))
+        rt.block_on(PgStore::connect_scratch(&pg_url(), &schema))
             .expect("connect (is `docker compose up -d` running?)"),
     );
     let backend = Backend { objects: pg.clone(), refs: pg.clone(), meta: pg };
@@ -866,12 +865,9 @@ fn concurrent_lands_postgres() {
         rt.block_on(concurrency_case(backend.clone(), format!("main-{n}"), plans))
     });
 
-    // Always drop the schema, even when the property failed.
-    rt.block_on(async {
-        let mut conn = sqlx::PgConnection::connect(&pg_url()).await.unwrap();
-        let stmt = format!("DROP SCHEMA \"{schema}\" CASCADE");
-        sqlx::query(sqlx::AssertSqlSafe(stmt.as_str())).execute(&mut conn).await.unwrap();
-    });
+    // The scratch store drops the schema with the last handle to it, even
+    // when the property failed.
+    drop(backend);
     if let Err(e) = result {
         panic!("{e}");
     }

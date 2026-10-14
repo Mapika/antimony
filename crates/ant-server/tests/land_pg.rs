@@ -126,8 +126,13 @@ async fn replicas(n: usize, counts: &Arc<Counts>) -> Vec<Backend> {
         lock_timeout: std::time::Duration::from_secs(120),
     };
     let mut out = Vec::new();
-    for _ in 0..n {
-        let pg = Arc::new(PgStore::connect_with(&pg_url(), &schema, &options).await.unwrap());
+    for i in 0..n {
+        // The first replica drops the schema (all replicas are idle by then).
+        let pg = Arc::new(if i == 0 {
+            PgStore::connect_scratch_with(&pg_url(), &schema, &options).await.unwrap()
+        } else {
+            PgStore::connect_with(&pg_url(), &schema, &options).await.unwrap()
+        });
         let refs = Arc::new(Observed {
             inner: pg.clone(),
             schema: schema.clone(),

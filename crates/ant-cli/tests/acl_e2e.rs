@@ -312,6 +312,8 @@ fn git(repo: &Path, args: &[&str]) {
 fn import_and_reindex_with_policy_postgres() {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
     let schema = format!("acl_e2e_{}_{nanos}", std::process::id());
+    // Declared first, so it drops last (after the server) and also on panic.
+    let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
     let repo = root.join("repo");
@@ -367,18 +369,7 @@ fn import_and_reindex_with_policy_postgres() {
             .expect("curl");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "404");
     });
-    drop_schema(&schema);
     if let Err(e) = result {
         std::panic::resume_unwind(e);
     }
-}
-
-fn drop_schema(schema: &str) {
-    let rt = tokio::runtime::Runtime::new().expect("runtime");
-    rt.block_on(async {
-        use sqlx::Connection;
-        let mut conn = sqlx::PgConnection::connect(PG_URL).await.expect("connect");
-        let stmt = format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE");
-        sqlx::query(sqlx::AssertSqlSafe(stmt.as_str())).execute(&mut conn).await.expect("drop");
-    });
 }

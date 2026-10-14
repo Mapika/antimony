@@ -75,6 +75,58 @@ pub struct PgStore {
     locks: Option<sqlx::PgPool>,
     schema: String,
     async_object_commit: bool,
+    /// Drops the schema with the last clone of the store (scratch stores only).
+    _cleanup: Option<std::sync::Arc<SchemaGuard>>,
+}
+
+/// Drops a Postgres schema (`DROP SCHEMA ... CASCADE`) when it goes out of
+/// scope, including when a test panics. The drop runs on its own thread and
+/// connection, so it works from any runtime flavour, and errors are reported
+/// but never panic. For tests and tools that create throw-away schemas:
+/// hold the guard (declared before everything that uses the schema, so it
+/// drops last) or use [`PgStore::connect_scratch`].
+#[derive(Debug)]
+pub struct SchemaGuard {
+    url: String,
+    schema: String,
+}
+
+impl SchemaGuard {
+    pub fn new(url: &str, schema: &str) -> Self {
+        Self { url: url.to_owned(), schema: schema.to_owned() }
+    }
+}
+
+impl Drop for SchemaGuard {
+    fn drop(&mut self) {
+        let (url, schema) = (self.url.clone(), self.schema.clone());
+        let work = move || -> std::result::Result<(), String> {
+            use sqlx::Connection;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            rt.block_on(async {
+                let mut conn =
+                    sqlx::PgConnection::connect(&url).await.map_err(|e| e.to_string())?;
+                let stmt = format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(&schema));
+                sqlx::query(sqlx::AssertSqlSafe(stmt))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let _ = conn.close().await;
+                Ok(())
+            })
+        };
+        match std::thread::Builder::new().name("drop-schema".into()).spawn(work) {
+            Ok(h) => {
+                if let Ok(Err(e)) = h.join() {
+                    eprintln!("warning: dropping schema {}: {e}", self.schema);
+                }
+            }
+            Err(e) => eprintln!("warning: dropping schema {}: {e}", self.schema),
+        }
+    }
 }
 
 /// Connection limits of a [`PgStore`]. Every process connected to one
@@ -327,6 +379,26 @@ impl PgStore {
         Self::connect_with(url, schema, &PgOptions::default()).await
     }
 
+    /// [`Self::connect`] to a throw-away schema that is dropped (with all its
+    /// data) when the returned store is dropped, even on panic. Meant for
+    /// tests; other handles to the same schema must not outlive the store.
+    pub async fn connect_scratch(url: &str, schema: &str) -> Result<Self> {
+        Self::connect_scratch_with(url, schema, &PgOptions::default()).await
+    }
+
+    /// [`Self::connect_scratch`] with explicit connection limits.
+    pub async fn connect_scratch_with(
+        url: &str,
+        schema: &str,
+        options: &PgOptions,
+    ) -> Result<Self> {
+        // Armed before connecting: a half-created schema is dropped too.
+        let guard = SchemaGuard::new(url, schema);
+        let mut store = Self::connect_with(url, schema, options).await?;
+        store._cleanup = Some(std::sync::Arc::new(guard));
+        Ok(store)
+    }
+
     /// [`Self::connect`] with explicit connection limits.
     pub async fn connect_with(url: &str, schema: &str, options: &PgOptions) -> Result<Self> {
         use sqlx::Connection;
@@ -500,7 +572,7 @@ impl PgStore {
             .transpose()?;
 
         let async_object_commit = std::env::var(BULK_ENV).is_ok_and(|v| !v.is_empty() && v != "0");
-        Ok(Self { pool, locks, schema: schema.to_owned(), async_object_commit })
+        Ok(Self { pool, locks, schema: schema.to_owned(), async_object_commit, _cleanup: None })
     }
 }
 
@@ -1084,7 +1156,16 @@ impl MetaStore for PgStore {
         let times: Vec<i64> = unique.iter().map(|(n, _)| n.committer_time).collect();
         let changesets: Vec<Vec<u8>> =
             unique.iter().map(|(_, c)| changeset_codec::encode(c)).collect::<Result<_>>()?;
-        self.insert_changesets(&ids, &changesets).await?;
+        // Small batches (one changeset, a landing's rebased commits) carry
+        // their changesets inside the commit statement below: one round trip
+        // and one WAL flush instead of two in sequence. The statement is
+        // atomic, so a commit still never exists without its changeset.
+        // Large batches store the changesets ahead, several parts at once.
+        const INLINE_CHANGESETS: usize = 16;
+        let inline = unique.len() <= INLINE_CHANGESETS;
+        if !inline {
+            self.insert_changesets(&ids, &changesets).await?;
+        }
 
         // One atomic statement (no explicit transaction round trips): insert
         // the new nodes, append them to the log in input order (parents
@@ -1093,8 +1174,12 @@ impl MetaStore for PgStore {
         let query = sqlx::query(
             "WITH input AS ( \
                  SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::bytea[], $4::bigint[], \
-                                      $5::bigint[]) \
-                 WITH ORDINALITY AS t(id, tree, parents, generation, committer_time, ord)), \
+                                      $5::bigint[], $6::bytea[]) \
+                 WITH ORDINALITY AS t(id, tree, parents, generation, committer_time, cs, ord)), \
+             csi AS ( \
+                 INSERT INTO changesets (commit_id, data) \
+                 SELECT id, cs FROM input WHERE $7 ORDER BY id \
+                 ON CONFLICT (commit_id) DO NOTHING), \
              ins AS ( \
                  INSERT INTO commits (id, tree, parents, generation, committer_time) \
                  SELECT id, tree, parents, generation, committer_time FROM input ORDER BY ord \
@@ -1112,7 +1197,9 @@ impl MetaStore for PgStore {
         .bind(&trees)
         .bind(&parents)
         .bind(&gens)
-        .bind(&times);
+        .bind(&times)
+        .bind(if inline { &changesets[..] } else { &[] })
+        .bind(inline);
         let result = self.write(query, crate::durability_deferred()).await?;
         let mut seqs: HashMap<ObjectId, u64> = HashMap::with_capacity(ids.len());
         for r in &result {
@@ -1270,7 +1357,9 @@ mod tests {
         let url = std::env::var("ANT_TEST_PG_URL")
             .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
         let schema = format!("t_{}", rand::random::<u64>());
-        PgStore::connect(&url, &schema).await.expect("connect (is `docker compose up -d` running?)")
+        PgStore::connect_scratch(&url, &schema)
+            .await
+            .expect("connect (is `docker compose up -d` running?)")
     }
 
     #[tokio::test]
@@ -1294,7 +1383,7 @@ mod tests {
         let schema = format!("t_{}", rand::random::<u64>());
         let opts =
             PgOptions { lock_timeout: std::time::Duration::from_secs(120), ..PgOptions::default() };
-        let a = PgStore::connect_with(&url, &schema, &opts).await.unwrap();
+        let a = PgStore::connect_scratch_with(&url, &schema, &opts).await.unwrap();
         let b = PgStore::connect_with(&url, &schema, &opts).await.unwrap();
         conformance::ref_lock(Arc::new(a), Arc::new(b)).await;
     }
@@ -1309,7 +1398,7 @@ mod tests {
             ..PgOptions::default()
         };
         let schema = format!("t_{}", rand::random::<u64>());
-        let a = PgStore::connect_with(&url, &schema, &opts).await.unwrap();
+        let a = PgStore::connect_scratch_with(&url, &schema, &opts).await.unwrap();
         let b = PgStore::connect_with(&url, &schema, &opts).await.unwrap();
         let other = fresh().await;
         let held = a.lock_ref("main").await.unwrap();
@@ -1477,13 +1566,50 @@ mod tests {
         assert!(s.has_many(&ids).await.unwrap().into_iter().take(350).all(|b| b));
     }
 
+    async fn schema_exists(url: &str, schema: &str) -> bool {
+        use sqlx::Connection;
+        let mut conn = sqlx::PgConnection::connect(url).await.unwrap();
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)",
+        )
+        .bind(schema)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap()
+    }
+
+    /// Scratch schemas go away with the last clone of the store, and a guard
+    /// drops its schema while a panic unwinds.
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_scratch_schema_is_dropped() {
+        let url = std::env::var("ANT_TEST_PG_URL")
+            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let schema = format!("t_{}", rand::random::<u64>());
+        let store = PgStore::connect_scratch(&url, &schema).await.unwrap();
+        let clone = store.clone();
+        assert!(schema_exists(&url, &schema).await);
+        drop(store);
+        assert!(schema_exists(&url, &schema).await, "a clone is still alive");
+        drop(clone);
+        assert!(!schema_exists(&url, &schema).await);
+
+        let schema = format!("t_{}", rand::random::<u64>());
+        let panicked = std::panic::catch_unwind(|| {
+            let _guard = SchemaGuard::new(&url, &schema);
+            panic!("test failure");
+        });
+        assert!(panicked.is_err());
+        assert!(!schema_exists(&url, &schema).await);
+    }
+
     #[tokio::test]
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_connect_is_idempotent() {
         let url = std::env::var("ANT_TEST_PG_URL")
             .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
         let schema = format!("t_{}", rand::random::<u64>());
-        let a = PgStore::connect(&url, &schema).await.unwrap();
+        let a = PgStore::connect_scratch(&url, &schema).await.unwrap();
         a.cas_ref("main", None, Some(ObjectId([1; 32]))).await.unwrap();
         let b = PgStore::connect(&url, &schema).await.unwrap();
         assert_eq!(b.get_ref("main").await.unwrap(), Some(ObjectId([1; 32])));
