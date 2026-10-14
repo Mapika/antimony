@@ -88,7 +88,7 @@ const PACK_RSS_LIMIT: usize = 96 << 20;
 /// Delta-base cache per git handle (one per worker thread).
 const DELTA_CACHE_BYTES: usize = 16 << 20;
 /// Largest memo, in objects (56 bytes each).
-const MEMO_MAX_ENTRIES: usize = 1 << 22;
+const MEMO_MAX_ENTRIES: usize = 1 << 21;
 
 #[derive(Debug, Clone)]
 pub struct ImportOptions {
@@ -129,7 +129,7 @@ impl Tuning {
             std::thread::available_parallelism()
                 .map_or(4, |n| n.get())
                 .saturating_sub(2)
-                .clamp(2, 12)
+                .clamp(2, 8)
         })
     }
 }
