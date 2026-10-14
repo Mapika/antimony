@@ -272,12 +272,12 @@ mod tests {
         RepoPath::new(s).unwrap()
     }
 
-    async fn blob(objs: &MemoryObjectStore, data: &[u8]) -> ObjectId {
+    async fn blob(objs: &dyn ObjectStore, data: &[u8]) -> ObjectId {
         objs.put(EncodedObject::new(ObjectKind::Blob, data)).await.unwrap()
     }
 
     async fn change(
-        objs: &MemoryObjectStore,
+        objs: &dyn ObjectStore,
         path: &str,
         kind: LocalChangeKind,
         data: Option<&[u8]>,
@@ -366,12 +366,13 @@ mod tests {
             (0..2000).map(|i| (format!("d{}/f{i}", i % 100), b"x".to_vec())).collect();
         let refs: Vec<(&str, &[u8])> =
             files.iter().map(|(a, b)| (a.as_str(), b.as_slice())).collect();
-        let old = build_tree(&objs.inner, &refs).await.unwrap();
+        let old = build_tree(objs.inner(), &refs).await.unwrap();
         files[5].1 = b"y".to_vec();
         let refs: Vec<(&str, &[u8])> =
             files.iter().map(|(a, b)| (a.as_str(), b.as_slice())).collect();
-        let new = build_tree(&objs.inner, &refs).await.unwrap();
-        let local = vec![change(&objs.inner, "d7/f7", LocalChangeKind::Modified, Some(b"z")).await];
+        let new = build_tree(objs.inner(), &refs).await.unwrap();
+        let local =
+            vec![change(objs.inner(), "d7/f7", LocalChangeKind::Modified, Some(b"z")).await];
         objs.reset();
         let plan = plan(&objs, old, new, &local).await.unwrap();
         assert_eq!(plan.len(), 2);

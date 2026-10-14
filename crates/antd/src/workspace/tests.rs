@@ -104,7 +104,7 @@ async fn sparse_skips_unneeded_subtrees() {
     }
     files.push(("want/a.rs".into(), b"w".to_vec()));
     let refs: Vec<(&str, &[u8])> = files.iter().map(|(a, b)| (a.as_str(), b.as_slice())).collect();
-    let t = build_tree(&objs.inner, &refs).await.unwrap();
+    let t = build_tree(objs.inner(), &refs).await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("ws");
     Workspace::materialize(&objs, &dir, C, t, Sparse::new(vec!["want".into()]).unwrap())

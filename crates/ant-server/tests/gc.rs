@@ -23,10 +23,7 @@ use ant_store::tiered::TieredObjectStore;
 use bytes::Bytes;
 use sqlx::Connection;
 
-fn pg_url() -> String {
-    std::env::var("ANT_TEST_PG_URL")
-        .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into())
-}
+use ant_store::testing::pg_url;
 
 struct Repo {
     b: Backend,

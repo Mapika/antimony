@@ -12,7 +12,7 @@ use fuser::*;
 
 use super::state::*;
 use super::*;
-use crate::test_support::{RecordingStore, runtime};
+use crate::test_support::{CountingStore, runtime};
 
 // Exercise the exact operation implementation even in a sandbox without
 // /dev/fuse; the mount tests in `tests.rs` independently cover kernel integration.
@@ -87,16 +87,16 @@ fn status_scales_with_changed_paths_without_kernel() {
     let rt = runtime();
     let paths = (0..20_000).map(|i| format!("d{:03}/f{:03}", i / 100, i % 100)).collect::<Vec<_>>();
     let entries = paths.iter().map(|p| (p.as_str(), b"base".as_slice())).collect::<Vec<_>>();
-    let (objects, _tree, temp) = workspace::<RecordingStore>(&rt, &entries);
+    let (objects, _tree, temp) = workspace::<CountingStore>(&rt, &entries);
     let state = temp.path();
     fs::create_dir_all(state.join("upper/d001")).unwrap();
     fs::create_dir_all(state.join("upper/d199")).unwrap();
     fs::write(state.join("upper/d001/f001"), b"one").unwrap();
     fs::write(state.join("upper/d199/f099"), b"two").unwrap();
-    objects.forget_reads();
+    objects.reset();
     let changes = rt.block_on(super::changes(objects.clone(), state)).unwrap();
     assert_eq!(changes.len(), 2);
-    assert_eq!(objects.ids_read(), 3);
+    assert_eq!(objects.ids(), 3);
     assert_eq!(changes[0].path.as_str(), "d001/f001");
     assert_eq!(changes[1].path.as_str(), "d199/f099");
 }

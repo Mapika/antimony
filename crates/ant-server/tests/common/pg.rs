@@ -11,11 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 
-/// `ANT_TEST_PG_URL`, default: the dev services' Postgres.
-pub fn pg_url() -> String {
-    std::env::var("ANT_TEST_PG_URL")
-        .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into())
-}
+pub use ant_store::testing::pg_url;
 
 /// A fresh schema name `<prefix>_<random>`.
 pub fn scratch_schema(prefix: &str) -> String {

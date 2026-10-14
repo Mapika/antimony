@@ -12,7 +12,7 @@ use antd::workspace::{LocalChange, LocalChangeKind};
 use fuser::*;
 
 use super::*;
-use crate::test_support::{RecordingStore, runtime};
+use crate::test_support::{CountingStore, runtime};
 
 struct Fixture {
     session: Option<BackgroundSession>,
@@ -342,7 +342,7 @@ fn writes_are_visible_to_reads_stat_and_status_immediately() {
 fn changes_only_reads_affected_branches_of_twenty_thousand_files() {
     let _gate = crate::KERNEL_GATE.lock();
     let rt = runtime();
-    let objects = Arc::new(RecordingStore::default());
+    let objects = Arc::new(CountingStore::default());
     let paths = (0..20_000).map(|i| format!("d{:03}/f{:03}", i / 100, i % 100)).collect::<Vec<_>>();
     let entries = paths.iter().map(|p| (p.as_str(), b"base".as_slice())).collect::<Vec<_>>();
     let tree = rt.block_on(build_tree(objects.as_ref(), &entries)).unwrap();
@@ -362,10 +362,10 @@ fn changes_only_reads_affected_branches_of_twenty_thousand_files() {
     .unwrap();
     fs::write(mount.join("d001/f001"), b"one").unwrap();
     fs::write(mount.join("d199/f099"), b"two").unwrap();
-    objects.forget_reads();
+    objects.reset();
     let changes = rt.block_on(changes(objects.clone(), &state)).unwrap();
     assert_eq!(changes.len(), 2);
-    assert!(objects.ids_read() <= 24, "too many base reads");
+    assert!(objects.ids() <= 24, "too many base reads");
     assert_eq!(&rt.block_on(objects.read_blob(&changes[0].new.unwrap().1)).unwrap()[..], b"one");
     session.umount_and_join().unwrap();
 }

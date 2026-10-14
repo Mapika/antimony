@@ -16,44 +16,21 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use ant_core::{EncodedObject, EntryMode, ObjectId, RepoPath};
+use ant_core::{EntryMode, ObjectId, RepoPath};
 use ant_server::ops::changeset::{ChangesetRequest, create_changeset};
 use ant_server::ops::history;
 use ant_server::ops::land::{LandOutcome, land};
 use ant_server::ops::query;
-use ant_store::{Backend, ChangeKind, ObjectStore};
-use async_trait::async_trait;
+use ant_store::testing::CountingStore;
+use ant_store::{Backend, ChangeKind};
 use common::*;
 
 const SHARDS: usize = 32;
 const AGENTS: usize = 512;
 /// Depth of `agents/<shard>/<agent>/<file>`: root, `agents`, shard, agent.
 const TREE_LEVELS: usize = 4;
-
-/// Forwards to another object store, counting `get_many` calls.
-struct CountingObjects {
-    inner: Arc<dyn ObjectStore>,
-    reads: AtomicUsize,
-}
-
-#[async_trait]
-impl ObjectStore for CountingObjects {
-    async fn get_many(&self, ids: &[ObjectId]) -> ant_store::Result<Vec<Option<EncodedObject>>> {
-        self.reads.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_many(ids).await
-    }
-
-    async fn put_many(&self, objects: &[EncodedObject]) -> ant_store::Result<()> {
-        self.inner.put_many(objects).await
-    }
-
-    async fn has_many(&self, ids: &[ObjectId]) -> ant_store::Result<Vec<bool>> {
-        self.inner.has_many(ids).await
-    }
-}
 
 fn agent_dir(i: usize) -> String {
     format!("agents/{:02}/{i}", i % SHARDS)
@@ -96,9 +73,8 @@ async fn soak_history(b: &Backend, lands: usize, lag: usize) -> (Vec<ObjectId>, 
 
 /// A backend whose object reads are counted, with caches of its own (they
 /// are scoped per store instance): every tree read starts cold.
-fn counted(b: &Backend) -> (Backend, Arc<CountingObjects>) {
-    let objects =
-        Arc::new(CountingObjects { inner: b.objects.clone(), reads: AtomicUsize::new(0) });
+fn counted(b: &Backend) -> (Backend, Arc<CountingStore>) {
+    let objects = Arc::new(CountingStore::new(b.objects.clone()));
     (Backend { objects: objects.clone(), ..b.clone() }, objects)
 }
 
@@ -110,7 +86,7 @@ async fn check_status_diffs(b: &Backend, tips: &[ObjectId], paths: &[String]) {
         let t = Instant::now();
         let changes = query::diff(&cold, Some(&base.to_hex()), &tip.to_hex()).await.unwrap();
         let elapsed = t.elapsed();
-        let reads = counter.reads.load(Ordering::Relaxed);
+        let reads = counter.calls();
         // What the landed changesets imply: every touched file, modified.
         let want: BTreeSet<&str> = paths[paths.len() - back..].iter().map(String::as_str).collect();
         let got: BTreeSet<&str> = changes.iter().map(|c| c.path.as_str()).collect();
@@ -125,7 +101,7 @@ async fn check_status_diffs(b: &Backend, tips: &[ObjectId], paths: &[String]) {
         let again = query::diff(&cold, Some(&base.to_hex()), &tip.to_hex()).await.unwrap();
         let warm = t.elapsed();
         assert_eq!(again, changes);
-        assert_eq!(counter.reads.load(Ordering::Relaxed), reads, "warm diff reads no trees");
+        assert_eq!(counter.calls(), reads, "warm diff reads no trees");
         eprintln!(
             "status diff {back:>4} lands back: {:>4} changes, {reads} reads, cold {elapsed:?}, \
              warm {warm:?}",

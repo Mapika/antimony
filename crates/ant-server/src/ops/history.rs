@@ -1595,8 +1595,7 @@ mod tests {
         use std::time::Instant;
 
         const N: usize = 20_000;
-        let url = std::env::var("ANT_TEST_PG_URL")
-            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let url = ant_store::testing::pg_url();
         let schema = format!(
             "hist_{}",
             std::time::SystemTime::now()

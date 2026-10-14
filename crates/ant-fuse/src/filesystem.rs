@@ -596,7 +596,7 @@ mod tests {
     use ant_store::graph::build_tree;
     use ant_store::memory::MemoryObjectStore;
 
-    use crate::test_support::RecordingStore;
+    use crate::test_support::CountingStore;
 
     #[test]
     fn lru_eviction_and_disabled_cache() {
@@ -621,7 +621,7 @@ mod tests {
     #[test]
     fn lazy_batched_trees_and_distinct_stable_inodes() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let store = Arc::new(RecordingStore::default());
+        let store = Arc::new(CountingStore::default());
         let root = rt
             .block_on(build_tree(
                 store.as_ref(),
@@ -629,12 +629,12 @@ mod tests {
             ))
             .unwrap();
         let view = View::new(store.clone(), root, rt.handle().clone(), MountOptions::default());
-        assert!(store.reads.lock().is_empty());
+        assert!(store.reads().is_empty());
         let mut s = view.state.lock();
         let tree = view.tree(&mut s, INodeNo(1)).unwrap();
-        assert_eq!(store.reads.lock().len(), 1);
+        assert_eq!(store.calls(), 1);
         view.prefetch(&mut s, INodeNo(1), &tree).unwrap();
-        assert_eq!(store.reads.lock()[1].len(), 2); // a and c share a tree.
+        assert_eq!(store.reads()[1].len(), 2); // a and c share a tree.
         view.prefetch(&mut s, INodeNo(1), &tree).unwrap();
         let a = view.lookup_inode(&mut s, INodeNo(1), OsStr::new("a")).unwrap();
         let c = view.lookup_inode(&mut s, INodeNo(1), OsStr::new("c")).unwrap();
@@ -644,10 +644,10 @@ mod tests {
         assert_ne!(ax, cx);
         assert_eq!(view.lookup_inode(&mut s, a, OsStr::new("x")).unwrap(), ax);
         assert_eq!(view.lookup_inode(&mut s, a, OsStr::new("..")).unwrap(), INodeNo(1));
-        assert_eq!(store.reads.lock().len(), 2);
+        assert_eq!(store.calls(), 2);
         assert_eq!(view.attr(&mut s, ax).unwrap().size, 4);
         assert_eq!(view.attr(&mut s, cx).unwrap().size, 4);
-        assert_eq!(store.reads.lock().len(), 3);
+        assert_eq!(store.calls(), 3);
         assert_eq!(view.lookup_inode(&mut s, ax, OsStr::new("x")), Err(Errno::ENOTDIR));
         assert_eq!(view.lookup_inode(&mut s, a, OsStr::new("missing")), Err(Errno::ENOENT));
     }
@@ -655,7 +655,7 @@ mod tests {
     #[test]
     fn missing_wrong_kind_gitlinks_and_cached_sizes() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let store = Arc::new(RecordingStore::default());
+        let store = Arc::new(CountingStore::default());
         let blob = rt.block_on(store.put(EncodedObject::new(ObjectKind::Blob, b"hello"))).unwrap();
         let opts = MountOptions { blob_cache_bytes: 0, ..MountOptions::default() };
         let view = View::new(store.clone(), blob, rt.handle().clone(), opts);
@@ -667,11 +667,11 @@ mod tests {
             INodeNo(1),
             &TreeEntry { mode: EntryMode::Gitlink, id: missing, name: "vendor".into() },
         );
-        let reads = store.reads.lock().len();
+        let reads = store.calls();
         assert!(view.tree(&mut s, gitlink).unwrap().is_empty());
         let attr = view.attr(&mut s, gitlink).unwrap();
         assert_eq!((attr.perm, attr.nlink), (0o555, 2));
-        assert_eq!(store.reads.lock().len(), reads);
+        assert_eq!(store.calls(), reads);
         assert_eq!(view.blob(&mut s, missing), Err(Errno::EIO));
         let file = View::inode(
             &mut s,
@@ -679,9 +679,9 @@ mod tests {
             &TreeEntry { mode: EntryMode::File, id: blob, name: "file".into() },
         );
         assert_eq!(view.attr(&mut s, file).unwrap().size, 5);
-        let reads = store.reads.lock().len();
+        let reads = store.calls();
         assert_eq!(view.attr(&mut s, file).unwrap().size, 5);
-        assert_eq!(store.reads.lock().len(), reads);
+        assert_eq!(store.calls(), reads);
         assert!(s.blobs.data.is_empty());
         assert!(View::node(&s, INodeNo(0)).is_err());
         assert!(View::node(&s, INodeNo(u64::MAX)).is_err());
@@ -690,7 +690,7 @@ mod tests {
     #[test]
     fn concurrent_lookup_reuses_inode_and_fetch() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let store = Arc::new(RecordingStore::default());
+        let store = Arc::new(CountingStore::default());
         let root = rt.block_on(build_tree(store.as_ref(), &[("file", b"data")])).unwrap();
         let view = View::new(store.clone(), root, rt.handle().clone(), MountOptions::default());
         std::thread::scope(|scope| {
@@ -710,13 +710,13 @@ mod tests {
                 assert_eq!(thread.join().unwrap(), INodeNo(2));
             }
         });
-        assert_eq!(store.reads.lock().len(), 2);
+        assert_eq!(store.calls(), 2);
     }
 
     #[test]
     fn reads_at_eof_and_extreme_offsets() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let store = Arc::new(RecordingStore::default());
+        let store = Arc::new(CountingStore::default());
         let root = rt.block_on(build_tree(store.as_ref(), &[("file", b"abcdef")])).unwrap();
         let view = View::new(store.clone(), root, rt.handle().clone(), MountOptions::default());
         let mut s = view.state.lock();
@@ -727,13 +727,13 @@ mod tests {
         assert!(view.read_range(&mut s, ino, u64::MAX, u32::MAX).unwrap().is_empty());
         assert!(view.read_range(&mut s, ino, 0, 0).unwrap().is_empty());
         assert_eq!(view.read_range(&mut s, INodeNo(1), 0, 1), Err(Errno::EISDIR));
-        assert_eq!(store.reads.lock().len(), 2);
+        assert_eq!(store.calls(), 2);
     }
 
     #[test]
     fn directory_pages_preserve_offsets_and_dot_entries() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let store = Arc::new(RecordingStore::default());
+        let store = Arc::new(CountingStore::default());
         let names: Vec<_> = (0..1500).map(|i| format!("f{i:04}")).collect();
         let files: Vec<_> = names.iter().map(|n| (n.as_str(), b"x".as_slice())).collect();
         let root = rt.block_on(build_tree(store.as_ref(), &files)).unwrap();
@@ -765,7 +765,7 @@ mod tests {
             assert_eq!(entry.0, view.lookup_inode(&mut s, INodeNo(1), OsStr::new(&name)).unwrap());
         }
         view.directory_page(&mut s, INodeNo(1), u64::MAX, |_, _, _, _| panic!("past EOF")).unwrap();
-        assert_eq!(store.reads.lock().len(), 1); // Listing never fetches file blobs.
+        assert_eq!(store.calls(), 1); // Listing never fetches file blobs.
     }
 
     #[test]

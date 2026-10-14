@@ -312,7 +312,7 @@ mod tests {
 
     /// Upstream that counts how many ids it was asked for and is slow.
     fn slow_upstream() -> CountingStore {
-        CountingStore { delay: Some(Duration::from_millis(50)), ..CountingStore::default() }
+        CountingStore::default().with_delay(Duration::from_millis(50))
     }
 
     /// Upstream that returns a different object than requested.
@@ -345,7 +345,7 @@ mod tests {
         let local = Arc::new(MemoryObjectStore::default());
         let up = Arc::new(slow_upstream());
         let o = EncodedObject::new(ObjectKind::Blob, b"remote");
-        up.inner.put(o.clone()).await.unwrap();
+        up.inner().put(o.clone()).await.unwrap();
         let rt = ReadThrough::new(local.clone(), up.clone());
         assert_eq!(rt.get(&o.id()).await.unwrap(), Some(o.clone()));
         assert_eq!(local.get(&o.id()).await.unwrap(), Some(o.clone()));
@@ -357,7 +357,7 @@ mod tests {
     async fn concurrent_misses_dedup() {
         let up = Arc::new(slow_upstream());
         let o = EncodedObject::new(ObjectKind::Blob, b"hot");
-        up.inner.put(o.clone()).await.unwrap();
+        up.inner().put(o.clone()).await.unwrap();
         let rt = Arc::new(ReadThrough::new(Arc::new(MemoryObjectStore::default()), up.clone()));
         let mut tasks = Vec::new();
         for _ in 0..20 {
@@ -393,7 +393,7 @@ mod tests {
                 EncodedObject::new(ObjectKind::Blob, &body)
             })
             .collect();
-        up.inner.put_many(&objs).await.unwrap();
+        up.inner().put_many(&objs).await.unwrap();
         let rt = Arc::new(ReadThrough::over_disk(disk.clone(), up.clone()).verified_upstream());
         let ids: Vec<ObjectId> = objs.iter().map(|o| o.id()).collect();
 
