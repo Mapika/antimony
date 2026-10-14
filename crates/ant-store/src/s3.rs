@@ -111,6 +111,12 @@ impl S3ObjectStore {
         }
     }
 
+    /// Readiness probe: `HEAD` on the bucket (cheap; no listing, no body).
+    pub async fn ping(&self) -> Result<()> {
+        self.client.head_bucket().bucket(&self.bucket).send().await.map_err(StoreError::backend)?;
+        Ok(())
+    }
+
     /// Object key for `id`.
     pub fn key(&self, id: &ObjectId) -> String {
         let hex = id.to_hex();

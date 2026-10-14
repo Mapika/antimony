@@ -7,7 +7,7 @@ For running a fleet in production (sizing, alerts, failure runbook), see the
 
 | process | role | state |
 |---|---|---|
-| `ant serve` | gRPC (`:7420`) + HTTP (`:7421`: `/o/<id>` objects, `/repo.git` git export, `/healthz`, `/metrics`) | none; caches only |
+| `ant serve` | gRPC (`:7420`) + HTTP (`:7421`: `/o/<id>` objects, `/repo.git` git export, `/healthz`, `/readyz`, `/metrics`) | none; caches only |
 | PostgreSQL ≥ 15 | refs, commit graph, changesets, small objects, history index | all metadata |
 | S3-compatible store | objects larger than 4 KiB (zstd) | large objects |
 | HTTP cache / CDN (optional) | caches `GET /o/<id>` (immutable; `private` for restricted zones) | disposable |
@@ -39,13 +39,20 @@ of both ports.
 **Metrics.** `GET /metrics` on the HTTP port returns Prometheus (OpenMetrics
 text) metrics. It is unauthenticated, so either keep the HTTP port private or
 move it with `--metrics-listen 127.0.0.1:9100` (`ANT_METRICS_LISTEN`): the
-endpoint then exists only on that listener (the HTTP port answers 404, or
-401 when a policy is set).
+endpoint then exists only on that listener (the HTTP port answers 404, also
+under a policy).
+
+**Health.** `GET /healthz` is liveness (static `ok`). `GET /readyz` is
+readiness: 200 `{"status":"ok","postgres":"ok","s3":"ok"}` when Postgres
+(`SELECT 1`) and S3 (`HEAD` bucket) answer within 2 s, else 503 naming the
+failing dependency (`"postgres":"down"`); in-memory is always ready. Both are
+unauthenticated. `GET /debug/stats` needs an admin token under a policy. Load
+balancer checks should use `/readyz`; see the operator guide.
 
 | family | labels | meaning |
 |---|---|---|
 | `ant_rpc_requests_total`, `ant_rpc_duration_seconds` | `method`, `code` / `method` | gRPC calls; `code` is the snake_case status (`ok`, `not_found`, `aborted`, ...; `cancelled` if the client left early); duration runs to the end of the response (streams included) |
-| `ant_http_requests_total`, `ant_http_duration_seconds` | `route`, `status` / `route` | `objects`, `git`, `healthz`, `metrics`, `other`; duration runs to the response headers |
+| `ant_http_requests_total`, `ant_http_duration_seconds` | `route`, `status` / `route` | `objects`, `git`, `healthz`, `readyz`, `metrics`, `other`; duration runs to the response headers |
 | `ant_land_batch_size` | | requests per group-commit batch |
 | `ant_land_outcomes_total` | `outcome` | `landed`, `rebased`, `conflict`, `aborted`, `denied` |
 | `ant_land_cas_retries_total` | | batches replayed after losing the ref CAS (another replica landed first) |
@@ -121,7 +128,8 @@ immediately.
   returns freed heap to the OS; `MALLOC_ARENA_MAX=2` saves about 50 MiB.
 - **Postgres:** `max_connections` must cover every server's pools
   (`--pg-max-connections`, default 64, plus `--pg-lock-connections`,
-  default 8, per process). Under sustained bulk import, autovacuum on `objects`
+  default 8, per process; ref-lock waits are bounded by `--pg-lock-timeout`,
+  default 10s). Under sustained bulk import, autovacuum on `objects`
   shows up; give it I/O headroom.
 - **Clients:** the shared disk cache defaults to 20 GiB
   (`--cache-bytes` / `ANT_CACHE_BYTES`). Sparse workspaces keep checkouts

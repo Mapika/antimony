@@ -430,6 +430,31 @@ impl PgStore {
         Ok(store)
     }
 
+    /// Readiness probe: one trivial query on the query pool. The connection
+    /// goes straight back to the pool; callers bound the wait themselves
+    /// (a saturated or unreachable pool blocks in `acquire`).
+    pub async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await.map_err(be)?;
+        Ok(())
+    }
+
+    /// A store whose pools connect on first use and run no migration, for
+    /// tests of unreachable-database behaviour (`url` may point nowhere).
+    pub fn connect_lazy_unchecked(url: &str, schema: &str) -> Result<Self> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect_lazy(url)
+            .map_err(be)?;
+        Ok(Self {
+            pool,
+            locks: None,
+            schema: schema.to_owned(),
+            async_object_commit: false,
+            _cleanup: None,
+        })
+    }
+
     /// [`Self::connect`] with explicit connection limits.
     pub async fn connect_with(url: &str, schema: &str, options: &PgOptions) -> Result<Self> {
         use sqlx::Connection;

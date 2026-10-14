@@ -6,6 +6,7 @@
 //!   --http-listen <addr>   default 127.0.0.1:7421
 //!   --metrics-listen <addr>  (ANT_METRICS_LISTEN) serve `/metrics` on its own
 //!                          listener instead of the HTTP port
+//!   --pg-lock-timeout <dur> (ANT_PG_LOCK_TIMEOUT) in the store flags, default 10s
 //!   --log-format json|text (ANT_LOG_FORMAT) default: text on a terminal,
 //!                          json otherwise; level via `RUST_LOG`
 //!   --policy <file>        (ANT_POLICY) access-control policy (`ant_auth`);
@@ -88,11 +89,9 @@ pub fn init_logging(format: Option<LogFormat>) {
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     init_logging(args.log_format);
 
-    let (backend, pg) = args.store.backend_with_pg().await?;
+    let (backend, probes) = args.store.backend_with_probes().await?;
     let metrics = Metrics::new();
-    if let Some(pg) = pg {
-        metrics.set_pg(pg);
-    }
+    metrics.set_probes(probes);
     let backend = metrics.instrument(&backend);
     spawn_malloc_trim();
     let acl = match &args.policy {
@@ -251,5 +250,19 @@ mod tests {
         assert_eq!(cli.serve.log_format, None);
         assert_eq!(cli.serve.metrics_listen, None);
         assert!(Cli::try_parse_from(["ant-server", "--memory", "--log-format", "xml"]).is_err());
+    }
+
+    #[test]
+    fn pg_lock_timeout_flag_parses() {
+        use std::time::Duration;
+        // Defaults and overrides are checked through the clap command: the
+        // field is private to `StoreArgs`, so assert parse success/failure.
+        assert!(Cli::try_parse_from(["ant-server", "--memory"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["ant-server", "--memory", "--pg-lock-timeout", "250ms"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["ant-server", "--memory", "--pg-lock-timeout", "0"]).is_err());
+        assert!(Cli::try_parse_from(["ant-server", "--memory", "--pg-lock-timeout", "x"]).is_err());
+        assert_eq!(crate::config::parse_duration("250ms"), Ok(Duration::from_millis(250)));
     }
 }

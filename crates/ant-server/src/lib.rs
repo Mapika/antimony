@@ -3,6 +3,7 @@
 
 pub mod acl;
 pub mod config;
+pub mod health;
 pub mod http;
 pub mod metrics;
 pub mod observe;

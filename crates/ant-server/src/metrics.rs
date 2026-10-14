@@ -23,7 +23,7 @@
 //!   streaming RPCs include the stream. Methods outside the proto service are
 //!   folded into `unknown`.
 //! - `ant_http_requests_total{route,status}`,
-//!   `ant_http_duration_seconds{route}`: routes `objects`, `git`, `healthz`,
+//!   `ant_http_duration_seconds{route}`: routes `objects`, `git`, `healthz`, `readyz`,
 //!   plus `metrics` and `other` (`/debug/stats`, 404s) so the label set stays
 //!   closed. The duration runs until the response headers are ready.
 //! - `ant_land_batch_size` (histogram, requests per group-commit batch),
@@ -203,6 +203,7 @@ pub struct Metrics {
     pg_max: Gauge,
     recent_refs: Mutex<RecentRefs>,
     pg: Mutex<Option<Arc<PgStore>>>,
+    probes: Mutex<crate::health::Probes>,
     /// Cache lookup totals already folded into the counters (starts at the
     /// process-wide values when this `Metrics` is created).
     cache_synced: Mutex<[(u64, u64); 4]>,
@@ -364,13 +365,29 @@ impl Metrics {
             pg_max,
             recent_refs: Mutex::new(RecentRefs::default()),
             pg: Mutex::new(None),
+            probes: Mutex::new(crate::health::Probes::default()),
             cache_synced: Mutex::new(lookup_counters()),
         })
     }
 
     /// Report the Postgres pool of `pg` in the `ant_pg_pool_*` gauges.
     pub fn set_pg(&self, pg: Arc<PgStore>) {
-        *self.pg.lock().unwrap_or_else(|e| e.into_inner()) = Some(pg);
+        *self.pg.lock().unwrap_or_else(|e| e.into_inner()) = Some(pg.clone());
+        self.probes.lock().unwrap_or_else(|e| e.into_inner()).pg = Some(pg);
+    }
+
+    /// Register the dependencies `GET /readyz` probes (also sets the
+    /// Postgres pool reported in the gauges).
+    pub fn set_probes(&self, probes: crate::health::Probes) {
+        if let Some(pg) = &probes.pg {
+            *self.pg.lock().unwrap_or_else(|e| e.into_inner()) = Some(pg.clone());
+        }
+        *self.probes.lock().unwrap_or_else(|e| e.into_inner()) = probes;
+    }
+
+    /// The dependencies `GET /readyz` probes.
+    pub fn probes(&self) -> crate::health::Probes {
+        self.probes.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     // -- transports -------------------------------------------------------

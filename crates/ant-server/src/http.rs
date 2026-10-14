@@ -7,11 +7,15 @@
 //!   `If-None-Match` matching the ETag → 304 with no body.
 //! - Unknown id → 404 with `Cache-Control: no-store` (it may appear later).
 //! - Malformed id → 400.
-//! - `GET /healthz` → 200 "ok".
+//! - `GET /healthz` → 200 "ok" (liveness: static, touches nothing).
+//! - `GET /readyz` → 200 `{"status":"ok","postgres":"ok","s3":"ok"}` when the
+//!   configured dependencies answer (`crate::health`; in-memory: just
+//!   `{"status":"ok"}`), else 503 with the failing ones as `down`/`timeout`.
 //! - `GET /metrics` → 200 Prometheus/OpenMetrics text (`crate::metrics`); absent
 //!   here when `--metrics-listen` serves it on its own listener.
 //! - `GET /debug/stats` → 200 JSON of process-local cache, land queue and
-//!   catch-up sizes (for soak monitoring).
+//!   catch-up sizes (for soak monitoring). Under a policy it needs an admin
+//!   token (401 without a valid one, 403 for a non-admin).
 //!
 //! Access control (`crate::acl`, only with a policy): `/o/{hex}` needs
 //! `Authorization: Bearer <token>` (or Basic with the token as password),
@@ -19,7 +23,7 @@
 //! outside the root zone are served `Cache-Control: private, ...`. The git
 //! export (`/repo.git/...`) takes Basic auth (401 carries
 //! `WWW-Authenticate: Basic` so git asks its credential helpers) and needs
-//! `can_read_everything`, else 403. `/healthz`, `/metrics` and `/debug/stats` stay open.
+//! `can_read_everything`, else 403. `/healthz`, `/readyz` and `/metrics` stay open.
 //!
 //! Every response carries `x-request-id` (the request's own or a fresh ULID);
 //! requests are counted and timed per route (`crate::observe`).
@@ -103,14 +107,14 @@ pub fn app_with_metrics(
 ) -> Router {
     let observer = Arc::new(Observer::new(metrics.clone(), acl.clone()));
     let git = ant_gitserve::router(backend.clone());
-    let git = if acl.is_open() {
-        git
-    } else {
-        git.layer(axum::middleware::from_fn_with_state(acl.clone(), git_auth))
-    };
-    router_with_state(backend, acl, metrics, expose_metrics)
-        .merge(git)
-        .layer(axum::middleware::from_fn_with_state(observer, http_observe))
+    let mut app = router_with_state(backend, acl.clone(), metrics, expose_metrics).merge(git);
+    if !acl.is_open() {
+        // A layer on the git router itself would also wrap its fallback and
+        // answer 401 for every unknown path (e.g. a `/metrics` moved to
+        // `--metrics-listen`); guarding by prefix keeps those a plain 404.
+        app = app.layer(axum::middleware::from_fn_with_state(acl, git_auth));
+    }
+    app.layer(axum::middleware::from_fn_with_state(observer, http_observe))
 }
 
 /// `GET /metrics`: the OpenMetrics text of the scrape.
@@ -137,16 +141,42 @@ fn router_with_state(
     let mut router = Router::new()
         .route("/o/{hex}", get(get_object))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
         .route("/debug/stats", get(debug_stats))
-        .with_state(HttpState { backend, acl });
+        .with_state(HttpState { backend, acl, probes: metrics.probes() });
     if expose_metrics {
         router = router.merge(Router::new().route("/metrics", get(scrape)).with_state(metrics));
     }
     router
 }
 
-/// `GET /debug/stats`: process-local sizes as one JSON line.
-async fn debug_stats() -> Response {
+/// `GET /readyz`: 200 when every configured dependency answers its probe,
+/// else 503; the JSON body names each dependency's state. Unauthenticated.
+async fn readyz(State(state): State<HttpState>) -> Response {
+    let readiness = state.probes.check().await;
+    let status =
+        if readiness.is_ready() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            (header::CACHE_CONTROL, HeaderValue::from_static(CACHE_NO_STORE)),
+        ],
+        readiness.json(),
+    )
+        .into_response()
+}
+
+/// `GET /debug/stats`: process-local sizes as one JSON line. Under a policy
+/// only admin principals may read it.
+async fn debug_stats(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    match state.acl.authenticate_header(authorization(&headers)) {
+        Err(e) => return unauthorized("Bearer realm=\"antimony\"", e),
+        Ok(Some(access)) if !access.is_admin() => {
+            return (StatusCode::FORBIDDEN, "admin token required").into_response();
+        }
+        Ok(_) => {}
+    }
     ([(header::CONTENT_TYPE, "application/json")], stats_json()).into_response()
 }
 
@@ -175,6 +205,7 @@ fn stats_json() -> String {
 struct HttpState {
     backend: Backend,
     acl: Acl,
+    probes: crate::health::Probes,
 }
 
 fn authorization(headers: &HeaderMap) -> Option<&str> {
@@ -219,6 +250,10 @@ async fn git_auth(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    let path = request.uri().path();
+    if path != "/repo.git" && !path.starts_with("/repo.git/") {
+        return next.run(request).await;
+    }
     match acl.authenticate_header(authorization(request.headers())) {
         Err(e) => unauthorized("Basic realm=\"antimony\"", e),
         Ok(Some(access)) if !access.can_read_everything() => {
@@ -230,7 +265,7 @@ async fn git_auth(
 }
 
 async fn get_object(
-    State(HttpState { backend, acl }): State<HttpState>,
+    State(HttpState { backend, acl, .. }): State<HttpState>,
     Path(hex): Path<String>,
     headers: HeaderMap,
 ) -> Response {
