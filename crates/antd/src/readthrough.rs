@@ -211,7 +211,6 @@ impl ObjectStore for ReadThrough {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
@@ -219,26 +218,11 @@ mod tests {
     use ant_store::memory::MemoryObjectStore;
     use ant_store::{ObjectStoreExt, conformance};
 
-    /// Upstream that counts how many ids it was asked for and is slow.
-    #[derive(Default)]
-    struct Counting {
-        inner: MemoryObjectStore,
-        fetched: AtomicUsize,
-    }
+    use crate::test_support::CountingStore;
 
-    #[async_trait]
-    impl ObjectStore for Counting {
-        async fn get_many(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
-            self.fetched.fetch_add(ids.len(), Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            self.inner.get_many(ids).await
-        }
-        async fn put_many(&self, objects: &[EncodedObject]) -> Result<()> {
-            self.inner.put_many(objects).await
-        }
-        async fn has_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {
-            self.inner.has_many(ids).await
-        }
+    /// Upstream that counts how many ids it was asked for and is slow.
+    fn slow_upstream() -> CountingStore {
+        CountingStore { delay: Some(Duration::from_millis(50)), ..CountingStore::default() }
     }
 
     /// Upstream that returns a different object than requested.
@@ -269,19 +253,19 @@ mod tests {
     #[tokio::test]
     async fn misses_fill_local() {
         let local = Arc::new(MemoryObjectStore::default());
-        let up = Arc::new(Counting::default());
+        let up = Arc::new(slow_upstream());
         let o = EncodedObject::new(ObjectKind::Blob, b"remote");
         up.inner.put(o.clone()).await.unwrap();
         let rt = ReadThrough::new(local.clone(), up.clone());
         assert_eq!(rt.get(&o.id()).await.unwrap(), Some(o.clone()));
         assert_eq!(local.get(&o.id()).await.unwrap(), Some(o.clone()));
         assert_eq!(rt.get(&o.id()).await.unwrap(), Some(o));
-        assert_eq!(up.fetched.load(Ordering::SeqCst), 1);
+        assert_eq!(up.ids(), 1);
     }
 
     #[tokio::test]
     async fn concurrent_misses_dedup() {
-        let up = Arc::new(Counting::default());
+        let up = Arc::new(slow_upstream());
         let o = EncodedObject::new(ObjectKind::Blob, b"hot");
         up.inner.put(o.clone()).await.unwrap();
         let rt = Arc::new(ReadThrough::new(Arc::new(MemoryObjectStore::default()), up.clone()));
@@ -294,7 +278,7 @@ mod tests {
         for t in tasks {
             assert_eq!(t.await.unwrap().unwrap(), Some(o.clone()));
         }
-        assert_eq!(up.fetched.load(Ordering::SeqCst), 1);
+        assert_eq!(up.ids(), 1);
     }
 
     #[tokio::test]

@@ -1,13 +1,12 @@
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
+use crate::test_support::CountingStore;
 use ant_core::{EncodedObject, Object, ObjectKind, Tree, TreeEntry};
+use ant_store::ObjectStoreExt;
 use ant_store::graph::build_tree;
 use ant_store::memory::MemoryObjectStore;
-use ant_store::{ObjectStoreExt, Result as SResult};
-use async_trait::async_trait;
 
 fn p(s: &str) -> RepoPath {
     RepoPath::new(s).unwrap()
@@ -15,25 +14,6 @@ fn p(s: &str) -> RepoPath {
 
 const C: ObjectId = ObjectId([0xc0; 32]);
 const C2: ObjectId = ObjectId([0xc2; 32]);
-
-#[derive(Default)]
-struct CountingStore {
-    inner: MemoryObjectStore,
-    calls: AtomicUsize,
-}
-#[async_trait]
-impl ObjectStore for CountingStore {
-    async fn get_many(&self, ids: &[ObjectId]) -> SResult<Vec<Option<EncodedObject>>> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.get_many(ids).await
-    }
-    async fn put_many(&self, o: &[EncodedObject]) -> SResult<()> {
-        self.inner.put_many(o).await
-    }
-    async fn has_many(&self, ids: &[ObjectId]) -> SResult<Vec<bool>> {
-        self.inner.has_many(ids).await
-    }
-}
 
 #[test]
 fn sparse_matching() {
@@ -124,11 +104,7 @@ async fn sparse_skips_unneeded_subtrees() {
     assert!(dir.join("want/a.rs").exists());
     assert!(!dir.join("other0").exists());
     // root tree level + "want" level + one blob batch; definitely not ~150.
-    assert!(
-        objs.calls.load(Ordering::SeqCst) <= 4,
-        "calls = {}",
-        objs.calls.load(Ordering::SeqCst)
-    );
+    assert!(objs.calls() <= 4, "calls = {}", objs.calls());
 }
 
 #[tokio::test]

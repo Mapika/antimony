@@ -264,9 +264,9 @@ pub fn parse_conflicts(text: &str) -> anyhow::Result<Vec<RepoPath>> {
 mod tests {
     use super::*;
     use crate::workspace::LocalChangeKind;
+    use ant_store::ObjectStoreExt;
     use ant_store::graph::build_tree;
     use ant_store::memory::MemoryObjectStore;
-    use ant_store::{ObjectStore, ObjectStoreExt};
 
     fn p(s: &str) -> RepoPath {
         RepoPath::new(s).unwrap()
@@ -361,41 +361,22 @@ mod tests {
 
     #[tokio::test]
     async fn reads_only_directories_on_changed_paths() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        #[derive(Default)]
-        struct Counting(MemoryObjectStore, AtomicUsize);
-        #[async_trait::async_trait]
-        impl ObjectStore for Counting {
-            async fn get_many(
-                &self,
-                ids: &[ObjectId],
-            ) -> ant_store::Result<Vec<Option<EncodedObject>>> {
-                self.1.fetch_add(ids.len(), Ordering::SeqCst);
-                self.0.get_many(ids).await
-            }
-            async fn put_many(&self, o: &[EncodedObject]) -> ant_store::Result<()> {
-                self.0.put_many(o).await
-            }
-            async fn has_many(&self, ids: &[ObjectId]) -> ant_store::Result<Vec<bool>> {
-                self.0.has_many(ids).await
-            }
-        }
-        let objs = Counting::default();
+        let objs = crate::test_support::CountingStore::default();
         let mut files: Vec<(String, Vec<u8>)> =
             (0..2000).map(|i| (format!("d{}/f{i}", i % 100), b"x".to_vec())).collect();
         let refs: Vec<(&str, &[u8])> =
             files.iter().map(|(a, b)| (a.as_str(), b.as_slice())).collect();
-        let old = build_tree(&objs.0, &refs).await.unwrap();
+        let old = build_tree(&objs.inner, &refs).await.unwrap();
         files[5].1 = b"y".to_vec();
         let refs: Vec<(&str, &[u8])> =
             files.iter().map(|(a, b)| (a.as_str(), b.as_slice())).collect();
-        let new = build_tree(&objs.0, &refs).await.unwrap();
-        let local = vec![change(&objs.0, "d7/f7", LocalChangeKind::Modified, Some(b"z")).await];
-        objs.1.store(0, Ordering::SeqCst);
+        let new = build_tree(&objs.inner, &refs).await.unwrap();
+        let local = vec![change(&objs.inner, "d7/f7", LocalChangeKind::Modified, Some(b"z")).await];
+        objs.reset();
         let plan = plan(&objs, old, new, &local).await.unwrap();
         assert_eq!(plan.len(), 2);
         // Root + one directory per side for the diff, root + d7 for the local path.
-        assert!(objs.1.load(Ordering::SeqCst) <= 8, "{}", objs.1.load(Ordering::SeqCst));
+        assert!(objs.ids() <= 8, "{}", objs.ids());
     }
 
     #[test]

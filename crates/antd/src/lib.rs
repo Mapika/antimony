@@ -20,3 +20,6 @@ pub mod remote;
 pub mod update;
 pub mod walk;
 pub mod workspace;
+
+#[cfg(test)]
+mod test_support;
