@@ -12,24 +12,18 @@ use fuser::*;
 
 use super::state::*;
 use super::*;
+use crate::test_support::{RecordingStore, runtime};
 
 // Exercise the exact operation implementation even in a sandbox without
 // /dev/fuse; the mount tests in `tests.rs` independently cover kernel integration.
 #[test]
 fn mutations_and_reset_without_kernel() {
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-    let objects = Arc::new(MemoryObjectStore::default());
-    let tree = rt
-        .block_on(build_tree(
-            objects.as_ref(),
-            &[("file", b"original"), ("dir/a", b"a"), ("dir/sub/b", b"b")],
-        ))
-        .unwrap();
-    let temp = tempfile::tempdir().unwrap();
+    let rt = runtime();
+    let (objects, tree, temp) = workspace::<MemoryObjectStore>(
+        &rt,
+        &[("file", b"original"), ("dir/a", b"a"), ("dir/sub/b", b"b")],
+    );
     let state = temp.path();
-    fs::create_dir(state.join("upper")).unwrap();
-    save_base(state, ObjectId([1; 32]), tree).unwrap();
-    save_whiteouts(state, &BTreeSet::new()).unwrap();
     let view = Writable::open(
         MountGuard::take(state).unwrap(),
         View::new(objects.clone(), tree, rt.handle().clone(), MountOptions::default()),
@@ -90,24 +84,19 @@ fn mutations_and_reset_without_kernel() {
 
 #[test]
 fn status_scales_with_changed_paths_without_kernel() {
-    use std::sync::atomic::Ordering;
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-    let objects = Arc::new(super::tests::CountingStore::default());
+    let rt = runtime();
     let paths = (0..20_000).map(|i| format!("d{:03}/f{:03}", i / 100, i % 100)).collect::<Vec<_>>();
     let entries = paths.iter().map(|p| (p.as_str(), b"base".as_slice())).collect::<Vec<_>>();
-    let tree = rt.block_on(build_tree(objects.as_ref(), &entries)).unwrap();
-    let temp = tempfile::tempdir().unwrap();
+    let (objects, _tree, temp) = workspace::<RecordingStore>(&rt, &entries);
     let state = temp.path();
     fs::create_dir_all(state.join("upper/d001")).unwrap();
     fs::create_dir_all(state.join("upper/d199")).unwrap();
     fs::write(state.join("upper/d001/f001"), b"one").unwrap();
     fs::write(state.join("upper/d199/f099"), b"two").unwrap();
-    save_base(state, ObjectId([1; 32]), tree).unwrap();
-    save_whiteouts(state, &BTreeSet::new()).unwrap();
-    objects.reads.store(0, Ordering::Relaxed);
+    objects.forget_reads();
     let changes = rt.block_on(super::changes(objects.clone(), state)).unwrap();
     assert_eq!(changes.len(), 2);
-    assert_eq!(objects.reads.load(Ordering::Relaxed), 3);
+    assert_eq!(objects.ids_read(), 3);
     assert_eq!(changes[0].path.as_str(), "d001/f001");
     assert_eq!(changes[1].path.as_str(), "d199/f099");
 }
@@ -138,7 +127,7 @@ fn interrupted_mutations_roll_forward() {
 
 #[test]
 fn reset_drops_unchanged_copies_and_splits_directory_whiteouts() {
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let rt = runtime();
     let objects = Arc::new(MemoryObjectStore::default());
     let old = rt
         .block_on(build_tree(
@@ -169,11 +158,13 @@ fn reset_drops_unchanged_copies_and_splits_directory_whiteouts() {
     assert_eq!(changes[0].kind, LocalChangeKind::Deleted);
 }
 
-fn workspace(
+/// A state directory (empty upper layer, no whiteouts) on a base tree of
+/// `files`, stored in a new `S`.
+fn workspace<S: ObjectStore + Default>(
     rt: &tokio::runtime::Runtime,
     files: &[(&str, &[u8])],
-) -> (Arc<MemoryObjectStore>, ObjectId, tempfile::TempDir) {
-    let objects = Arc::new(MemoryObjectStore::default());
+) -> (Arc<S>, ObjectId, tempfile::TempDir) {
+    let objects = Arc::new(S::default());
     let tree = rt.block_on(build_tree(objects.as_ref(), files)).unwrap();
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("upper")).unwrap();
@@ -185,11 +176,11 @@ fn workspace(
 #[test]
 fn whiteouts_are_journaled_and_compacted_past_the_threshold() {
     use super::journal::JOURNAL;
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let rt = runtime();
     let names = (0..300).map(|i| format!("f{i:03}")).collect::<Vec<_>>();
     let paths = names.iter().map(|n| format!("d/{n}")).collect::<Vec<_>>();
     let files = paths.iter().map(|p| (p.as_str(), b"x".as_slice())).collect::<Vec<_>>();
-    let (objects, tree, temp) = workspace(&rt, &files);
+    let (objects, tree, temp) = workspace::<MemoryObjectStore>(&rt, &files);
     let state = temp.path();
     let open = || {
         Writable::open(
@@ -236,8 +227,8 @@ fn whiteouts_are_journaled_and_compacted_past_the_threshold() {
 #[test]
 fn trailing_journal_rename_rolls_forward_once() {
     use super::journal::{JOURNAL, Record, append_durably, parse};
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-    let (_objects, _tree, temp) = workspace(&rt, &[("old", b"lower")]);
+    let rt = runtime();
+    let (_objects, _tree, temp) = workspace::<MemoryObjectStore>(&rt, &[("old", b"lower")]);
     let state = temp.path();
     fs::write(state.join("upper/old"), b"copied up").unwrap();
     // Crash after journaling the rename, before moving the upper copy.
@@ -258,8 +249,8 @@ fn trailing_journal_rename_rolls_forward_once() {
 #[test]
 fn torn_journal_tail_is_dropped_before_appending() {
     use super::journal::{JOURNAL, Record, append_durably, parse};
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-    let (_objects, _tree, temp) = workspace(&rt, &[("a", b"a"), ("b", b"b")]);
+    let rt = runtime();
+    let (_objects, _tree, temp) = workspace::<MemoryObjectStore>(&rt, &[("a", b"a"), ("b", b"b")]);
     let state = temp.path();
     append_durably(state, &Record::Whiteout("a".into())).unwrap();
     let good = fs::metadata(state.join(JOURNAL)).unwrap().len();

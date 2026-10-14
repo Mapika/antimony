@@ -33,6 +33,8 @@ use ant_store::ObjectStore;
 
 mod filesystem;
 pub mod rw;
+#[cfg(test)]
+mod test_support;
 pub use rw::mount_rw;
 
 #[derive(Debug, Clone)]
@@ -100,6 +102,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::test_support::runtime;
     use ant_core::{EncodedObject, EntryMode, Object, ObjectKind, Tree, TreeEntry};
     use ant_store::ObjectStoreExt;
     use ant_store::graph::build_tree;
@@ -152,13 +155,9 @@ mod tests {
         (gate, tmp, mnt, sess)
     }
 
-    fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap()
-    }
-
     #[test]
     fn reads_files_dirs_links() {
-        let rt = rt();
+        let rt = runtime();
         let (_gate, _tmp, mnt, _sess) = mount_fixture(&rt);
         assert_eq!(std::fs::read_to_string(mnt.join("src/lib.rs")).unwrap(), "pub fn x() {}\n");
         assert_eq!(std::fs::read_to_string(mnt.join("src/deep/er/f")).unwrap(), "deep");
@@ -187,7 +186,7 @@ mod tests {
 
     #[test]
     fn large_file_and_wide_dir() {
-        let rt = rt();
+        let rt = runtime();
         let (_gate, _tmp, mnt, _sess) = mount_fixture(&rt);
         let big = std::fs::read(mnt.join("big.bin")).unwrap();
         assert_eq!(big.len(), 3_000_000);
@@ -197,7 +196,7 @@ mod tests {
 
     #[test]
     fn read_only() {
-        let rt = rt();
+        let rt = runtime();
         let (_gate, _tmp, mnt, _sess) = mount_fixture(&rt);
         let e = std::fs::write(mnt.join("new"), b"x").unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::EROFS));

@@ -313,13 +313,10 @@ mod tests {
     use crate::rw::changes::{compare, scan_upper};
     use crate::rw::journal::{Persisted, load};
     use crate::rw::state::save_whiteouts;
+    use crate::test_support::runtime;
 
     /// The visible workspace: path → (exec, content).
     type View = BTreeMap<String, (bool, Vec<u8>)>;
-
-    fn runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap()
-    }
 
     async fn leaves(
         objects: &MemoryObjectStore,

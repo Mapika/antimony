@@ -573,49 +573,8 @@ mod tests {
     use ant_core::EncodedObject;
     use ant_store::graph::build_tree;
     use ant_store::memory::MemoryObjectStore;
-    use std::future::Future;
-    use std::pin::Pin;
 
-    #[derive(Default)]
-    struct RecordingStore {
-        inner: MemoryObjectStore,
-        reads: Mutex<Vec<Vec<ObjectId>>>,
-    }
-
-    // Spell out async_trait's boxed futures to avoid adding a dependency.
-    type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = ant_store::Result<T>> + Send + 'a>>;
-    impl ObjectStore for RecordingStore {
-        fn get_many<'a, 'b, 'f>(
-            &'a self,
-            ids: &'b [ObjectId],
-        ) -> StoreFuture<'f, Vec<Option<EncodedObject>>>
-        where
-            'a: 'f,
-            'b: 'f,
-            Self: 'f,
-        {
-            Box::pin(async move {
-                self.reads.lock().push(ids.to_vec());
-                self.inner.get_many(ids).await
-            })
-        }
-        fn put_many<'a, 'b, 'f>(&'a self, objects: &'b [EncodedObject]) -> StoreFuture<'f, ()>
-        where
-            'a: 'f,
-            'b: 'f,
-            Self: 'f,
-        {
-            Box::pin(async move { self.inner.put_many(objects).await })
-        }
-        fn has_many<'a, 'b, 'f>(&'a self, ids: &'b [ObjectId]) -> StoreFuture<'f, Vec<bool>>
-        where
-            'a: 'f,
-            'b: 'f,
-            Self: 'f,
-        {
-            Box::pin(async move { self.inner.has_many(ids).await })
-        }
-    }
+    use crate::test_support::RecordingStore;
 
     #[test]
     fn lru_eviction_and_disabled_cache() {
