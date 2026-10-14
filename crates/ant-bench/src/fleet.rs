@@ -17,7 +17,7 @@ use ant_proto::v1 as pb;
 use ant_proto::v1::ant_client::AntClient;
 use ant_server::acl::Acl;
 use ant_server::config::StoreArgs;
-use ant_server::serve::spawn_local;
+use ant_server::serve::spawn_local_with_metrics;
 use anyhow::{Context as _, Result, anyhow, bail};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -309,7 +309,10 @@ pub async fn run(args: Args) -> Result<i32> {
         (None, true) => {
             let backend = args.store.backend().await?;
             let backend = instrument(&backend, &metrics, "server.store");
-            let server = spawn_local(backend, Acl::open()).await?;
+            // Full production instrumentation (metrics layers, store timing).
+            let server =
+                spawn_local_with_metrics(backend, Acl::open(), ant_server::metrics::Metrics::new())
+                    .await?;
             (server.grpc_url(), "embedded")
         }
     };

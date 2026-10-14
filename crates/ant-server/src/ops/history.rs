@@ -48,6 +48,7 @@ use bytes::Bytes;
 use super::query::{self, LogEntry};
 use super::{OpError, OpResult};
 use crate::acl::Access;
+use crate::metrics::Metrics;
 
 /// Commits per index batch (changeset fetch + row write + watermark CAS).
 const INDEX_BATCH: usize = 1000;
@@ -139,12 +140,41 @@ pub async fn is_first_parent_ancestor(
 
 /// Bring `ref_name`'s history index up to date. Returns commits indexed.
 pub async fn catch_up(b: &Backend, ref_name: &str) -> OpResult<usize> {
+    catch_up_observed(b, ref_name, None).await
+}
+
+/// [`catch_up`] reporting the index lag and the duration of runs that indexed
+/// something to `metrics`.
+pub async fn catch_up_observed(
+    b: &Backend,
+    ref_name: &str,
+    metrics: Option<&Metrics>,
+) -> OpResult<usize> {
+    let start = std::time::Instant::now();
+    let indexed = catch_up_rounds(b, ref_name, metrics).await?;
+    if let (Some(m), true) = (metrics, indexed > 0) {
+        m.record_catch_up(start.elapsed().as_secs_f64());
+    }
+    Ok(indexed)
+}
+
+async fn catch_up_rounds(
+    b: &Backend,
+    ref_name: &str,
+    metrics: Option<&Metrics>,
+) -> OpResult<usize> {
     ant_store::validate_ref_name(ref_name)?;
+    let lag = |commits: usize| {
+        if let Some(m) = metrics {
+            m.set_history_lag(ref_name, commits);
+        }
+    };
     let mut indexed = 0;
     for _ in 0..MAX_ROUNDS {
         let Some(tip) = b.refs.get_ref(ref_name).await? else { return Ok(indexed) };
         let mut wm = b.meta.history_watermark(ref_name).await?;
         if wm == Some(tip) {
+            lag(0);
             return Ok(indexed);
         }
         // Newest first; ends before the watermark when it is an ancestor.
@@ -155,6 +185,7 @@ pub async fn catch_up(b: &Backend, ref_name: &str) -> OpResult<usize> {
             wm = None;
         }
         chain.reverse();
+        lag(chain.len());
         let mut pos = 0;
         while pos < chain.len() {
             let end = (pos + INDEX_BATCH).min(chain.len());
@@ -176,6 +207,7 @@ pub async fn catch_up(b: &Backend, ref_name: &str) -> OpResult<usize> {
                 indexed += batch.len();
                 wm = Some(last);
                 pos = end;
+                lag(chain.len() - pos);
                 continue;
             }
             // Someone else advanced the watermark; rows are idempotent. Skip
@@ -190,6 +222,7 @@ pub async fn catch_up(b: &Backend, ref_name: &str) -> OpResult<usize> {
             }
         }
         if pos >= chain.len() && b.refs.get_ref(ref_name).await? == Some(tip) {
+            lag(0);
             return Ok(indexed);
         }
     }
@@ -209,6 +242,11 @@ pub(crate) fn running_catch_ups() -> usize {
 /// running it is told to run once more instead of starting a second. Errors
 /// are logged; queries fall back to changeset scans.
 pub fn schedule_catch_up(b: &Backend, ref_name: &str) {
+    schedule_catch_up_observed(b, ref_name, None);
+}
+
+/// [`schedule_catch_up`] reporting to `metrics`.
+pub fn schedule_catch_up_observed(b: &Backend, ref_name: &str, metrics: Option<Arc<Metrics>>) {
     let key = (Arc::as_ptr(&b.meta).cast::<()>() as usize, ref_name.to_string());
     {
         let mut running = CATCH_UPS.lock().unwrap_or_else(|e| e.into_inner());
@@ -222,7 +260,7 @@ pub fn schedule_catch_up(b: &Backend, ref_name: &str) {
     let ref_name = ref_name.to_string();
     tokio::spawn(async move {
         loop {
-            if let Err(error) = catch_up(&b, &ref_name).await {
+            if let Err(error) = catch_up_observed(&b, &ref_name, metrics.as_deref()).await {
                 tracing::warn!(%error, ref_name, "history catch-up failed");
             }
             let mut running = CATCH_UPS.lock().unwrap_or_else(|e| e.into_inner());

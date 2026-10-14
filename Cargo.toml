@@ -34,10 +34,15 @@ futures = "0.3"
 flate2 = "1"
 gix = { version = "0.89", default-features = false, features = ["max-performance-safe", "revision", "sha1"] }
 globset = "0.4"
+http = "1"
+http-body = "1"
 hex = "0.4"
 libc = "0.2"
 lru = "0.16"
 parking_lot = "0.12"
+pin-project-lite = "0.2"
+prometheus-client = "0.25"
+prometheus-parse = "0.2"
 proptest = "1"
 prost = "0.14"
 protox = "0.10"
@@ -50,12 +55,14 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 toml = "1"
+tower = { version = "0.5", default-features = false }
 tokio-stream = "0.1"
 tonic = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+ulid = "1"
 walkdir = "2"
 zstd = "0.13"
 

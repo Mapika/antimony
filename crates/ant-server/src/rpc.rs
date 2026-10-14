@@ -23,6 +23,7 @@
 //! RPCs report unreadable objects exactly like missing ones.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, RepoPath, Signature};
 use ant_proto::MAX_MESSAGE_BYTES;
@@ -34,6 +35,8 @@ use futures::stream::{BoxStream, StreamExt};
 use tonic::{Request, Response, Status};
 
 use crate::acl::{self, Access, Acl};
+use crate::metrics::Metrics;
+use crate::observe::{GrpcObserveLayer, Observer};
 use crate::ops::OpError;
 use crate::ops::changeset::{self, ChangesetRequest, FileOp, WriteContent};
 use crate::ops::history;
@@ -49,6 +52,7 @@ const MAX_IDS: usize = 100_000;
 pub struct AntService {
     pub backend: Backend,
     acl: Acl,
+    metrics: Arc<Metrics>,
 }
 
 impl AntService {
@@ -58,7 +62,12 @@ impl AntService {
     }
 
     pub fn with_acl(backend: Backend, acl: Acl) -> Self {
-        Self { backend, acl }
+        Self::with_metrics(backend, acl, Metrics::new())
+    }
+
+    /// Report landing and history-index metrics to `metrics`.
+    pub fn with_metrics(backend: Backend, acl: Acl, metrics: Arc<Metrics>) -> Self {
+        Self { backend, acl, metrics }
     }
 
     /// The caller of `request`: `None` in open mode.
@@ -88,12 +97,28 @@ pub async fn serve_with_acl(
     acl: Acl,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
-    let svc = AntServer::new(AntService::with_acl(backend, acl))
+    serve_with_metrics(backend, acl, listener, Metrics::new()).await
+}
+
+/// [`serve_with_acl`] recording gRPC, landing and history metrics, with
+/// request ids and slow-request logs (`crate::observe`), into `metrics`.
+pub async fn serve_with_metrics(
+    backend: Backend,
+    acl: Acl,
+    listener: tokio::net::TcpListener,
+    metrics: Arc<Metrics>,
+) -> anyhow::Result<()> {
+    let observe = GrpcObserveLayer::new(Observer::new(metrics.clone(), acl.clone()));
+    let svc = AntServer::new(AntService::with_metrics(backend, acl, metrics))
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
     // Without TCP_NODELAY, Nagle + delayed ACKs add ~40 ms to small RPCs.
     let incoming = tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
-    tonic::transport::Server::builder().add_service(svc).serve_with_incoming(incoming).await?;
+    tonic::transport::Server::builder()
+        .layer(observe)
+        .add_service(svc)
+        .serve_with_incoming(incoming)
+        .await?;
     Ok(())
 }
 
@@ -363,7 +388,11 @@ impl Ant for AntService {
         Ok(Response::new(match outcome {
             CasOutcome::Updated => {
                 if new.is_some() {
-                    history::schedule_catch_up(&self.backend, &req.name);
+                    history::schedule_catch_up_observed(
+                        &self.backend,
+                        &req.name,
+                        Some(self.metrics.clone()),
+                    );
                 }
                 pb::UpdateRefResponse { updated: true, actual: None }
             }
@@ -404,13 +433,23 @@ impl Ant for AntService {
         let req = request.into_inner();
         ant_store::validate_ref_name(&req.ref_name).map_err(store_status)?;
         let commit = parse_id(&req.commit)?;
-        let outcome = land::land_as(&self.backend, access.as_ref(), &req.ref_name, commit)
-            .await
-            .map_err(op_status)?;
+        let outcome = land::land_observed(
+            &self.backend,
+            access.as_ref(),
+            &req.ref_name,
+            commit,
+            Some(&self.metrics),
+        )
+        .await
+        .map_err(op_status)?;
         if matches!(outcome, LandOutcome::Landed { .. }) {
             // Coalesced per ref, so a burst of lands in one leader batch (or
             // across batches) costs one background catch-up, not one each.
-            history::schedule_catch_up(&self.backend, &req.ref_name);
+            history::schedule_catch_up_observed(
+                &self.backend,
+                &req.ref_name,
+                Some(self.metrics.clone()),
+            );
         }
         let outcome = match outcome {
             LandOutcome::Landed { new_tip, rebased } => {

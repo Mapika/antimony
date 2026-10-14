@@ -143,6 +143,23 @@ fn ids_to_vecs(ids: &[ObjectId]) -> Vec<Vec<u8>> {
     ids.iter().map(|id| id.as_bytes().to_vec()).collect()
 }
 
+/// Connection counts of a [`PgStore`]'s query pool ([`PgStore::pool_stats`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolStats {
+    /// Open connections (idle plus in use).
+    pub size: u32,
+    /// Open connections waiting in the pool.
+    pub idle: u32,
+    /// Configured maximum.
+    pub max: u32,
+}
+
+impl PoolStats {
+    pub fn in_use(&self) -> u32 {
+        self.size.saturating_sub(self.idle)
+    }
+}
+
 impl PgStore {
     /// Commit object inserts with `synchronous_commit = off` (also enabled by the
     /// `ANT_PG_BULK` environment variable at connect time).
@@ -277,6 +294,15 @@ impl PgStore {
             });
         }
         Ok(map)
+    }
+
+    /// Current state of the query pool (for monitoring).
+    pub fn pool_stats(&self) -> PoolStats {
+        PoolStats {
+            size: self.pool.size(),
+            idle: u32::try_from(self.pool.num_idle()).unwrap_or(u32::MAX),
+            max: self.pool.options().get_max_connections(),
+        }
     }
 
     /// Connect and ensure `schema` and all tables exist.

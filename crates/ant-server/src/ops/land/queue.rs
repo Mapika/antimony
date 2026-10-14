@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 use super::replay::BatchState;
 use super::verify::Verified;
 use super::{LANDED_AS, LandOutcome, MAX_LAND_ATTEMPTS};
+use crate::metrics::Metrics;
 use crate::ops::{OpError, OpResult, cache};
 
 pub(super) const MAX_BATCH: usize = 64;
@@ -20,6 +21,7 @@ struct Request {
     commit: ObjectId,
     verified: Verified,
     policy: Option<Arc<Policy>>,
+    metrics: Option<Arc<Metrics>>,
     reply: Reply,
 }
 
@@ -81,7 +83,11 @@ impl Worker {
                 let count = queue.len().min(MAX_BATCH);
                 queue.drain(..count).collect()
             };
-            let result = land_batch(&b, &self.key.3, &batch).await;
+            let metrics = batch.iter().find_map(|r| r.metrics.as_deref());
+            if let Some(m) = metrics {
+                m.record_land_batch(batch.len());
+            }
+            let result = land_batch(&b, &self.key.3, &batch, metrics).await;
             // Mappings are durable before land_batch returns, so the next
             // holder sees everything this batch published.
             if let Err(error) = lock.release().await {
@@ -110,13 +116,23 @@ pub(crate) fn queue_stats() -> (usize, usize) {
     (queues.len(), queues.values().map(VecDeque::len).sum())
 }
 
+/// Waiting requests per ref name, summed over backends (for metrics).
+pub(crate) fn queue_depths() -> Vec<(String, usize)> {
+    let queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut by_ref: HashMap<&str, usize> = HashMap::new();
+    for (key, queue) in queues.iter() {
+        *by_ref.entry(key.3.as_str()).or_default() += queue.len();
+    }
+    by_ref.into_iter().map(|(r, n)| (r.to_owned(), n)).collect()
+}
+
 #[cfg(test)]
 pub(super) fn enqueue(
     b: &Backend,
     ref_name: &str,
     commit: ObjectId,
 ) -> oneshot::Receiver<OpResult<LandOutcome>> {
-    enqueue_checked(b, ref_name, commit, Verified::All, None)
+    enqueue_checked(b, ref_name, commit, Verified::All, None, None)
 }
 
 /// Queue a request already checked by `verify_land` (or `All` in open mode).
@@ -126,6 +142,7 @@ pub(super) fn enqueue_checked(
     commit: ObjectId,
     verified: Verified,
     policy: Option<Arc<Policy>>,
+    metrics: Option<Arc<Metrics>>,
 ) -> oneshot::Receiver<OpResult<LandOutcome>> {
     let key = QueueKey(
         Arc::as_ptr(&b.objects) as *const () as usize,
@@ -136,7 +153,13 @@ pub(super) fn enqueue_checked(
     let (reply, receiver) = oneshot::channel();
     let mut queues = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
     let lead = !queues.contains_key(&key);
-    queues.entry(key.clone()).or_default().push_back(Request { commit, verified, policy, reply });
+    queues.entry(key.clone()).or_default().push_back(Request {
+        commit,
+        verified,
+        policy,
+        metrics,
+        reply,
+    });
     if lead {
         tokio::spawn(Worker { key, active: true }.run(b.clone()));
     }
@@ -147,6 +170,7 @@ async fn land_batch(
     b: &Backend,
     ref_name: &str,
     batch: &[Request],
+    metrics: Option<&Metrics>,
 ) -> OpResult<Vec<OpResult<LandOutcome>>> {
     let mut state = BatchState::default();
     let ids: Vec<_> = batch.iter().map(|r| r.commit).collect();
@@ -203,6 +227,9 @@ async fn land_batch(
                 return Ok(outcomes);
             }
             CasOutcome::Mismatch { actual } => {
+                if let Some(m) = metrics {
+                    m.record_land_cas_retry();
+                }
                 start = actual;
                 state.pending.clear();
                 // Another process may have published new landed-as mappings.
