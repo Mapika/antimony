@@ -31,6 +31,15 @@ fn sparse_matching() {
     assert!(prefix_only.may_contain_under(&p("src/foo/bar")));
     assert!(!prefix_only.may_contain_under(&p("lib")));
     assert!(!prefix_only.may_contain_under(&p("src/foobar")));
+
+    // Directories wholly in scope (fetched with their contents as bundles).
+    let m = prefix_only.compile().unwrap();
+    assert!(m.covers_all_under(&p("src/foo")) && m.covers_all_under(&p("src/foo/x")));
+    assert!(!m.covers_all_under(&p("src")) && !m.covers_all_under(&RepoPath::root()));
+    assert!(!m.covers_all_under(&p("src/foobar")));
+    assert!(Sparse::all().compile().unwrap().covers_all_under(&RepoPath::root()));
+    let globs = Sparse::new(vec!["**/BUILD".into()]).unwrap().compile().unwrap();
+    assert!(!globs.covers_all_under(&p("x")));
 }
 
 #[tokio::test]

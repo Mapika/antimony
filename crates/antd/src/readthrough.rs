@@ -11,6 +11,11 @@
 //!   on several threads.
 //! - `put_many`: write to upstream first, then local (write-through).
 //! - `has_many`: local first, upstream for misses.
+//! - `with_tree_bundles(remote)`: [`ReadThrough::get_trees_bundled`] (the
+//!   workspace's [`DirFetch`]) fetches locally missing trees as HTTP tree
+//!   bundles, storing every bundled object (already verified by `remote`)
+//!   locally, so the walk's later reads of their blobs and subtrees are
+//!   local hits. Trees that no bundle delivered go through `get_many`.
 //! - In-flight dedup: concurrent `get_many` calls that miss on the same id
 //!   trigger only one upstream fetch for it (a map of shared futures).
 
@@ -24,6 +29,8 @@ use futures::future::{BoxFuture, FutureExt, Shared};
 
 use crate::disk::DiskObjectStore;
 use crate::par::par_map;
+use crate::remote::RemoteObjectStore;
+use crate::workspace::DirFetch;
 use parking_lot::Mutex;
 
 type Fetched = std::result::Result<Arc<HashMap<ObjectId, EncodedObject>>, Arc<String>>;
@@ -38,11 +45,20 @@ pub struct ReadThrough {
     /// Upstream verifies what it returns (e.g. `RemoteObjectStore`).
     trusted_upstream: bool,
     inflight: Arc<Mutex<HashMap<ObjectId, InFlight>>>,
+    /// Source of tree bundles (HTTP), if enabled.
+    bundles: Option<RemoteObjectStore>,
 }
 
 impl ReadThrough {
     pub fn new(local: Arc<dyn ObjectStore>, upstream: Arc<dyn ObjectStore>) -> Self {
-        Self { local, disk: None, upstream, trusted_upstream: false, inflight: Default::default() }
+        Self {
+            local,
+            disk: None,
+            upstream,
+            trusted_upstream: false,
+            inflight: Default::default(),
+            bundles: None,
+        }
     }
 
     /// Read-through over a disk cache. Fetched objects are written to it
@@ -54,7 +70,73 @@ impl ReadThrough {
             upstream,
             trusted_upstream: false,
             inflight: Default::default(),
+            bundles: None,
         }
+    }
+
+    /// Fetch missing trees for walks as tree bundles from `remote` (used
+    /// only while it has an HTTP base and the server serves bundles).
+    pub fn with_tree_bundles(mut self, remote: RemoteObjectStore) -> Self {
+        self.bundles = Some(remote);
+        self
+    }
+
+    /// `get_many(trees)` for a walk that will also read the trees' blobs
+    /// and subtrees: trees missing locally are fetched as bundles when
+    /// enabled, and every bundled object is stored locally.
+    pub async fn get_trees_bundled(
+        &self,
+        trees: &[ObjectId],
+    ) -> Result<Vec<Option<EncodedObject>>> {
+        let Some(remote) = self.bundles.as_ref().filter(|r| r.tree_bundles_enabled()) else {
+            return self.get_many(trees).await;
+        };
+        let mut out = self.local.get_many(trees).await?;
+        let mut misses: Vec<ObjectId> =
+            trees.iter().zip(&out).filter(|(_, o)| o.is_none()).map(|(id, _)| *id).collect();
+        if misses.is_empty() {
+            return Ok(out);
+        }
+        misses.sort_unstable();
+        misses.dedup();
+        let mut fetched: HashMap<ObjectId, EncodedObject> = HashMap::new();
+        for bundle in remote.get_tree_bundles(&misses).await.into_iter().flatten() {
+            fetched.extend(bundle);
+        }
+        if !fetched.is_empty() {
+            let found: Vec<(ObjectId, EncodedObject)> =
+                fetched.iter().map(|(id, o)| (*id, o.clone())).collect();
+            match &self.disk {
+                Some(disk) => disk.put_many_trusted(found).await?,
+                None => {
+                    let objs: Vec<EncodedObject> = found.into_iter().map(|(_, o)| o).collect();
+                    self.local.put_many(&objs).await?
+                }
+            }
+        }
+        let mut rest = Vec::new();
+        for (slot, id) in out.iter_mut().zip(trees) {
+            if slot.is_none() {
+                *slot = fetched.get(id).cloned();
+                if slot.is_none() {
+                    rest.push(*id);
+                }
+            }
+        }
+        if !rest.is_empty() {
+            let got: HashMap<ObjectId, EncodedObject> = rest
+                .iter()
+                .copied()
+                .zip(self.get_many(&rest).await?)
+                .filter_map(|(id, o)| Some((id, o?)))
+                .collect();
+            for (slot, id) in out.iter_mut().zip(trees) {
+                if slot.is_none() {
+                    *slot = got.get(id).cloned();
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Declare that `upstream` already hash-verifies every object it returns
@@ -116,6 +198,13 @@ impl ReadThrough {
         }
         out.extend(found);
         Ok(out)
+    }
+}
+
+#[async_trait]
+impl DirFetch for ReadThrough {
+    async fn get_dirs(&self, trees: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
+        self.get_trees_bundled(trees).await
     }
 }
 

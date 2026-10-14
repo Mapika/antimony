@@ -23,4 +23,5 @@ zstd.workspace = true
 
 [dev-dependencies]
 ant-server.workspace = true
+axum.workspace = true
 tempfile.workspace = true

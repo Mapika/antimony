@@ -327,6 +327,61 @@ async fn http_get_object_200_304_404_400() {
 }
 
 #[tokio::test]
+async fn http_tree_bundle_200_404_400() {
+    use ant_core::{EntryMode, Tree, TreeEntry};
+    let s = spawn_server().await;
+    let tree = |entries: Vec<(&str, EntryMode, ObjectId)>| {
+        let es = entries
+            .into_iter()
+            .map(|(n, mode, id)| TreeEntry { mode, name: n.into(), id })
+            .collect();
+        EncodedObject::new(ObjectKind::Tree, &Tree::new(es).unwrap().encode())
+    };
+    let (a, b) = (blob("a\n"), blob("b\n"));
+    // Over the 1 MiB bundle limit: left to `GET /o/`.
+    let big = EncodedObject::new(ObjectKind::Blob, &vec![1u8; (1 << 20) + 1]);
+    let sub = tree(vec![("b", EntryMode::File, b.id()), ("big", EntryMode::File, big.id())]);
+    let root = tree(vec![
+        ("a", EntryMode::Executable, a.id()),
+        ("sub", EntryMode::Tree, sub.id()),
+        ("link", EntryMode::Symlink, b.id()),
+    ]);
+    s.backend
+        .objects
+        .put_many(&[a.clone(), b.clone(), big.clone(), sub.clone(), root.clone()])
+        .await
+        .unwrap();
+
+    let resp =
+        s.http.get(format!("{}/t/{}", s.http_base, root.id().to_hex())).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.headers()["content-type"], ant_proto::bundle::CONTENT_TYPE);
+    assert_eq!(resp.headers()["cache-control"], "public, max-age=31536000, immutable");
+    assert_eq!(resp.headers()[ant_proto::bundle::HEADER], "1");
+    let body = resp.bytes().await.unwrap();
+    let frames = ant_proto::bundle::decode(&body, 64 << 20).unwrap();
+    let got: Vec<ObjectId> = frames.iter().map(|(id, _)| *id).collect();
+    // The tree first, its blob (once, though listed twice), then sub/ whole
+    // minus the large blob.
+    assert_eq!(got, [root.id(), a.id(), b.id(), sub.id()]);
+    for (id, data) in &frames {
+        EncodedObject::from_bytes(data.clone()).unwrap().verify(id).unwrap();
+    }
+
+    // Unknown ids and non-trees: 404, not cacheable, marked as a bundle route.
+    for id in [blob("absent").id(), a.id()] {
+        let resp = s.http.get(format!("{}/t/{}", s.http_base, id.to_hex())).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 404);
+        assert_eq!(resp.headers()["cache-control"], "no-store");
+        assert_eq!(resp.headers()[ant_proto::bundle::HEADER], "1");
+    }
+    for bad in ["/t/xyz", "/t/abcd"] {
+        let resp = s.http.get(format!("{}{bad}", s.http_base)).send().await.unwrap();
+        assert_eq!(resp.status(), 400, "GET {bad}");
+    }
+}
+
+#[tokio::test]
 async fn grpc_and_http_see_the_same_objects() {
     let mut s = spawn_server().await;
     let obj = blob("shared view");

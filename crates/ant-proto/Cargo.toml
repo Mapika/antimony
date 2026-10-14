@@ -6,9 +6,11 @@ license.workspace = true
 
 [dependencies]
 ant-core.workspace = true
+bytes.workspace = true
 prost.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+zstd.workspace = true
 
 [build-dependencies]
 protox.workspace = true

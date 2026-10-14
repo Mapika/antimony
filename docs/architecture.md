@@ -124,7 +124,55 @@ cache hit can never hide a missing object.
   costs a few round trips, not one per changed directory.
 - **Objects:** batched over gRPC (`GetObjects`), or as plain immutable HTTP
   (`GET /o/<id>`, `Cache-Control: immutable`), so any HTTP cache or CDN can
-  serve as the regional cache tier.
+  serve as the regional cache tier. Checkouts over HTTP fetch *tree bundles*
+  (`GET /t/<tree-id>`, below) instead of one request per object.
+
+### Tree bundles (`GET /t/<tree-id>`)
+
+A checkout through an HTTP cache used to cost one request per file and
+directory (~160k for a 96k-file tree); gRPC `GetObjects` batches, but no
+HTTP cache can store it. A tree bundle is a batch keyed by something
+immutable, so every tier caches it like an object:
+
+- **Content** (`ant_server::bundle`): the requested tree, its blobs in entry
+  order while they fit, then whole subdirectories breadth first until the
+  first one that does not fit. Limits: 8 MiB of objects, 8192 objects; blobs
+  over 1 MiB are never bundled (they stay single `/o/` requests). A
+  subdirectory is included with all its small blobs or not at all. The
+  content is a function of the tree id and the limits, so the response is
+  `Cache-Control: public, max-age=31536000, immutable`.
+- **Format** (`ant_proto::bundle`): one zstd frame of `ANTBNDL1` followed by
+  `id (32) | len (u32 BE) | encoded object` frames, the tree first. The
+  client hashes every object against its id before caching it (a forged or
+  corrupt bundle is discarded and the objects are fetched by id) and stores
+  everything in its disk cache.
+- **Client** (`Workspace::materialize_with`, `ReadThrough::with_tree_bundles`):
+  the breadth-first walk asks for each level's locally missing trees as
+  bundles (64 in flight). A directory that arrived in a bundle is local
+  when the walk reaches it, so the next request starts where a bundle
+  stopped; requests ≈ data / 8 MiB plus one per bundle boundary. Only
+  directories wholly inside the sparse scope (no patterns, or under a prefix
+  pattern) use bundles; the rest of a sparse walk reads trees by id. Blobs a
+  bundle did not carry (large, restricted, evicted) are read per object as
+  before. Without `--http` nothing changes (gRPC batches already).
+- **Old servers**: their `/t/` 404 lacks the `x-ant-bundle` header, which
+  every `/t/` answer of a new server carries (also its 404s), so the client
+  turns bundles off after one probe and reads per object.
+- **Access control and shared caches.** A shared cache serves a `public`
+  response to anyone who reaches it, exactly like `/o/` objects in the root
+  zone; so a public bundle must (1) hold only objects that `/o/` would serve
+  `public` and (2) be the same for every caller. The server therefore always
+  leaves out objects outside the root zone (zone-tagged without the root
+  tag), and drops every subdirectory that lists one, with everything below
+  it; the client fetches those with their own requests, which are then
+  checked for that caller. If the caller cannot read an object the bundle
+  would still hold (a policy whose root zone is not readable by everyone),
+  that object is left out too and the response becomes `private, no-store`;
+  a bundle of a tree outside the root zone is always built per caller and
+  `private, no-store`. An unreadable tree is a 404 like a missing one. URLs
+  never encode a principal. Like `/o/`, cached public responses outlive a
+  later policy change that restricts already-public content: purge the CDN
+  when tightening a policy.
 
 ## Clients (`antd`, `ant-fuse`, `ant-cli`)
 

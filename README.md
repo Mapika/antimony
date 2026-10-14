@@ -245,7 +245,10 @@ auth password (any user name) for `git clone`. Missing or unknown tokens get
   `GET /o/<id>` report it exactly like a missing object (same code, body and
   headers). Content is readable by id if *any* place it is stored is
   readable: the same bytes at a public path are not secret. Objects outside
-  the root zone are served with `Cache-Control: private`.
+  the root zone are served with `Cache-Control: private`. Tree bundles
+  (`GET /t/<tree-id>`) never carry such objects in a `public` response, and
+  bundles that depend on the caller are `private, no-store`
+  (`docs/architecture.md`).
 - *Read by copy*: `CreateChangeset` may reference a blob by id only if the
   caller can read it or uploaded it; otherwise it is "not found". Fresh
   uploads stay hidden from everyone until a changeset places them.

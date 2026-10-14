@@ -1421,3 +1421,219 @@ async fn ops_level_checks() {
     let ok = land::land_as(&b, Some(&writer), "main", sneaky).await.unwrap();
     assert!(matches!(ok, LandOutcome::Landed { .. }));
 }
+
+// ---------------------------------------------------------------------------
+// tree bundles (`GET /t/{id}`)
+// ---------------------------------------------------------------------------
+
+struct BundleResponse {
+    status: u16,
+    cache: String,
+    ids: Vec<ObjectId>,
+    body: Bytes,
+}
+
+async fn get_bundle(s: &Server, tree: &ObjectId, token: Option<&str>) -> BundleResponse {
+    let mut req = s.http.get(format!("{}/t/{}", s.http_base, tree.to_hex()));
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status().as_u16();
+    let cache = resp
+        .headers()
+        .get("cache-control")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    let body = resp.bytes().await.unwrap();
+    let ids = if status == 200 {
+        let frames = ant_proto::bundle::decode(&body, 64 << 20).unwrap();
+        for (id, data) in &frames {
+            EncodedObject::from_bytes(data.clone()).unwrap().verify(id).unwrap();
+        }
+        frames.into_iter().map(|(id, _)| id).collect()
+    } else {
+        Vec::new()
+    };
+    BundleResponse { status, cache, ids, body }
+}
+
+/// The safety invariants of bundles for every (tree, caller) pair: a
+/// response a shared cache may store (`public`) holds no object outside the
+/// root zone and is byte-identical for every caller that gets one; every
+/// other 200 is `private, no-store` and holds only objects the caller can
+/// read by id.
+async fn check_bundle_invariants(s: &Server, policy: &Policy, trees: &[ObjectId], tokens: &[&str]) {
+    let acl = Acl::new(policy.clone());
+    for tree in trees {
+        let mut public: Option<Bytes> = None;
+        for token in tokens {
+            let r = get_bundle(s, tree, Some(token)).await;
+            if r.status != 200 {
+                assert_eq!(r.status, 404, "{tree} for {token}");
+                continue;
+            }
+            assert_eq!(r.ids.first(), Some(tree));
+            if r.cache.starts_with("public") {
+                let private = acl::private_many(&s.backend, policy, &r.ids).await.unwrap();
+                assert!(!private.contains(&true), "private object in a public bundle of {tree}");
+                match &public {
+                    Some(b) => {
+                        assert_eq!(b, &r.body, "public bundle of {tree} differs for {token}")
+                    }
+                    None => public = Some(r.body.clone()),
+                }
+            } else {
+                assert_eq!(r.cache, "private, no-store", "{tree} for {token}");
+                let a = acl.authenticate(Some(token)).unwrap().unwrap();
+                let readable =
+                    acl::readable(&s.backend, &a.policy, &a.principal, &r.ids).await.unwrap();
+                assert!(readable.iter().all(|r| *r), "unreadable object for {token} in {tree}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn tree_bundles_never_share_restricted_objects() {
+    let (s, _) = seeded().await;
+    let mut w = s.client(Some(WRITER));
+    let root = path_id(&mut w, "main", "").await;
+    let src = path_id(&mut w, "main", "src").await;
+    let secrets = path_id(&mut w, "main", "secrets").await;
+    let secrets_dir = path_id(&mut w, "main", "secrets/dir").await;
+    let key = path_id(&mut w, "main", "secrets/key").await;
+    let nested = path_id(&mut w, "main", "secrets/dir/x").await;
+    let restricted = [secrets, secrets_dir, key, nested];
+
+    // The root bundle is shared: the same public bytes for everyone, with
+    // the public files but nothing from secrets/ (not even for the writer,
+    // who may read it: shared caches serve it to anyone).
+    let reader = get_bundle(&s, &root, Some(READER)).await;
+    let writer = get_bundle(&s, &root, Some(WRITER)).await;
+    let admin = get_bundle(&s, &root, Some(ADMIN)).await;
+    for r in [&reader, &writer, &admin] {
+        assert_eq!(r.status, 200);
+        assert_eq!(r.cache, "public, max-age=31536000, immutable");
+        assert_eq!(r.body, reader.body);
+        for id in restricted {
+            assert!(!r.ids.contains(&id), "restricted {id} in the root bundle");
+        }
+        for id in [root, src, blob_id("pub fn a() {}\n"), blob_id("readme\n")] {
+            assert!(r.ids.contains(&id), "{id} missing from the root bundle");
+        }
+    }
+
+    // The restricted directory: 404 like a missing tree for the reader;
+    // a caller-specific, never-stored bundle for the writer.
+    let r = get_bundle(&s, &secrets, Some(READER)).await;
+    assert_eq!(r.status, 404);
+    assert_eq!(r.cache, "no-store");
+    let r = get_bundle(&s, &secrets, Some(WRITER)).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.cache, "private, no-store");
+    for id in restricted {
+        assert!(r.ids.contains(&id), "{id} missing from the writer's secrets bundle");
+    }
+
+    // Authentication as for `/o/`.
+    assert_eq!(get_bundle(&s, &root, None).await.status, 401);
+    assert_eq!(get_bundle(&s, &root, Some("t-unknown")).await.status, 401);
+
+    let policy = Policy::parse(&policy_text()).unwrap();
+    let trees = [root, src, secrets, secrets_dir];
+    check_bundle_invariants(&s, &policy, &trees, &[READER, WRITER, ADMIN]).await;
+}
+
+/// A policy whose root zone is not readable by everyone: `outsider` reads
+/// only `docs/`, `insider` reads everything.
+fn closed_policy() -> Policy {
+    Policy::parse(&format!(
+        r#"
+        [[principal]]
+        name = "outsider"
+        token_sha256 = "{}"
+
+        [[principal]]
+        name = "insider"
+        token_sha256 = "{}"
+        groups = ["staff"]
+
+        [[path]]
+        prefix = ""
+        read = ["group:staff"]
+        write = ["group:staff"]
+
+        [[path]]
+        prefix = "docs"
+        read = ["*"]
+        write = ["group:staff"]
+        "#,
+        hex(hash_token("t-outsider")),
+        hex(hash_token("t-insider")),
+    ))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn tree_bundles_when_the_root_zone_is_restricted() {
+    let policy = closed_policy();
+    let s = Server::start(Acl::new(policy.clone())).await;
+    let b = &s.backend;
+    let tree = |entries: Vec<(&str, EntryMode, ObjectId)>| {
+        let es = entries.into_iter().map(|(n, mode, id)| TreeEntry { mode, name: n.into(), id });
+        Object::Tree(Tree::new(es.collect()).unwrap()).encode()
+    };
+    let blob = |s: &str| EncodedObject::new(ObjectKind::Blob, s.as_bytes());
+
+    // docs/guide (docs zone only); src/main (root zone, untagged).
+    let guide = blob("guide\n");
+    let docs = tree(vec![("guide", EntryMode::File, guide.id())]);
+    let main_rs = blob("fn main() {}\n");
+    let src = tree(vec![("main", EntryMode::File, main_rs.id())]);
+    let root = tree(vec![("docs", EntryMode::Tree, docs.id()), ("src", EntryMode::Tree, src.id())]);
+    acl::tag_written(b, &policy, &[(p("docs"), docs.id()), (p("docs/guide"), guide.id())])
+        .await
+        .unwrap();
+    b.objects
+        .put_many(&[guide.clone(), docs.clone(), main_rs.clone(), src.clone(), root.clone()])
+        .await
+        .unwrap();
+    // `shared` is stored untagged (public), then also placed under docs/,
+    // so it carries the root and the docs tag: the outsider can read the
+    // tree, but not its untagged blob.
+    let hidden = blob("staff only\n");
+    let shared = tree(vec![("f", EntryMode::File, hidden.id())]);
+    b.objects.put_many(&[hidden.clone(), shared.clone()]).await.unwrap();
+    acl::tag_written(b, &policy, &[(p("docs/shared"), shared.id())]).await.unwrap();
+
+    // The root tree: unreadable for the outsider; a public bundle without
+    // docs/ (outside the root zone) for the insider.
+    assert_eq!(get_bundle(&s, &root.id(), Some("t-outsider")).await.status, 404);
+    let r = get_bundle(&s, &root.id(), Some("t-insider")).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.cache, "public, max-age=31536000, immutable");
+    assert_eq!(r.ids, [root.id(), src.id(), main_rs.id()]);
+
+    // docs/ lies outside the root zone: caller-specific, never stored.
+    for token in ["t-outsider", "t-insider"] {
+        let r = get_bundle(&s, &docs.id(), Some(token)).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(r.cache, "private, no-store");
+        assert_eq!(r.ids, [docs.id(), guide.id()]);
+    }
+
+    // shared/ is public, but the outsider cannot read its blob: the
+    // outsider's response leaves it out and is caller-specific; the
+    // insider's is the shared one.
+    let r = get_bundle(&s, &shared.id(), Some("t-outsider")).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.cache, "private, no-store");
+    assert_eq!(r.ids, [shared.id()]);
+    let r = get_bundle(&s, &shared.id(), Some("t-insider")).await;
+    assert_eq!(r.cache, "public, max-age=31536000, immutable");
+    assert_eq!(r.ids, [shared.id(), hidden.id()]);
+
+    let trees = [root.id(), docs.id(), src.id(), shared.id()];
+    check_bundle_invariants(&s, &policy, &trees, &["t-outsider", "t-insider"]).await;
+}
