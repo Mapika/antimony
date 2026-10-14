@@ -73,29 +73,24 @@ pub(super) fn scan_dir<'a>(
             continue;
         }
         let meta = entry.metadata()?;
-        let (kind, new) = match index.get_key_value(rel_str.as_str()) {
-            Some((key, rec)) => {
-                out.seen.push(key.as_str());
-                let racy = index_mtime.is_some_and(|im| rec.stat.mtime_ns >= im);
-                if !racy && rec.stat == stat_of(&meta) {
-                    continue;
-                }
-                let (mode, body) = hash_disk(&entry.path(), &meta)?;
-                let id = hash_object(ObjectKind::Blob, &body);
-                if id == rec.id && mode == rec.mode {
-                    continue;
-                }
-                out.blobs.push(EncodedObject::new(ObjectKind::Blob, &body));
-                (LocalChangeKind::Modified, Some((mode, id)))
+        let indexed = index.get_key_value(rel_str.as_str());
+        if let Some((key, rec)) = indexed {
+            out.seen.push(key.as_str());
+            let racy = index_mtime.is_some_and(|im| rec.stat.mtime_ns >= im);
+            if !racy && rec.stat == stat_of(&meta) {
+                continue;
             }
-            None => {
-                let (mode, body) = hash_disk(&entry.path(), &meta)?;
-                let id = hash_object(ObjectKind::Blob, &body);
-                out.blobs.push(EncodedObject::new(ObjectKind::Blob, &body));
-                (LocalChangeKind::Added, Some((mode, id)))
-            }
+        }
+        let (mode, body) = hash_disk(&entry.path(), &meta)?;
+        let id = hash_object(ObjectKind::Blob, &body);
+        let kind = match indexed {
+            Some((_, rec)) if id == rec.id && mode == rec.mode => continue,
+            Some(_) => LocalChangeKind::Modified,
+            None => LocalChangeKind::Added,
         };
-        out.changes.push(LocalChange { path: RepoPath::new(rel_str.as_str())?, kind, new });
+        out.blobs.push(EncodedObject::new(ObjectKind::Blob, &body));
+        let path = RepoPath::new(rel_str.as_str())?;
+        out.changes.push(LocalChange { path, kind, new: Some((mode, id)) });
     }
     Ok(out)
 }
