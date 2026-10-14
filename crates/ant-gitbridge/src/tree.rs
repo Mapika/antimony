@@ -1,9 +1,8 @@
 //! Compact parsed source trees and a byte-bounded cache of them.
 
-use std::cmp::Ordering;
 use std::sync::Arc;
 
-use ant_core::EntryMode;
+use ant_core::{EntryMode, git_name_cmp};
 use anyhow::{anyhow, bail};
 
 use crate::commit::Oid;
@@ -46,27 +45,9 @@ impl Parsed {
     /// The entry called `name`, as a tree (`is_tree`) or as a non-tree.
     pub fn find(&self, name: &[u8], is_tree: bool) -> Option<&Ent> {
         self.ents
-            .binary_search_by(|e| key_cmp(self.name_bytes(e), e.mode.is_tree(), name, is_tree))
+            .binary_search_by(|e| git_name_cmp(self.name_bytes(e), e.mode.is_tree(), name, is_tree))
             .ok()
             .map(|i| &self.ents[i])
-    }
-}
-
-/// git's tree order: names compare bytewise, with tree names treated as if
-/// suffixed by `/`.
-pub(crate) fn key_cmp(a: &[u8], a_tree: bool, b: &[u8], b_tree: bool) -> Ordering {
-    let n = a.len().min(b.len());
-    match a[..n].cmp(&b[..n]) {
-        Ordering::Equal => {}
-        o => return o,
-    }
-    let ac = a.get(n).copied().or(a_tree.then_some(b'/'));
-    let bc = b.get(n).copied().or(b_tree.then_some(b'/'));
-    match (ac, bc) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (Some(x), Some(y)) => x.cmp(&y),
     }
 }
 
@@ -149,17 +130,6 @@ impl TreeCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn key_order_matches_git() {
-        // "foo-" < "foo.c" < "foo/" (tree "foo").
-        assert_eq!(key_cmp(b"foo-", false, b"foo.c", false), Ordering::Less);
-        assert_eq!(key_cmp(b"foo.c", false, b"foo", true), Ordering::Less);
-        assert_eq!(key_cmp(b"foo", true, b"foo", false), Ordering::Greater);
-        assert_eq!(key_cmp(b"foo", false, b"foo", false), Ordering::Equal);
-        assert_eq!(key_cmp(b"a", false, b"ab", false), Ordering::Less);
-        assert_eq!(key_cmp(b"a", true, b"ab", false), Ordering::Less);
-    }
 
     #[test]
     fn legacy_modes_keep_spelling_and_class() {

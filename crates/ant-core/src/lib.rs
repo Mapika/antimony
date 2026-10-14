@@ -5,7 +5,7 @@
 //! crate boundary — stores, the wire protocol, the daemon — speaks in terms of
 //! [`ObjectId`] plus *encoded* object bytes (header included).
 
-mod commit;
+pub mod commit;
 mod error;
 mod id;
 pub mod merge;
@@ -19,5 +19,5 @@ pub use error::{Error, Result};
 pub use id::ObjectId;
 pub use object::{EncodedObject, Object, ObjectKind, hash_object};
 pub use path::RepoPath;
-pub use tree::{EntryMode, LegacyMode, Tree, TreeEntry};
+pub use tree::{EntryMode, LegacyMode, Tree, TreeEntry, git_name_cmp};
 pub use version::NewerFormat;

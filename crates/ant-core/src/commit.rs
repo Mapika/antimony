@@ -55,6 +55,30 @@ impl Signature {
     }
 }
 
+/// The `(key, value)` fields of a commit's header block (the body up to the
+/// blank line), in order. Continuation lines (leading space) are folded into
+/// the previous value, joined by `\n`; a line without a space is a key with
+/// an empty value.
+pub fn header_fields(headers: &[u8]) -> Result<Vec<(&[u8], Vec<u8>)>> {
+    let mut fields: Vec<(&[u8], Vec<u8>)> = Vec::new();
+    for line in headers.split(|&b| b == b'\n') {
+        if let Some(cont) = line.strip_prefix(b" ") {
+            let last = fields
+                .last_mut()
+                .ok_or_else(|| Error::Malformed("commit: orphan continuation".into()))?;
+            last.1.push(b'\n');
+            last.1.extend_from_slice(cont);
+        } else {
+            let (k, v) = match line.iter().position(|&b| b == b' ') {
+                Some(i) => (&line[..i], &line[i + 1..]),
+                None => (line, &b""[..]),
+            };
+            fields.push((k, v.to_vec()));
+        }
+    }
+    Ok(fields)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     pub tree: ObjectId,
@@ -105,25 +129,7 @@ impl Commit {
             .ok_or_else(|| Error::Malformed("commit: missing header terminator".into()))?;
         let (headers, message) = (&body[..split], &body[split + 2..]);
 
-        // Fold continuation lines (leading space) into the previous header.
-        let mut fields: Vec<(&[u8], Vec<u8>)> = Vec::new();
-        for line in headers.split(|&b| b == b'\n') {
-            if let Some(cont) = line.strip_prefix(b" ") {
-                let last = fields
-                    .last_mut()
-                    .ok_or_else(|| Error::Malformed("commit: orphan continuation".into()))?;
-                last.1.push(b'\n');
-                last.1.extend_from_slice(cont);
-            } else {
-                let (k, v) = match line.iter().position(|&b| b == b' ') {
-                    Some(i) => (&line[..i], &line[i + 1..]),
-                    None => (line, &b""[..]),
-                };
-                fields.push((k, v.to_vec()));
-            }
-        }
-
-        let mut it = fields.into_iter().peekable();
+        let mut it = header_fields(headers)?.into_iter().peekable();
         let id_of = |v: &[u8]| -> Result<ObjectId> {
             std::str::from_utf8(v)
                 .map_err(|_| Error::Malformed("commit: bad object id".into()))?

@@ -18,7 +18,7 @@ use crate::graph::Graph;
 use crate::memo::{Memo, Sha1};
 use crate::prep::Prep;
 use crate::read::{Reader, oid};
-use crate::tree::{Parsed, TreeCache, key_cmp, parse_tree};
+use crate::tree::{Parsed, TreeCache, parse_tree};
 use crate::{Msg, NewCommit};
 
 /// Cut a batch of objects at this many bytes even if `batch_objects` is not reached.
@@ -233,8 +233,12 @@ impl<'g> Converter<'g> {
                 canonical = false;
             }
             if let Some(p) = prev
-                && key_cmp(parsed.name_bytes(p), p.mode.is_tree(), name, e.mode.is_tree())
-                    != std::cmp::Ordering::Less
+                && ant_core::git_name_cmp(
+                    parsed.name_bytes(p),
+                    p.mode.is_tree(),
+                    name,
+                    e.mode.is_tree(),
+                ) != std::cmp::Ordering::Less
             {
                 canonical = false;
             }

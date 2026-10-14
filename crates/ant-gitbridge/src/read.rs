@@ -1,8 +1,7 @@
 //! Reading source objects with a reusable buffer.
 
-use ant_core::EncodedObject;
+use ant_core::{EncodedObject, ObjectKind};
 use anyhow::Context as _;
-use bytes::Bytes;
 use gix::prelude::Find as _;
 
 use crate::commit::Oid;
@@ -52,11 +51,6 @@ impl Reader {
 
     /// A blob as an antimony object (header added in a single copy).
     pub fn read_blob(&mut self, id: &Oid) -> anyhow::Result<EncodedObject> {
-        let body = self.find(id)?;
-        let header = format!("blob {}\0", body.len());
-        let mut data = Vec::with_capacity(header.len() + body.len());
-        data.extend_from_slice(header.as_bytes());
-        data.extend_from_slice(body);
-        Ok(EncodedObject::from_bytes(Bytes::from(data))?)
+        Ok(EncodedObject::new(ObjectKind::Blob, self.find(id)?))
     }
 }

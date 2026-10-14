@@ -20,7 +20,7 @@ use crate::commit::{Oid, RawCommit, parse_commit};
 use crate::graph::Graph;
 use crate::memo::{DigestMap, Sha1};
 use crate::read::{Reader, oid, sha};
-use crate::tree::{Ent, Parsed, TreeCache, key_cmp, parse_tree};
+use crate::tree::{Ent, Parsed, TreeCache, parse_tree};
 
 /// Commits per unit of work.
 const CHUNK: usize = 16;
@@ -138,7 +138,7 @@ impl<'g> Prepper<'g> {
                 let (n, o): (Option<&Ent>, Option<&Ent>) =
                     match (newp.ents.get(i), oldp.ents.get(j)) {
                         (Some(a), Some(b)) => {
-                            match key_cmp(
+                            match ant_core::git_name_cmp(
                                 newp.name_bytes(a),
                                 a.mode.is_tree(),
                                 oldp.name_bytes(b),

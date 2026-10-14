@@ -135,12 +135,26 @@ pub struct TreeEntry {
     pub id: ObjectId,
 }
 
-/// git's tree ordering: names compare bytewise, with tree names treated as if
-/// suffixed by `/`.
+/// git's tree order of entry names: names compare bytewise, with tree names
+/// (`a_tree`, `b_tree`) treated as if suffixed by `/`.
+pub fn git_name_cmp(a: &[u8], a_tree: bool, b: &[u8], b_tree: bool) -> Ordering {
+    let n = a.len().min(b.len());
+    match a[..n].cmp(&b[..n]) {
+        Ordering::Equal => {}
+        o => return o,
+    }
+    let ac = a.get(n).copied().or(a_tree.then_some(b'/'));
+    let bc = b.get(n).copied().or(b_tree.then_some(b'/'));
+    match (ac, bc) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(x), Some(y)) => x.cmp(&y),
+    }
+}
+
 fn git_cmp(a: &TreeEntry, b: &TreeEntry) -> Ordering {
-    let ak = a.name.as_bytes().iter().copied().chain(a.mode.is_tree().then_some(b'/'));
-    let bk = b.name.as_bytes().iter().copied().chain(b.mode.is_tree().then_some(b'/'));
-    ak.cmp(bk)
+    git_name_cmp(a.name.as_bytes(), a.mode.is_tree(), b.name.as_bytes(), b.mode.is_tree())
 }
 
 /// A directory listing. Entries are always kept in git order with unique names.
@@ -263,6 +277,17 @@ mod tests {
         .unwrap();
         let names: Vec<_> = t.entries().iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["foo-", "foo.c", "foo"]);
+    }
+
+    #[test]
+    fn name_order_matches_git() {
+        // "foo-" < "foo.c" < "foo/" (tree "foo").
+        assert_eq!(git_name_cmp(b"foo-", false, b"foo.c", false), Ordering::Less);
+        assert_eq!(git_name_cmp(b"foo.c", false, b"foo", true), Ordering::Less);
+        assert_eq!(git_name_cmp(b"foo", true, b"foo", false), Ordering::Greater);
+        assert_eq!(git_name_cmp(b"foo", false, b"foo", false), Ordering::Equal);
+        assert_eq!(git_name_cmp(b"a", false, b"ab", false), Ordering::Less);
+        assert_eq!(git_name_cmp(b"a", true, b"ab", false), Ordering::Less);
     }
 
     #[test]

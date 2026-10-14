@@ -1,6 +1,7 @@
 //! Raw commit parsing (names, emails and messages stay raw bytes).
 
 use ant_core::Signature;
+use ant_core::commit::header_fields;
 use anyhow::{anyhow, bail};
 
 /// A source object id (SHA-1 or SHA-256 git).
@@ -23,22 +24,7 @@ pub(crate) fn parse_commit(id: gix::ObjectId, raw: &[u8]) -> anyhow::Result<RawC
         None => (raw, &raw[raw.len()..]),
     };
 
-    // Fold continuation lines into the previous header, as ant-core does.
-    let mut fields: Vec<(&[u8], Vec<u8>)> = Vec::new();
-    for line in head.split(|&b| b == b'\n') {
-        if let Some(cont) = line.strip_prefix(b" ") {
-            let last = fields.last_mut().ok_or_else(|| bad("orphan continuation line"))?;
-            last.1.push(b'\n');
-            last.1.extend_from_slice(cont);
-        } else {
-            let (k, v) = match line.iter().position(|&b| b == b' ') {
-                Some(i) => (&line[..i], &line[i + 1..]),
-                None => (line, &b""[..]),
-            };
-            fields.push((k, v.to_vec()));
-        }
-    }
-
+    let fields = header_fields(head).map_err(|e| anyhow!("commit {id}: {e}"))?;
     let hex_id = |v: &[u8], what: &str| -> anyhow::Result<gix::ObjectId> {
         gix::ObjectId::from_hex(v).map_err(|_| bad(what))
     };
