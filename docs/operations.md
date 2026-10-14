@@ -118,6 +118,60 @@ immediately.
   (`--cache-bytes` / `ANT_CACHE_BYTES`). Sparse workspaces keep checkouts
   proportional to what an agent actually touches.
 
+## Upgrading
+
+**Postgres schema.** Each schema records its layout version in the
+`schema_version` table (one row per applied migration: version, name, time,
+binary version). `ant serve` and `ant import` (and `ant admin`) migrate the
+schema on start: they apply the missing migrations in order, in one
+transaction, under a per-schema Postgres advisory lock. Replicas that start
+together are safe: one migrates, the others wait for the lock and find
+nothing left to do. Migrations are idempotent and additive, so a schema
+written by a release from before versioning (version 0: no `schema_version`
+table, per-path `changes` rows, large objects one per S3 key) is adopted in
+place and stays readable.
+
+```sh
+ant admin schema --pg-url ... --pg-schema ant            # inspect
+# version 3
+# supported 4
+# pending 4 storage_tuning
+ant admin schema --migrate --pg-url ... --pg-schema ant  # apply now
+```
+
+| version | migration | adds |
+|---|---|---|
+| 1 | `baseline` | objects, refs, commit graph, log, per-path changes, derived data, history index |
+| 2 | `object_index` | index of large objects bundled into S3 packs |
+| 3 | `changesets` | one compressed changeset row per commit |
+| 4 | `storage_tuning` | out-of-line storage and insert-only autovacuum settings |
+
+To control when migrations run, start servers with `--no-migrate`
+(`ANT_NO_MIGRATE=1`) and run `ant admin schema --migrate` yourself; a
+server started with `--no-migrate` against an out-of-date schema exits with
+`error: Postgres schema "ant" is at version N, ...` and a `hint:`.
+
+**Never run an older binary against a newer store.** A binary refuses a
+schema whose version is higher than it supports (`error: Postgres schema
+"ant" version 5 is newer than this version of ant supports (up to 4)`,
+`hint: upgrade ant ...`) instead of misreading it; for example, servers from
+before migration 2 cannot see objects stored in S3 packs. Releases from
+before schema versioning do not have this check, so do not start one against
+a migrated schema. In a rolling upgrade, start one new server first (it
+migrates); servers of the previous release that are already running keep
+working while you replace them unless the release notes say a migration
+needs all servers stopped first. Take a Postgres backup before upgrading:
+there are no down-migrations.
+
+**Clients.** The disk cache (`<cache>/format`), sparse workspaces
+(`format=` in `.ant/workspace`) and lazy workspace state directories
+(`<state>/format`) carry a format version too. Missing markers mean
+version 1, the layout from before markers existed, so existing caches and
+workspaces keep working; a newer version is refused with `hint: upgrade
+ant`, and so is a lazy workspace journal record of an unknown kind. Upgrade
+`ant` on a machine before using caches or workspaces that a newer `ant` has
+written.
+
 ## Local development services
 
 `scripts/dev-services.sh start|stop|status|wipe` runs Postgres and SeaweedFS

@@ -1,7 +1,9 @@
 //! Postgres-backed `RefStore` + `MetaStore` + small-object `ObjectStore`.
 //!
-//! - All tables live in the schema passed to [`PgStore::connect`], which
-//!   creates the schema and tables idempotently (`CREATE ... IF NOT EXISTS`).
+//! - All tables live in the schema passed to [`PgStore::connect`]. The
+//!   schema is versioned (`schema_version` table, see `migrate`): connecting
+//!   creates or migrates it to [`SCHEMA_VERSION`] (unless
+//!   [`PgOptions::migrate`] is off) and refuses a newer one.
 //!   Queries are built at runtime (`sqlx::query`), not with the `query!`
 //!   macros: there is no DATABASE_URL at build time.
 //! - Refs: one row per ref; `cas_ref` is a single atomic statement
@@ -39,6 +41,9 @@ use bytes::Bytes;
 use sqlx::Row;
 
 use crate::changeset_codec;
+
+mod migrate;
+pub use migrate::{MIGRATIONS, Migration, SCHEMA_VERSION, SchemaStatus};
 
 use crate::{
     CasOutcome, ChangeKind, CommitNode, MetaStore, ObjectStore, PathChange, RefStore, Result,
@@ -143,6 +148,10 @@ pub struct PgOptions {
     /// Longest wait for a ref lock before `lock_ref` fails (callers then
     /// fall back to plain CAS).
     pub lock_timeout: std::time::Duration,
+    /// Create the schema or migrate it to [`SCHEMA_VERSION`] when connecting
+    /// (default). Off: connecting fails with
+    /// [`StoreError::MigrationRequired`] unless the schema is current.
+    pub migrate: bool,
 }
 
 impl Default for PgOptions {
@@ -151,6 +160,7 @@ impl Default for PgOptions {
             max_connections: 64,
             lock_connections: 8,
             lock_timeout: std::time::Duration::from_secs(10),
+            migrate: true,
         }
     }
 }
@@ -374,7 +384,28 @@ impl PgStore {
         }
     }
 
-    /// Connect and ensure `schema` and all tables exist.
+    /// Version state of `schema` (which need not exist), without changing it.
+    pub async fn schema_status(url: &str, schema: &str) -> Result<SchemaStatus> {
+        use sqlx::Connection;
+        let mut conn = sqlx::PgConnection::connect(url).await.map_err(be)?;
+        let status = migrate::status(&mut conn, schema).await?;
+        conn.close().await.map_err(be)?;
+        Ok(status)
+    }
+
+    /// Create `schema` or migrate it to [`SCHEMA_VERSION`] (what connecting
+    /// does by default). Returns the versions applied by this call: empty when
+    /// the schema was current, or another process migrated it concurrently.
+    /// A newer schema is [`StoreError::NewerFormat`].
+    pub async fn migrate(url: &str, schema: &str) -> Result<Vec<u32>> {
+        use sqlx::Connection;
+        let mut conn = sqlx::PgConnection::connect(url).await.map_err(be)?;
+        let applied = migrate::migrate(&mut conn, schema).await?;
+        conn.close().await.map_err(be)?;
+        Ok(applied)
+    }
+
+    /// Connect, creating `schema` or migrating it to [`SCHEMA_VERSION`].
     pub async fn connect(url: &str, schema: &str) -> Result<Self> {
         Self::connect_with(url, schema, &PgOptions::default()).await
     }
@@ -404,133 +435,12 @@ impl PgStore {
         use sqlx::Connection;
 
         let qs = quote_ident(schema);
-        let ql = qs.replace('\'', "''");
-
-        // Create the schema and tables under a transaction-scoped advisory lock
-        // so concurrent connects to a fresh schema do not race on the catalog.
         let mut conn = sqlx::PgConnection::connect(url).await.map_err(be)?;
-        let mut tx = conn.begin().await.map_err(be)?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(schema)
-            .execute(&mut *tx)
-            .await
-            .map_err(be)?;
-        let ddl = [
-            format!("CREATE SCHEMA IF NOT EXISTS {qs}"),
-            format!(
-                "CREATE TABLE IF NOT EXISTS {qs}.objects (\
-                    id bytea PRIMARY KEY, \
-                    data bytea NOT NULL)"
-            ),
-            // Where large objects live inside S3 packs (see `crate::packed`).
-            format!(
-                "CREATE TABLE IF NOT EXISTS {qs}.object_index (\
-                    id bytea PRIMARY KEY, \
-                    pack bytea NOT NULL, \
-                    off bigint NOT NULL, \
-                    len integer NOT NULL)"
-            ),
-            format!(
-                "CREATE TABLE IF NOT EXISTS {qs}.refs (\
-                    name text PRIMARY KEY, \
-                    target bytea NOT NULL)"
-            ),
-            format!(
-                "CREATE TABLE IF NOT EXISTS {qs}.commits (\
-                    id bytea PRIMARY KEY, \
-                    tree bytea NOT NULL, \
-                    parents bytea NOT NULL, \
-                    generation bigint NOT NULL, \
-                    committer_time bigint NOT NULL)"
-            ),
-            format!(
-                "CREATE TABLE IF NOT EXISTS {qs}.log (\
-                    seq bigserial PRIMARY KEY, \
-                    commit_id bytea NOT NULL UNIQUE)"
-            ),
-            format!(
-                "CREATE TABLE IF NOT EXISTS {qs}.changes (\
-                    commit_id bytea NOT NULL, \
-                    idx integer NOT NULL, \
-                    path text NOT NULL, \
-                    kind smallint NOT NULL, \
-                    old_mode text, \
-                    old_id bytea, \
-                    new_mode text, \
-                    new_id bytea, \
-                    PRIMARY KEY (commit_id, idx))"
-            ),
-            format!(
-                "CREATE TABLE IF NOT EXISTS {qs}.changesets (\
-                    commit_id bytea PRIMARY KEY, \
-                    data bytea NOT NULL)"
-            ),
-            // Object bodies and changesets are already compressed: store them
-            // out of line without Postgres trying (and failing) to compress them.
-            // Guarded: these ALTERs take heavy locks, so run them only once.
-            format!(
-                "DO $$ BEGIN \
-                 IF (SELECT attstorage FROM pg_attribute \
-                     WHERE attrelid = '{ql}.objects'::regclass AND attname = 'data') <> 'e' THEN \
-                   ALTER TABLE {qs}.objects ALTER COLUMN data SET STORAGE EXTERNAL; \
-                 END IF; \
-                 IF (SELECT attstorage FROM pg_attribute \
-                     WHERE attrelid = '{ql}.changesets'::regclass AND attname = 'data') <> 'e' THEN \
-                   ALTER TABLE {qs}.changesets ALTER COLUMN data SET STORAGE EXTERNAL; \
-                 END IF; \
-                 END $$"
-            ),
-            // Insert-only tables: vacuum when they have doubled, not every 20%.
-            format!(
-                "DO $$ BEGIN \
-                 IF (SELECT reloptions IS NULL FROM pg_class \
-                     WHERE oid = '{ql}.objects'::regclass) THEN \
-                   ALTER TABLE {qs}.objects SET (autovacuum_vacuum_insert_scale_factor = 1.0, \
-                     autovacuum_vacuum_insert_threshold = 200000, \
-                     toast.autovacuum_vacuum_insert_scale_factor = 1.0, \
-                     toast.autovacuum_vacuum_insert_threshold = 200000); \
-                 END IF; \
-                 IF (SELECT reloptions IS NULL FROM pg_class \
-                     WHERE oid = '{ql}.changesets'::regclass) THEN \
-                   ALTER TABLE {qs}.changesets SET (autovacuum_vacuum_insert_scale_factor = 1.0, \
-                     autovacuum_vacuum_insert_threshold = 200000); \
-                 END IF; \
-                 END $$"
-            ),
-            format!(
-                "CREATE TABLE IF NOT EXISTS {qs}.derived (\
-                    kind text NOT NULL, \
-                    key bytea NOT NULL, \
-                    value bytea NOT NULL, \
-                    PRIMARY KEY (kind, key))"
-            ),
-            format!(
-                "CREATE TABLE IF NOT EXISTS {qs}.history (\
-                    ref text NOT NULL, \
-                    path text NOT NULL, \
-                    generation bigint NOT NULL, \
-                    commit_id bytea NOT NULL, \
-                    PRIMARY KEY (ref, path, generation, commit_id))"
-            ),
-            format!(
-                "CREATE INDEX IF NOT EXISTS history_by_gen ON {qs}.history \
-                    (ref, generation DESC)"
-            ),
-            format!(
-                "CREATE INDEX IF NOT EXISTS history_by_path ON {qs}.history \
-                    (ref, path text_pattern_ops, generation DESC)"
-            ),
-            format!(
-                "CREATE TABLE IF NOT EXISTS {qs}.history_watermark (\
-                    ref text PRIMARY KEY, \
-                    commit_id bytea NOT NULL)"
-            ),
-        ];
-        for stmt in &ddl {
-            // Schema name is quoted by `quote_ident`; no user data is interpolated.
-            sqlx::query(sqlx::AssertSqlSafe(stmt.as_str())).execute(&mut *tx).await.map_err(be)?;
+        if options.migrate {
+            migrate::migrate(&mut conn, schema).await?;
+        } else {
+            migrate::require_current(&mut conn, schema).await?;
         }
-        tx.commit().await.map_err(be)?;
         conn.close().await.map_err(be)?;
 
         let search_path = format!("SET search_path TO {qs}");

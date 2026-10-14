@@ -1,6 +1,8 @@
 //! `ant-server` binary: thin wrapper over [`ant_server::serve`] (the same
 //! server is available as `ant serve`).
 
+use std::process::ExitCode;
+
 use ant_server::serve::{ServeArgs, run};
 use clap::Parser;
 
@@ -12,6 +14,15 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    run(Args::parse().serve).await
+async fn main() -> ExitCode {
+    match run(Args::parse().serve).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            if let Some(hint) = ant_store::compat_hint(e.chain()) {
+                eprintln!("hint: {hint}");
+            }
+            ExitCode::FAILURE
+        }
+    }
 }

@@ -35,12 +35,50 @@ pub enum StoreError {
     Core(#[from] ant_core::Error),
     #[error("backend error: {0}")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The store was written by a newer version (its schema version is
+    /// higher than this binary supports); nothing is read from it.
+    #[error(transparent)]
+    NewerFormat(#[from] ant_core::NewerFormat),
+    /// The Postgres schema needs migrations, and migrating was disabled.
+    #[error(
+        "Postgres schema \"{schema}\" is at version {found}, this version of ant needs {required} \
+         (migrations not run: --no-migrate)"
+    )]
+    MigrationRequired { schema: String, found: u32, required: u32 },
 }
 
 impl StoreError {
     pub fn backend(e: impl std::error::Error + Send + Sync + 'static) -> Self {
         StoreError::Backend(Box::new(e))
     }
+}
+
+/// Hint for a `hint:` line when an error chain says the stored data needs a
+/// newer binary (`upgrade ant`) or a schema migration. Looks through
+/// [`StoreError`]s, [`ant_core::NewerFormat`] and `io::Error`s wrapping one.
+pub fn compat_hint<'a>(
+    chain: impl IntoIterator<Item = &'a (dyn std::error::Error + 'static)>,
+) -> Option<&'static str> {
+    for e in chain {
+        let newer = e.downcast_ref::<ant_core::NewerFormat>().is_some()
+            || e.downcast_ref::<std::io::Error>()
+                .and_then(|io| io.get_ref())
+                .is_some_and(|inner| inner.downcast_ref::<ant_core::NewerFormat>().is_some());
+        if newer {
+            return Some(ant_core::NewerFormat::HINT);
+        }
+        match e.downcast_ref::<StoreError>() {
+            Some(StoreError::NewerFormat(_)) => return Some(ant_core::NewerFormat::HINT),
+            Some(StoreError::MigrationRequired { .. }) => {
+                return Some(
+                    "run `ant admin schema --migrate` with the same store flags (or start \
+                     without --no-migrate)",
+                );
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;

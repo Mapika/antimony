@@ -14,7 +14,8 @@
 //! Frame: `len: u32 LE | crc32(len ++ payload): u32 LE | payload`, where the
 //! payload is a tag byte and the record's fields (`u32 LE` length-prefixed
 //! strings, raw 32-byte ids). An unknown tag behind a valid checksum is an
-//! error, never silently dropped.
+//! error, never silently dropped: `ant_core::NewerFormat` (the journal was
+//! written by a newer version; upgrade ant), not a corruption error.
 //!
 //! Durability is batched ([`Journal`]): appends and upper-directory changes
 //! are made durable by explicit `fsync`/`fsyncdir`, at unmount and by a
@@ -50,6 +51,8 @@ const TAG_RENAME: u8 = 2;
 const TAG_DONE: u8 = 3;
 const TAG_RESET: u8 = 4;
 const TAG_UPDATE: u8 = 5;
+/// Highest record kind this version reads.
+const TAG_MAX: u8 = TAG_UPDATE;
 const MAX_RECORD: usize = 1 << 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,7 +244,14 @@ impl Record {
                 removes: r.paths()?,
                 conflicts: r.paths()?,
             })),
-            tag => return Err(other(format!("unsupported journal record kind {tag}"))),
+            // Behind a valid checksum: written by a newer version.
+            tag => {
+                return Err(io::Error::other(ant_core::NewerFormat {
+                    what: "lazy workspace journal record kind".into(),
+                    found: u64::from(tag),
+                    supported: u64::from(TAG_MAX),
+                }));
+            }
         };
         if !r.0.is_empty() {
             return Err(other("trailing bytes in journal record"));
@@ -586,6 +596,54 @@ mod tests {
         image.extend_from_slice(&crc32(&[&len, &payload]).to_le_bytes());
         image.extend_from_slice(&payload);
         assert!(parse(&image).is_err());
+    }
+
+    /// State directories from before the format marker keep working; a
+    /// newer format is refused by every entry point, untouched.
+    #[test]
+    fn state_format_marker() {
+        use super::super::state::{STATE_FORMAT, ensure_format, recover};
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        save_base(state, ObjectId([1; 32]), ObjectId([2; 32])).unwrap();
+        save_whiteouts(state, &BTreeSet::new()).unwrap();
+        append_durably(state, &Record::Whiteout("a".into())).unwrap();
+        // No marker: the baseline layout.
+        assert_eq!(base(state).unwrap(), (ObjectId([1; 32]), ObjectId([2; 32])));
+        recover(state).unwrap();
+        ensure_format(state).unwrap();
+        assert_eq!(fs::read_to_string(state.join("format")).unwrap(), format!("{STATE_FORMAT}\n"));
+        assert_eq!(load(state).unwrap().deleted, BTreeSet::from(["a".to_string()]));
+
+        fs::write(state.join("format"), "2\n").unwrap();
+        let journal = fs::read(state.join(JOURNAL)).unwrap();
+        for err in [base(state).unwrap_err(), recover(state).unwrap_err()] {
+            let newer = err.get_ref().and_then(|e| e.downcast_ref::<ant_core::NewerFormat>());
+            assert_eq!(newer.map(|n| (n.found, n.supported)), Some((2, STATE_FORMAT)), "{err}");
+        }
+        assert!(ensure_format(state).is_err());
+        assert_eq!(fs::read(state.join(JOURNAL)).unwrap(), journal, "nothing was touched");
+        fs::write(state.join("format"), "two").unwrap();
+        let err = base(state).unwrap_err();
+        assert!(err.get_ref().and_then(|e| e.downcast_ref::<ant_core::NewerFormat>()).is_none());
+    }
+
+    #[test]
+    fn unknown_kind_is_reported_as_newer_version() {
+        let payload = [TAG_MAX + 1];
+        let len = (payload.len() as u32).to_le_bytes();
+        let mut image = Record::Done.frame();
+        image.extend_from_slice(&len);
+        image.extend_from_slice(&crc32(&[&len, &payload]).to_le_bytes());
+        image.extend_from_slice(&payload);
+        let err = parse(&image).unwrap_err();
+        let newer = err.get_ref().and_then(|e| e.downcast_ref::<ant_core::NewerFormat>());
+        assert_eq!(
+            newer.map(|n| (n.found, n.supported)),
+            Some((u64::from(TAG_MAX) + 1, u64::from(TAG_MAX))),
+            "{err}"
+        );
+        assert!(err.to_string().contains("newer than this version of ant"), "{err}");
     }
 
     #[test]

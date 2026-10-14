@@ -40,3 +40,5 @@ proptest.workspace = true
 rand.workspace = true
 tempfile.workspace = true
 sqlx.workspace = true
+aws-sdk-s3.workspace = true
+zstd.workspace = true

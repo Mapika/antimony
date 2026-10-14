@@ -1,8 +1,11 @@
 //! Sparse working copies.
 //!
 //! On-disk state lives in `{dir}/.ant/` (never reported as a change):
-//! - `.ant/workspace`: `base_commit=<hex>`, `base_tree=<hex>`, and one
-//!   `sparse=<pattern>` line per pattern. Plain text, one `key=value` per line.
+//! - `.ant/workspace`: `format=<n>` ([`WORKSPACE_FORMAT`], the version of
+//!   the whole `.ant/` layout; absent = 1, workspaces from before it),
+//!   `base_commit=<hex>`, `base_tree=<hex>`, and one `sparse=<pattern>` line
+//!   per pattern. Plain text, one `key=value` per line. `open` refuses a
+//!   newer format (`ant_core::NewerFormat`).
 //! - `.ant/index`: one tab-separated line per materialized non-tree entry
 //!   (path, mode, object id, size, mtime in ns, inode). After `update`, an
 //!   entry may carry an all-zero stat: the path differs locally from the new
@@ -83,6 +86,9 @@ const STATE_DIR: &str = ".ant";
 const CONFIG_FILE: &str = "workspace";
 const INDEX_FILE: &str = "index";
 const CONFLICTS_FILE: &str = "conflicts";
+/// Version of the `.ant/` state layout, the `format=` line of
+/// `.ant/workspace` (absent in workspaces created before it: version 1).
+pub const WORKSPACE_FORMAT: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sparse {
@@ -362,7 +368,11 @@ fn save_state(
 ) -> anyhow::Result<()> {
     let state = state_dir(dir);
     fs::create_dir_all(&state)?;
-    let mut cfg = format!("base_commit={}\nbase_tree={}\n", commit.to_hex(), tree.to_hex());
+    let mut cfg = format!(
+        "format={WORKSPACE_FORMAT}\nbase_commit={}\nbase_tree={}\n",
+        commit.to_hex(),
+        tree.to_hex()
+    );
     for p in patterns {
         cfg.push_str(&format!("sparse={p}\n"));
     }
@@ -823,6 +833,17 @@ impl Workspace {
         let path = state_dir(dir).join(CONFIG_FILE);
         let text = fs::read_to_string(&path)
             .with_context(|| format!("reading workspace config {}", path.display()))?;
+        // First, so a newer layout is refused before anything in it is
+        // interpreted. No `format` line: written before it existed (1).
+        if let Some(val) = text.lines().find_map(|l| l.strip_prefix("format=")) {
+            let found = ant_core::version::parse_format_marker(val)
+                .ok_or_else(|| anyhow!("corrupt workspace format {val:?}"))?;
+            ant_core::version::check_format(
+                || format!("workspace {} format", dir.display()),
+                found,
+                WORKSPACE_FORMAT,
+            )?;
+        }
         let mut base_commit = None;
         let mut base_tree = None;
         let mut patterns = Vec::new();
@@ -1179,6 +1200,43 @@ mod tests {
         assert_eq!(reopened.base_commit, C);
         assert_eq!(reopened.base_tree, t);
         assert!(reopened.status(&objs).await.unwrap().is_empty());
+    }
+
+    /// Workspaces from before the format line keep working; a newer format
+    /// is refused with a recognizable error.
+    #[tokio::test]
+    async fn workspace_format_versions() {
+        let objs = MemoryObjectStore::default();
+        let t = build_tree(&objs, &[("a.txt", b"A")]).await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ws");
+        let mut ws =
+            Workspace::materialize(&objs, &dir, C, t, Sparse::new(vec!["a.txt".into()]).unwrap())
+                .await
+                .unwrap();
+        let config = dir.join(".ant/workspace");
+        let written = fs::read_to_string(&config).unwrap();
+        assert!(written.starts_with(&format!("format={WORKSPACE_FORMAT}\n")), "{written}");
+
+        // The layout written before versioning: no format line.
+        fs::write(&config, format!("base_commit={C}\nbase_tree={t}\nsparse=a.txt\n")).unwrap();
+        let old = Workspace::open(&dir).unwrap();
+        assert_eq!((old.base_commit, old.base_tree), (C, t));
+        assert_eq!(old.sparse.patterns, vec!["a.txt".to_string()]);
+        assert!(old.status(&objs).await.unwrap().is_empty());
+        // Rewritten state records the version.
+        ws.reset_to(&objs, C2, t).await.unwrap();
+        assert!(fs::read_to_string(&config).unwrap().starts_with("format=1\n"));
+
+        // Newer: refused before anything else in the file is interpreted.
+        fs::write(&config, "format=2\nbase_commit=not-an-id-in-v1\n").unwrap();
+        let err = Workspace::open(&dir).err().unwrap();
+        let newer = err.downcast_ref::<ant_core::NewerFormat>().unwrap();
+        assert_eq!((newer.found, newer.supported), (2, WORKSPACE_FORMAT));
+        fs::write(&config, format!("format=x\nbase_commit={C}\nbase_tree={t}\n")).unwrap();
+        let err = Workspace::open(&dir).err().unwrap();
+        assert!(err.downcast_ref::<ant_core::NewerFormat>().is_none());
+        assert!(err.to_string().contains("corrupt workspace format"), "{err}");
     }
 
     #[tokio::test]

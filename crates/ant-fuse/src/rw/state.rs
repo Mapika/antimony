@@ -102,8 +102,42 @@ pub(super) fn atomic(dir: &Path, name: &str, data: &[u8]) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// Version of the state directory layout, recorded in `format` (`"1\n"`).
+/// State directories from before the marker are version 1.
+pub const STATE_FORMAT: u64 = 1;
+const FORMAT: &str = "format";
+
+/// Refuse a state directory written by a newer version (an `io::Error`
+/// wrapping [`ant_core::NewerFormat`]).
+pub(super) fn check_format(state: &Path) -> io::Result<()> {
+    let text = match fs::read_to_string(state.join(FORMAT)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let found = ant_core::version::parse_format_marker(&text)
+        .ok_or_else(|| other(format!("corrupt lazy workspace format {text:?}")))?;
+    ant_core::version::check_format(
+        || format!("lazy workspace state {} format", state.display()),
+        found,
+        STATE_FORMAT,
+    )
+    .map_err(io::Error::other)
+}
+
+/// [`check_format`], then record the version if the marker is missing. The
+/// caller holds the state lock.
+pub(super) fn ensure_format(state: &Path) -> io::Result<()> {
+    check_format(state)?;
+    if !state.join(FORMAT).exists() {
+        atomic(state, FORMAT, format!("{STATE_FORMAT}\n").as_bytes())?;
+    }
+    Ok(())
+}
+
 /// Read the persisted base (commit, tree).
 pub fn base(state: &Path) -> io::Result<(ObjectId, ObjectId)> {
+    check_format(state)?;
     let text = fs::read_to_string(state.join("base"))?;
     let get = |key: &str| -> io::Result<ObjectId> {
         text.lines()
@@ -150,6 +184,9 @@ pub(super) fn save_whiteouts(state: &Path, paths: &BTreeSet<String>) -> io::Resu
 /// state lock: roll forward a legacy `intent`, drop a torn journal tail and
 /// roll forward a trailing journal rename. Idempotent; a no-op when clean.
 pub(super) fn recover(state: &Path) -> io::Result<()> {
+    // Every operation on the state directory starts here: never interpret
+    // (or "repair") a layout from a newer version.
+    check_format(state)?;
     recover_intent(state)?;
     let data = read_journal(state)?;
     if data.is_empty() {

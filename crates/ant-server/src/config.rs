@@ -34,6 +34,11 @@ pub struct StoreArgs {
     #[arg(long, env = "ANT_PG_LOCK_CONNECTIONS", default_value_t = 8)]
     pg_lock_connections: u32,
 
+    /// Do not create or migrate the Postgres schema: fail unless it is
+    /// already at this version's layout (`ant admin schema --migrate`).
+    #[arg(long, env = "ANT_NO_MIGRATE")]
+    no_migrate: bool,
+
     /// S3 endpoint for large objects.
     #[arg(long, env = "ANT_S3_ENDPOINT")]
     s3_endpoint: Option<String>,
@@ -124,6 +129,7 @@ impl StoreArgs {
                         &PgOptions {
                             max_connections: self.pg_max_connections,
                             lock_connections: self.pg_lock_connections,
+                            migrate: !self.no_migrate,
                             ..PgOptions::default()
                         },
                     )

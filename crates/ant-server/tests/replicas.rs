@@ -199,6 +199,7 @@ async fn pg_replicas(n: usize) -> Vec<Backend> {
         // A lock wait that times out falls back to CAS, which this test
         // counts as a failure; allow for stalls of a loaded shared database.
         lock_timeout: std::time::Duration::from_secs(120),
+        ..PgOptions::default()
     };
     let mut out = Vec::new();
     for i in 0..n {

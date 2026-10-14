@@ -21,6 +21,9 @@
 //!   miss.
 //! - `ObjectStore::put_many` writes every object (no size check);
 //!   `gc` is the only place that evicts.
+//! - Format version: `{root}/format` holds [`CACHE_FORMAT`]. `open` writes
+//!   it when missing (a cache from before the marker is version 1) and
+//!   refuses a cache whose version is newer (`ant_core::NewerFormat`).
 
 use std::cell::RefCell;
 use std::io::{ErrorKind, Read, Write};
@@ -120,17 +123,60 @@ pub(crate) fn par_map<T: Sync, R: Send>(
     flat.into_iter().flat_map(|(_, v)| v).collect()
 }
 
+/// Version of the cache layout, recorded in `{root}/format` (`"1\n"`). A
+/// cache without the file was written before it existed: version 1.
+pub const CACHE_FORMAT: u64 = 1;
+const FORMAT_FILE: &str = "format";
+
+/// Refuse a cache written by a newer version; record the version in a cache
+/// that has no marker yet.
+fn check_cache_format(root: &Path) -> std::io::Result<()> {
+    let path = root.join(FORMAT_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let found = ant_core::version::parse_format_marker(&text).ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("corrupt cache format marker {}: {text:?}", path.display()),
+                )
+            })?;
+            ant_core::version::check_format(
+                || format!("disk cache {} format", root.display()),
+                found,
+                CACHE_FORMAT,
+            )
+            .map_err(std::io::Error::other)
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            // Unique temp name: concurrent opens each rename a whole file.
+            let tmp = root.join(format!(
+                ".{FORMAT_FILE}{TMP_PREFIX}{}.{}",
+                std::process::id(),
+                TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::write(&tmp, format!("{CACHE_FORMAT}\n"))?;
+            std::fs::rename(&tmp, &path).inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub struct DiskObjectStore {
     root: PathBuf,
     max_bytes: u64,
 }
 
 impl DiskObjectStore {
-    /// Open (creating directories as needed).
+    /// Open (creating directories and the format marker as needed). A cache
+    /// written by a newer version is refused: an `io::Error` wrapping
+    /// [`ant_core::NewerFormat`].
     pub fn open(root: impl AsRef<Path>, max_bytes: u64) -> std::io::Result<Self> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(root.join("objects"))?;
         std::fs::create_dir_all(root.join("tmp"))?;
+        check_cache_format(&root)?;
         Ok(Self { root, max_bytes })
     }
 
@@ -370,6 +416,33 @@ mod tests {
         }
         let s = DiskObjectStore::open(dir.path(), u64::MAX).unwrap();
         assert_eq!(s.get(&o.id()).await.unwrap(), Some(o));
+    }
+
+    #[tokio::test]
+    async fn format_marker_is_written_and_newer_caches_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        // A cache written before the marker existed: objects, no `format`.
+        let o = EncodedObject::new(ObjectKind::Blob, b"old cache");
+        DiskObjectStore::open(dir.path(), u64::MAX).unwrap().put(o.clone()).await.unwrap();
+        std::fs::remove_file(dir.path().join("format")).unwrap();
+        let s = DiskObjectStore::open(dir.path(), u64::MAX).unwrap();
+        assert_eq!(s.get(&o.id()).await.unwrap(), Some(o.clone()));
+        assert_eq!(std::fs::read_to_string(dir.path().join("format")).unwrap(), "1\n");
+        // No temp files next to it.
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| !n.contains(TMP_PREFIX)), "{names:?}");
+        // A newer version is refused with a recognizable error.
+        std::fs::write(dir.path().join("format"), "2\n").unwrap();
+        let err = DiskObjectStore::open(dir.path(), u64::MAX).err().unwrap();
+        let newer = err.get_ref().and_then(|e| e.downcast_ref::<ant_core::NewerFormat>());
+        assert_eq!(newer.map(|n| (n.found, n.supported)), Some((2, CACHE_FORMAT)), "{err}");
+        // Garbage is corruption, not a newer version.
+        std::fs::write(dir.path().join("format"), "x").unwrap();
+        let err = DiskObjectStore::open(dir.path(), u64::MAX).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
     #[tokio::test]
