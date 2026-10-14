@@ -61,7 +61,11 @@ struct Request {
 // Include all backend identities: independent repositories named "main" must
 // never share requests. The worker owns the Backend while the key is live.
 #[derive(Clone, Hash, PartialEq, Eq)]
-struct QueueKey(usize, usize, usize, String);
+struct QueueKey {
+    /// Store identities (`Arc` addresses) of the backend.
+    stores: [usize; 3],
+    ref_name: String,
+}
 type Queues = HashMap<QueueKey, VecDeque<Request>>;
 static QUEUES: LazyLock<Mutex<Queues>> = LazyLock::new(Default::default);
 
@@ -101,10 +105,10 @@ impl Worker {
             // after the lock is granted lets requests that arrived during the
             // wait join the first batch. Without the lock (store error,
             // timeout) the CAS still keeps the ref correct.
-            let mut lock = match b.refs.lock_ref(&self.key.3).await {
+            let mut lock = match b.refs.lock_ref(&self.key.ref_name).await {
                 Ok(lock) => lock,
                 Err(error) => {
-                    tracing::warn!(%error, ref_name = self.key.3, "ref lock unavailable; landing with CAS only");
+                    tracing::warn!(%error, ref_name = self.key.ref_name, "ref lock unavailable; landing with CAS only");
                     RefLock::unheld()
                 }
             };
@@ -112,7 +116,7 @@ impl Worker {
             // Every batch of the turn is published (mappings included) or
             // failed, so the next holder sees all of it.
             if let Err(error) = lock.release().await {
-                tracing::warn!(%error, ref_name = self.key.3, "releasing ref lock failed");
+                tracing::warn!(%error, ref_name = self.key.ref_name, "releasing ref lock failed");
             }
         }
     }
@@ -120,7 +124,7 @@ impl Worker {
     /// Land batches under one hold of `lock` (see the module docs). Returns
     /// with no batch prepared and unpublished.
     async fn turn(&self, b: &Backend, lock: &mut RefLock) {
-        let ref_name = self.key.3.as_str();
+        let ref_name = self.key.ref_name.as_str();
         let started = Instant::now();
         let deferred = lock.can_publish();
         // The ref's value, when this turn knows it (it published it).
@@ -406,7 +410,7 @@ pub(crate) fn queue_depths() -> Vec<(String, usize)> {
     let queues = crate::lock(&QUEUES);
     let mut by_ref: HashMap<&str, usize> = HashMap::new();
     for (key, queue) in queues.iter() {
-        *by_ref.entry(key.3.as_str()).or_default() += queue.len();
+        *by_ref.entry(key.ref_name.as_str()).or_default() += queue.len();
     }
     by_ref.into_iter().map(|(r, n)| (r.to_owned(), n)).collect()
 }
@@ -429,12 +433,14 @@ pub(super) fn enqueue_checked(
     policy: Option<Arc<Policy>>,
     metrics: Option<Arc<Metrics>>,
 ) -> oneshot::Receiver<OpResult<LandOutcome>> {
-    let key = QueueKey(
-        Arc::as_ptr(&b.objects) as *const () as usize,
-        Arc::as_ptr(&b.refs) as *const () as usize,
-        Arc::as_ptr(&b.meta) as *const () as usize,
-        ref_name.to_owned(),
-    );
+    let key = QueueKey {
+        stores: [
+            Arc::as_ptr(&b.objects).cast::<()>() as usize,
+            Arc::as_ptr(&b.refs).cast::<()>() as usize,
+            Arc::as_ptr(&b.meta).cast::<()>() as usize,
+        ],
+        ref_name: ref_name.to_owned(),
+    };
     let (reply, receiver) = oneshot::channel();
     let mut queues = crate::lock(&QUEUES);
     let lead = !queues.contains_key(&key);

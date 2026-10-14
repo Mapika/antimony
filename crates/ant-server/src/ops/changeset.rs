@@ -28,14 +28,14 @@
 //! Cost: O(changed paths × depth) object reads/writes, independent of repo
 //! size.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ant_core::{
     Commit, EncodedObject, EntryMode, Object, ObjectId, ObjectKind, RepoPath, Signature, Tree,
     TreeEntry,
 };
-use ant_store::{Backend, ChangeKind, CommitNode, PathChange};
+use ant_store::{Backend, CommitNode, PathChange};
 use bytes::Bytes;
 
 use super::{OpError, OpResult, cache};
@@ -148,7 +148,8 @@ pub async fn create_changeset_as(
     let mut directories = match base_tree {
         Some(root) => {
             let paths: Vec<_> = req.ops.iter().map(|op| op.path().clone()).collect();
-            let [dirs] = super::tree_edit::load_directories(b, [root], &paths).await?;
+            let [dirs] =
+                super::tree_edit::load_directories(b, &HashMap::new(), [root], &paths).await?;
             dirs
         }
         None => Default::default(),
@@ -161,20 +162,11 @@ pub async fn create_changeset_as(
         .iter()
         .zip(&edits)
         .filter_map(|(op, (_, edit))| {
-            let path = op.path();
-            let old =
-                super::tree_edit::entry(&directories, path).filter(|(mode, _)| !mode.is_tree());
             let new = match *edit {
                 Edit::Write(mode, id) => Some((mode, id)),
                 Edit::Delete => None,
             };
-            let kind = match (old, new) {
-                _ if old == new => return None,
-                (None, _) => ChangeKind::Added,
-                (_, None) => ChangeKind::Deleted,
-                _ => ChangeKind::Modified,
-            };
-            Some(PathChange { path: path.clone(), kind, old, new })
+            super::tree_edit::leaf_change(&directories, op.path(), new)
         })
         .collect();
     changes.sort_by(|a, b| a.path.cmp(&b.path));

@@ -5,27 +5,19 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use ant_core::{EntryMode, ObjectId, ObjectKind, RepoPath, Tree, TreeEntry};
-use ant_store::{Backend, StoreError};
+use ant_core::{EntryMode, ObjectId, RepoPath, Tree, TreeEntry};
+use ant_store::{Backend, ChangeKind, PathChange, StoreError};
 
 use super::{OpResult, cache};
 
 pub(super) type Entry = (EntryMode, ObjectId);
 pub(super) type Directories = BTreeMap<RepoPath, Tree>;
 
-// Load only directories on changed paths, one batch per depth.
+/// Load only the directories on `paths` under each root, one batch per
+/// depth: first from `local` (trees built but not yet written), then the
+/// store-scoped tree cache; only misses hit the store, with at most one
+/// `get_many` per depth.
 pub(super) async fn load_directories<const N: usize>(
-    b: &Backend,
-    roots: [ObjectId; N],
-    paths: &[RepoPath],
-) -> OpResult<[Directories; N]> {
-    load_directories_with(b, &HashMap::new(), roots, paths).await
-}
-
-/// [`load_directories`] that first consults `local` (trees built but not yet
-/// written) and then the store-scoped tree cache; only misses hit the store,
-/// with at most one `get_many` per depth.
-pub(super) async fn load_directories_with<const N: usize>(
     b: &Backend,
     local: &HashMap<ObjectId, Arc<Tree>>,
     roots: [ObjectId; N],
@@ -40,7 +32,6 @@ pub(super) async fn load_directories_with<const N: usize>(
             path = parent;
         }
     }
-    let caches = cache::objects(&b.objects);
     let mut pending: Vec<_> =
         roots.into_iter().enumerate().map(|(i, root)| (i, RepoPath::root(), root)).collect();
     let mut dirs: [Directories; N] = std::array::from_fn(|_| BTreeMap::new());
@@ -54,40 +45,9 @@ pub(super) async fn load_directories_with<const N: usize>(
             .map(|((_, _, id), _)| *id)
             .collect();
         if !lookups.is_empty() {
-            let mut hits = caches.trees.get_many(&lookups).into_iter();
-            let mut misses = Vec::new();
-            for ((_, _, id), slot) in pending.iter().zip(&mut trees) {
-                if slot.is_none() {
-                    *slot = hits.next().flatten();
-                    if slot.is_none() {
-                        misses.push(*id);
-                    }
-                }
-            }
-            if !misses.is_empty() {
-                misses.sort_unstable();
-                misses.dedup();
-                let mut fetched = HashMap::with_capacity(misses.len());
-                for (id, object) in misses.iter().zip(b.objects.get_many(&misses).await?) {
-                    let object = object.ok_or(StoreError::NotFound(*id))?;
-                    if object.kind() != ObjectKind::Tree {
-                        return Err(StoreError::WrongKind {
-                            id: *id,
-                            expected: ObjectKind::Tree,
-                            actual: object.kind(),
-                        }
-                        .into());
-                    }
-                    fetched.insert(*id, Arc::new(Tree::decode(object.body())?));
-                }
-                caches.trees.insert_many(
-                    fetched.iter().map(|(id, t)| (*id, t.clone(), cache::tree_weight(t))),
-                );
-                for ((_, _, id), slot) in pending.iter().zip(&mut trees) {
-                    if slot.is_none() {
-                        *slot = fetched.get(id).cloned();
-                    }
-                }
+            let mut read = cache::read_trees(b, &lookups).await?.into_iter();
+            for slot in trees.iter_mut().filter(|t| t.is_none()) {
+                *slot = read.next();
             }
         }
         let mut next = Vec::new();
@@ -109,6 +69,24 @@ pub(super) async fn load_directories_with<const N: usize>(
 pub(super) fn entry(dirs: &Directories, path: &RepoPath) -> Option<Entry> {
     let (parent, name) = path.split_last()?;
     dirs.get(&parent)?.get(name).map(|e| (e.mode, e.id))
+}
+
+/// The changeset entry for setting the leaf at `path` in `dirs` to `new`
+/// (`None` = delete), or `None` when that changes nothing. Changesets
+/// describe leaves, so a directory at `path` counts as absent.
+pub(super) fn leaf_change(
+    dirs: &Directories,
+    path: &RepoPath,
+    new: Option<Entry>,
+) -> Option<PathChange> {
+    let old = entry(dirs, path).filter(|(mode, _)| !mode.is_tree());
+    let kind = match (old, new) {
+        _ if old == new => return None,
+        (None, _) => ChangeKind::Added,
+        (_, None) => ChangeKind::Deleted,
+        _ => ChangeKind::Modified,
+    };
+    Some(PathChange { path: path.clone(), kind, old, new })
 }
 
 pub(super) fn deepest_first(dirs: &Directories) -> Vec<RepoPath> {

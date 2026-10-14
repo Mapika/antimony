@@ -23,6 +23,10 @@ use super::{OpError, OpResult};
 
 /// Cache names, indexed by [`Cache`] slot.
 pub(crate) const CACHE_NAMES: [&str; 4] = ["trees", "commits", "nodes", "changesets"];
+const TREES: usize = 0;
+const COMMITS: usize = 1;
+const NODES: usize = 2;
+const CHANGESETS: usize = 3;
 
 /// Process-wide lookup counters per cache slot (all store instances). Plain
 /// relaxed atomics: the metrics endpoint reads them on scrape.
@@ -197,7 +201,7 @@ fn scoped<S: ?Sized, C>(
     store: &Arc<S>,
     make: impl FnOnce() -> C,
 ) -> Arc<C> {
-    let mut entries = crate::lock(&registry);
+    let mut entries = crate::lock(registry);
     entries.retain(|(weak, _)| weak.strong_count() > 0);
     let weak = Arc::downgrade(store);
     if let Some((_, caches)) = entries.iter().find(|(w, _)| Weak::ptr_eq(w, &weak)) {
@@ -210,21 +214,21 @@ fn scoped<S: ?Sized, C>(
 
 pub(crate) fn objects(store: &Arc<dyn ObjectStore>) -> Arc<ObjectCaches> {
     scoped(&OBJECTS, store, || ObjectCaches {
-        trees: Cache::new(TREE_BUDGET, 0),
-        commits: Cache::new(COMMIT_BUDGET, 1),
+        trees: Cache::new(TREE_BUDGET, TREES),
+        commits: Cache::new(COMMIT_BUDGET, COMMITS),
     })
 }
 
 pub(crate) fn meta(store: &Arc<dyn MetaStore>) -> Arc<MetaCaches> {
     scoped(&META, store, || MetaCaches {
-        nodes: Cache::new(NODE_BUDGET, 2),
-        changesets: Cache::new(CHANGESET_BUDGET, 3),
+        nodes: Cache::new(NODE_BUDGET, NODES),
+        changesets: Cache::new(CHANGESET_BUDGET, CHANGESETS),
     })
 }
 
 /// Clones the caches of every live registration, releasing the lock first.
 fn live<S: ?Sized, C>(registry: &Registry<S, C>) -> Vec<Arc<C>> {
-    let entries = crate::lock(&registry);
+    let entries = crate::lock(registry);
     entries.iter().filter(|(w, _)| w.strong_count() > 0).map(|(_, c)| c.clone()).collect()
 }
 
@@ -244,15 +248,14 @@ pub fn cache_stats() -> (Vec<CacheStat>, usize, usize) {
     let metas = live(&META);
     let mut totals = [(0, 0, 0); 4];
     for c in &objects {
-        add(&mut totals[0], &c.trees);
-        add(&mut totals[1], &c.commits);
+        add(&mut totals[TREES], &c.trees);
+        add(&mut totals[COMMITS], &c.commits);
     }
     for c in &metas {
-        add(&mut totals[2], &c.nodes);
-        add(&mut totals[3], &c.changesets);
+        add(&mut totals[NODES], &c.nodes);
+        add(&mut totals[CHANGESETS], &c.changesets);
     }
-    const NAMES: [&str; 4] = CACHE_NAMES;
-    let stats = NAMES
+    let stats = CACHE_NAMES
         .iter()
         .zip(totals)
         .map(|(name, (entries, weight_bytes, budget_bytes))| CacheStat {
