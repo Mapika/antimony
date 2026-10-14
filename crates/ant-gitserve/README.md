@@ -1,71 +1,88 @@
 # Git pack export
 
-The fetch planner keeps object IDs and 64-bit path fingerprints, deduplicates
-before enqueueing trees, and stably groups objects by path. Revisions at a path
-retain their traversal order (newest first for linear histories). Fingerprint
-collisions can reduce compression quality but cannot change reconstructed bytes.
-Shared objects are sent once. Known historical objects are still subtracted for
-incremental fetches, including files restored from earlier revisions.
+## Planning
+
+The fetch planner keeps object IDs, 64-bit path fingerprints and (for trees,
+which it reads anyway) body sizes; it deduplicates before enqueueing trees.
+The tree walk keeps several store reads in flight while the previous batch is
+parsed on the blocking pool, with a zero-copy entry parser. Shared objects are
+sent once. Known historical objects are still subtracted for incremental
+fetches, including files restored from earlier revisions.
+
+The plan is sorted by (path, size descending), as git's own packer does. On
+real, merge-heavy histories the traversal order interleaves branches, so
+"consecutive" versions of a directory differ a lot; size order brings near
+versions together and lets bases fan out. Fingerprint collisions can reduce
+compression quality but cannot change reconstructed bytes.
+
+## Deltas
 
 Clients advertising `ofs-delta` receive tree and blob deltas against an earlier
-entry in the same pack. The encoder indexes 16-byte base blocks in a fixed 256 KiB
-hash table and scans the target with a rolling hash. It accepts instructions only
-below half the target's uncompressed size, caps chains at 50, and resets to a full
-object at the limit. It checks object kinds, including file/directory transitions.
-No REF_DELTA or external base is emitted, even when `thin-pack` is offered.
-Clients without `ofs-delta` receive full objects.
+entry in the same pack. Each object tries the previous `WINDOW` (10) objects of
+its path, newest first, and keeps the smallest delta, with git's depth-scaled
+size limit (a deeper base must beat the current best proportionally) so chains
+fan out instead of running to the cap. Chains are capped at depth 50. A delta
+must be below half the target size. Kinds are checked, including
+file/directory transitions. The encoder builds one block index per base (sized
+to the base, at most 2^20 slots, high bits of a mixed rolling hash), reuses it
+for every target, and extends matches backwards and forwards. No REF_DELTA or
+external base is emitted, even when `thin-pack` is offered. Clients without
+`ofs-delta` receive full objects. Entries are zlib level 6 (git's default).
 
-A blocking worker performs matching, zlib compression, pack hashing, and sideband
-framing. A one-batch channel overlaps asynchronous `get_many` reads (16 objects
-per batch) with compression and sending. The existing bounded HTTP channel
-provides backpressure. Sideband buffering is capped at 65,515 payload bytes;
-only one previous base body is retained, capped at 8 MiB. Larger objects are
-stream-compressed without delta matching. Missing objects and disconnects stop
-the pipeline; failed reads cannot produce a successful pack trailer/flush.
+## Streaming and memory
 
-ObjectStore returns whole bodies, so read memory is bounded by three batches
-(one being compressed, one queued, one being fetched), not by a strict byte
-limit independent of individual object size. Planning reads at most 512 trees
-per batch and moves tree parsing and final sorting off async executors. Planning
-memory remains O(number of distinct objects): final ID/path arrays use 40 bytes
-per object (400 MB for 10 million objects), with transient reachability sets,
-queues, and sort/unzip allocations. This is not a constant-memory graph walk.
-No complete pack or complete history of object bodies is retained by the export.
+Store reads (128 trees/commits or 16 blobs per `get_many`, 8 in flight) feed a
+segmenter that cuts the stream into segments (at a path change after 1 MiB,
+or inside a path at 16 MiB). Each segment is delta-searched and compressed by
+its own blocking worker (up to 8 at once); one writer emits segments in order,
+resolves OFS distances, hashes the pack and frames sidebands (65,515 payload
+bytes). The bounded queue between segmenter and writer provides backpressure.
+A cut inside a path hands the last window of objects to the next segment as
+delta candidates; the earlier segment keeps those objects at most 25 deep and
+the next one assumes that bound, so the depth cap holds without coordination.
+Missing objects and disconnects stop the pipeline; failed reads cannot produce
+a successful pack trailer/flush.
 
-## Reproducible measurements
+Memory is bounded by these constants (reads in flight, about ten segments,
+windows of at most 16 MiB each), not by history size; no complete pack or
+history of object bodies is retained. Planning memory is O(number of distinct
+objects): 48 bytes per planned object plus transient reachability sets.
 
-Run offline in the checkout's default `target`:
+The S3 packed store coalesces nearby objects of one pack into single ranged
+reads and bounds range bytes in flight per store (`ant-store/src/packed.rs`):
+SeaweedFS answers 429 above 64 MiB of in-flight chunk reads, and the SDK then
+backs off for seconds.
 
-```
-cargo nextest run --offline -p ant-gitserve
-cargo clippy --offline -p ant-gitserve --all-targets -- -D warnings
-```
+## Measurements
 
-`large_blobless_history_is_delta_compressed` clones 2,000 commits with 2,000-entry
-trees using real Git over HTTP, measures the received `.pack`, checks it is at
-most 30% of the old undeltified encoding, and runs `git fsck --full`.
+Unit/integration tests (`cargo nextest run -p ant-gitserve`):
 
-`synthetic_history_pack_size_time_and_peak_rss` uses the same fixture, planner,
-encoder, and real Git `index-pack` over stdin. It runs with deltas disabled and
-enabled and checks both packs with `git fsck --full` in a promisor repository.
-This also works where listening sockets are prohibited. The undeltified size is
-independently calculated using the old encoder's header sizes and zlib settings.
-RSS is sampled every 5 ms from `/proc/self/status` on Linux and includes the
-in-memory fixture store; the test reports pre-transfer RSS separately.
+- `merged_history_pack_is_close_to_git_repack`: 1,200 commits plus merged
+  topic branches touching a few files in deep trees; the blobless pack must be
+  no larger than `git repack -adf` of the same objects and at most 35% of the
+  undeltified size (measured: 30%, 0.5x git; the old single-base encoder: 50%).
+- `appended_history_stops_at_the_depth_cap`: depth reaches 50 and never passes
+  it, also across segment cuts with handed-over context.
+- `synthetic_history_pack_size_time_and_peak_rss`,
+  `large_blobless_history_is_delta_compressed`: 2,000 x 2,000-entry trees,
+  deltas vs undeltified, `git fsck --full`.
 
-A local debug-profile run on 2026-10-14 produced:
+git/git (82,443 commits on master) imported into Postgres + SeaweedFS S3,
+cloned over HTTP from `ant serve` on 2026-10-14 (release build, 20-core WSL2
+machine shared with other work; native = `git clone file://` of the SHA-1
+source, master only, reusing its on-disk deltas):
 
-| Measurement | Deltas disabled | Deltas enabled |
-|---|---:|---:|
-| Pack bytes | 145,578,540 | 3,379,899 |
-| Planning | 2.54 s | 2.58 s |
-| Planning + transfer + Git indexing | 4.45 s | 3.83 s |
-| Server RSS before transfer | 197,472 KiB | 197,912 KiB |
-| Peak server RSS | 199,232 KiB | 198,712 KiB |
+| clone | before | after | native git |
+|---|---:|---:|---:|
+| `--filter=blob:none --no-checkout` time | 48.3 s | 13.9-15.6 s | 5.8 s |
+| ... `.git` size | 905 MiB | 116 MiB | 115 MiB |
+| ... trees packed | 899 MB (50k full) | 72.8 MB (6.7k full) | 98.8 MB (SHA-256 `repack -adf`) |
+| ... server peak RSS | 177 MiB | 505-534 MiB | |
+| `--filter=blob:none` with checkout | 48.7 s, 1 lazy fetch | 14.9-31 s, 1 lazy fetch | 8.8 s |
+| `--depth 1` | 0.73 s | 0.54 s | 1.6 s |
+| full clone | 99 s, 1.45 GiB | 34-47 s, 252 MiB | 17.8 s, 311 MiB |
 
-The delta pack is 2.32% of the undeltified size. These are controlled comparisons
-using the new pipeline in both modes, not timings of the old HTTP server. Git's
-child-process memory is not included in the server RSS. This sandbox rejects
-localhost socket binding, so HTTP clone timings and the full HTTP suite could
-not be validated here. `RUSTC_WRAPPER=` was needed because the sandbox also
-rejects sccache; builds still used the local `./target` and `--offline`.
+Of the blobless time, about 6 s is planning (reading all 164k trees, 3.3 GB
+raw, once) and 7 s the pack phase (reading them again for delta search); the
+S3 server (SeaweedFS, ~10 cores busy) is the limit in both. The trees cannot
+be kept from the first pass without holding the history in memory.

@@ -1,15 +1,34 @@
 //! Reachability planning retains IDs, not object contents. Tree entries let us
 //! include/exclude blobs without downloading their bodies during planning.
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    cmp::Reverse,
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     hash::{DefaultHasher, Hash, Hasher},
 };
 
-use ant_core::{EntryMode, ObjectId, ObjectKind, Tree};
+use ant_core::{EntryMode, ObjectId, ObjectKind};
 use ant_store::{Backend, CommitNode};
 use anyhow::{Result, anyhow, bail, ensure};
 
 pub const BATCH: usize = 512;
+/// Trees per read, and reads in flight, while planning.
+const TREE_BATCH: usize = 256;
+const TREE_READS: usize = 8;
+/// Path fingerprint of commits and directly wanted objects (sorted first).
+const NO_PATH: u64 = 0;
+/// Path fingerprint of root trees (children hash their names into it).
+const ROOT_PATH: u64 = 1;
+
+/// One object of the pack plan: its id, a fingerprint of the path it was
+/// first reached at, and the uncompressed size when planning read the body
+/// (trees; 0 for commits and blobs, which planning never reads).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Planned {
+    pub id: ObjectId,
+    pub path: u64,
+    pub size: u32,
+    pub blob: bool,
+}
 
 #[derive(Default)]
 pub struct Fetch {
@@ -55,10 +74,16 @@ impl Fetch {
 }
 
 pub struct Selection {
-    pub ids: Vec<ObjectId>,
-    pub paths: Vec<u64>,
+    pub objects: Vec<Planned>,
     pub shallow: Vec<ObjectId>,
     pub unshallow: Vec<ObjectId>,
+}
+
+#[cfg(test)]
+impl Selection {
+    pub fn ids(&self) -> Vec<ObjectId> {
+        self.objects.iter().map(|p| p.id).collect()
+    }
 }
 
 /// Lazily paint have ancestry in generation order. To test a candidate at
@@ -120,71 +145,136 @@ impl Known {
     }
 }
 
+/// Entries of a canonical tree body without allocating names: (mode, name, id).
+fn entries(mut body: &[u8]) -> impl Iterator<Item = Result<(EntryMode, &[u8], ObjectId)>> {
+    std::iter::from_fn(move || {
+        if body.is_empty() {
+            return None;
+        }
+        let entry = (|| {
+            let space = body.iter().position(|&b| b == b' ').ok_or_else(|| anyhow!("bad tree"))?;
+            let mode = EntryMode::from_octal(&body[..space])?;
+            let rest = &body[space + 1..];
+            let nul = rest.iter().position(|&b| b == 0).ok_or_else(|| anyhow!("bad tree"))?;
+            ensure!(rest.len() >= nul + 1 + ObjectId::LEN, "truncated tree entry");
+            let id = ObjectId::from_bytes(&rest[nul + 1..nul + 1 + ObjectId::LEN])?;
+            body = &rest[nul + 1 + ObjectId::LEN..];
+            Ok((mode, &rest[..nul], id))
+        })();
+        if entry.is_err() {
+            body = &[];
+        }
+        Some(entry)
+    })
+}
+
+/// Breadth-first tree walk state; moved to the blocking pool per batch.
+struct Walk {
+    excluded: HashSet<ObjectId>,
+    found: HashSet<ObjectId>,
+    ordered: Vec<Planned>,
+    queue: VecDeque<(ObjectId, u64)>,
+    no_blobs: bool,
+}
+
+impl Walk {
+    fn visit(
+        &mut self,
+        batch: Vec<(ObjectId, u64)>,
+        objects: Vec<Option<ant_core::EncodedObject>>,
+    ) -> Result<()> {
+        ensure!(objects.len() == batch.len(), "incomplete tree batch");
+        for ((id, path), object) in batch.into_iter().zip(objects) {
+            let object = object.ok_or_else(|| anyhow!("missing tree {id}"))?;
+            ensure!(object.kind() == ObjectKind::Tree, "expected tree {id}");
+            let size = u32::try_from(object.body().len()).unwrap_or(u32::MAX);
+            self.ordered.push(Planned { id, path, size, blob: false });
+            for entry in entries(object.body()) {
+                let (mode, name, id) = entry?;
+                if !(mode == EntryMode::Tree || mode.is_blob() && !self.no_blobs) {
+                    continue;
+                }
+                // Mark on enqueue, not dequeue: shared subtrees must not
+                // accumulate millions of duplicate pending references.
+                if self.excluded.contains(&id) || !self.found.insert(id) {
+                    continue;
+                }
+                let mut hash = DefaultHasher::new();
+                path.hash(&mut hash);
+                name.hash(&mut hash);
+                let path = hash.finish();
+                if mode == EntryMode::Tree {
+                    self.queue.push_back((id, path));
+                } else {
+                    self.ordered.push(Planned { id, path, size: 0, blob: true });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Aborts a spawned read when planning stops early (error or disconnect).
+struct Read(tokio::task::JoinHandle<Result<TreeBatch>>);
+
+type TreeBatch = (Vec<(ObjectId, u64)>, Vec<Option<ant_core::EncodedObject>>);
+
+impl Drop for Read {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Expand each distinct tree once, recording compact path fingerprints rather
 /// than allocating full paths for millions of historical objects. Collisions
 /// only affect compression: the encoder checks kinds and encodes actual bytes.
+/// Store reads are pipelined: `TREE_READS` batches stay in flight while the
+/// previous one is parsed on the blocking pool.
 async fn trees(
     b: &Backend,
     roots: Vec<ObjectId>,
     excluded: HashSet<ObjectId>,
     no_blobs: bool,
-) -> Result<Vec<(ObjectId, u64)>> {
-    let mut excluded = excluded;
-    let mut found = HashSet::new();
-    let mut ordered = Vec::new();
-    let mut queue = VecDeque::new();
+) -> Result<Vec<Planned>> {
+    let mut walk = Walk {
+        excluded,
+        found: HashSet::new(),
+        ordered: Vec::new(),
+        queue: VecDeque::new(),
+        no_blobs,
+    };
     for id in roots {
-        if !excluded.contains(&id) && found.insert(id) {
-            queue.push_back((id, 0));
+        if !walk.excluded.contains(&id) && walk.found.insert(id) {
+            walk.queue.push_back((id, ROOT_PATH));
         }
     }
-    while !queue.is_empty() {
-        let batch: Vec<_> = queue.drain(..queue.len().min(BATCH)).collect();
-        let ids: Vec<_> = batch.iter().map(|(id, _)| *id).collect();
-        let objects = b.objects.get_many(&ids).await?;
-        ensure!(objects.len() == ids.len(), "incomplete tree batch");
+    let mut reads = VecDeque::new();
+    loop {
+        while reads.len() < TREE_READS && !walk.queue.is_empty() {
+            let batch: Vec<_> = walk.queue.drain(..walk.queue.len().min(TREE_BATCH)).collect();
+            let b = b.clone();
+            reads.push_back(Read(tokio::spawn(async move {
+                let ids: Vec<_> = batch.iter().map(|(id, _)| *id).collect();
+                let objects = b.objects.get_many(&ids).await?;
+                Ok((batch, objects))
+            })));
+        }
+        let Some(mut read) = reads.pop_front() else { break };
+        let (batch, objects) = (&mut read.0).await??;
         // Parsing large trees is CPU work, too. Do not stall HTTP executors.
-        let (next_found, next_ordered, next_queue, next_excluded) =
-            tokio::task::spawn_blocking(move || -> Result<_> {
-                for ((id, path), object) in batch.into_iter().zip(objects) {
-                    let object = object.ok_or_else(|| anyhow!("missing tree {id}"))?;
-                    ensure!(object.kind() == ObjectKind::Tree, "expected tree {id}");
-                    ordered.push((id, path));
-                    for entry in Tree::decode(object.body())?.entries() {
-                        if !(entry.mode == EntryMode::Tree || entry.mode.is_blob() && !no_blobs) {
-                            continue;
-                        }
-                        // Mark on enqueue, not dequeue: shared subtrees must not
-                        // accumulate millions of duplicate pending references.
-                        if excluded.contains(&entry.id) || !found.insert(entry.id) {
-                            continue;
-                        }
-                        let mut hash = DefaultHasher::new();
-                        path.hash(&mut hash);
-                        entry.name.hash(&mut hash);
-                        let child_path = hash.finish();
-                        if entry.mode == EntryMode::Tree {
-                            queue.push_back((entry.id, child_path));
-                        } else {
-                            ordered.push((entry.id, child_path));
-                        }
-                    }
-                }
-                Ok((found, ordered, queue, excluded))
-            })
-            .await??;
-        found = next_found;
-        ordered = next_ordered;
-        queue = next_queue;
-        excluded = next_excluded;
+        walk = tokio::task::spawn_blocking(move || -> Result<Walk> {
+            walk.visit(batch, objects)?;
+            Ok(walk)
+        })
+        .await??;
     }
-    Ok(ordered)
+    Ok(walk.ordered)
 }
-
 pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
     let mut known = Known::default();
     known.add(b, &fetch.haves).await?;
     let mut selected = HashSet::new();
+    let mut direct_blobs = HashMap::new();
     let mut roots = Vec::new();
     let mut shallow = Vec::new();
     let mut unshallow = Vec::new();
@@ -232,6 +322,8 @@ pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
                     match object.kind() {
                         ObjectKind::Blob => {
                             selected.insert(*id);
+                            let size = u32::try_from(object.body().len()).unwrap_or(u32::MAX);
+                            direct_blobs.insert(*id, size);
                         }
                         ObjectKind::Tree => roots.push(*id),
                         ObjectKind::Commit => bail!("commit {id} has no graph metadata"),
@@ -243,7 +335,14 @@ pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
         level += 1;
     }
     drop(seen);
-    let mut entries: Vec<_> = selected.iter().map(|id| (*id, 0)).collect();
+    let mut entries: Vec<_> = selected
+        .iter()
+        .map(|id| match direct_blobs.get(id) {
+            Some(size) => Planned { id: *id, path: NO_PATH, size: *size, blob: true },
+            None => Planned { id: *id, path: NO_PATH, size: 0, blob: false },
+        })
+        .collect();
+    drop(direct_blobs);
     if !roots.is_empty() {
         // Exact subtraction includes historical trees, including restored files.
         known.advance_to(b, 0, &fetch.shallow).await?;
@@ -252,24 +351,26 @@ pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
         let known_objects = trees(b, known_roots, HashSet::new(), fetch.no_blobs)
             .await?
             .into_iter()
-            .map(|(id, _)| id)
+            .map(|planned| planned.id)
             .collect();
         entries.extend(
             trees(b, roots, known_objects, fetch.no_blobs)
                 .await?
                 .into_iter()
-                .filter(|(id, _)| !selected.contains(id)),
+                .filter(|planned| !selected.contains(&planned.id)),
         );
     }
     drop(selected);
-    // Stable grouping preserves traversal (newest to oldest) within each path.
-    // This lets streaming retain just ONE previous body, not a per-path cache.
-    let (ids, paths) = tokio::task::spawn_blocking(move || {
-        entries.sort_by_key(|(_, path)| *path);
-        entries.into_iter().unzip()
+    // Group by path, largest first within a path (as git's own packer does):
+    // deltas then mostly delete from a bigger, usually newer base, and chains
+    // fan out instead of growing one step per revision. The stable sort keeps
+    // traversal order (newest first) among equal sizes.
+    let objects = tokio::task::spawn_blocking(move || {
+        entries.sort_by_key(|planned| (planned.path, Reverse(planned.size)));
+        entries
     })
     .await?;
-    Ok(Selection { ids, paths, shallow, unshallow })
+    Ok(Selection { objects, shallow, unshallow })
 }
 
 #[cfg(test)]
@@ -323,16 +424,16 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(selection.ids.len(), 3);
-        assert!(selection.ids.contains(&right));
-        assert!(!selection.ids.contains(&root));
+        assert_eq!(selection.ids().len(), 3);
+        assert!(selection.ids().contains(&right));
+        assert!(!selection.ids().contains(&root));
         let empty = select(
             &b,
             &Fetch { wants: vec![left], haves: vec![tip], done: true, ..Fetch::default() },
         )
         .await
         .unwrap();
-        assert!(empty.ids.is_empty());
+        assert!(empty.objects.is_empty());
     }
 
     #[tokio::test]
@@ -347,7 +448,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(selection.ids, [tip], "old tree and blob already belong to the client");
+        assert_eq!(selection.ids(), [tip], "old tree and blob already belong to the client");
         let blob = b.objects.put(EncodedObject::new(ObjectKind::Blob, b"lazy")).await.unwrap();
         let selection = select(
             &b,
@@ -355,7 +456,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(selection.ids, [blob], "explicit wants override blob filtering");
+        assert_eq!(selection.ids(), [blob], "explicit wants override blob filtering");
     }
 
     #[tokio::test]
@@ -375,8 +476,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(selection.ids.len(), 3);
-        assert!(selection.ids.contains(&root));
+        assert_eq!(selection.ids().len(), 3);
+        assert!(selection.ids().contains(&root));
     }
 
     #[test]
@@ -395,9 +496,9 @@ mod tests {
             select(&b, &Fetch { wants: vec![tip, blob], done: true, ..Default::default() })
                 .await
                 .unwrap();
-        assert_eq!(selection.ids.len(), 3);
-        assert_eq!(selection.ids.iter().filter(|id| **id == blob).count(), 1);
-        assert_eq!(selection.ids.len(), selection.paths.len());
+        assert_eq!(selection.ids().len(), 3);
+        assert_eq!(selection.ids().iter().filter(|id| **id == blob).count(), 1);
+        assert_eq!(selection.objects.iter().filter(|p| p.blob).count(), 1);
     }
 
     #[test]

@@ -1,23 +1,58 @@
-//! SHA-256 packs with path-local OFS_DELTA entries and bounded backpressure.
-//! One blocking worker owns compression state; a bounded read queue overlaps
-//! store I/O with compression and HTTP sending. No pack-sized buffer is built.
-use std::io::{self, Write};
+//! SHA-256 packs with OFS_DELTA entries, parallel delta search and bounded
+//! backpressure. No pack-sized buffer is built.
+//!
+//! Pipeline: concurrent store reads in plan order → small segments of
+//! consecutive objects → one blocking delta+zlib worker per segment, several
+//! at once → one blocking writer that emits the segments in order, resolves
+//! OFS_DELTA distances, hashes the pack and frames sidebands.
+//!
+//! A segment cut inside one path hands the next segment the last objects of
+//! that path as delta candidates ("context"), so chains continue across the
+//! cut. Their real depth is only known once the previous segment is encoded,
+//! so that segment keeps them at most `CONTEXT_DEPTH` deep and the next one
+//! assumes exactly that bound: the depth limit holds without coordination.
+use std::{
+    collections::VecDeque,
+    io::{self, Write},
+    ops::Range,
+};
 
-use ant_core::{EncodedObject, ObjectId, ObjectKind};
+use ant_core::{EncodedObject, ObjectKind};
 use ant_store::Backend;
 use anyhow::{Result, anyhow, ensure};
 use bytes::Bytes;
 use flate2::{Compression, write::ZlibEncoder};
+use futures::{StreamExt, TryStreamExt, stream};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::{
+    mpsc::{self, Sender},
+    oneshot,
+};
 
-use crate::{delta, protocol::packet};
+use crate::{delta, protocol::packet, select::Planned};
 
 pub type Chunk = Result<Bytes, io::Error>;
 const SIDEBAND: usize = 65515;
-const READ_BATCH: usize = 16;
-const MAX_BASE: usize = 8 * 1024 * 1024;
+/// One store read takes up to this many trees/commits; a blob, whose size
+/// planning does not know, costs `BLOB_COST` of it.
+const READ_BUDGET: usize = 128;
+const BLOB_COST: usize = 8;
+const READS_IN_FLIGHT: usize = 8;
+/// A segment ends at the first path change after this many body bytes...
+const SEGMENT_BYTES: usize = 1 << 20;
+/// ...or here, even inside one path (handing over context, see above).
+const SEGMENT_MAX_BYTES: usize = 16 << 20;
+const MAX_WORKERS: usize = 8;
+/// Larger objects are stored whole and never used as delta bases.
+const MAX_BASE: usize = 8 << 20;
 const MAX_DEPTH: u8 = 50;
+const CONTEXT_DEPTH: u8 = MAX_DEPTH / 2;
+/// Delta candidates: the previous objects at the same path (git's default
+/// `pack.window`), bounded in bytes including their block indices.
+const WINDOW: usize = 10;
+const WINDOW_BYTES: usize = 16 << 20;
+/// zlib level of every entry (git's default `core.compression`).
+const LEVEL: u32 = 6;
 
 struct PackWriter {
     tx: Sender<Chunk>,
@@ -82,114 +117,346 @@ fn distance(writer: &mut PackWriter, mut offset: u64) -> io::Result<()> {
     writer.write_all(&bytes[pos..])
 }
 
-struct Base {
-    path: u64,
+/// Where a delta base was written: an entry of this or the previous segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Base {
+    Here(usize),
+    Previous(usize),
+}
+
+/// One pack entry of an encoded segment; its zlib stream ends at `end` in
+/// `Segment::data`.
+struct Entry {
+    kind: u8,
+    size: usize,
+    base: Option<Base>,
+    end: usize,
+}
+
+#[derive(Default)]
+struct Segment {
+    entries: Vec<Entry>,
+    data: Vec<u8>,
+}
+
+/// Input of one delta worker.
+struct Work {
+    objects: Vec<(u64, EncodedObject)>,
+    /// Candidates at the path of `objects[0]` from the end of the previous
+    /// segment, oldest first, with their entry index there.
+    context: Vec<(EncodedObject, usize)>,
+    /// Objects from this index on become the next segment's context.
+    tail: usize,
+    deltas: bool,
+}
+
+struct Candidate {
     object: EncodedObject,
-    offset: u64,
+    /// Built on first use; `None` inside when the body cannot be indexed.
+    index: Option<Option<delta::Index>>,
+    bytes: usize,
+    base: Base,
     depth: u8,
 }
 
-fn object(
-    writer: &mut PackWriter,
-    object: EncodedObject,
-    path: u64,
-    base: &mut Option<Base>,
-    deltas: bool,
-) -> io::Result<()> {
-    let offset = writer.position;
-    let eligible = deltas && object.kind() != ObjectKind::Commit && object.body().len() <= MAX_BASE;
-    let candidate = base.as_ref().filter(|b| {
-        eligible && b.path == path && b.object.kind() == object.kind() && b.depth < MAX_DEPTH
-    });
-    let instructions = candidate.and_then(|b| delta::encode(b.object.body(), object.body()));
-    let mut depth = 0;
-    let body = if let (Some(instructions), Some(base)) = (&instructions, candidate) {
-        header(writer, 6, instructions.len())?;
-        distance(writer, offset - base.offset)?;
-        depth = base.depth + 1;
-        instructions.as_slice()
-    } else {
-        let kind = match object.kind() {
-            ObjectKind::Commit => 1,
-            ObjectKind::Tree => 2,
-            ObjectKind::Blob => 3,
+struct Window {
+    path: Option<u64>,
+    candidates: VecDeque<Candidate>,
+    bytes: usize,
+}
+
+impl Window {
+    fn reset(&mut self, path: u64) {
+        if self.path != Some(path) {
+            self.path = Some(path);
+            self.candidates.clear();
+            self.bytes = 0;
+        }
+    }
+
+    fn push(&mut self, object: EncodedObject, base: Base, depth: u8) {
+        let bytes = object.body().len();
+        self.bytes += bytes;
+        self.candidates.push_back(Candidate { object, index: None, bytes, base, depth });
+        while self.candidates.len() > WINDOW || self.bytes > WINDOW_BYTES {
+            let Some(evicted) = self.candidates.pop_front() else { break };
+            self.bytes -= evicted.bytes;
+        }
+    }
+
+    /// The smallest delta against the window, chosen git-style: a deeper base
+    /// must beat the current best proportionally, so chains fan out instead
+    /// of running to the depth limit. Results are at most `max_depth` deep.
+    fn best_delta(&mut self, object: &EncodedObject, max_depth: u8) -> Option<(Vec<u8>, Base, u8)> {
+        let body = object.body();
+        let mut best: Option<(Vec<u8>, Base, u8)> = None;
+        for candidate in self.candidates.iter_mut().rev() {
+            if candidate.object.kind() != object.kind() || candidate.depth >= max_depth {
+                continue;
+            }
+            let base_len = candidate.object.body().len();
+            let (limit, ref_depth) = match &best {
+                Some((delta, _, depth)) => (delta.len(), *depth),
+                None => ((body.len() / 2).saturating_sub(32), 1),
+            };
+            let limit = limit * usize::from(MAX_DEPTH - candidate.depth)
+                / usize::from(MAX_DEPTH + 1 - ref_depth);
+            if limit == 0
+                || body.len().saturating_sub(base_len) >= limit
+                || body.len() < base_len / 32
+            {
+                continue;
+            }
+            let index = candidate.index.get_or_insert_with(|| {
+                let index = delta::Index::new(candidate.object.body());
+                let heap = index.as_ref().map_or(0, delta::Index::heap_bytes);
+                candidate.bytes += heap;
+                self.bytes += heap;
+                index
+            });
+            let Some(index) = index else { continue };
+            if let Some(delta) = delta::encode_indexed(index, candidate.object.body(), body, limit)
+            {
+                best = Some((delta, candidate.base, candidate.depth + 1));
+            }
+        }
+        best
+    }
+}
+
+fn eligible(object: &EncodedObject, deltas: bool) -> bool {
+    deltas && object.kind() != ObjectKind::Commit && object.body().len() <= MAX_BASE
+}
+
+fn encode_segment(work: Work) -> io::Result<Segment> {
+    let Work { objects, context, tail, deltas } = work;
+    let mut segment = Segment { entries: Vec::with_capacity(objects.len()), data: Vec::new() };
+    let mut window = Window { path: None, candidates: VecDeque::new(), bytes: 0 };
+    if let Some((path, _)) = objects.first() {
+        window.reset(*path);
+        for (object, entry) in context {
+            window.push(object, Base::Previous(entry), CONTEXT_DEPTH);
+        }
+    }
+    for (n, (path, object)) in objects.into_iter().enumerate() {
+        window.reset(path);
+        let eligible = eligible(&object, deltas);
+        let max_depth = if n >= tail { CONTEXT_DEPTH } else { MAX_DEPTH };
+        let best = if eligible { window.best_delta(&object, max_depth) } else { None };
+        let entry = segment.entries.len();
+        let mut encoder = ZlibEncoder::new(&mut segment.data, Compression::new(LEVEL));
+        let (kind, size, base, depth) = match &best {
+            Some((delta, base, depth)) => {
+                encoder.write_all(delta)?;
+                (6, delta.len(), Some(*base), *depth)
+            }
+            None => {
+                encoder.write_all(object.body())?;
+                let kind = match object.kind() {
+                    ObjectKind::Commit => 1,
+                    ObjectKind::Tree => 2,
+                    ObjectKind::Blob => 3,
+                };
+                (kind, object.body().len(), None, 0)
+            }
         };
-        header(writer, kind, object.body().len())?;
-        object.body()
-    };
-    let mut encoder = ZlibEncoder::new(writer, Compression::fast());
-    encoder.write_all(body)?;
-    encoder.finish()?;
-    *base = eligible.then_some(Base { path, object, offset, depth });
-    Ok(())
+        encoder.finish()?;
+        segment.entries.push(Entry { kind, size, base, end: segment.data.len() });
+        if eligible {
+            window.push(object, Base::Here(entry), depth);
+        }
+    }
+    Ok(segment)
+}
+
+/// What a finished pack contained, for logs.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PackStats {
+    pub objects: u32,
+    pub deltas: u32,
+    pub bytes: u64,
+}
+
+type Pending = oneshot::Receiver<io::Result<Segment>>;
+
+fn write_pack(
+    mut writer: PackWriter,
+    mut segments: mpsc::Receiver<Pending>,
+    count: u32,
+) -> Result<PackStats> {
+    writer.write_all(b"PACK")?;
+    writer.write_all(&2_u32.to_be_bytes())?;
+    writer.write_all(&count.to_be_bytes())?;
+    let mut stats = PackStats::default();
+    let mut offsets = Vec::new();
+    let mut previous = Vec::new();
+    while let Some(pending) = segments.blocking_recv() {
+        let segment = pending.blocking_recv().map_err(|_| anyhow!("delta worker failed"))??;
+        std::mem::swap(&mut offsets, &mut previous);
+        offsets.clear();
+        let mut start = 0;
+        for entry in &segment.entries {
+            let offset = writer.position;
+            offsets.push(offset);
+            header(&mut writer, entry.kind, entry.size)?;
+            if let Some(base) = entry.base {
+                let base = match base {
+                    Base::Here(n) => offsets[n],
+                    Base::Previous(n) => previous[n],
+                };
+                distance(&mut writer, offset - base)?;
+                stats.deltas += 1;
+            }
+            writer.write_all(&segment.data[start..entry.end])?;
+            start = entry.end;
+            stats.objects += 1;
+        }
+    }
+    ensure!(stats.objects == count, "incomplete pack read");
+    let digest = writer.hash.clone().finalize();
+    writer.write_all(&digest)?;
+    writer.flush()?;
+    stats.bytes = writer.position;
+    writer.tx.blocking_send(Ok(Bytes::from_static(b"0000")))?;
+    Ok(stats)
+}
+
+/// Consecutive plan ranges, each read with one `get_many`.
+fn read_batches(plan: &[Planned]) -> Vec<Range<usize>> {
+    let mut batches = Vec::new();
+    let (mut start, mut cost) = (0, 0);
+    for (n, planned) in plan.iter().enumerate() {
+        let item = if planned.blob { BLOB_COST } else { 1 };
+        if cost + item > READ_BUDGET && n > start {
+            batches.push(start..n);
+            (start, cost) = (n, 0);
+        }
+        cost += item;
+    }
+    if start < plan.len() {
+        batches.push(start..plan.len());
+    }
+    batches
+}
+
+/// Cuts the object stream into segments and starts a worker for each.
+struct Segmenter {
+    segments: Sender<Pending>,
+    deltas: bool,
+    objects: Vec<(u64, EncodedObject)>,
+    bytes: usize,
+    context: Vec<(EncodedObject, usize)>,
+}
+
+impl Segmenter {
+    async fn push(&mut self, path: u64, object: EncodedObject) -> Result<()> {
+        let path_changed = self.objects.last().is_some_and(|(last, _)| *last != path);
+        if self.bytes >= SEGMENT_MAX_BYTES && !path_changed {
+            self.dispatch(true).await?;
+        } else if self.bytes >= SEGMENT_BYTES && path_changed {
+            self.dispatch(false).await?;
+        }
+        self.bytes += object.body().len();
+        self.objects.push((path, object));
+        Ok(())
+    }
+
+    /// Hand the current segment to a worker; `carry` keeps its last objects
+    /// as the next segment's context (a cut inside one path).
+    async fn dispatch(&mut self, carry: bool) -> Result<()> {
+        let objects = std::mem::take(&mut self.objects);
+        let mut tail = objects.len();
+        let mut next = Vec::new();
+        if carry && self.deltas {
+            let path = objects.last().map(|(path, _)| *path);
+            for (n, (p, object)) in objects.iter().enumerate().rev() {
+                if Some(*p) != path || next.len() == WINDOW {
+                    break;
+                }
+                tail = n;
+                if eligible(object, self.deltas) {
+                    next.push((object.clone(), n));
+                }
+            }
+            next.reverse();
+        }
+        let work = Work {
+            objects,
+            context: std::mem::replace(&mut self.context, next),
+            tail,
+            deltas: self.deltas,
+        };
+        self.bytes = 0;
+        let (done, pending) = oneshot::channel();
+        // Waiting for queue space here bounds the segments held in memory.
+        self.segments.send(pending).await.map_err(|_| anyhow!("pack consumer disconnected"))?;
+        tokio::task::spawn_blocking(move || {
+            let _ = done.send(encode_segment(work));
+        });
+        Ok(())
+    }
 }
 
 #[cfg(test)]
-pub async fn send(b: Backend, ids: Vec<ObjectId>, tx: Sender<Chunk>) -> Result<()> {
-    let paths = vec![0; ids.len()];
-    send_planned(b, ids, paths, false, tx).await
+pub async fn send(b: Backend, ids: Vec<ant_core::ObjectId>, tx: Sender<Chunk>) -> Result<()> {
+    let plan = ids.into_iter().map(|id| Planned { id, path: 0, size: 0, blob: true }).collect();
+    send_planned(b, plan, false, tx).await.map(|_| ())
 }
 
 pub async fn send_planned(
     b: Backend,
-    ids: Vec<ObjectId>,
-    paths: Vec<u64>,
+    plan: Vec<Planned>,
     deltas: bool,
     tx: Sender<Chunk>,
-) -> Result<()> {
-    ensure!(ids.len() == paths.len(), "invalid pack plan");
-    let count = u32::try_from(ids.len())?;
-    let (read_tx, mut read_rx) = mpsc::channel::<Vec<(u64, EncodedObject)>>(1);
-    let worker = tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut writer = PackWriter {
+) -> Result<PackStats> {
+    let count = u32::try_from(plan.len())?;
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(MAX_WORKERS);
+    let (segment_tx, segment_rx) = mpsc::channel(workers);
+    let writer = tokio::task::spawn_blocking(move || {
+        let writer = PackWriter {
             tx,
             hash: Sha256::new(),
             position: 0,
             pending: Vec::with_capacity(SIDEBAND),
         };
-        writer.write_all(b"PACK")?;
-        writer.write_all(&2_u32.to_be_bytes())?;
-        writer.write_all(&count.to_be_bytes())?;
-        let mut base = None;
-        let mut received = 0_u32;
-        while let Some(objects) = read_rx.blocking_recv() {
-            for (path, item) in objects {
-                object(&mut writer, item, path, &mut base, deltas)?;
-                received += 1;
-            }
-        }
-        ensure!(received == count, "incomplete pack read");
-        let digest = writer.hash.clone().finalize();
-        writer.write_all(&digest)?;
-        writer.flush()?;
-        writer.tx.blocking_send(Ok(Bytes::from_static(b"0000")))?;
-        Ok(())
+        write_pack(writer, segment_rx, count)
     });
     let reader = async move {
-        for (chunk, paths) in ids.chunks(READ_BATCH).zip(paths.chunks(READ_BATCH)) {
-            if read_tx.is_closed() {
-                return Err(anyhow!("pack consumer disconnected"));
+        let mut reads = stream::iter(read_batches(&plan))
+            .map(|range| {
+                let ids: Vec<_> = plan[range.clone()].iter().map(|planned| planned.id).collect();
+                let b = &b;
+                async move { Ok::<_, anyhow::Error>((range, b.objects.get_many(&ids).await?)) }
+            })
+            .buffered(READS_IN_FLIGHT);
+        let mut segmenter = Segmenter {
+            segments: segment_tx,
+            deltas,
+            objects: Vec::new(),
+            bytes: 0,
+            context: Vec::new(),
+        };
+        while let Some((range, objects)) = reads.try_next().await? {
+            ensure!(objects.len() == range.len(), "incomplete store batch");
+            for (planned, object) in plan[range].iter().zip(objects) {
+                let object = object.ok_or_else(|| anyhow!("object disappeared"))?;
+                segmenter.push(planned.path, object).await?;
             }
-            let objects = b.objects.get_many(chunk).await?;
-            ensure!(objects.len() == chunk.len(), "incomplete store batch");
-            let objects: Result<Vec<_>> = paths
-                .iter()
-                .zip(objects)
-                .map(|(path, item)| Ok((*path, item.ok_or_else(|| anyhow!("object disappeared"))?)))
-                .collect();
-            read_tx.send(objects?).await.map_err(|_| anyhow!("pack consumer disconnected"))?;
         }
-        Ok(())
+        if !segmenter.objects.is_empty() {
+            segmenter.dispatch(false).await?;
+        }
+        Ok::<_, anyhow::Error>(())
     };
-    let (read_result, write_result) = tokio::join!(reader, worker);
+    let (read_result, write_result) = tokio::join!(reader, writer);
     read_result?;
-    write_result??;
-    Ok(())
+    write_result?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ant_core::ObjectId;
     use tokio::io::AsyncWriteExt;
 
     mod support {
@@ -240,7 +507,7 @@ mod tests {
             .unwrap();
         let mut input = child.stdin.take().unwrap();
         let (tx, mut rx) = mpsc::channel(8);
-        let sender = tokio::spawn(send_planned(b, selection.ids, selection.paths, deltas, tx));
+        let sender = tokio::spawn(send_planned(b, selection.objects, deltas, tx));
         let mut size = 0;
         while let Some(chunk) = rx.recv().await {
             let bytes = chunk.unwrap();
@@ -326,7 +593,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let old: std::collections::HashSet<_> = selection.ids.iter().copied().collect();
+        let old: std::collections::HashSet<_> = selection.ids().iter().copied().collect();
         let (dir, _) = receive(b.clone(), selection, true, false).await;
         git(dir.path(), &["update-ref", "refs/heads/main", &tip.to_string()]).await;
         git(dir.path(), &["fsck", "--full"]).await;
@@ -349,7 +616,9 @@ mod tests {
             }
         }
         assert!(trees > 50 && blobs > 50, "trees={trees} blobs={blobs}");
-        assert_eq!(depth, usize::from(MAX_DEPTH));
+        // Bases fan out (see `best_delta`); the cap itself is pinned by
+        // `appended_history_stops_at_the_depth_cap`.
+        assert!((2..=usize::from(MAX_DEPTH)).contains(&depth), "depth {depth}");
         let next = support::revisions(&b, Some(tip), 125..135).await;
         let selection = crate::select::select(
             &b,
@@ -362,8 +631,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(selection.ids.len(), 30);
-        assert!(selection.ids.iter().all(|id| !old.contains(id)));
+        assert_eq!(selection.ids().len(), 30);
+        assert!(selection.ids().iter().all(|id| !old.contains(id)));
         let (incremental, _) = receive(b, selection, true, false).await;
         for entry in std::fs::read_dir(dir.path().join("objects/pack")).unwrap() {
             let path = entry.unwrap().path();
@@ -377,12 +646,110 @@ mod tests {
         git(incremental.path(), &["fsck", "--full"]).await;
     }
 
+    fn pack_files(dir: &std::path::Path, extension: &str) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir.join("objects/pack"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|e| e == extension))
+            .collect()
+    }
+
+    /// Regression guard for real histories (git/git's blobless export once
+    /// was 7.5x git's own pack): deep trees, a few hot directories, merged
+    /// topic branches. The blobless pack must be no larger than what git's own
+    /// delta search (`repack -adf`: window 10, depth 50) makes of the same
+    /// objects, and far below the undeltified size.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merged_history_pack_is_close_to_git_repack() {
+        let b = Backend::in_memory();
+        let tip = support::merge_history(&b, 1200).await;
+        let fetch = crate::select::Fetch {
+            wants: vec![tip],
+            no_blobs: true,
+            done: true,
+            ..Default::default()
+        };
+        let selection = crate::select::select(&b, &fetch).await.unwrap();
+        let (plain, undeltified) = receive(b.clone(), selection, false, true).await;
+        drop(plain);
+        let selection = crate::select::select(&b, &fetch).await.unwrap();
+        let (dir, size) = receive(b, selection, true, true).await;
+        git(dir.path(), &["update-ref", "refs/heads/main", &tip.to_string()]).await;
+        git(dir.path(), &["fsck", "--full"]).await;
+        git(dir.path(), &["repack", "-a", "-d", "-f", "-q"]).await;
+        let repacked: u64 =
+            pack_files(dir.path(), "pack").iter().map(|p| p.metadata().unwrap().len()).sum();
+        eprintln!("merged history: undeltified={undeltified} pack={size} git repack={repacked}");
+        // Measured 2026-10-14: pack 30% of undeltified, 0.5x git's repack. A
+        // single previous-version base in traversal order (the old encoder)
+        // gives 50% and fails here.
+        assert!(size <= repacked, "pack {size} larger than git's {repacked}");
+        assert!(size * 100 <= undeltified * 35, "pack {size} vs undeltified {undeltified}");
+    }
+
+    /// A long chain where only the previous version is a good base: depths
+    /// must reach the cap exactly and never pass it, also across segment
+    /// cuts inside one path (context handed to the next worker).
+    #[test]
+    fn appended_history_stops_at_the_depth_cap() {
+        let mut body = Vec::new();
+        let mut objects = Vec::new();
+        let mut state = 7_u32;
+        for version in 0..300 {
+            // A large first version keeps each appended delta far below the
+            // depth-scaled size limit, so only the cap stops the chain.
+            for _ in 0..if version == 0 { 100_000 } else { 64 } {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                body.push(state as u8);
+            }
+            objects.push((9, EncodedObject::new(ObjectKind::Blob, &body)));
+        }
+        let mut depths: Vec<u8> = Vec::new();
+        let mut previous: Vec<u8> = Vec::new();
+        let mut context = Vec::new();
+        for (n, chunk) in objects.chunks(100).enumerate() {
+            let tail = if n < 2 { chunk.len() - WINDOW } else { chunk.len() };
+            let work = Work {
+                objects: chunk.to_vec(),
+                context: std::mem::take(&mut context),
+                tail,
+                deltas: true,
+            };
+            let segment = encode_segment(work).unwrap();
+            let mut here = Vec::new();
+            for entry in &segment.entries {
+                let depth = match entry.base {
+                    None => 0,
+                    Some(Base::Here(i)) => here[i] + 1,
+                    Some(Base::Previous(i)) => previous[i] + 1,
+                };
+                assert!(depth <= MAX_DEPTH);
+                here.push(depth);
+            }
+            assert!(here[tail..].iter().all(|d| *d <= CONTEXT_DEPTH));
+            context = (tail..chunk.len()).map(|i| (chunk[i].1.clone(), i)).collect();
+            depths.extend(&here);
+            previous = here;
+        }
+        assert_eq!(depths.iter().max(), Some(&MAX_DEPTH));
+        assert!(depths.iter().filter(|d| **d == 0).count() <= 300 / usize::from(MAX_DEPTH) + 1);
+    }
+
     #[tokio::test]
     async fn failed_reads_and_disconnected_clients_stop_the_pipeline() {
         let b = Backend::in_memory();
         let (tx, mut rx) = mpsc::channel(8);
         assert!(
-            send_planned(b.clone(), vec![ObjectId::empty_tree()], vec![0], true, tx).await.is_err()
+            send_planned(
+                b.clone(),
+                vec![Planned { id: ObjectId::empty_tree(), path: 0, size: 0, blob: false }],
+                true,
+                tx
+            )
+            .await
+            .is_err()
         );
         while let Some(chunk) = rx.recv().await {
             assert_ne!(chunk.unwrap(), b"0000"[..], "failed pack must not finish successfully");
@@ -391,7 +758,7 @@ mod tests {
         drop(rx);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            send_planned(b, vec![], vec![], true, tx),
+            send_planned(b, vec![], true, tx),
         )
         .await;
         assert!(result.unwrap().is_err());

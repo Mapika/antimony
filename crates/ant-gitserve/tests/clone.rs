@@ -258,6 +258,34 @@ fn rss_kib() -> u64 {
         .unwrap_or(0)
 }
 
+/// Merge-heavy history over real HTTP: blobless clone with a lazy checkout,
+/// fsck, and a pack well below the undeltified size of its trees and commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merged_history_blobless_clone_and_checkout() {
+    let b = Backend::in_memory();
+    let tip = support::merge_history(&b, 300).await;
+    b.refs.cas_ref("main", None, Some(tip)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, ant_gitserve::router(b)).await.unwrap();
+    });
+    let temp = tempfile::tempdir().unwrap();
+    git(temp.path(), &["clone", "--filter=blob:none", "--no-checkout", &url, "merged"]).await;
+    let dir = temp.path().join("merged");
+    let packed = pack_bytes(&dir);
+    git(&dir, &["checkout", "main"]).await;
+    git(&dir, &["fsck", "--full"]).await;
+    assert_eq!(git(&dir, &["rev-parse", "HEAD"]).await, tip.to_string());
+    assert_eq!(git(&dir, &["status", "--porcelain"]).await, "");
+    let merges = git(&dir, &["rev-list", "--merges", "--count", "HEAD"]).await;
+    assert!(merges.parse::<usize>().unwrap() > 30, "{merges} merges");
+    task.abort();
+    // 300 commits plus topics; the single-base encoder needed ~70% more.
+    eprintln!("merged history over HTTP: blobless pack {packed} bytes");
+    assert!(packed < 320_000, "blobless pack {packed} bytes (measured 254k)");
+}
+
 /// Includes the in-memory store in RSS; reports the pre-clone resident set
 /// separately so fixture storage is not confused with pack working memory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

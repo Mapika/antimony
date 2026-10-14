@@ -17,11 +17,12 @@
 //! - An object stored twice (concurrent writers) occupies space in two packs;
 //!   the index keeps the first. Packs are never rewritten here.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use ant_core::{EncodedObject, ObjectId, ObjectKind, hash_object};
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, stream};
+use tokio::sync::Semaphore;
 
 use crate::postgres::{IndexEntry, PgStore};
 use crate::s3::S3ObjectStore;
@@ -36,29 +37,91 @@ const FANOUT: usize = 32;
 const ZSTD_LEVEL: i32 = 3;
 /// Bodies larger than this are decompressed on the blocking pool.
 const BLOCKING_THRESHOLD: usize = 64 * 1024;
+/// Objects of one pack at most this far apart are read with one ranged GET
+/// (the gap is downloaded and dropped)...
+const COALESCE_GAP: u64 = 256 * 1024;
+/// ...as long as the whole range stays below this many bytes.
+const COALESCE_SPAN: u64 = 2 * 1024 * 1024;
+
+/// Bytes of ranged reads in flight per store, across all callers. Bounds
+/// memory, and S3 servers throttle beyond some in-flight volume (SeaweedFS
+/// answers 429 above 64 MiB per volume server, counting whole storage chunks
+/// rather than requested ranges, and the SDK then backs off for seconds).
+/// Every read counts at least `READ_MIN_COST`, which caps concurrent requests.
+const READ_BUDGET: u64 = 48 * 1024 * 1024;
+const READ_MIN_COST: u64 = 1024 * 1024;
+const READ_UNIT: u64 = 4096;
+const READ_PERMITS: usize = (READ_BUDGET / READ_UNIT) as usize;
+
+/// One ranged GET: `entries` (sorted by offset, all in `pack`) lie within
+/// `start..end`.
+#[derive(Debug)]
+struct Run {
+    pack: [u8; 16],
+    start: u64,
+    end: u64,
+    entries: Vec<IndexEntry>,
+}
+
+/// Group packed objects into few ranged reads. Request overhead, not bytes,
+/// bounds S3 reads of small objects, and objects written together (one
+/// import or land batch) are read together (a tree walk, a pack export).
+fn coalesce(mut entries: Vec<IndexEntry>) -> Vec<Run> {
+    entries.sort_by_key(|e| (e.pack, e.off));
+    let mut runs: Vec<Run> = Vec::new();
+    for e in entries {
+        let end = e.off + u64::from(e.len);
+        if let Some(run) = runs.last_mut().filter(|run| {
+            run.pack == e.pack
+                && e.off <= run.end.saturating_add(COALESCE_GAP)
+                && end.max(run.end) - run.start <= COALESCE_SPAN
+        }) {
+            run.end = run.end.max(end);
+            run.entries.push(e);
+        } else {
+            runs.push(Run { pack: e.pack, start: e.off, end, entries: vec![e] });
+        }
+    }
+    runs
+}
 
 #[derive(Clone)]
 pub struct PackedS3Store {
     index: PgStore,
     s3: S3ObjectStore,
+    /// Range bytes being downloaded, in `READ_UNIT`s (see `READ_BUDGET`).
+    reading: Arc<Semaphore>,
 }
 
 impl PackedS3Store {
     /// `index` holds the `object_index` table; `s3` receives the packs and is
     /// also consulted for objects stored one per key.
     pub fn new(index: PgStore, s3: S3ObjectStore) -> Self {
-        Self { index, s3 }
+        Self { index, s3, reading: Arc::new(Semaphore::new(READ_PERMITS)) }
     }
 
-    async fn get_packed(&self, e: IndexEntry) -> Result<EncodedObject> {
-        let body = self.s3.get_range(&self.s3.pack_key(&e.pack), e.off, u64::from(e.len)).await?;
-        let id = e.id;
-        if body.len() > BLOCKING_THRESHOLD {
-            tokio::task::spawn_blocking(move || S3ObjectStore::decode_object(id, &body))
-                .await
-                .map_err(StoreError::backend)?
+    /// Read one run with a single ranged GET and decode its objects.
+    async fn get_run(&self, run: Run) -> Result<Vec<(ObjectId, EncodedObject)>> {
+        let len = run.end - run.start;
+        let units = len.max(READ_MIN_COST).div_ceil(READ_UNIT).clamp(1, READ_PERMITS as u64) as u32;
+        let permit = self.reading.acquire_many(units).await.map_err(StoreError::backend)?;
+        let body = self.s3.get_range(&self.s3.pack_key(&run.pack), run.start, len).await?;
+        drop(permit);
+        let decode = move || -> Result<Vec<(ObjectId, EncodedObject)>> {
+            run.entries
+                .iter()
+                .map(|e| {
+                    let at = (e.off - run.start) as usize;
+                    let object =
+                        S3ObjectStore::decode_object(e.id, &body[at..at + e.len as usize])?;
+                    Ok((e.id, object))
+                })
+                .collect()
+        };
+        if (run.end - run.start) as usize > BLOCKING_THRESHOLD {
+            tokio::task::spawn_blocking(decode).await.map_err(StoreError::backend)?
         } else {
-            S3ObjectStore::decode_object(id, &body)
+            decode()
         }
     }
 }
@@ -82,13 +145,13 @@ impl ObjectStore for PackedS3Store {
             .filter(|id| wanted.insert(**id))
             .filter_map(|id| index.get(id).copied())
             .collect();
-        let fetched: Vec<(ObjectId, EncodedObject)> = stream::iter(found)
-            .map(|e| async move { Ok::<_, StoreError>((e.id, self.get_packed(e).await?)) })
+        let fetched: Vec<Vec<(ObjectId, EncodedObject)>> = stream::iter(coalesce(found))
+            .map(|run| self.get_run(run))
             .buffer_unordered(FANOUT)
             .try_collect()
             .await?;
         let mut got: std::collections::HashMap<ObjectId, EncodedObject> =
-            fetched.into_iter().collect();
+            fetched.into_iter().flatten().collect();
         // Objects stored one per key (before packs existed).
         let legacy_ids: Vec<ObjectId> =
             wanted.iter().filter(|id| !got.contains_key(id)).copied().collect();
@@ -208,6 +271,48 @@ mod tests {
         let s3 = S3ObjectStore::connect(&cfg).await.unwrap();
         s3.ensure_bucket().await.unwrap();
         (PackedS3Store::new(pg, s3.clone()), s3)
+    }
+
+    #[test]
+    fn nearby_objects_of_one_pack_share_a_range_read() {
+        let entry = |pack: u8, off: u64, len: u32| IndexEntry {
+            id: ObjectId::from_bytes(&[pack.wrapping_add(off as u8); 32]).unwrap(),
+            pack: [pack; 16],
+            off,
+            len,
+        };
+        let far = COALESCE_GAP + 1;
+        let mut entries = vec![
+            entry(1, 5000, 10),
+            entry(2, 0, 100),
+            entry(1, 0, 100),
+            entry(1, 100 + COALESCE_GAP, 50),
+            entry(1, 150 + COALESCE_GAP + far, 7),
+        ];
+        // Pack 3: a chain of near neighbours, longer than one span.
+        let steps = COALESCE_SPAN / COALESCE_GAP;
+        entries.extend((0..=steps).map(|k| entry(3, k * COALESCE_GAP, 10)));
+        let runs = coalesce(entries);
+        let shape: Vec<_> =
+            runs.iter().map(|r| (r.pack[0], r.start, r.end, r.entries.len())).collect();
+        assert_eq!(
+            shape,
+            [
+                (1, 0, 150 + COALESCE_GAP, 3),
+                (1, 150 + COALESCE_GAP + far, 157 + COALESCE_GAP + far, 1),
+                (2, 0, 100, 1),
+                // Each step is close enough, but the range stops at the span.
+                (3, 0, (steps - 1) * COALESCE_GAP + 10, steps as usize),
+                (3, steps * COALESCE_GAP, steps * COALESCE_GAP + 10, 1),
+            ]
+        );
+        for run in &runs {
+            assert!(run.entries.windows(2).all(|w| w[0].off <= w[1].off));
+            assert!(run.entries.iter().all(|e| e.off >= run.start
+                && e.off + u64::from(e.len) <= run.end
+                && e.pack == run.pack));
+        }
+        assert!(coalesce(Vec::new()).is_empty());
     }
 
     #[tokio::test]

@@ -1,7 +1,11 @@
-//! Git delta instructions. A fixed-size block index bounds both memory and
-//! collision work, including on repetitive or adversarial input.
+//! Git delta instructions. A block index sized to the base (at most 2^20
+//! slots) bounds both memory and collision work, including on repetitive or
+//! adversarial input. An index is built once per base and reused for every
+//! target tried against it (see the delta window in `pack.rs`).
 const BLOCK: usize = 16;
-const SLOTS: usize = 1 << 16;
+const MIN_SLOTS: usize = 1 << 8;
+const MAX_SLOTS: usize = 1 << 20;
+const EMPTY: u32 = u32::MAX;
 
 fn size(out: &mut Vec<u8>, mut n: usize) {
     loop {
@@ -50,15 +54,45 @@ fn copy(out: &mut Vec<u8>, mut offset: usize, mut length: usize) {
     }
 }
 
-/// Return a delta only when its uncompressed instructions are below half the
-/// target size. Caller limits base/target size and depth before attempting it.
-pub fn encode(base: &[u8], target: &[u8]) -> Option<Vec<u8>> {
-    if base.len() < BLOCK || target.len() < BLOCK || base.len() > u32::MAX as usize {
-        return None;
+/// Block positions of one base, keyed by its rolling hash. The low bits of
+/// the polynomial hash are close to a plain byte sum, which collides heavily
+/// on text, so slots take the high bits of a multiplicative mix instead.
+pub struct Index {
+    table: Vec<u32>,
+    shift: u32,
+}
+
+impl Index {
+    /// `None` when `base` is too small to match or too large to address.
+    pub fn new(base: &[u8]) -> Option<Self> {
+        if base.len() < BLOCK || base.len() > u32::MAX as usize {
+            return None;
+        }
+        let slots = (base.len() / BLOCK * 2).next_power_of_two().clamp(MIN_SLOTS, MAX_SLOTS);
+        let mut index = Self { table: vec![EMPTY; slots], shift: 64 - slots.trailing_zeros() };
+        // Reverse order: on a collision the earliest block wins.
+        for pos in (0..base.len() - BLOCK + 1).step_by(BLOCK).rev() {
+            let slot = index.slot(hash(&base[pos..pos + BLOCK]));
+            index.table[slot] = pos as u32;
+        }
+        Some(index)
     }
-    let mut table = vec![u32::MAX; SLOTS];
-    for pos in (0..=base.len() - BLOCK).step_by(BLOCK) {
-        table[hash(&base[pos..pos + BLOCK]) as usize & (SLOTS - 1)] = pos as u32;
+
+    fn slot(&self, rolling: u64) -> usize {
+        (rolling.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
+    }
+
+    /// Heap bytes held by the index (for window memory accounting).
+    pub fn heap_bytes(&self) -> usize {
+        self.table.len() * std::mem::size_of::<u32>()
+    }
+}
+
+/// Delta instructions turning `base` into `target`, or `None` unless they are
+/// shorter than `limit` bytes. `index` must have been built from `base`.
+pub fn encode_indexed(index: &Index, base: &[u8], target: &[u8], limit: usize) -> Option<Vec<u8>> {
+    if target.len() < BLOCK {
+        return None;
     }
     let mut out = Vec::new();
     size(&mut out, base.len());
@@ -68,10 +102,18 @@ pub fn encode(base: &[u8], target: &[u8]) -> Option<Vec<u8>> {
     let power = 257_u64.wrapping_pow((BLOCK - 1) as u32);
     let mut rolling = hash(&target[..BLOCK]);
     while pos + BLOCK <= target.len() {
-        let candidate = table[rolling as usize & (SLOTS - 1)];
+        let candidate = index.table[index.slot(rolling)];
         let offset = candidate as usize;
-        if candidate != u32::MAX && base[offset..offset + BLOCK] == target[pos..pos + BLOCK] {
-            insert(&mut out, &target[literal..pos]);
+        if candidate != EMPTY && base[offset..offset + BLOCK] == target[pos..pos + BLOCK] {
+            // Grow the match backwards into the pending literal, then forwards.
+            let mut back = 0;
+            while back < pos - literal
+                && back < offset
+                && base[offset - back - 1] == target[pos - back - 1]
+            {
+                back += 1;
+            }
+            insert(&mut out, &target[literal..pos - back]);
             let mut length = BLOCK;
             while offset + length < base.len()
                 && pos + length < target.len()
@@ -79,7 +121,7 @@ pub fn encode(base: &[u8], target: &[u8]) -> Option<Vec<u8>> {
             {
                 length += 1;
             }
-            copy(&mut out, offset, length);
+            copy(&mut out, offset - back, length + back);
             pos += length;
             literal = pos;
             if pos + BLOCK <= target.len() {
@@ -94,12 +136,19 @@ pub fn encode(base: &[u8], target: &[u8]) -> Option<Vec<u8>> {
             }
             pos += 1;
         }
-        if out.len() + pos - literal >= target.len() / 2 {
+        // Pending literals cost at least their own length.
+        if out.len() + pos - literal >= limit {
             return None;
         }
     }
     insert(&mut out, &target[literal..]);
-    (out.len() < target.len() / 2).then_some(out)
+    (out.len() < limit).then_some(out)
+}
+
+/// One-shot delta, accepted only below half the target size.
+#[cfg(test)]
+pub fn encode(base: &[u8], target: &[u8]) -> Option<Vec<u8>> {
+    encode_indexed(&Index::new(base)?, base, target, target.len() / 2)
 }
 
 #[cfg(test)]

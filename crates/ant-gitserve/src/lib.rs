@@ -2,8 +2,8 @@
 //!
 //! Serves SHA-256 `upload-pack` (`ls-refs`, `fetch` with `shallow` and
 //! `filter blob:none`) at `/repo.git`; `receive-pack` is refused. Packs are
-//! streamed with bounded memory and delta-compress trees and blobs against
-//! the previous version of the same path (see `delta.rs`, `README.md`).
+//! streamed with bounded memory and delta-compress trees and blobs against a
+//! window of other versions of the same path (see `pack.rs`, `README.md`).
 //! Commits served must be recorded in the MetaStore (generation numbers bound
 //! the `have` walk).
 mod delta;
@@ -89,7 +89,10 @@ async fn upload(State(backend): State<Backend>, headers: HeaderMap, body: Bytes)
             };
             match fetch_response(backend, fetch).await {
                 Ok(response) => response,
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                Err(error) => {
+                    tracing::warn!(error = format!("{error:?}"), "git fetch failed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
             }
         }
         _ => StatusCode::BAD_REQUEST.into_response(),
@@ -155,7 +158,9 @@ async fn fetch_response(b: Backend, fetch: Fetch) -> Result<Response> {
         prefix.extend_from_slice(b"0000");
         return Ok(response(prefix, false));
     }
+    let started = std::time::Instant::now();
     let selection = select::select(&b, &fetch).await?;
+    let planned = started.elapsed();
     if fetch.depth.is_some() {
         prefix.extend(packet(b"shallow-info\n"));
         for id in selection.shallow {
@@ -170,10 +175,19 @@ async fn fetch_response(b: Backend, fetch: Fetch) -> Result<Response> {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tx.send(Ok(prefix.into())).await?;
     tokio::spawn(async move {
-        if let Err(error) =
-            pack::send_planned(b, selection.ids, selection.paths, fetch.ofs_delta, tx.clone()).await
-        {
-            let _ = tx.send(Err(std::io::Error::other(error.to_string()))).await;
+        match pack::send_planned(b, selection.objects, fetch.ofs_delta, tx.clone()).await {
+            Ok(stats) => tracing::info!(
+                objects = stats.objects,
+                deltas = stats.deltas,
+                bytes = stats.bytes,
+                planning_ms = planned.as_millis() as u64,
+                total_ms = started.elapsed().as_millis() as u64,
+                "git pack sent"
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "git pack failed");
+                let _ = tx.send(Err(std::io::Error::other(error.to_string()))).await;
+            }
         }
     });
     Ok(response(Body::from_stream(ReceiverStream::new(rx)), false))

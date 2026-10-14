@@ -129,8 +129,8 @@ cache hit can never hide a missing object.
   throughput is about 1,100 commits/s on git/git.
 - **Export:** read-only git smart HTTP (protocol v2) at `/repo.git` on the
   HTTP port. Full, shallow and `--filter=blob:none` clones and incremental
-  fetch are supported, with packs delta-compressed against the previous
-  version of each path.
+  fetch are supported, with packs delta-compressed (git-style window over
+  other versions of each path, sorted by size).
 
 ## Observability (`ant-server::metrics`, `ant-server::observe`)
 
