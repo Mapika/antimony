@@ -12,6 +12,7 @@ pub mod merge;
 mod object;
 mod path;
 mod tree;
+pub mod version;
 
 pub use commit::{Commit, Signature};
 pub use error::{Error, Result};
@@ -19,3 +20,4 @@ pub use id::ObjectId;
 pub use object::{EncodedObject, Object, ObjectKind, hash_object};
 pub use path::RepoPath;
 pub use tree::{EntryMode, Tree, TreeEntry};
+pub use version::NewerFormat;

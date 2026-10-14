@@ -13,6 +13,10 @@
 //!   at mount, at unmount and past 4 MiB);
 //! - `intent`: a pending delete/rename written by earlier versions, rolled
 //!   forward by recovery;
+//! - `format`: the layout version ([`STATE_FORMAT`]; written at mount, absent
+//!   in state directories from before it = 1). Every entry point (recovery,
+//!   [`base`]) refuses a newer version (`ant_core::NewerFormat`) instead of
+//!   interpreting or repairing it;
 //! - `staging/`, `conflicts`: files prepared by an in-progress [`update`]
 //!   and the unresolved conflicts it left (see `update`);
 //! - `lock` / `mount.lock`: the state lock and the exclusive mount marker.
@@ -101,8 +105,9 @@ use crate::MountOptions;
 use crate::filesystem::View;
 pub use changes::{changes, reset};
 use overlay::Writable;
+pub use state::STATE_FORMAT;
 pub use state::base;
-use state::{MountGuard, StateLock, recover, save_base, save_whiteouts};
+use state::{MountGuard, StateLock, ensure_format, recover, save_base, save_whiteouts};
 pub use update::{CONFLICTS, conflicts, resolve, update};
 
 /// FUSE request threads per writable mount. Namespace operations serialize
@@ -178,6 +183,7 @@ pub fn mount_rw(
     }
     let mount_lock = MountGuard::take(&state_dir)?;
     let lock = StateLock::take(&state_dir)?;
+    ensure_format(&state_dir)?;
     fs::create_dir_all(state_dir.join("upper"))?;
     if !state_dir.join("base").exists() {
         save_base(&state_dir, base_commit, base_tree)?;

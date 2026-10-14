@@ -132,6 +132,10 @@ fn store_status(e: StoreError) -> Status {
         StoreError::InvalidArgument(m) => Status::invalid_argument(m),
         StoreError::Core(e) => Status::invalid_argument(e.to_string()),
         StoreError::WrongKind { .. } => Status::invalid_argument(e.to_string()),
+        StoreError::NewerFormat(_) | StoreError::MigrationRequired { .. } => {
+            tracing::error!(error = %e, "store error");
+            Status::failed_precondition(e.to_string())
+        }
         StoreError::Backend(_) => {
             tracing::error!(error = %e, "store error");
             Status::internal("storage backend error")

@@ -126,6 +126,19 @@ pub enum AdminCmd {
     /// Tag the objects of a rev's tree with their access-control zones (run
     /// after imports and after changing the policy's path rules).
     ReindexAcl(ReindexArgs),
+    /// Show the Postgres schema version and pending migrations; `--migrate`
+    /// applies them.
+    Schema(SchemaArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SchemaArgs {
+    /// Apply pending migrations (what `ant serve` and `ant import` do on
+    /// start unless `--no-migrate`).
+    #[arg(long)]
+    pub migrate: bool,
+    #[command(flatten)]
+    pub store: StoreArgs,
 }
 
 #[derive(Args, Debug)]

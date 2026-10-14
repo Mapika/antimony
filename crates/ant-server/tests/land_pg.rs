@@ -124,6 +124,7 @@ async fn replicas(n: usize, counts: &Arc<Counts>) -> Vec<Backend> {
         max_connections: 12,
         lock_connections: 2,
         lock_timeout: std::time::Duration::from_secs(120),
+        ..PgOptions::default()
     };
     let mut out = Vec::new();
     for i in 0..n {

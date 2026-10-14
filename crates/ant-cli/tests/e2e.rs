@@ -594,3 +594,93 @@ fn check_bytes(ctx: &Ctx, what: &str, actual: &[u8], expected: &[u8]) {
         );
     }
 }
+
+/// `ant admin schema`, `--no-migrate` and the refusal of a newer schema
+/// (Postgres only).
+#[test]
+#[ignore = "needs docker compose up -d"]
+fn cli_schema_versions() {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+    let schema = format!("e2e_schema_{}_{nanos}", std::process::id());
+    let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ctx = Ctx {
+        ant: PathBuf::from(env!("CARGO_BIN_EXE_ant")),
+        env: vec![("ANT_CACHE".into(), tmp.path().join("cache").display().to_string())],
+    };
+    let store = ["--pg-url", PG_URL, "--pg-schema", &schema];
+    let with = |args: &[&'static str]| -> Vec<String> {
+        args.iter().chain(store.iter()).map(|s| s.to_string()).collect()
+    };
+    let run = |args: &[String]| {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        ctx.run(None, &args)
+    };
+    let latest = ant_store::postgres::SCHEMA_VERSION;
+    let names: Vec<String> = ant_store::postgres::MIGRATIONS
+        .iter()
+        .map(|m| format!("{} {}", m.version, m.name))
+        .collect();
+
+    // A schema that does not exist yet: everything pending, nothing created.
+    let r = run(&with(&["admin", "schema"])).ok();
+    let mut want = format!("version 0\nsupported {latest}\n");
+    for n in &names {
+        want.push_str(&format!("pending {n}\n"));
+    }
+    check_eq(&r, "schema status", r.stdout(), want);
+    let r = run(&with(&["import", "/nonexistent.git", "--no-migrate"])).expect_code(1);
+    let err = r.stderr();
+    if !err.contains("error: ") || !err.contains("hint: run `ant admin schema --migrate`") {
+        r.fail("--no-migrate on an unmigrated schema: error + hint");
+    }
+
+    let r = run(&with(&["admin", "schema", "--migrate"])).ok();
+    let mut want = String::new();
+    for n in &names {
+        want.push_str(&format!("migrated {n}\n"));
+    }
+    want.push_str(&format!("version {latest}\nsupported {latest}\n"));
+    check_eq(&r, "migrate", r.stdout(), want);
+    let r = run(&with(&["admin", "schema", "--migrate"])).ok();
+    check_eq(&r, "migrate again", r.stdout(), format!("version {latest}\nsupported {latest}\n"));
+
+    // A newer version's schema: refused by every entry point.
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    rt.block_on(async {
+        use sqlx::Connection;
+        let mut conn = sqlx::PgConnection::connect(PG_URL).await.expect("connect");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO \"{schema}\".schema_version (version, name, applied_by) \
+             VALUES ({}, 'future', 'ant 99')",
+            latest + 1
+        )))
+        .execute(&mut conn)
+        .await
+        .expect("insert");
+        conn.close().await.expect("close");
+    });
+    let (grpc, http) = free_ports();
+    let mut serve: Vec<String> = vec![
+        "serve".into(),
+        "--grpc-listen".into(),
+        format!("127.0.0.1:{grpc}"),
+        "--http-listen".into(),
+        format!("127.0.0.1:{http}"),
+    ];
+    serve.extend(with(&[]));
+    for args in [
+        with(&["admin", "schema"]),
+        with(&["admin", "schema", "--migrate"]),
+        with(&["import", "/nonexistent.git"]),
+        serve,
+    ] {
+        let r = run(&args).expect_code(1);
+        let err = r.stderr();
+        if !err.contains(&format!("version {} is newer than this version of ant", latest + 1))
+            || !err.contains("hint: upgrade ant")
+        {
+            r.fail("newer schema: error + upgrade hint");
+        }
+    }
+}

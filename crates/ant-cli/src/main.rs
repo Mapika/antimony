@@ -69,6 +69,20 @@
 //!       Zone-tag objects for access control straight in the stores (after
 //!       imports / policy path-rule changes). stdout:
 //!       `<commit-id> <trees walked> <trees skipped> <tags written>`.
+//!   ant admin schema [--migrate] <store flags>
+//!       Postgres schema version. With `--migrate`, first applies pending
+//!       migrations: `migrated <version> <name>` per migration. Then
+//!       `version <n>` (0: none recorded, i.e. a new or pre-versioning
+//!       schema), `supported <n>` (this binary's version) and
+//!       `pending <version> <name>` per migration still to apply. A schema
+//!       newer than supported: exit 1 with a `hint:` to upgrade.
+//!
+//! Store flags (`ant import`, `ant serve`, `ant admin`) include
+//! `--no-migrate` (ANT_NO_MIGRATE): by default the Postgres schema is
+//! created or migrated on start; with it, a schema that needs migrations is
+//! an error (exit 1, `hint:` naming `ant admin schema --migrate`). Data
+//! written by a newer version (schema, disk cache, workspace state) is
+//! always refused with a `hint:` to upgrade ant.
 //!
 //! `--token` / ANT_TOKEN: bearer token sent on every gRPC and HTTP request
 //! (servers running with `--policy`). `ant import --policy <file>` (or
@@ -97,6 +111,11 @@ use clap::Parser;
 /// A one-line hint for failures with an obvious remedy.
 fn hint_for(e: &anyhow::Error) -> Option<&'static str> {
     use tonic::Code;
+    // Data from a newer version, or a schema needing migration (before the
+    // generic "connecting to" hint: these come wrapped in such a context).
+    if let Some(hint) = ant_store::compat_hint(e.chain()) {
+        return Some(hint);
+    }
     if let Some(rpc) = e.downcast_ref::<ctx::RpcError>() {
         return match rpc.code {
             Code::Unauthenticated => Some(
@@ -189,6 +208,27 @@ mod tests {
         assert!(h(anyhow::anyhow!("a still contains conflict markers")).contains("ws resolve"));
         assert!(h(anyhow::anyhow!("a is not conflicted")).contains("ant status"));
         assert!(h(anyhow::anyhow!("non-fast-forward update of ref main: x")).contains("--force"));
+    }
+
+    #[test]
+    fn hints_for_newer_data_and_pending_migrations() {
+        use ant_store::StoreError;
+        let h = |e: anyhow::Error| hint_for(&e).unwrap_or("");
+        let newer = ant_core::NewerFormat { what: "x".into(), found: 9, supported: 1 };
+        // Wrapped in the "connecting to" context, which has a hint of its own.
+        let e =
+            anyhow::Error::new(StoreError::from(newer.clone())).context("connecting to Postgres");
+        assert!(h(e).starts_with("upgrade ant"));
+        let e = anyhow::Error::new(std::io::Error::other(newer.clone())).context("opening cache");
+        assert!(h(e).starts_with("upgrade ant"));
+        assert!(h(anyhow::Error::new(newer)).starts_with("upgrade ant"));
+        let e = anyhow::Error::new(StoreError::MigrationRequired {
+            schema: "ant".into(),
+            found: 1,
+            required: 4,
+        })
+        .context("connecting to Postgres");
+        assert!(h(e).contains("ant admin schema --migrate"));
     }
 
     #[test]

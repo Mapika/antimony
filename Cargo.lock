@@ -222,6 +222,7 @@ dependencies = [
  "ant-store",
  "anyhow",
  "async-trait",
+ "aws-sdk-s3",
  "axum",
  "bytes",
  "clap",
@@ -244,6 +245,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "zstd",
 ]
 
 [[package]]

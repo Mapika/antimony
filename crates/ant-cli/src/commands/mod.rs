@@ -59,5 +59,6 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
         Command::Land { ref_name, commit } => ws::land(&ctx, &ref_name, commit).await,
         Command::Mount { rev, mountpoint } => mount::run(&ctx, &rev, &mountpoint).await,
         Command::Admin { cmd: AdminCmd::ReindexAcl(a) } => admin::reindex_acl(a).await,
+        Command::Admin { cmd: AdminCmd::Schema(a) } => admin::schema(a).await,
     }
 }
