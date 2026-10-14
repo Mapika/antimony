@@ -64,12 +64,22 @@ pub struct Index {
 
 impl Index {
     /// `None` when `base` is too small to match or too large to address.
+    #[cfg(test)]
     pub fn new(base: &[u8]) -> Option<Self> {
+        Self::reuse(base, Vec::new())
+    }
+
+    /// A new index in the allocation of an earlier index's table (see
+    /// [`Index::into_table`]): delta search builds one index per base, and
+    /// reusing tables keeps that churn away from the allocator.
+    pub fn reuse(base: &[u8], mut table: Vec<u32>) -> Option<Self> {
         if base.len() < BLOCK || base.len() > u32::MAX as usize {
             return None;
         }
         let slots = (base.len() / BLOCK * 2).next_power_of_two().clamp(MIN_SLOTS, MAX_SLOTS);
-        let mut index = Self { table: vec![EMPTY; slots], shift: 64 - slots.trailing_zeros() };
+        table.clear();
+        table.resize(slots, EMPTY);
+        let mut index = Self { table, shift: 64 - slots.trailing_zeros() };
         // Reverse order: on a collision the earliest block wins.
         for pos in (0..base.len() - BLOCK + 1).step_by(BLOCK).rev() {
             let slot = index.slot(hash(&base[pos..pos + BLOCK]));
@@ -84,7 +94,11 @@ impl Index {
 
     /// Heap bytes held by the index (for window memory accounting).
     pub fn heap_bytes(&self) -> usize {
-        self.table.len() * std::mem::size_of::<u32>()
+        self.table.capacity() * std::mem::size_of::<u32>()
+    }
+
+    pub fn into_table(self) -> Vec<u32> {
+        self.table
     }
 }
 
@@ -143,6 +157,62 @@ pub fn encode_indexed(index: &Index, base: &[u8], target: &[u8], limit: usize) -
     }
     insert(&mut out, &target[literal..]);
     (out.len() < limit).then_some(out)
+}
+
+fn varint(input: &mut &[u8]) -> Option<usize> {
+    let mut n = 0_usize;
+    for shift in (0..64).step_by(7) {
+        let (&byte, rest) = input.split_first()?;
+        *input = rest;
+        n |= usize::from(byte & 127).checked_shl(shift)?;
+        if byte & 128 == 0 {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Rebuild the target of `delta` against `base` into `out` (cleared first).
+/// `None` if the instructions are malformed or do not match `base`.
+pub fn apply(base: &[u8], mut delta: &[u8], out: &mut Vec<u8>) -> Option<()> {
+    out.clear();
+    if varint(&mut delta)? != base.len() {
+        return None;
+    }
+    let length = varint(&mut delta)?;
+    out.reserve(length);
+    while let Some((&op, rest)) = delta.split_first() {
+        delta = rest;
+        if op & 128 == 0 {
+            let count = usize::from(op);
+            if count == 0 || count > delta.len() {
+                return None;
+            }
+            out.extend_from_slice(&delta[..count]);
+            delta = &delta[count..];
+        } else {
+            let (mut offset, mut size) = (0_usize, 0_usize);
+            for n in 0..7 {
+                if op & (1 << n) != 0 {
+                    let (&value, rest) = delta.split_first()?;
+                    delta = rest;
+                    if n < 4 {
+                        offset |= usize::from(value) << (8 * n);
+                    } else {
+                        size |= usize::from(value) << (8 * (n - 4));
+                    }
+                }
+            }
+            if size == 0 {
+                size = 0x10000;
+            }
+            out.extend_from_slice(base.get(offset..offset.checked_add(size)?)?);
+        }
+        if out.len() > length {
+            return None;
+        }
+    }
+    (out.len() == length).then_some(())
 }
 
 /// One-shot delta, accepted only below half the target size.
@@ -236,5 +306,17 @@ mod tests {
         let mut changed = base.clone();
         changed.splice(1000..1011, vec![1; 301]);
         assert_eq!(apply(&base, &encode(&base, &changed).unwrap()), changed);
+        // The checked decoder agrees with this reference and rejects
+        // truncated or mismatched instructions.
+        let delta = encode(&base, &changed).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(super::apply(&base, &delta, &mut out), Some(()));
+        assert_eq!(out, changed);
+        assert_eq!(super::apply(&base[1..], &delta, &mut out), None);
+        for cut in [1, delta.len() / 2, delta.len() - 1] {
+            assert_eq!(super::apply(&base, &delta[..cut], &mut out), None);
+        }
+        assert_eq!(super::apply(&base, &instructions, &mut out), Some(()));
+        assert_eq!(out, base[..65536]);
     }
 }

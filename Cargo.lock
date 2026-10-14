@@ -195,6 +195,7 @@ dependencies = [
  "ant-gitbridge",
  "ant-store",
  "anyhow",
+ "async-trait",
  "axum",
  "bytes",
  "flate2",
