@@ -3,7 +3,8 @@
 //! - [`disk`]: a local content-addressed object cache shared by all agents on
 //!   a machine. It is safe for concurrent use by many processes without a
 //!   coordinating daemon: objects are immutable and written via
-//!   write-temp-then-rename.
+//!   write-temp-then-rename. Its size budget is enforced automatically by
+//!   LRU eviction (counter file + eviction lock; see the module docs).
 //! - [`readthrough`]: the cache in front of the server, with batched,
 //!   de-duplicated and hash-verified fetches.
 //! - [`remote`]: the server as an `ObjectStore` (gRPC, optionally HTTP reads).

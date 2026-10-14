@@ -223,10 +223,18 @@ first run).
 ### Client cache
 
 The shared per-machine disk cache has a 20 GiB budget by default
-(`--cache-bytes` / `ANT_CACHE_BYTES`). LRU eviction by file mtime (down
-to 90 percent of the budget) exists as `DiskObjectStore::gc`, but no
-command runs it yet: today the budget is not enforced, so watch the cache
-directory's size. Size it to the working set of the paths your agents
+(`--cache-bytes` / `ANT_CACHE_BYTES`), enforced automatically: when the
+cache grows past the budget, the least recently used objects (by file
+mtime; reads refresh it, at most once a minute per object) are evicted
+down to 90 percent of it. Processes sharing a cache count their writes in
+`gc/usage` and take `gc/evict.lock` so only one evicts at a time; long-lived
+daemons (`ant mount`, lazy workspaces) also check every five minutes. The
+limit is approximate: expect overshoot of about 1/64 of the budget per
+concurrently writing process plus the batch in flight. An evicted object
+is simply fetched again on its next use. `ant cache stats` prints
+`objects`, `bytes` and `budget`; `ant cache gc [--to <bytes>]` evicts now
+(for example `--to 0` to empty it, or after lowering the budget). Every
+process using one cache should be given the same `--cache-bytes`. Size it to the working set of the paths your agents
 touch, multiplied by the number of distinct bases they check out.
 Sparse workspaces keep checkouts proportional to what an agent touches. Full
 96k-file checkout on the dev machine: 4.2-4.7 s cold, 1.4-1.9 s warm,

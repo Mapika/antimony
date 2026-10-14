@@ -447,7 +447,7 @@ async fn spawn_lazy(ctx: &Ctx, dir: &Path, state: &Path) -> Result<()> {
 }
 
 pub async fn serve(ctx: &Ctx, dir: &Path, state: &Path) -> Result<Outcome> {
-    let (objects, _) = ctx.read_through().await?;
+    let (objects, _) = ctx.read_through_daemon().await?;
     let d = dir.to_path_buf();
     let s = state.to_path_buf();
     let handle = tokio::runtime::Handle::current();

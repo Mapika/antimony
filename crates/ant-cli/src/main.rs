@@ -83,6 +83,17 @@
 //!       (`ant ws update`, resolve, submit and land again).
 //!   ant mount <rev> <mountpoint>   read-only FUSE view, foreground until SIGINT/SIGTERM
 //!   ant serve <server flags>       the server (`ant_server::serve`), foreground
+//!   ant cache stats                the local object cache (`--cache`), by a scan:
+//!       `objects <n>`, `bytes <n>` (compressed, as stored), `budget <n>`
+//!       (`--cache-bytes`), one per line. The budget is enforced
+//!       automatically as objects are cached (least recently used evicted
+//!       first, down to 90%); daemons (`mount`, lazy workspaces) also
+//!       enforce it periodically.
+//!   ant cache gc [--to <bytes>]    evicts least-recently-used objects now: down
+//!       to 90% of the budget if the cache is over it, or, with `--to`, down
+//!       to at most that many bytes (`--to 0` empties it). Waits for another
+//!       running eviction. stdout: `removed <n>`, `freed <bytes>`,
+//!       `objects <n>`, `bytes <n>` (the last two: what is left).
 //!   ant completions <shell>        shell completion script on stdout
 //!   ant admin reindex-acl <rev> --policy <file> [--full] [--history] <store flags>
 //!       Zone-tag objects for access control straight in the stores (after
