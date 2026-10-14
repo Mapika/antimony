@@ -27,18 +27,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ant_core::merge::{self, EntryMerge, TextMerge};
-use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, RepoPath, Tree};
+use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, RepoPath};
 use ant_store::ObjectStore;
 use ant_store::graph::diff_trees;
 use anyhow::{Context, anyhow, bail};
 
+use crate::walk::{BATCH, Visit, WalkError, walk};
 use crate::workspace::{LocalChange, escape_path, unescape_path};
 
 /// A leaf entry at one path (`None`: absent).
 pub type Value = Option<(EntryMode, ObjectId)>;
-
-/// Objects per `get_many` call.
-const BATCH: usize = 512;
 
 /// What the workspace holds at a path after the update.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +68,7 @@ pub struct PathUpdate {
 
 impl PathUpdate {
     /// Does the path exist after the update?
-    pub fn present(&self) -> bool {
+    pub(crate) fn present(&self) -> bool {
         match self.target {
             Target::Upstream => self.upstream.is_some(),
             Target::Local => self.local.is_some(),
@@ -217,14 +215,13 @@ fn shape_conflicts(out: &mut [PathUpdate]) {
 
 /// The entries at `paths` in `tree` (absent paths are left out), reading
 /// only the directories on those paths, one batched read per depth.
-pub async fn entries_at(
+async fn entries_at(
     objects: &dyn ObjectStore,
     tree: ObjectId,
     paths: &[RepoPath],
 ) -> anyhow::Result<HashMap<RepoPath, Value>> {
-    let mut out = HashMap::new();
     if paths.is_empty() {
-        return Ok(out);
+        return Ok(HashMap::new());
     }
     let wanted: BTreeSet<&str> = paths.iter().map(|p| p.as_str()).collect();
     let mut dirs: BTreeSet<&str> = BTreeSet::new();
@@ -233,35 +230,24 @@ pub async fn entries_at(
             dirs.insert(&p[..cut]);
         }
     }
-    let mut level = vec![(String::new(), tree)];
-    while !level.is_empty() {
-        let mut next = Vec::new();
-        for chunk in level.chunks(BATCH) {
-            let ids: Vec<ObjectId> = chunk.iter().map(|(_, id)| *id).collect();
-            for ((prefix, id), obj) in chunk.iter().zip(objects.get_many(&ids).await?) {
-                let obj = obj.ok_or_else(|| anyhow!("missing tree {id}"))?;
-                if obj.kind() != ObjectKind::Tree {
-                    bail!("object {id} is not a tree");
-                }
-                for e in Tree::decode(obj.body())?.entries() {
-                    let path = if prefix.is_empty() {
-                        e.name.clone()
-                    } else {
-                        format!("{prefix}/{}", e.name)
-                    };
-                    if e.mode.is_tree() {
-                        if dirs.contains(path.as_str()) {
-                            next.push((path, e.id));
-                        }
-                    } else if wanted.contains(path.as_str()) {
-                        out.insert(RepoPath::new(path)?, Some((e.mode, e.id)));
-                    }
-                }
-            }
+    let found = walk(objects, tree, |path, e, _| {
+        if e.mode.is_tree() {
+            if dirs.contains(path) { Visit::Descend(false) } else { Visit::Skip }
+        } else if wanted.contains(path) {
+            Visit::Leaf
+        } else {
+            Visit::Skip
         }
-        level = next;
-    }
-    Ok(out)
+    })
+    .await
+    .map_err(|e| match e {
+        WalkError::Store(e) => anyhow::Error::from(e),
+        WalkError::Misaligned => anyhow!("misaligned tree batch"),
+        WalkError::Missing(id) => anyhow!("missing tree {id}"),
+        WalkError::NotTree(id) => anyhow!("object {id} is not a tree"),
+        WalkError::Decode(e) => anyhow::Error::from(e),
+    })?;
+    found.into_iter().map(|(path, entry)| Ok((RepoPath::new(path)?, Some(entry)))).collect()
 }
 
 /// The conflicts file: one escaped repo path per line, sorted.

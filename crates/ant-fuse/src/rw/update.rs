@@ -36,8 +36,8 @@ use ant_core::{EntryMode, ObjectId, RepoPath};
 use ant_store::ObjectStore;
 use antd::update::{PathUpdate, Target};
 
-use super::changes::{affected_base, compare, scan_upper};
-use super::journal::{Persisted, Record, UpdateRecord, append_durably, load};
+use super::changes::{Local, affected_base, local_changes};
+use super::journal::{Record, UpdateRecord, append_durably};
 use super::state::{StateLock, atomic, base, recover, save_base};
 use super::{metadata, other, under};
 
@@ -105,17 +105,10 @@ pub(super) async fn update_with(
                 pending[0]
             )));
         }
-        let Persisted { tree: old_tree, deleted, .. } = load(&state)?;
-        let upper = scan_upper(&state)?;
-        let old_lower = rt.block_on(affected_base(objects.as_ref(), old_tree, &upper, &deleted))?;
-        let local = compare(&upper, &deleted, &old_lower)?;
-        // The plan reads the local versions of changed files by id.
-        let changed: BTreeSet<_> = local.iter().filter_map(|c| c.new.map(|(_, id)| id)).collect();
-        let blobs: Vec<_> =
-            upper.blobs.iter().filter(|b| changed.contains(&b.id())).cloned().collect();
-        for batch in blobs.chunks(512) {
-            rt.block_on(objects.put_many(batch)).map_err(other)?;
-        }
+        // The plan reads the local versions of changed files by id, which
+        // `local_changes` stores.
+        let Local { tree: old_tree, deleted, upper, changes: local } =
+            local_changes(&state, objects.as_ref(), &rt)?;
         let plan = rt
             .block_on(antd::update::plan(objects.as_ref(), old_tree, tree, &local))
             .map_err(other)?;
@@ -310,11 +303,13 @@ fn create_dirs(upper: &Path, dir: &Path, dirty: &mut BTreeSet<PathBuf>) -> io::R
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use ant_core::Tree;
     use ant_store::graph::build_tree;
     use ant_store::memory::MemoryObjectStore;
+    use antd::walk::{Visit, walk};
 
     use super::*;
+    use crate::rw::changes::{compare, scan_upper};
+    use crate::rw::journal::{Persisted, load};
     use crate::rw::state::save_whiteouts;
 
     /// The visible workspace: path → (exec, content).
@@ -328,21 +323,10 @@ mod tests {
         objects: &MemoryObjectStore,
         tree: ObjectId,
     ) -> BTreeMap<String, (EntryMode, ObjectId)> {
-        let mut out = BTreeMap::new();
-        let mut todo = vec![(String::new(), tree)];
-        while let Some((prefix, id)) = todo.pop() {
-            let obj = objects.get_many(&[id]).await.unwrap().pop().flatten().unwrap();
-            for e in Tree::decode(obj.body()).unwrap().entries() {
-                let path =
-                    if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
-                if e.mode.is_tree() {
-                    todo.push((path, e.id));
-                } else {
-                    out.insert(path, (e.mode, e.id));
-                }
-            }
-        }
-        out
+        let every = |_: &str, e: &ant_core::TreeEntry, _| {
+            if e.mode.is_tree() { Visit::Descend(false) } else { Visit::Leaf }
+        };
+        walk(objects, tree, every).await.unwrap()
     }
 
     /// Read the workspace like the overlay does, from the state directory.
