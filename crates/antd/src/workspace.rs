@@ -72,7 +72,7 @@ use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, RepoPath, Tree, h
 use ant_store::ObjectStore;
 use ant_store::graph::diff_trees;
 
-use crate::disk::par_map;
+use crate::par::par_map;
 use anyhow::{Context, anyhow, bail};
 use bytes::Bytes;
 use futures::StreamExt;

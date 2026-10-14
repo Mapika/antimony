@@ -22,7 +22,8 @@ use ant_store::{ObjectStore, Result, StoreError};
 use async_trait::async_trait;
 use futures::future::{BoxFuture, FutureExt, Shared};
 
-use crate::disk::{DiskObjectStore, par_map};
+use crate::disk::DiskObjectStore;
+use crate::par::par_map;
 use parking_lot::Mutex;
 
 type Fetched = std::result::Result<Arc<HashMap<ObjectId, EncodedObject>>, Arc<String>>;
