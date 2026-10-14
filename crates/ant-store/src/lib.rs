@@ -155,6 +155,22 @@ pub trait RefStore: Send + Sync + 'static {
 #[async_trait]
 pub trait RefLockRelease: Send + Sync {
     async fn release(self: Box<Self>) -> Result<()>;
+
+    /// Whether [`RefLockRelease::publish`] is supported.
+    fn can_publish(&self) -> bool {
+        false
+    }
+
+    /// See [`RefLock::publish`].
+    async fn publish(
+        &mut self,
+        _expected: Option<ObjectId>,
+        _new: ObjectId,
+        _kind: &str,
+        _derived: Vec<(Vec<u8>, Bytes)>,
+    ) -> Result<CasOutcome> {
+        Err(StoreError::InvalidArgument("this ref lock cannot publish".into()))
+    }
 }
 
 /// Exclusive write access to one ref, from [`RefStore::lock_ref`]. Dropping
@@ -183,12 +199,68 @@ impl RefLock {
             None => Ok(()),
         }
     }
+
+    /// Whether [`Self::publish`] is available: the lock holds a database
+    /// session of its own, opened before the lock was granted.
+    pub fn can_publish(&self) -> bool {
+        self.0.as_ref().is_some_and(|lock| lock.can_publish())
+    }
+
+    /// Compare-and-swap the locked ref from `expected` to `new` and, only if
+    /// it moved, insert `derived` rows (`kind`, key → value; existing keys
+    /// are kept), atomically, in one synchronous (durable) commit made on
+    /// the lock's own session.
+    ///
+    /// That session is the crash witness for [`deferred_durability`]: it
+    /// was opened before any write made while holding the lock, and a
+    /// database crash or restart (the only way acknowledged but unflushed
+    /// writes are lost) ends every session. So when `publish` commits, no
+    /// crash happened since the lock was taken, every write acknowledged
+    /// before the call precedes this commit in the write-ahead log, and the
+    /// synchronous commit flushes them with it. If the session died,
+    /// `publish` fails and nothing is published.
+    pub async fn publish(
+        &mut self,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+        kind: &str,
+        derived: Vec<(Vec<u8>, Bytes)>,
+    ) -> Result<CasOutcome> {
+        match &mut self.0 {
+            Some(lock) if lock.can_publish() => lock.publish(expected, new, kind, derived).await,
+            _ => Err(StoreError::InvalidArgument("this ref lock cannot publish".into())),
+        }
+    }
 }
 
 impl std::fmt::Debug for RefLock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("RefLock").field(&self.is_held()).finish()
     }
+}
+
+tokio::task_local! {
+    static DEFERRED: ();
+}
+
+/// Run `fut` with deferred durability: stores that support it (Postgres)
+/// acknowledge the writes `fut` makes before they are durable (Postgres:
+/// `synchronous_commit = off`, no wait for the WAL flush). Reads, and
+/// writes outside `fut`, are unaffected; other stores ignore it.
+///
+/// A database crash can lose acknowledged deferred writes, so they must not
+/// become reachable before a later synchronous commit has made them durable
+/// *and* proved that no crash happened in between: use this only for writes
+/// that a [`RefLock::publish`] of the lock held throughout `fut` makes
+/// reachable. The scope is task-local; work spawned onto other tasks writes
+/// synchronously, which is always safe.
+pub async fn deferred_durability<F: std::future::Future>(fut: F) -> F::Output {
+    DEFERRED.scope((), fut).await
+}
+
+/// Whether the current task runs inside [`deferred_durability`].
+pub fn durability_deferred() -> bool {
+    DEFERRED.try_with(|_| ()).is_ok()
 }
 
 /// Ref names: `/`-separated, each component non-empty, no `.`/`..`, no
@@ -382,5 +454,24 @@ impl Backend {
             refs: Arc::new(memory::MemoryRefStore::default()),
             meta: Arc::new(memory::MemoryMetaStore::default()),
         }
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::{deferred_durability, durability_deferred};
+
+    #[tokio::test]
+    async fn deferred_durability_is_scoped_to_the_task() {
+        assert!(!durability_deferred());
+        deferred_durability(async {
+            assert!(durability_deferred());
+            // Work moved to another task writes synchronously (always safe).
+            assert!(!tokio::spawn(async { durability_deferred() }).await.unwrap());
+            tokio::task::yield_now().await;
+            assert!(durability_deferred());
+        })
+        .await;
+        assert!(!durability_deferred());
     }
 }

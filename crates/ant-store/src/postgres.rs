@@ -25,7 +25,11 @@
 //!   (schema, ref) held by a connection of a separate, small, lazily opened
 //!   lock pool (holders never compete with the queries they lock for).
 //!   Waits are bounded by `lock_timeout`; an unreleased lock closes its
-//!   connection, which releases it server-side.
+//!   connection, which releases it server-side. `RefLock::publish` runs the
+//!   ref CAS and the derived-row inserts as one statement on that same
+//!   connection (synchronous commit).
+//! - Inside [`crate::deferred_durability`], object, changeset, commit and
+//!   derived writes commit with `SET LOCAL synchronous_commit = off`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -40,6 +44,8 @@ use crate::{
     CasOutcome, ChangeKind, CommitNode, MetaStore, ObjectStore, PathChange, RefStore, Result,
     StoreError, validate_ref_name,
 };
+
+type PgQuery<'q> = sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>;
 
 /// Compression level for stored object bodies (matches the S3 store).
 const ZSTD_LEVEL: i32 = 3;
@@ -189,18 +195,39 @@ impl PgStore {
         let ids: Vec<&[u8]> = order.iter().map(|&i| ids[i]).collect();
         let data: Vec<&[u8]> = order.iter().map(|&i| data[i].as_slice()).collect();
         let parts = ids.chunks(PART).zip(data.chunks(PART)).map(|(ids, data)| async move {
-            sqlx::query(
+            let query = sqlx::query(
                 "INSERT INTO changesets (commit_id, data) \
                  SELECT * FROM unnest($1::bytea[], $2::bytea[]) ON CONFLICT (commit_id) DO NOTHING",
             )
             .bind(ids)
-            .bind(data)
-            .execute(&self.pool)
-            .await
-            .map_err(be)
+            .bind(data);
+            self.write(query, crate::durability_deferred()).await
         });
         futures::future::try_join_all(parts).await?;
         Ok(())
+    }
+
+    /// Run one write statement and return its rows. `deferred`: commit it
+    /// with `synchronous_commit = off` (acknowledged before the WAL flush;
+    /// see [`crate::deferred_durability`] and [`Self::with_async_object_commit`]).
+    async fn write(
+        &self,
+        query: PgQuery<'_>,
+        deferred: bool,
+    ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        if !deferred {
+            return query.fetch_all(&self.pool).await.map_err(be);
+        }
+        let mut tx =
+            self.pool.begin_with("BEGIN; SET LOCAL synchronous_commit = off").await.map_err(be)?;
+        let rows = query.fetch_all(&mut *tx).await.map_err(be)?;
+        tx.commit().await.map_err(be)?;
+        Ok(rows)
+    }
+
+    /// Whether object writes are deferred (bulk mode or a deferred scope).
+    fn objects_deferred(&self) -> bool {
+        self.async_object_commit || crate::durability_deferred()
     }
 
     /// Record where objects live inside packs; first writer wins (identical content).
@@ -224,17 +251,7 @@ impl PgStore {
         .bind(&packs)
         .bind(&offs)
         .bind(&lens);
-        if self.async_object_commit {
-            let mut tx = self.pool.begin().await.map_err(be)?;
-            sqlx::query("SET LOCAL synchronous_commit = off")
-                .execute(&mut *tx)
-                .await
-                .map_err(be)?;
-            insert.execute(&mut *tx).await.map_err(be)?;
-            tx.commit().await.map_err(be)?;
-        } else {
-            insert.execute(&self.pool).await.map_err(be)?;
-        }
+        self.write(insert, self.objects_deferred()).await?;
         Ok(())
     }
 
@@ -492,9 +509,16 @@ impl PgStore {
 /// connection goes back to the lock pool; a lock dropped unreleased (or a
 /// failed release) closes its connection instead, which makes the server drop
 /// the lock, so a locked connection is never reused.
+///
+/// The same connection publishes (`RefLock::publish`): the lock pool sets no
+/// `search_path`, so its statements name the schema explicitly.
 struct PgRefLock {
     conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
     key: String,
+    /// The locked ref.
+    name: String,
+    /// Quoted schema identifier.
+    schema: String,
 }
 
 impl Drop for PgRefLock {
@@ -521,6 +545,71 @@ impl crate::RefLockRelease for PgRefLock {
         // Unlocked: return the connection to the pool (Drop sees None).
         drop(self.conn.take());
         Ok(())
+    }
+
+    fn can_publish(&self) -> bool {
+        self.conn.is_some()
+    }
+
+    /// One statement (one synchronous commit) on the lock's session: move the
+    /// ref and, only if it moved, insert the derived rows.
+    async fn publish(
+        &mut self,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+        kind: &str,
+        derived: Vec<(Vec<u8>, Bytes)>,
+    ) -> Result<CasOutcome> {
+        let Some(conn) = self.conn.as_mut() else {
+            return Err(StoreError::InvalidArgument(format!("ref lock {} not held", self.key)));
+        };
+        // Key order for a consistent lock order across concurrent writers.
+        let mut derived = derived;
+        derived.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        derived.dedup_by(|a, b| a.0 == b.0);
+        let (keys, values): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
+            derived.into_iter().map(|(k, v)| (k, v.to_vec())).unzip();
+        let qs = &self.schema;
+        let moved = match expected {
+            Some(_) => format!(
+                "UPDATE {qs}.refs SET target = $3 WHERE name = $1 AND target = $2 RETURNING 1"
+            ),
+            None => format!(
+                "INSERT INTO {qs}.refs (name, target) SELECT $1, $3 WHERE $2::bytea IS NULL \
+                 ON CONFLICT (name) DO NOTHING RETURNING 1"
+            ),
+        };
+        let stmt = format!(
+            "WITH moved AS ({moved}), \
+             rows AS (INSERT INTO {qs}.derived (kind, key, value) \
+                 SELECT $4, k, v FROM unnest($5::bytea[], $6::bytea[]) AS t(k, v) \
+                 WHERE EXISTS (SELECT 1 FROM moved) \
+                 ON CONFLICT (kind, key) DO NOTHING) \
+             SELECT count(*) FROM moved"
+        );
+        // The schema is quoted by `quote_ident`; everything else is bound.
+        let moved: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(stmt))
+            .bind(&self.name)
+            .bind(expected.map(|e| e.as_bytes().to_vec()))
+            .bind(new.as_bytes().as_slice())
+            .bind(kind)
+            .bind(&keys)
+            .bind(&values)
+            .fetch_one(&mut **conn)
+            .await
+            .map_err(be)?;
+        if moved == 1 {
+            return Ok(CasOutcome::Updated);
+        }
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT target FROM {qs}.refs WHERE name = $1"
+        )))
+        .bind(&self.name)
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(be)?;
+        let actual = row.map(|r| object_id_col(&r, "target")).transpose()?;
+        Ok(CasOutcome::Mismatch { actual })
     }
 }
 
@@ -575,14 +664,14 @@ impl ObjectStore for PgStore {
         }
         let tasks = chunks.into_iter().map(|chunk| {
             tokio::task::spawn_blocking(move || -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+                // One compression context per chunk: creating one per object
+                // costs more than compressing a small object.
+                let mut zstd = zstd::bulk::Compressor::new(ZSTD_LEVEL).map_err(be)?;
                 chunk
                     .into_iter()
                     .map(|raw| {
                         let id = raw.id();
-                        Ok((
-                            id.as_bytes().to_vec(),
-                            zstd::encode_all(&raw.as_bytes()[..], ZSTD_LEVEL).map_err(be)?,
-                        ))
+                        Ok((id.as_bytes().to_vec(), zstd.compress(raw.as_bytes()).map_err(be)?))
                     })
                     .collect()
             })
@@ -603,17 +692,7 @@ impl ObjectStore for PgStore {
         )
         .bind(&ids)
         .bind(&data);
-        if self.async_object_commit {
-            let mut tx = self.pool.begin().await.map_err(be)?;
-            sqlx::query("SET LOCAL synchronous_commit = off")
-                .execute(&mut *tx)
-                .await
-                .map_err(be)?;
-            insert.execute(&mut *tx).await.map_err(be)?;
-            tx.commit().await.map_err(be)?;
-        } else {
-            insert.execute(&self.pool).await.map_err(be)?;
-        }
+        self.write(insert, self.objects_deferred()).await?;
         Ok(())
     }
 
@@ -714,7 +793,12 @@ impl RefStore for PgStore {
         let conn = locks.acquire().await.map_err(be)?;
         // Owned by the guard before the lock query: an error or cancellation
         // mid-wait closes the connection rather than pooling it.
-        let mut lock = PgRefLock { conn: Some(conn), key: format!("ant/{}/{name}", self.schema) };
+        let mut lock = PgRefLock {
+            conn: Some(conn),
+            key: format!("ant/{}/{name}", self.schema),
+            name: name.to_owned(),
+            schema: quote_ident(&self.schema),
+        };
         if let Some(conn) = lock.conn.as_mut() {
             sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
                 .bind(&lock.key)
@@ -1006,7 +1090,7 @@ impl MetaStore for PgStore {
         // the new nodes, append them to the log in input order (parents
         // first), and return every input's seq. Already-recorded commits keep
         // their seq and changeset (the changesets were stored just before).
-        let result = sqlx::query(
+        let query = sqlx::query(
             "WITH input AS ( \
                  SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::bytea[], $4::bigint[], \
                                       $5::bigint[]) \
@@ -1028,10 +1112,8 @@ impl MetaStore for PgStore {
         .bind(&trees)
         .bind(&parents)
         .bind(&gens)
-        .bind(&times)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(be)?;
+        .bind(&times);
+        let result = self.write(query, crate::durability_deferred()).await?;
         let mut seqs: HashMap<ObjectId, u64> = HashMap::with_capacity(ids.len());
         for r in &result {
             seqs.insert(
@@ -1163,17 +1245,15 @@ impl MetaStore for PgStore {
         entries.dedup_by(|a, b| a.0 == b.0);
         let (keys, values): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
             entries.into_iter().map(|(k, v)| (k, v.to_vec())).unzip();
-        sqlx::query(
+        let query = sqlx::query(
             "INSERT INTO derived (kind, key, value) \
              SELECT $1, k, v FROM unnest($2::bytea[], $3::bytea[]) AS t(k, v) \
              ON CONFLICT (kind, key) DO NOTHING",
         )
         .bind(kind)
         .bind(&keys)
-        .bind(&values)
-        .execute(&self.pool)
-        .await
-        .map_err(be)?;
+        .bind(&values);
+        self.write(query, crate::durability_deferred()).await?;
         Ok(())
     }
 }
@@ -1245,6 +1325,104 @@ mod tests {
         let held = a.lock_ref("main").await.unwrap();
         assert!(!c.lock_ref("main").await.unwrap().is_held());
         held.release().await.unwrap();
+    }
+
+    fn id(n: u8) -> ObjectId {
+        ObjectId([n; 32])
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_ref_lock_publishes_ref_and_derived_rows_atomically() {
+        let s = fresh().await;
+        let row = |k: &[u8], v: &[u8]| (k.to_vec(), Bytes::copy_from_slice(v));
+        let mut lock = s.lock_ref("main").await.unwrap();
+        assert!(lock.can_publish());
+        // Creating the ref.
+        assert_eq!(
+            lock.publish(None, id(1), "k", vec![row(b"a", b"1")]).await.unwrap(),
+            CasOutcome::Updated
+        );
+        assert_eq!(s.get_ref("main").await.unwrap(), Some(id(1)));
+        assert_eq!(s.get_derived("k", b"a").await.unwrap().as_deref(), Some(&b"1"[..]));
+        // A mismatch writes no rows.
+        assert_eq!(
+            lock.publish(Some(id(9)), id(2), "k", vec![row(b"b", b"2")]).await.unwrap(),
+            CasOutcome::Mismatch { actual: Some(id(1)) }
+        );
+        assert_eq!(
+            lock.publish(None, id(2), "k", vec![row(b"b", b"2")]).await.unwrap(),
+            CasOutcome::Mismatch { actual: Some(id(1)) }
+        );
+        assert_eq!(s.get_derived("k", b"b").await.unwrap(), None);
+        assert_eq!(s.get_ref("main").await.unwrap(), Some(id(1)));
+        // Moving it; existing keys keep their first value.
+        assert_eq!(
+            lock.publish(Some(id(1)), id(2), "k", vec![row(b"b", b"2"), row(b"a", b"x")])
+                .await
+                .unwrap(),
+            CasOutcome::Updated
+        );
+        assert_eq!(s.get_ref("main").await.unwrap(), Some(id(2)));
+        assert_eq!(s.get_derived("k", b"a").await.unwrap().as_deref(), Some(&b"1"[..]));
+        assert_eq!(s.get_derived("k", b"b").await.unwrap().as_deref(), Some(&b"2"[..]));
+        lock.release().await.unwrap();
+        // Without a lock session there is nothing to publish with.
+        let url = std::env::var("ANT_TEST_PG_URL")
+            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let opts = PgOptions { lock_connections: 0, ..PgOptions::default() };
+        let unlocked = PgStore::connect_with(&url, &s.schema, &opts).await.unwrap();
+        let mut lock = unlocked.lock_ref("main").await.unwrap();
+        assert!(!lock.can_publish());
+        assert!(lock.publish(Some(id(2)), id(3), "k", vec![]).await.is_err());
+        assert_eq!(s.get_ref("main").await.unwrap(), Some(id(2)));
+    }
+
+    /// The crash witness: deferred writes followed by the loss of the lock's
+    /// session (what any database crash or restart does) never publish.
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_publish_fails_once_the_lock_session_is_gone() {
+        let s = fresh().await;
+        let mut lock = s.lock_ref("main").await.unwrap();
+        let node = CommitNode {
+            id: id(7),
+            tree: id(8),
+            parents: vec![],
+            generation: 1,
+            committer_time: 0,
+        };
+        let object = EncodedObject::new(ant_core::ObjectKind::Blob, b"deferred");
+        crate::deferred_durability(async {
+            assert!(crate::durability_deferred());
+            s.put_many(std::slice::from_ref(&object)).await.unwrap();
+            s.put_commits(vec![(node, vec![])]).await.unwrap();
+        })
+        .await;
+        assert!(!crate::durability_deferred());
+        // Deferred writes are visible like any other.
+        assert!(s.has_many(&[object.id()]).await.unwrap()[0]);
+        assert!(s.get_commits(&[id(7)]).await.unwrap()[0].is_some());
+        // Kill the session holding the lock, as a server crash would.
+        let key = format!("ant/{}/main", s.schema);
+        let killed: bool = sqlx::query_scalar(
+            "SELECT pg_terminate_backend(pid) FROM pg_locks \
+             WHERE locktype = 'advisory' AND granted AND objsubid = 1 \
+               AND ((classid::bigint << 32) | objid::bigint) = hashtextextended($1, 0)",
+        )
+        .bind(&key)
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+        assert!(killed);
+        assert!(lock.publish(None, id(7), "k", vec![(b"k".to_vec(), Bytes::new())]).await.is_err());
+        assert_eq!(s.get_ref("main").await.unwrap(), None);
+        assert_eq!(s.get_derived("k", b"k").await.unwrap(), None);
+        // A new lock (new session) publishes normally.
+        drop(lock);
+        let mut lock = s.lock_ref("main").await.unwrap();
+        assert_eq!(lock.publish(None, id(7), "k", vec![]).await.unwrap(), CasOutcome::Updated);
+        lock.release().await.unwrap();
     }
 
     #[tokio::test]
