@@ -28,6 +28,13 @@
 //!   mountpoint's `.ant` are symlinks to `meta/`; [`changes`] skips
 //!   `upper/.ant`.
 //!
+//! Ignore rules (`antd::ignore`) apply to `status`/`submit`: untracked upper
+//! entries matching the `.gitignore` files of the visible workspace (the
+//! upper copy, else the base's) or `meta/ignore` (`.ant/ignore` in the
+//! mount) are neither read nor reported, and ignored directories are not
+//! entered; they stay in the upper layer and readable. Tracked files below
+//! them are still compared.
+//!
 //! Snapshots are replaced atomically (write temp + fsync + rename + fsync).
 //!
 //! # Performance model
@@ -110,7 +117,7 @@ use fuser::{BackgroundSession, Config, Errno, MountOption};
 
 use crate::MountOptions;
 use crate::filesystem::{View, kind as file_kind};
-pub use changes::{changes, reset};
+pub use changes::{changes, changes_with_ignored, reset};
 use overlay::Writable;
 pub use state::STATE_FORMAT;
 pub use state::base;
@@ -198,3 +205,6 @@ mod tests;
 
 #[cfg(test)]
 mod operation_tests;
+
+#[cfg(test)]
+mod ignore_tests;

@@ -51,7 +51,12 @@
 //!   indexing) and is always re-hashed.
 //! - Indexed paths missing on disk → `Deleted`.
 //! - Unindexed files anywhere (even outside the sparse patterns) → `Added`
-//!   (it's the agent's new file — never ignore it).
+//!   (it's the agent's new file), unless an ignore rule hides them
+//!   ([`crate::ignore`]: `.gitignore` files at any depth plus `.ant/ignore`).
+//!   Indexed (tracked) files are always compared, ignored or not. An ignored
+//!   directory is not entered unless it contains indexed files (so a huge
+//!   `target/` costs one `readdir` of its parent), and its untracked
+//!   contents are reported only by `status_with_ignored`.
 //! - Empty directories are ignored. Output sorted by path.
 //! - New/modified blob contents are stored into `objects` (so `submit` can
 //!   upload them by id) — `LocalChange.new` carries their ids.
@@ -100,6 +105,8 @@ const STATE_DIR: &str = ".ant";
 const CONFIG_FILE: &str = "workspace";
 const INDEX_FILE: &str = "index";
 const CONFLICTS_FILE: &str = "conflicts";
+/// `.ant/ignore`: optional workspace-local ignore patterns (user-written).
+const IGNORE_FILE: &str = "ignore";
 /// Version of the `.ant/` state layout, the `format=` line of
 /// `.ant/workspace` (absent in workspaces created before it: version 1).
 pub const WORKSPACE_FORMAT: u64 = 1;
@@ -215,15 +222,24 @@ impl Workspace {
     }
 
     pub async fn status(&self, objects: &dyn ObjectStore) -> anyhow::Result<Vec<LocalChange>> {
+        Ok(self.status_with_ignored(objects).await?.0)
+    }
+
+    /// [`status`](Self::status) plus the untracked paths the ignore rules
+    /// hide (sorted; ignored directories end in `/`).
+    pub async fn status_with_ignored(
+        &self,
+        objects: &dyn ObjectStore,
+    ) -> anyhow::Result<(Vec<LocalChange>, Vec<String>)> {
         let dir = self.dir.clone();
-        let (changes, blobs) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let found = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let index = read_index(&dir)?;
             let mtime = index_mtime(&dir)?;
             scan(&dir, &index, mtime)
         })
         .await??;
-        put_blobs(objects, &blobs).await?;
-        Ok(changes)
+        put_blobs(objects, &found.blobs).await?;
+        Ok((found.changes, found.ignored))
     }
 
     pub async fn reset_to(

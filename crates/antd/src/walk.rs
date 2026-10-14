@@ -3,9 +3,9 @@
 //! status (`ant_fuse::rw`). Every tree of a depth is read with batched
 //! `get_many` calls ([`BATCH`] ids each); blobs are never read.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
-use ant_core::{EntryMode, ObjectId, ObjectKind, Tree, TreeEntry};
+use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, Tree, TreeEntry};
 use ant_store::{ObjectStore, StoreError};
 
 /// Objects per `get_many` / `put_many` call in client batch work.
@@ -39,6 +39,17 @@ pub enum WalkError {
 pub async fn walk(
     objects: &dyn ObjectStore,
     root: ObjectId,
+    visit: impl FnMut(&str, &TreeEntry, bool) -> Visit,
+) -> Result<BTreeMap<String, (EntryMode, ObjectId)>, WalkError> {
+    walk_cached(objects, root, &HashMap::new(), visit).await
+}
+
+/// [`walk`] that takes the trees in `known` (by id) without reading them
+/// from `objects`.
+pub async fn walk_cached(
+    objects: &dyn ObjectStore,
+    root: ObjectId,
+    known: &HashMap<ObjectId, EncodedObject>,
     mut visit: impl FnMut(&str, &TreeEntry, bool) -> Visit,
 ) -> Result<BTreeMap<String, (EntryMode, ObjectId)>, WalkError> {
     let mut out = BTreeMap::new();
@@ -46,13 +57,22 @@ pub async fn walk(
     while !level.is_empty() {
         let mut next = Vec::new();
         for chunk in level.chunks(BATCH) {
-            let ids: Vec<ObjectId> = chunk.iter().map(|(_, id, _)| *id).collect();
-            let found = objects.get_many(&ids).await.map_err(WalkError::Store)?;
+            let ids: Vec<ObjectId> =
+                chunk.iter().map(|(_, id, _)| *id).filter(|id| !known.contains_key(id)).collect();
+            let found = if ids.is_empty() {
+                Vec::new()
+            } else {
+                objects.get_many(&ids).await.map_err(WalkError::Store)?
+            };
             if found.len() != ids.len() {
                 return Err(WalkError::Misaligned);
             }
-            for ((prefix, id, flag), obj) in chunk.iter().zip(found) {
-                let obj = obj.ok_or(WalkError::Missing(*id))?;
+            let mut found = found.into_iter();
+            for (prefix, id, flag) in chunk {
+                let obj = match known.get(id) {
+                    Some(obj) => obj.clone(),
+                    None => found.next().flatten().ok_or(WalkError::Missing(*id))?,
+                };
                 if obj.kind() != ObjectKind::Tree {
                     return Err(WalkError::NotTree(*id));
                 }

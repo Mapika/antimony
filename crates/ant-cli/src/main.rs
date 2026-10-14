@@ -72,6 +72,16 @@
 //!       starting with `<<<<<<< ` or `>>>>>>> `. stdout: empty.
 //!   ant status                     `A|M|D|C\t<path>` (sorted); `C` = unresolved
 //!       conflict from `ws update` (replaces the path's A/M/D line)
+//!       Untracked files that match an ignore rule are not listed (nor
+//!       submitted). Rules: the `.gitignore` files of the workspace (root and
+//!       nested, git semantics: negation, `dir/`, anchoring, `**`) and the
+//!       optional workspace-local `.ant/ignore` (root-anchored patterns,
+//!       lowest precedence); global git excludes are not read. Tracked files
+//!       are always compared, whatever the rules say; an ignored directory is
+//!       not entered. `ant status --ignored` also prints `!\t<path>` for each
+//!       ignored untracked path (an ignored directory as `<dir>/`, not its
+//!       contents), sorted with the other lines. `.gitignore` files are
+//!       ordinary files (A/M/D).
 //!   ant submit -m <msg>            uploads changed blobs (PutObjects), then
 //!       CreateChangeset with base = workspace base commit and blob_id ops.
 //!       Records the id in `.ant/last_submit`. stdout: `<commit-id>`.

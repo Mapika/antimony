@@ -53,7 +53,7 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
         Command::Ws { cmd: WsCmd::Unmount { dir } } => ws::unmount(&dir).await,
         Command::Ws { cmd: WsCmd::Remount { dir } } => ws::remount(&ctx, dir).await,
         Command::Ws { cmd: WsCmd::Serve { dir, state } } => ws::serve(&ctx, &dir, &state).await,
-        Command::Status => ws::status(&ctx).await,
+        Command::Status { ignored } => ws::status(&ctx, ignored).await,
         Command::Submit { message } => ws::submit(&ctx, &message).await,
         Command::Land { ref_name, commit } => ws::land(&ctx, &ref_name, commit).await,
         Command::Mount { rev, mountpoint } => mount::run(&ctx, &rev, &mountpoint).await,

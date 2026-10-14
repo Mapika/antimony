@@ -123,7 +123,11 @@ pub enum Command {
         cmd: WsCmd,
     },
     /// Show local changes in the workspace.
-    Status,
+    Status {
+        /// Also list untracked paths hidden by .gitignore / .ant/ignore, marked `!`.
+        #[arg(long)]
+        ignored: bool,
+    },
     /// Upload local changes as a changeset.
     Submit {
         /// Commit message.
