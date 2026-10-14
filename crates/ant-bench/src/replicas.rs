@@ -5,7 +5,7 @@
 //! - [`PgMonitor`] keeps one Postgres connection open to watch server
 //!   connection counts per `application_name`.
 //! - [`proc_rss_bytes`] reads a process's resident set size from `/proc`.
-#![allow(dead_code)]
+
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
