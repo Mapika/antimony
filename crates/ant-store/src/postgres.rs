@@ -283,6 +283,8 @@ impl PgStore {
         query: PgQuery<'_>,
         deferred: bool,
     ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        #[cfg(test)]
+        let _ = gc::tests::WRITES.try_with(|n| n.set(n.get() + 1));
         if !deferred {
             return query.fetch_all(&self.pool).await.map_err(be);
         }
@@ -319,16 +321,22 @@ impl PgStore {
             let offs: Vec<i64> = pending.iter().map(|&i| offs[i]).collect();
             let lens: Vec<i32> = pending.iter().map(|&i| lens[i]).collect();
             let insert = sqlx::query(
-                "INSERT INTO object_index (id, pack, off, len) \
-                 SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::bigint[], $4::integer[]) \
-                 ON CONFLICT (id) DO NOTHING RETURNING id",
+                "WITH ins AS (INSERT INTO object_index (id, pack, off, len) \
+                     SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::bigint[], $4::integer[]) \
+                     ON CONFLICT (id) DO NOTHING RETURNING id) \
+                 SELECT id FROM ins \
+                 UNION ALL \
+                 SELECT id FROM object_index WHERE id = ANY($1) \
+                    AND written_at >= now() - make_interval(secs => $5) \
+                    AND (SELECT count(*) FROM ins) < cardinality($1)",
             )
             .bind(&ids)
             .bind(&packs)
             .bind(&offs)
-            .bind(&lens);
-            let inserted = self.write(insert, self.objects_deferred()).await?;
-            let missing = self.refresh_existing(gc::Table::ObjectIndex, &ids, &inserted).await?;
+            .bind(&lens)
+            .bind(gc::FRESHEN_AFTER.as_secs_f64());
+            let settled = self.write(insert, self.objects_deferred()).await?;
+            let missing = self.refresh_existing(gc::Table::ObjectIndex, &ids, &settled).await?;
             if missing.is_empty() {
                 return Ok(());
             }
@@ -726,13 +734,20 @@ impl ObjectStore for PgStore {
             let (ids, data): (Vec<&[u8]>, Vec<&[u8]>) =
                 rows.iter().map(|(id, data)| (id.as_slice(), data.as_slice())).unzip();
             let insert = sqlx::query(
-                "INSERT INTO objects (id, data) SELECT * FROM unnest($1::bytea[], $2::bytea[]) \
-                 ON CONFLICT (id) DO NOTHING RETURNING id",
+                "WITH ins AS (INSERT INTO objects (id, data) \
+                     SELECT * FROM unnest($1::bytea[], $2::bytea[]) \
+                     ON CONFLICT (id) DO NOTHING RETURNING id) \
+                 SELECT id FROM ins \
+                 UNION ALL \
+                 SELECT id FROM objects WHERE id = ANY($1) \
+                    AND written_at >= now() - make_interval(secs => $3) \
+                    AND (SELECT count(*) FROM ins) < cardinality($1)",
             )
             .bind(&ids)
-            .bind(&data);
-            let inserted = self.write(insert, self.objects_deferred()).await?;
-            let missing = self.refresh_existing(gc::Table::Objects, &ids, &inserted).await?;
+            .bind(&data)
+            .bind(gc::FRESHEN_AFTER.as_secs_f64());
+            let settled = self.write(insert, self.objects_deferred()).await?;
+            let missing = self.refresh_existing(gc::Table::Objects, &ids, &settled).await?;
             if missing.is_empty() {
                 return Ok(());
             }
