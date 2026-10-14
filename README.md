@@ -26,6 +26,13 @@ clients are always online, history lives on the server, and nobody pushes.
   conversion exactly); `git clone` (full, `--filter=blob:none`, `--depth`) and
   `git fetch` work against the server for humans and IDEs.
 
+## Documentation
+
+- [Architecture](docs/architecture.md): object model, storage, write and read
+  paths, clients, git interop, access control.
+- [Operations](docs/operations.md): running a server, imports, policies,
+  sizing, local services, benchmarks.
+
 ## Layout
 
 | crate | role |
