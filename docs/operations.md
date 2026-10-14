@@ -39,7 +39,8 @@ of both ports.
 **Metrics.** `GET /metrics` on the HTTP port returns Prometheus (OpenMetrics
 text) metrics. It is unauthenticated, so either keep the HTTP port private or
 move it with `--metrics-listen 127.0.0.1:9100` (`ANT_METRICS_LISTEN`): the
-endpoint then exists only on that listener, and the HTTP port answers 404.
+endpoint then exists only on that listener (the HTTP port answers 404, or
+401 when a policy is set).
 
 | family | labels | meaning |
 |---|---|---|
@@ -111,11 +112,16 @@ immediately.
 
 ## Sizing notes (measured, single node, WSL2, 20 cores)
 
-- **Landing:** about 1,200 lands/s with 64 concurrent agents on Postgres +
-  S3, with zero aborts. Commit creation is bounded by one durable Postgres
-  commit (≈ 5–8 ms per synchronous commit on that disk).
-- **Postgres:** `max_connections` must cover every server's pool (64 per
-  process by default). Under sustained bulk import, autovacuum on `objects`
+- **Landing:** about 4,000 lands/s with 64 concurrent agents on Postgres +
+  S3, land p99 ≈ 30 ms, zero aborts (`docs/scorecard/2026-10-14.md`).
+  create_changeset p50 ≈ 2 ms: one durable Postgres statement per commit.
+- **Replicas:** 4 replicas × 1,000 agents for 30 minutes: 266k lands, zero
+  errors, RSS levelling off at about 610–660 MiB per replica with the
+  default caches. `ANT_MALLOC_TRIM_SECS=<n>` (off by default) periodically
+  returns freed heap to the OS; `MALLOC_ARENA_MAX=2` saves about 50 MiB.
+- **Postgres:** `max_connections` must cover every server's pools
+  (`--pg-max-connections`, default 64, plus `--pg-lock-connections`,
+  default 8, per process). Under sustained bulk import, autovacuum on `objects`
   shows up; give it I/O headroom.
 - **Clients:** the shared disk cache defaults to 20 GiB
   (`--cache-bytes` / `ANT_CACHE_BYTES`). Sparse workspaces keep checkouts
