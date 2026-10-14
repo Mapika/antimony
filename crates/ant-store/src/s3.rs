@@ -182,7 +182,7 @@ where
     if retry {
         Attempt::Retry { why, after }
     } else {
-        Attempt::Fatal(corrupt(format!("s3 {op} {what}: {why}")))
+        Attempt::Fatal(backend_error(format!("s3 {op} {what}: {why}")))
     }
 }
 
@@ -194,7 +194,8 @@ fn backoff(n: u32) -> Duration {
     cap.mul_f64(0.5 + 0.5 * rand::random::<f64>())
 }
 
-fn corrupt(msg: impl Into<String>) -> StoreError {
+/// A [`StoreError::Backend`] carrying `msg` (failed requests, corrupt bodies).
+fn backend_error(msg: impl Into<String>) -> StoreError {
     StoreError::Backend(msg.into().into())
 }
 
@@ -249,7 +250,7 @@ impl S3ObjectStore {
                 };
                 let pause = after.map_or_else(|| backoff(n), |a| a.max(backoff(n)));
                 if n >= t.max_attempts.max(1) || started.elapsed() + pause >= t.operation {
-                    return Err(corrupt(format!(
+                    return Err(backend_error(format!(
                         "s3 {op} {what}: gave up after {n} attempt(s) in {:?}: {why}",
                         started.elapsed()
                     )));
@@ -260,9 +261,10 @@ impl S3ObjectStore {
         };
         match tokio::time::timeout(t.operation, run).await {
             Ok(r) => r,
-            Err(_) => {
-                Err(corrupt(format!("s3 {op} {what}: operation timed out after {:?}", t.operation)))
-            }
+            Err(_) => Err(backend_error(format!(
+                "s3 {op} {what}: operation timed out after {:?}",
+                t.operation
+            ))),
         }
     }
 
@@ -294,9 +296,10 @@ impl S3ObjectStore {
         let probe = self.client.head_bucket().bucket(&self.bucket).send();
         match tokio::time::timeout(self.timeouts.attempt, probe).await {
             Ok(r) => r.map(|_| ()).map_err(StoreError::backend),
-            Err(_) => {
-                Err(corrupt(format!("s3 head_bucket: timed out after {:?}", self.timeouts.attempt)))
-            }
+            Err(_) => Err(backend_error(format!(
+                "s3 head_bucket: timed out after {:?}",
+                self.timeouts.attempt
+            ))),
         }
     }
 
@@ -395,7 +398,7 @@ impl S3ObjectStore {
                 })
                 .await?;
             if let Some(e) = resp.errors().first() {
-                return Err(corrupt(format!(
+                return Err(backend_error(format!(
                     "deleting pack {}: {}",
                     e.key().unwrap_or("?"),
                     e.message().unwrap_or("error")
@@ -468,8 +471,8 @@ impl S3ObjectStore {
     pub(crate) fn decode_object(id: ObjectId, compressed: &[u8]) -> Result<EncodedObject> {
         let raw = zstd::stream::decode_all(compressed).map_err(StoreError::backend)?;
         let obj = EncodedObject::from_bytes(Bytes::from(raw))
-            .map_err(|e| corrupt(format!("object {id}: {e}")))?;
-        obj.verify(&id).map_err(|e| corrupt(format!("object {id}: {e}")))?;
+            .map_err(|e| backend_error(format!("object {id}: {e}")))?;
+        obj.verify(&id).map_err(|e| backend_error(format!("object {id}: {e}")))?;
         Ok(obj)
     }
 
