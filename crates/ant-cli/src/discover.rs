@@ -9,15 +9,47 @@ pub fn find_workspace(start: &Path) -> Option<PathBuf> {
     start.ancestors().find(|d| d.join(".ant").join("workspace").is_file()).map(Path::to_path_buf)
 }
 
+/// A lazy workspace whose FUSE daemon is gone: the mountpoint still exists
+/// in the kernel's mount table but every access fails with `ENOTCONN`.
+#[derive(Debug)]
+pub struct DeadMount(pub PathBuf);
+
+impl std::fmt::Display for DeadMount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "lazy workspace mount {} is dead: its FUSE daemon is gone (Transport endpoint is not connected)",
+            self.0.display()
+        )
+    }
+}
+impl std::error::Error for DeadMount {}
+
+/// Does `dir` itself fail with `ENOTCONN`?
+pub fn is_dead(dir: &Path) -> bool {
+    std::fs::metadata(dir).is_err_and(|e| e.kind() == std::io::ErrorKind::NotConnected)
+}
+
+/// The outermost directory of `start`'s ancestry that is a dead FUSE mount.
+pub fn find_dead_mount(start: &Path) -> Option<PathBuf> {
+    start.ancestors().filter(|d| is_dead(d)).last().map(Path::to_path_buf)
+}
+
 /// Like [`find_workspace`] with `-C` / cwd handling and an error on miss.
 pub fn require_workspace(override_dir: Option<&Path>) -> Result<PathBuf> {
     let start = match override_dir {
         Some(d) => std::path::absolute(d)?,
         None => std::env::current_dir()?,
     };
-    find_workspace(&start).ok_or_else(|| {
-        anyhow!("not inside an ant workspace (no .ant/workspace found from {})", start.display())
-    })
+    if let Some(root) = find_workspace(&start) {
+        return Ok(root);
+    }
+    // A killed lazy-workspace daemon leaves a mount whose files all fail with
+    // ENOTCONN, which would otherwise look like "no workspace here".
+    if let Some(dead) = find_dead_mount(&start) {
+        return Err(DeadMount(dead).into());
+    }
+    Err(anyhow!("not inside an ant workspace (no .ant/workspace found from {})", start.display()))
 }
 
 #[cfg(test)]

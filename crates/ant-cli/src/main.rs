@@ -36,6 +36,18 @@
 //!   ant ws new <dir> [--at <rev>] [--sparse <pattern>]... [--lazy]
 //!       rev default `main`. stdout: `<commit-id>`. If <rev> is a ref name the
 //!       workspace tracks it (`ws update` default).
+//!   ant ws remount [<dir>]
+//!       Remounts a lazy workspace whose FUSE daemon died (accesses fail with
+//!       `Transport endpoint is not connected`; other commands then fail with
+//!       `error: lazy workspace mount <dir> is dead ...` and a hint naming this
+//!       command) or that was unmounted: detaches the stale mount, restarts the
+//!       daemon on the same state (upper layer and journal recovered, edits
+//!       kept). <dir> defaults to the dead mount or workspace found from
+//!       cwd / `-C`. stdout: `<base-commit-id>`.
+//!   ant ref init [<name>] [-m <msg>]
+//!       Creates ref <name> (default `main`) at a new root commit with the empty
+//!       tree: the first commit of an empty server. stdout: `<commit-id>`.
+//!       Refused (exit 1) if the ref exists.
 //!   ant ws update [--to <rev>]
 //!       Moves the workspace to <rev> (default: the tracked ref, else
 //!       `main`), carrying local edits over: paths changed on one side take
@@ -106,10 +118,18 @@ mod rev;
 use std::io::Write as _;
 use std::process::ExitCode;
 
-use clap::Parser;
-
 /// A one-line hint for failures with an obvious remedy.
-fn hint_for(e: &anyhow::Error) -> Option<&'static str> {
+fn hint_for(e: &anyhow::Error) -> Option<String> {
+    if let Some(dead) = e.downcast_ref::<discover::DeadMount>() {
+        return Some(format!(
+            "your edits are safe in the workspace state; run `ant ws remount {}` to remount it",
+            dead.0.display()
+        ));
+    }
+    static_hint(e).map(str::to_string)
+}
+
+fn static_hint(e: &anyhow::Error) -> Option<&'static str> {
     use tonic::Code;
     // Data from a newer version, or a schema needing migration (before the
     // generic "connecting to" hint: these come wrapped in such a context).
@@ -154,7 +174,7 @@ fn hint_for(e: &anyhow::Error) -> Option<&'static str> {
 }
 
 fn main() -> ExitCode {
-    let cli = args::Cli::parse();
+    let cli = args::parse();
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -196,7 +216,7 @@ mod tests {
 
     #[test]
     fn hints_by_error_kind() {
-        let h = |e: anyhow::Error| hint_for(&e).unwrap_or("");
+        let h = |e: anyhow::Error| hint_for(&e).unwrap_or_default();
         assert!(h(rpc(tonic::Code::Unauthenticated, "missing bearer token")).contains("ANT_TOKEN"));
         assert!(h(rpc(tonic::Code::PermissionDenied, "nope")).contains("policy"));
         assert!(h(rpc(tonic::Code::NotFound, "ref x")).contains("ant ref list"));
@@ -213,7 +233,7 @@ mod tests {
     #[test]
     fn hints_for_newer_data_and_pending_migrations() {
         use ant_store::StoreError;
-        let h = |e: anyhow::Error| hint_for(&e).unwrap_or("");
+        let h = |e: anyhow::Error| hint_for(&e).unwrap_or_default();
         let newer = ant_core::NewerFormat { what: "x".into(), found: 9, supported: 1 };
         // Wrapped in the "connecting to" context, which has a hint of its own.
         let e =
@@ -229,6 +249,13 @@ mod tests {
         })
         .context("connecting to Postgres");
         assert!(h(e).contains("ant admin schema --migrate"));
+    }
+
+    #[test]
+    fn dead_mount_hint_names_the_directory() {
+        let e = anyhow::Error::new(discover::DeadMount("/w/ws".into()));
+        assert!(e.to_string().starts_with("lazy workspace mount /w/ws is dead"));
+        assert!(hint_for(&e).unwrap().contains("ant ws remount /w/ws"));
     }
 
     #[test]

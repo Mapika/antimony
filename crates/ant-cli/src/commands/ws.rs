@@ -319,6 +319,9 @@ async fn lazy_state(root: &Path) -> Result<Option<std::path::PathBuf>> {
     match tokio::fs::read_to_string(root.join(".ant/lazy")).await {
         Ok(path) => Ok(Some(path.into())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {
+            Err(crate::discover::DeadMount(root.to_path_buf()).into())
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -445,6 +448,54 @@ pub async fn serve(ctx: &Ctx, dir: &Path, state: &Path) -> Result<Outcome> {
         tokio::fs::remove_file(state.join("ready")).await?;
     }
     Ok(Outcome::empty())
+}
+
+/// Remount a lazy workspace: detach a dead mount, then start a daemon on the
+/// existing state (recovery runs at mount).
+pub async fn remount(ctx: &Ctx, dir: Option<std::path::PathBuf>) -> Result<Outcome> {
+    use crate::discover::{find_dead_mount, find_workspace, is_dead};
+    let dir = match dir {
+        Some(d) => std::path::absolute(d)?,
+        None => {
+            let start = match ctx.directory.as_deref() {
+                Some(d) => std::path::absolute(d)?,
+                None => std::env::current_dir()?,
+            };
+            find_dead_mount(&start)
+                .or_else(|| find_workspace(&start))
+                .ok_or_else(|| anyhow!("not inside an ant workspace (from {})", start.display()))?
+        }
+    };
+    if is_dead(&dir) {
+        let d = dir.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("fusermount3").arg("-u").arg("-z").arg(&d).output()
+        })
+        .await?
+        .context("running fusermount3")?;
+        if !output.status.success() {
+            bail!(
+                "detaching dead mount failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while is_dead(&dir) {
+            if tokio::time::Instant::now() >= deadline {
+                bail!("dead mount {} did not detach", dir.display());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+    let state = lazy_state(&dir)
+        .await?
+        .ok_or_else(|| anyhow!("not a lazy workspace: {}", dir.display()))?;
+    if let Ok(pid) = tokio::fs::read_to_string(state.join("ready")).await
+        && tokio::fs::try_exists(format!("/proc/{}", pid.trim())).await?
+    {
+        bail!("lazy workspace {} is already mounted (daemon pid {})", dir.display(), pid.trim());
+    }
+    new_lazy(ctx, &dir, DEFAULT_REF).await
 }
 
 pub async fn unmount(dir: &Path) -> Result<Outcome> {
