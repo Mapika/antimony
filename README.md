@@ -34,6 +34,9 @@ clients are always online, history lives on the server, and nobody pushes.
   sizing, local services, benchmarks.
 - [Operator guide](docs/operator-guide.md): topology, sizing, fleet workflow,
   metrics and alerts, failure runbook, backups.
+- [Compatibility](docs/compatibility.md): what each 0.x release keeps stable
+  (API, Postgres schema, on-disk formats, CLI output) and how deprecations work.
+- [Changelog](CHANGELOG.md) and [release checklist](docs/release.md).
 
 ## Layout
 
