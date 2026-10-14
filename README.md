@@ -52,34 +52,29 @@ clients are always online, history lives on the server, and nobody pushes.
 
 ## Quickstart
 
-Needs Rust, `git`, `curl`, and Postgres plus an S3-compatible store on the
-ports below (`docker compose up -d`, or `scripts/dev-services.sh start`
-without Docker). Run it from the repository root; the demo lives in
+Needs Rust, `git` and `curl`. It runs against an in-memory throwaway server;
+for a durable one add Postgres and an S3-compatible store (`docker compose up
+-d`, or `scripts/dev-services.sh start` without Docker) and see "Importing a
+large history" below. Run it from the repository root; the demo lives in
 `/tmp/ant-demo`.
 
 ```sh
-docker compose up -d                       # Postgres :54329 + SeaweedFS S3 :9009
 cargo build --release                      # one binary: target/release/ant (server + client)
 export PATH=$PWD/target/release:$PATH
 
-# Every flag has an ANT_* environment variable; set the stores once for import and serve.
-export ANT_PG_URL=postgres://ant:ant@localhost:54329/ant
-export ANT_S3_ENDPOINT=http://localhost:9009 ANT_S3_BUCKET=ant
-export ANT_S3_ACCESS_KEY=x ANT_S3_SECRET_KEY=x     # tables and bucket are created on first use
-
-# 1. A small git repo to play with.
-rm -rf /tmp/ant-demo && mkdir -p /tmp/ant-demo/repo/src
-printf 'pub fn answer() -> u32 {\n    41\n}\n' > /tmp/ant-demo/repo/src/lib.rs
-echo '# demo' > /tmp/ant-demo/repo/README.md
-git init -q -b main /tmp/ant-demo/repo
-git -C /tmp/ant-demo/repo add -A
-git -C /tmp/ant-demo/repo -c user.name=demo -c user.email=demo@example.com commit -qm "initial import"
-
-# 2. Import it straight into the stores, then serve it (gRPC :7420, HTTP :7421).
-ant import /tmp/ant-demo/repo              # prints: main <tip-id>
-ant serve > /tmp/ant-demo/serve.log 2>&1 &
+# 1. Start an empty in-memory server (gRPC :7420, HTTP :7421).
+rm -rf /tmp/ant-demo && mkdir -p /tmp/ant-demo
+ant serve --memory > /tmp/ant-demo/serve.log 2>&1 &
 SERVER_PID=$!
 until curl -sf http://127.0.0.1:7421/healthz >/dev/null; do sleep 0.2; done
+
+# 2. Create the first commit (an empty root commit on `main`), then put some files in it.
+ant ref init main                          # prints: <root-commit-id>
+ant ws new /tmp/ant-demo/seed
+mkdir /tmp/ant-demo/seed/src
+printf 'pub fn answer() -> u32 {\n    41\n}\n' > /tmp/ant-demo/seed/src/lib.rs
+echo '# demo' > /tmp/ant-demo/seed/README.md
+(cd /tmp/ant-demo/seed && ant submit -m "initial import" && ant land)    # landed <id>
 
 # 3. Read without checking anything out.
 ant ls main                                # <mode> <kind> <id><TAB><name>
@@ -125,7 +120,8 @@ fix them, run `ant ws resolve <path>...`, then submit and land again.
 
 Optional: `ant ws new /tmp/lazy --lazy` mounts a writable copy-on-write
 workspace over FUSE (needs `/dev/fuse` and `fusermount3`; `ant ws unmount
-/tmp/lazy` keeps the edits), and `ant mount main /tmp/view` gives a read-only
+/tmp/lazy` keeps the edits; if its FUSE daemon dies, `ant ws remount /tmp/lazy`
+recovers the workspace with its edits), and `ant mount main /tmp/view` gives a read-only
 view.
 
 ### Access control in two minutes
@@ -161,8 +157,10 @@ git clone http://x:$TOKEN@127.0.0.1:7421/repo.git   # the token is the Basic-aut
 One binary, `ant`, is both the server and the client; the standalone
 `ant-server` binary is a thin wrapper around `ant serve`. Clients find the
 server via `ANT_SERVER` (default `http://127.0.0.1:7420`).
-`ant serve --memory` starts an empty throwaway server (`ant import` writes
-straight to the stores, so it cannot feed an in-memory server).
+`ant serve --memory` starts an empty throwaway server. `ant import` writes
+straight to the stores, so it cannot feed an in-memory server; instead create
+the first commit with `ant ref init [<ref>]` (an empty root commit) and fill it
+from a workspace with `ant submit` and `ant land`, as in the Quickstart.
 `ant completions <bash|zsh|fish|...>` prints a shell completion script.
 
 ### Importing a large history

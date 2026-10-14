@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use ant_server::config::StoreArgs;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(name = "ant", about = "antimony source control client", version = env!("ANT_VERSION"))]
@@ -34,6 +34,43 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Client-only global flags (they configure the connection to a server).
+const CLIENT_GLOBALS: [&str; 6] = ["server", "http", "cache", "cache_bytes", "token", "directory"];
+
+/// Subcommands that run against the stores directly and never talk to a
+/// server: they still accept the client globals (existing command lines keep
+/// working), but their `--help` does not list them.
+const LOCAL_COMMANDS: [&str; 4] = ["serve", "import", "admin", "completions"];
+
+fn hide_client_globals(sub: clap::Command) -> clap::Command {
+    // `mut_args` keeps the argument order (re-pushing one breaks `--help`).
+    let mut sub = sub
+        .mut_args(|a| if CLIENT_GLOBALS.contains(&a.get_id().as_str()) { a.hide(true) } else { a });
+    let nested: Vec<String> = sub.get_subcommands().map(|s| s.get_name().to_string()).collect();
+    for name in nested {
+        sub = sub.mut_subcommand(name, hide_client_globals);
+    }
+    sub
+}
+
+/// The `ant` command line, with client-only globals hidden from the help of
+/// server/admin subcommands.
+pub fn command() -> clap::Command {
+    let mut cmd = Cli::command();
+    // Propagate the global args into the subcommands so they can be hidden.
+    cmd.build();
+    for name in LOCAL_COMMANDS {
+        cmd = cmd.mut_subcommand(name, hide_client_globals);
+    }
+    cmd
+}
+
+/// Parse the process arguments (exits with usage on error, like clap).
+pub fn parse() -> Cli {
+    let mut matches = command().get_matches();
+    Cli::from_arg_matches_mut(&mut matches).unwrap_or_else(|e| e.exit())
 }
 
 #[derive(Subcommand, Debug)]
@@ -79,7 +116,7 @@ pub enum Command {
         #[command(subcommand)]
         cmd: RefCmd,
     },
-    /// Create and manage workspaces (`ws new`, `ws update`, `ws resolve`, `ws unmount`).
+    /// Create and manage workspaces (`ws new`, `ws update`, `ws resolve`, `ws unmount`, `ws remount`).
     Ws {
         #[command(subcommand)]
         cmd: WsCmd,
@@ -176,6 +213,16 @@ pub enum RefCmd {
         #[arg(default_value = "")]
         prefix: String,
     },
+    /// Create a ref at a new empty-tree root commit: the first commit of an
+    /// empty server. Refused if the ref exists.
+    Init {
+        /// Ref to create.
+        #[arg(default_value = "main")]
+        name: String,
+        /// Commit message.
+        #[arg(short = 'm', long, default_value = "initial commit")]
+        message: String,
+    },
     /// Move a ref to a rev (compare-and-swap; `--create` for a new ref).
     /// Moves that are not fast-forwards need `--force`.
     Set {
@@ -218,6 +265,13 @@ pub enum WsCmd {
         /// The lazy workspace directory.
         dir: PathBuf,
     },
+    /// Remount a lazy workspace whose FUSE daemon died (or that was
+    /// unmounted), recovering its edits. Default: the workspace found from
+    /// the cwd / `-C`.
+    Remount {
+        /// The lazy workspace directory.
+        dir: Option<PathBuf>,
+    },
     #[command(hide = true)]
     Serve { dir: PathBuf, state: PathBuf },
     /// Create a (sparse) workspace.
@@ -250,6 +304,33 @@ mod tests {
         );
         let cli = Cli::try_parse_from(["ant", "ws", "unmount", "/tmp/ws"]).unwrap();
         assert!(matches!(cli.command, Command::Ws { cmd: WsCmd::Unmount { .. } }));
+    }
+
+    #[test]
+    fn serve_and_import_help_hide_client_globals() {
+        for sub in ["serve", "import"] {
+            let mut cmd = command();
+            let help = cmd.find_subcommand_mut(sub).unwrap().render_long_help().to_string();
+            for flag in ["--token", "--server", "--http <", "--cache <", "--cache-bytes", "-C <"] {
+                assert!(!help.contains(flag), "ant {sub} --help mentions {flag}:\n{help}");
+            }
+        }
+        let mut cmd = command();
+        let top = cmd.render_long_help().to_string();
+        assert!(top.contains("--token") && top.contains("--server"));
+        // Still accepted where they were before.
+        let cli = Cli::try_parse_from(["ant", "serve", "--memory", "--token", "x", "-C", "/"]);
+        assert!(cli.is_ok(), "{cli:?}");
+    }
+
+    #[test]
+    fn remount_and_ref_init() {
+        let cli = Cli::try_parse_from(["ant", "ws", "remount"]).unwrap();
+        assert!(matches!(cli.command, Command::Ws { cmd: WsCmd::Remount { dir: None } }));
+        let cli = Cli::try_parse_from(["ant", "ref", "init"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Ref { cmd: RefCmd::Init { name, .. } } if name == "main")
+        );
     }
 
     #[test]

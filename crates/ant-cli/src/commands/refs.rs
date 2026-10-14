@@ -85,6 +85,39 @@ pub async fn list(ctx: &Ctx, prefix: &str) -> Result<Outcome> {
     Ok(Outcome::ok(out))
 }
 
+/// Create `name` at a root commit with the empty tree (what an empty server
+/// needs before the first workspace can be created).
+pub async fn init(ctx: &Ctx, name: &str, message: &str) -> Result<Outcome> {
+    let mut client = ctx.remote().await?.client();
+    let current = client.get_ref(pb::GetRefRequest { name: name.into() }).await.rpc()?.into_inner();
+    if let Some(target) = current.target {
+        bail!("ref {name} already exists (at {})", id_from(&target)?);
+    }
+    let author = tokio::task::spawn_blocking(crate::author::current_author).await?;
+    let commit = client
+        .create_changeset(pb::CreateChangesetRequest {
+            base: None,
+            ops: Vec::new(),
+            author: Some(pb::Signature::from(&author)),
+            committer: None,
+            message: message.to_string(),
+        })
+        .await
+        .rpc()?
+        .into_inner()
+        .commit;
+    let r =
+        client.land(pb::LandRequest { ref_name: name.into(), commit }).await.rpc()?.into_inner();
+    match r.outcome {
+        Some(pb::land_response::Outcome::Landed(l)) => {
+            Ok(Outcome::ok(format!("{}\n", id_from(&l.new_tip)?)))
+        }
+        // Someone created the ref between the check and the land.
+        Some(pb::land_response::Outcome::Conflict(_)) => bail!("ref {name} already exists"),
+        None => bail!("server returned an empty land response"),
+    }
+}
+
 pub async fn set(
     ctx: &Ctx,
     name: &str,
