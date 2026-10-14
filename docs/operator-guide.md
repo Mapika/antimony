@@ -124,7 +124,11 @@ Budget about 700 MiB per replica to start (soak: 610-660 MiB at 1,000 agents
 with default caches). The in-process caches have fixed budgets: trees 64 MiB,
 commits 8 MiB, graph nodes 16 MiB, changesets 16 MiB, in two generations (a
 cache can briefly hold up to twice its budget). Watch `ant_cache_bytes` and
-the process RSS; on glibc you can set `ANT_MALLOC_TRIM_SECS=<n>` to call
+the process RSS. On glibc the server caps malloc arenas at start
+(`--malloc-arenas` / `ANT_MALLOC_ARENAS`, default twice the CPU count up to
+16; `MALLOC_ARENA_MAX` in the environment wins; 0 = glibc default): freed
+memory otherwise lingers in per-thread arenas and a full git clone's peak RSS
+is far above its live heap. On glibc you can also set `ANT_MALLOC_TRIM_SECS=<n>` to call
 `malloc_trim` every n seconds (off by default) if RSS stays high after bursts.
 `GET /debug/stats` on the HTTP port prints cache entries and budgets, land
 queue counts and running history catch-ups as one JSON line. Without a policy

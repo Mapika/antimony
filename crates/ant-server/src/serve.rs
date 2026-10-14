@@ -68,11 +68,55 @@ pub struct ServeArgs {
     #[arg(long, env = "ANT_POLICY")]
     pub policy: Option<PathBuf>,
 
+    /// Maximum glibc malloc arenas (default: the smaller of 16 and twice the
+    /// CPU count; an explicit `MALLOC_ARENA_MAX` wins). Applied by
+    /// [`configure_malloc`] before the runtime starts; ignored off glibc.
+    /// Many arenas let freed memory pile up per thread (a git clone's peak
+    /// RSS was 3x its live heap); few arenas contend on locks. 0 = leave
+    /// glibc's default.
+    #[arg(long, env = "ANT_MALLOC_ARENAS")]
+    pub malloc_arenas: Option<usize>,
+
     #[command(flatten)]
     pub limits: LimitArgs,
 
     #[command(flatten)]
     pub store: StoreArgs,
+}
+
+/// Default arena cap: twice the CPU count, within 2..=16.
+pub fn default_malloc_arenas() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (cpus * 2).clamp(2, 16)
+}
+
+/// Cap the glibc malloc arenas of a server process. Call it first thing in
+/// `main`, before the tokio runtime (and so any worker thread) exists:
+/// threads that already own an arena keep it. An explicit `MALLOC_ARENA_MAX`
+/// environment variable is respected. Returns the cap applied, or `None`
+/// when left alone (env var set, `0`, or not glibc).
+pub fn configure_malloc(arenas: Option<usize>) -> Option<usize> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+            return None;
+        }
+        let n = arenas.unwrap_or_else(default_malloc_arenas);
+        if n == 0 {
+            return None;
+        }
+        let n = n.min(i32::MAX as usize) as libc::c_int;
+        // SAFETY: mallopt only sets allocator tunables.
+        if unsafe { libc::mallopt(libc::M_ARENA_MAX, n) } == 1 {
+            return Some(n as usize);
+        }
+        None
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        let _ = arenas;
+        None
+    }
 }
 
 /// Install the global tracing subscriber (`RUST_LOG`, default info) writing to
@@ -284,6 +328,28 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    #[test]
+    fn malloc_arenas_flag_parses_and_defaults_are_sane() {
+        let cli = Cli::try_parse_from(["ant-server", "--memory", "--malloc-arenas", "4"]).unwrap();
+        assert_eq!(cli.serve.malloc_arenas, Some(4));
+        let cli = Cli::try_parse_from(["ant-server", "--memory"]).unwrap();
+        assert_eq!(cli.serve.malloc_arenas, None);
+        assert!((2..=16).contains(&default_malloc_arenas()));
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn configure_malloc_applies_cap() {
+        // mallopt reports success; an explicit env var wins, 0 leaves glibc alone.
+        assert_eq!(configure_malloc(Some(0)), None);
+        if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+            assert_eq!(configure_malloc(Some(7)), None);
+        } else {
+            assert_eq!(configure_malloc(Some(7)), Some(7));
+            assert_eq!(configure_malloc(None), Some(default_malloc_arenas()));
+        }
     }
 
     #[test]

@@ -47,25 +47,40 @@ enum Cmd {
     Serve(ant_server::serve::ServeArgs),
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let cli = Cli::parse();
+    if let Cmd::Serve(args) = &cli.cmd {
+        // Before the runtime exists: threads keep the arena they start with.
+        ant_server::serve::configure_malloc(args.malloc_arenas);
+    }
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: starting runtime: {e}");
+            std::process::exit(2);
+        }
+    };
+    let code = rt.block_on(main_async(cli));
+    std::process::exit(code);
+}
+
+async fn main_async(cli: Cli) -> i32 {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
         )
         .init();
-    let code = match run().await {
+    match run(cli).await {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e:#}");
             2
         }
-    };
-    std::process::exit(code);
+    }
 }
 
-async fn run() -> anyhow::Result<i32> {
-    match Cli::parse().cmd {
+async fn run(cli: Cli) -> anyhow::Result<i32> {
+    match cli.cmd {
         Cmd::Import(args) => import::run(args).await.map(|()| 0),
         Cmd::Fleet(args) => fleet::run(args).await,
         Cmd::Checkout(args) => checkout::run(args).await.map(|()| 0),

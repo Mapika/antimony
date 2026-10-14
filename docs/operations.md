@@ -149,6 +149,17 @@ immediately.
   errors, RSS levelling off at about 610–660 MiB per replica with the
   default caches. `ANT_MALLOC_TRIM_SECS=<n>` (off by default) periodically
   returns freed heap to the OS; `MALLOC_ARENA_MAX=2` saves about 50 MiB.
+- **Memory during git clones:** a full git/git clone peaked at about 1.0 GiB
+  RSS against a live heap of 300-380 MiB: glibc keeps freed memory in
+  per-thread arenas. The server therefore caps arenas before its runtime
+  starts (`--malloc-arenas` / `ANT_MALLOC_ARENAS`, default twice the CPU
+  count within 2..16; an explicit `MALLOC_ARENA_MAX` wins; `0` = glibc
+  default; `ant serve`, `ant-server`, `ant-bench serve`). Measured: full
+  clone 1005 -> 665 MiB, blobless 867 -> 632 MiB, no slowdown; 8 arenas
+  gives about 565 MiB. An in-process 16-agent fleet loses about 2.6% at 16
+  arenas (24 arenas: none, but about 700-780 MiB clone peak).
+  `MALLOC_TRIM_THRESHOLD_`/`MALLOC_MMAP_THRESHOLD_` of 128 KiB halve the
+  peak again but make clones 30-80% slower, so they are not set.
 - **Postgres:** `max_connections` must cover every server's pools
   (`--pg-max-connections`, default 64, plus `--pg-lock-connections`,
   default 8, per process; ref-lock waits are bounded by `--pg-lock-timeout`,
