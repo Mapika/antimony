@@ -39,7 +39,8 @@
 //!    statement; its object and index rows are locked and re-checked while
 //!    doing so (see *Re-storing*). From that moment readers treat condemned
 //!    ids as missing (`get_many`, `has_many`, the packed-object index,
-//!    `get_commits`, `get_changesets`, `first_parent_chain`), object and
+//!    `get_commits`, `get_changesets`, `first_parent_chain`,
+//!    `ancestors_above`), object and
 //!    index rows only while they are older than the cutoff, i.e. exactly
 //!    those the sweep would delete: no operation that starts later can read
 //!    a condemned object and build on it.
@@ -166,8 +167,10 @@ pub const FRESHEN_AFTER: Duration = Duration::from_secs(3600);
 /// (`ant-gitbridge`).
 pub const DEFAULT_ROOT_KINDS: [&str; 2] = ["land/landed-as/v1", "git-import/commit/v1"];
 /// Derived-data kinds keyed by `<commit id><suffix>` whose rows go with their
-/// commit: the blame cache (`ant-server` `ops::history`).
-pub const DEFAULT_COMMIT_KEYED_KINDS: [&str; 1] = ["blame/v1"];
+/// commit: the blame cache (`ant-server` `ops::history`) and the
+/// first-parent skip index ([`crate::graph::SKIP_KIND`]; an entry points
+/// only at its commit's ancestors, which live at least as long).
+pub const DEFAULT_COMMIT_KEYED_KINDS: [&str; 2] = ["blame/v1", crate::graph::SKIP_KIND];
 
 /// Attempts at storing objects that a concurrent collection keeps deleting.
 pub(super) const STORE_ATTEMPTS: usize = 8;
@@ -1596,6 +1599,7 @@ pub(super) mod tests {
         assert_eq!(s.get_commits(&[c]).await.unwrap(), vec![None]);
         assert_eq!(s.get_changesets(&[c]).await.unwrap(), vec![None]);
         assert!(s.first_parent_chain(c, None, 10).await.unwrap().is_empty());
+        assert!(s.ancestors_above(&[c], 0, 10).await.unwrap().is_empty());
         // The collector itself sees them.
         assert!(unhidden(s.get_many(&[b])).await.unwrap()[0].is_some());
         // Storing the blob again takes it back and refreshes its write time.

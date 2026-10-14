@@ -25,8 +25,10 @@
 //!   Without a ref, the first [`MAX_LANDED_PROBE`] refs in name order are
 //!   tried.
 //!
-//! All walks read commit nodes a first-parent segment per store call
-//! (`graph`), never one commit per round trip. Access control: commit
+//! Walks read commit nodes in batches (`graph`: the ancestry above a
+//! generation floor, or a first-parent segment, per store call; the
+//! first-parent skip index for "on the first-parent chain"), never one commit
+//! or one merge per round trip. Access control: commit
 //! history is not path-restricted (as with `Log`), so `merge_base`,
 //! `is_ancestor` and `landed_as` need only an authenticated caller;
 //! `log_range` with a path counts only readable changes (`log_range_as`).

@@ -184,6 +184,31 @@ impl MetaStore for MemoryMetaStore {
         Ok(self.inner.lock().commits.get(id).map(|(_, _, c)| c.clone()))
     }
 
+    async fn ancestors_above(
+        &self,
+        tips: &[ObjectId],
+        min_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<CommitNode>> {
+        let m = self.inner.lock();
+        let mut seen = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<ObjectId> =
+            tips.iter().copied().filter(|id| seen.insert(*id)).collect();
+        let mut out = Vec::new();
+        while let Some(id) = queue.pop_front() {
+            if out.len() >= limit {
+                break;
+            }
+            let Some((_, n, _)) = m.commits.get(&id) else { continue };
+            if n.generation <= min_generation {
+                continue;
+            }
+            queue.extend(n.parents.iter().copied().filter(|p| seen.insert(*p)));
+            out.push(n.clone());
+        }
+        Ok(out)
+    }
+
     async fn tail(&self, after: u64, limit: usize) -> Result<Vec<(u64, ObjectId)>> {
         let m = self.inner.lock();
         let start = m.log.partition_point(|(s, _)| *s <= after);
@@ -287,5 +312,64 @@ mod tests {
     #[tokio::test]
     async fn memory_meta_batch_conforms() {
         conformance::meta_store_batch(Arc::new(MemoryMetaStore::default())).await;
+    }
+
+    #[tokio::test]
+    async fn memory_ancestors_above_conforms() {
+        conformance::ancestors_above(Arc::new(MemoryMetaStore::default())).await;
+        conformance::ancestors_above(Arc::new(Defaults::default())).await;
+    }
+
+    /// The required methods only: exercises the trait's default
+    /// `ancestors_above` (and other defaults).
+    #[derive(Default)]
+    struct Defaults(MemoryMetaStore);
+
+    #[async_trait]
+    impl MetaStore for Defaults {
+        async fn put_commit(&self, node: CommitNode, changes: Vec<PathChange>) -> Result<u64> {
+            self.0.put_commit(node, changes).await
+        }
+        async fn get_commits(&self, ids: &[ObjectId]) -> Result<Vec<Option<CommitNode>>> {
+            self.0.get_commits(ids).await
+        }
+        async fn get_changeset(&self, id: &ObjectId) -> Result<Option<Vec<PathChange>>> {
+            self.0.get_changeset(id).await
+        }
+        async fn tail(&self, after: u64, limit: usize) -> Result<Vec<(u64, ObjectId)>> {
+            self.0.tail(after, limit).await
+        }
+        async fn get_derived(&self, kind: &str, key: &[u8]) -> Result<Option<Bytes>> {
+            self.0.get_derived(kind, key).await
+        }
+        async fn put_derived(&self, kind: &str, key: &[u8], value: Bytes) -> Result<()> {
+            self.0.put_derived(kind, key, value).await
+        }
+        async fn index_history(&self, ref_name: &str, rows: &[HistoryRow]) -> Result<()> {
+            self.0.index_history(ref_name, rows).await
+        }
+        async fn query_history(
+            &self,
+            ref_name: &str,
+            prefix: &RepoPath,
+            max_generation: u64,
+            limit: usize,
+        ) -> Result<Vec<(u64, ObjectId)>> {
+            self.0.query_history(ref_name, prefix, max_generation, limit).await
+        }
+        async fn history_watermark(&self, ref_name: &str) -> Result<Option<ObjectId>> {
+            self.0.history_watermark(ref_name).await
+        }
+        async fn set_history_watermark(
+            &self,
+            ref_name: &str,
+            expected: Option<ObjectId>,
+            new: ObjectId,
+        ) -> Result<bool> {
+            self.0.set_history_watermark(ref_name, expected, new).await
+        }
+        async fn clear_history(&self, ref_name: &str) -> Result<()> {
+            self.0.clear_history(ref_name).await
+        }
     }
 }

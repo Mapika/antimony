@@ -308,6 +308,60 @@ pub async fn meta_store_batch(s: Arc<dyn MetaStore>) {
     assert_eq!(s.get_derived("b/v1", b"a").await.unwrap().as_deref(), Some(&b"1"[..]));
 }
 
+/// `ancestors_above` (part of the meta-store contract): the generation
+/// floor, merges, several roots, unknown tips, tips first, breadth-first
+/// truncation.
+pub async fn ancestors_above(s: Arc<dyn MetaStore>) {
+    let id = |n: u8| ObjectId([n; 32]);
+    let node = |n: u8, parents: &[u8], generation: u64| CommitNode {
+        id: id(n),
+        tree: ObjectId::empty_tree(),
+        parents: parents.iter().map(|p| id(*p)).collect(),
+        generation,
+        committer_time: n as i64,
+    };
+    //  1 - 2 - 4 - 5 - 7      (4 merges 2 and 3; 7 merges 5 and root 6)
+    //   \- 3 -/       /
+    //  6 -------------
+    let nodes = [
+        node(1, &[], 1),
+        node(2, &[1], 2),
+        node(3, &[1], 2),
+        node(4, &[2, 3], 3),
+        node(5, &[4], 4),
+        node(6, &[], 1),
+        node(7, &[5, 6], 5),
+    ];
+    for n in &nodes {
+        s.put_commit(n.clone(), vec![]).await.unwrap();
+    }
+    let ids = |got: &[CommitNode]| {
+        let mut v: Vec<u8> = got.iter().map(|n| n.id.0[0]).collect();
+        v.sort_unstable();
+        v
+    };
+    let all = s.ancestors_above(&[id(7)], 0, 100).await.unwrap();
+    assert_eq!(all[0], nodes[6]);
+    assert_eq!(ids(&all), vec![1, 2, 3, 4, 5, 6, 7]);
+    for n in &all {
+        assert_eq!(n, &nodes[usize::from(n.id.0[0]) - 1]);
+    }
+    assert_eq!(ids(&s.ancestors_above(&[id(7)], 2, 100).await.unwrap()), vec![4, 5, 7]);
+    let two = s.ancestors_above(&[id(7), id(3)], 1, 100).await.unwrap();
+    assert_eq!(ids(&two[..2]), vec![3, 7], "tips first");
+    assert_eq!(ids(&two), vec![2, 3, 4, 5, 7]);
+    assert_eq!(
+        ids(&s.ancestors_above(&[id(9), id(4), id(4)], 0, 100).await.unwrap()),
+        vec![1, 2, 3, 4]
+    );
+    let first = s.ancestors_above(&[id(7)], 0, 3).await.unwrap();
+    assert_eq!(first[0], nodes[6]);
+    assert_eq!(ids(&first), vec![5, 6, 7], "breadth-first");
+    assert_eq!(s.ancestors_above(&[id(2)], 2, 10).await.unwrap(), vec![]);
+    assert_eq!(s.ancestors_above(&[id(7)], 0, 0).await.unwrap(), vec![]);
+    assert_eq!(s.ancestors_above(&[], 0, 10).await.unwrap(), vec![]);
+}
+
 /// History-index suite (part of the meta-store contract).
 pub async fn history_index(s: Arc<dyn MetaStore>) {
     let c = |n: u8| ObjectId([n; 32]);

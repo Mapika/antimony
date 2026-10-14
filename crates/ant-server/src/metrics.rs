@@ -609,6 +609,7 @@ impl Metrics {
                 get_changeset: self.store_op("meta", "get_changeset"),
                 get_changesets: self.store_op("meta", "get_changesets"),
                 first_parent_chain: self.store_op("meta", "first_parent_chain"),
+                ancestors_above: self.store_op("meta", "ancestors_above"),
                 tail: self.store_op("meta", "tail"),
                 get_derived: self.store_op("meta", "get_derived"),
                 get_derived_many: self.store_op("meta", "get_derived_many"),
@@ -769,6 +770,7 @@ struct TimedMeta {
     get_changeset: StoreOp,
     get_changesets: StoreOp,
     first_parent_chain: StoreOp,
+    ancestors_above: StoreOp,
     tail: StoreOp,
     get_derived: StoreOp,
     get_derived_many: StoreOp,
@@ -808,6 +810,15 @@ impl MetaStore for TimedMeta {
         limit: usize,
     ) -> StoreResult<Vec<CommitNode>> {
         self.first_parent_chain.time(self.inner.first_parent_chain(tip, stop, limit)).await
+    }
+
+    async fn ancestors_above(
+        &self,
+        tips: &[ObjectId],
+        min_generation: u64,
+        limit: usize,
+    ) -> StoreResult<Vec<CommitNode>> {
+        self.ancestors_above.time(self.inner.ancestors_above(tips, min_generation, limit)).await
     }
 
     async fn tail(&self, after: u64, limit: usize) -> StoreResult<Vec<(u64, ObjectId)>> {

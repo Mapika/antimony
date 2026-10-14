@@ -317,6 +317,7 @@ pub struct TimedMeta {
     get_changeset: Arc<Counter>,
     get_changesets: Arc<Counter>,
     first_parent_chain: Arc<Counter>,
+    ancestors_above: Arc<Counter>,
     tail: Arc<Counter>,
     get_derived: Arc<Counter>,
     put_derived: Arc<Counter>,
@@ -360,6 +361,17 @@ impl MetaStore for TimedMeta {
         limit: usize,
     ) -> Result<Vec<CommitNode>> {
         timed(&self.first_parent_chain, 1, self.inner.first_parent_chain(tip, stop, limit)).await
+    }
+
+    async fn ancestors_above(
+        &self,
+        tips: &[ObjectId],
+        min_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<CommitNode>> {
+        let n = tips.len() as u64;
+        timed(&self.ancestors_above, n, self.inner.ancestors_above(tips, min_generation, limit))
+            .await
     }
 
     async fn tail(&self, after: u64, limit: usize) -> Result<Vec<(u64, ObjectId)>> {
@@ -433,6 +445,7 @@ pub fn instrument(backend: &Backend, m: &Metrics, prefix: &str) -> Backend {
             get_changeset: c("get_changeset"),
             get_changesets: c("get_changesets"),
             first_parent_chain: c("first_parent_chain"),
+            ancestors_above: c("ancestors_above"),
             tail: c("tail"),
             get_derived: c("get_derived"),
             put_derived: c("put_derived"),

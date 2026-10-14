@@ -1173,6 +1173,59 @@ impl MetaStore for PgStore {
         rows.iter().map(commit_node).collect()
     }
 
+    async fn ancestors_above(
+        &self,
+        tips: &[ObjectId],
+        min_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<CommitNode>> {
+        if tips.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let Ok(min_generation) = i64::try_from(min_generation) else {
+            return Ok(Vec::new());
+        };
+        // `UNION` (not `ALL`) drops rows already produced, so every commit is
+        // expanded once; the walk is evaluated only as far as `LIMIT` pulls
+        // it, level by level, the tips (the non-recursive term) first. Each
+        // parent is looked up through the primary key (the `LIMIT 1`
+        // subquery is not flattened into a join): a plain join gets planned
+        // as a hash join over every commit above the floor, a sequential
+        // scan per level that made low floors take seconds per call.
+        macro_rules! walk {
+            ($($hide:tt)*) => {
+                concat!(
+                    "WITH RECURSIVE walk(id, tree, parents, generation, committer_time) AS ( \
+                         SELECT id, tree, parents, generation, committer_time \
+                           FROM commits c WHERE id = ANY($1) AND generation > $2",
+                    $($hide)*,
+                    " UNION \
+                         SELECT c.id, c.tree, c.parents, c.generation, c.committer_time \
+                           FROM walk w \
+                          CROSS JOIN LATERAL generate_series(0, length(w.parents) / 32 - 1) AS k(i) \
+                          CROSS JOIN LATERAL ( \
+                              SELECT id, tree, parents, generation, committer_time \
+                                FROM commits c \
+                               WHERE c.id = substring(w.parents from k.i * 32 + 1 for 32) \
+                                 AND c.generation > $2",
+                    $($hide)*,
+                    " LIMIT 1) c \
+                     ) SELECT id, tree, parents, generation, committer_time FROM walk LIMIT $3"
+                )
+            };
+        }
+        let sql = if gc::hiding() { walk!(not_condemned!("c")) } else { walk!("") };
+        let rows = sqlx::query(sql)
+            .bind(ids_to_vecs(tips))
+            .bind(min_generation)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(be)?;
+        rows.iter().map(commit_node).collect()
+    }
+
     async fn get_changesets(&self, ids: &[ObjectId]) -> Result<Vec<Option<Vec<PathChange>>>> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -1647,6 +1700,12 @@ mod tests {
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_meta_batch_conforms() {
         conformance::meta_store_batch(Arc::new(fresh().await)).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_ancestors_above_conforms() {
+        conformance::ancestors_above(Arc::new(fresh().await)).await;
     }
 
     /// Concurrent batches sharing objects in opposite orders used to deadlock

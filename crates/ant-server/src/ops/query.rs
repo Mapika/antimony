@@ -27,6 +27,10 @@ use bytes::Bytes;
 use super::{OpError, OpResult, cache, history, patch};
 use crate::acl::Access;
 
+/// `rev~N` steps resolved one cached node at a time; longer ones read the
+/// chain or the skip index (`graph::first_parent_ancestor`).
+const RESOLVE_CACHED_STEPS: usize = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathInfo {
     pub mode: EntryMode,
@@ -68,12 +72,13 @@ pub async fn resolve_rev(b: &Backend, rev: &str) -> OpResult<ObjectId> {
             })?
             .ok_or_else(|| OpError::NotFound(format!("ref {base}")))?,
     };
+    let shorter = || OpError::NotFound(format!("{rev}: history is shorter"));
+    if steps > RESOLVE_CACHED_STEPS {
+        // One chain read or a skip-index descent, not a read per step.
+        return graph::first_parent_ancestor(b, id, steps).await?.ok_or_else(shorter);
+    }
     for _ in 0..steps {
-        id = *cache::get_node(b, id)
-            .await?
-            .parents
-            .first()
-            .ok_or_else(|| OpError::NotFound(format!("{rev}: history is shorter")))?;
+        id = *cache::get_node(b, id).await?.parents.first().ok_or_else(shorter)?;
     }
     Ok(id)
 }

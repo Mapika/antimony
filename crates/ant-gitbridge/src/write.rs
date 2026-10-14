@@ -277,6 +277,12 @@ async fn record_inner(
                 wait_mapping(&mut mapping_task).await?;
                 publisher.publish(backend, &ant_ref, id).await?;
                 let _ = ack.send(());
+                // Index the ref's first-parent chain for ancestry queries now
+                // rather than in the first query after the import. Best
+                // effort: queries fill it in themselves otherwise.
+                if let Err(e) = ant_store::graph::fill_skip_index(backend, id).await {
+                    tracing::warn!(ant_ref, error = %e, "skip index not filled in");
+                }
             }
         }
     }

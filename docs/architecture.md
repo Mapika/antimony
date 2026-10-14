@@ -129,8 +129,15 @@ gets one coalesced event instead of unbounded buffering.
   (path prefixes, merge-base diffs, server-side patches), `Blame`,
   `MergeBase`, `IsAncestor`, `LogRange` and `LandedAs` over gRPC
   (`ops/query.rs`, `ops/ancestry.rs`, `ops/patch.rs`). Ancestry walks go in
-  generation order and read the commit graph a first-parent segment per
-  store call (`graph.rs`).
+  generation order (`graph.rs`): walks over the whole DAG (merge base,
+  reachability) read the ancestry above a generation floor per store call
+  (`MetaStore::ancestors_above`, one recursive query in Postgres; the floor
+  drops by a doubling window), first-parent walks a chain segment per call.
+  Whether a commit lies on another's first-parent chain is answered from
+  the skip index (`graph/skip/v1`: per commit its first-parent depth and
+  one jump pointer, O(log n) reads), filled in lazily along a chain and by
+  the importer; merge base and reachability try it first when the other
+  side is far older.
 - **Path history:** each ref has an index (`history` table) of which commits
   touched which paths along its first-parent chain. It is maintained in the
   background after lands and ref updates (`ops/history.rs`, coalesced per

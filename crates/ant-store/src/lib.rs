@@ -441,6 +441,38 @@ pub trait MetaStore: Send + Sync + 'static {
         Ok(out)
     }
 
+    /// The commits reachable from `tips` (inclusive, through every parent)
+    /// whose generation is above `min_generation`, each once, at most
+    /// `limit`. The walk neither returns nor passes through commits at or
+    /// below `min_generation` or unrecorded ones. Order: the recorded `tips`
+    /// above `min_generation` first (so a `limit >= tips.len()` returns all
+    /// of them), then the rest in breadth-first order (a truncated result is
+    /// the part of the ancestry closest to `tips`). The default reads one
+    /// `get_commits` per level; persistent stores should override this with
+    /// a single server-side traversal.
+    async fn ancestors_above(
+        &self,
+        tips: &[ObjectId],
+        min_generation: u64,
+        limit: usize,
+    ) -> Result<Vec<CommitNode>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut level: Vec<ObjectId> = tips.iter().copied().filter(|id| seen.insert(*id)).collect();
+        let mut out = Vec::new();
+        while !level.is_empty() && out.len() < limit {
+            let mut next = Vec::new();
+            for n in self.get_commits(&level).await?.into_iter().flatten() {
+                if n.generation <= min_generation || out.len() >= limit {
+                    continue;
+                }
+                next.extend(n.parents.iter().copied().filter(|p| seen.insert(*p)));
+                out.push(n);
+            }
+            level = next;
+        }
+        Ok(out)
+    }
+
     /// Log entries with sequence number `> after`, ascending, at most `limit`.
     /// Sequence numbers start at 1 and strictly increase (gaps allowed).
     async fn tail(&self, after: u64, limit: usize) -> Result<Vec<(u64, ObjectId)>>;

@@ -70,6 +70,58 @@ fn fixed_dag(n: usize, mut seed: u64) -> Dag {
     Dag(out)
 }
 
+/// A merge-heavy DAG shaped like rust-lang/rust's history: a first-parent
+/// chain where every commit merges a topic branch (bors), based a few
+/// commits back or, now and then, far back (long-lived branches); some
+/// topics are merges themselves (rollups), some merges are octopus merges,
+/// and a few bring in a history with its own root (subtree merges). Long
+/// enough that first-parent gaps exceed the walks' first window, so the
+/// skip index and the windowed reads are exercised. Returns the DAG and
+/// its first-parent chain (indices, oldest first).
+fn merge_heavy_dag(merges: usize, mut seed: u64) -> (Dag, Vec<usize>) {
+    let mut next = move |m: usize| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % m.max(1)
+    };
+    fn add(nodes: &mut Vec<Vec<usize>>, ps: Vec<usize>) -> usize {
+        nodes.push(ps);
+        nodes.len() - 1
+    }
+    /// A chain of `len >= 1` commits on `base` (`None`: a new root).
+    fn topic(nodes: &mut Vec<Vec<usize>>, base: Option<usize>, len: usize) -> usize {
+        let mut tip = base;
+        for _ in 0..len {
+            tip = Some(add(nodes, tip.into_iter().collect()));
+        }
+        tip.unwrap_or(0)
+    }
+    let mut nodes: Vec<Vec<usize>> = vec![vec![]];
+    let mut main = vec![0usize];
+    for _ in 0..merges {
+        let back = if next(16) == 0 { next(main.len()) } else { next(4) };
+        let base = main[main.len() - 1 - back.min(main.len() - 1)];
+        let len = 1 + next(3);
+        let mut tip = topic(&mut nodes, Some(base), len);
+        if next(8) == 0 {
+            // A rollup: the topic merges another one.
+            let len = 1 + next(3);
+            let other = topic(&mut nodes, Some(base), len);
+            tip = add(&mut nodes, vec![tip, other]);
+        }
+        let mut ps = vec![main[main.len() - 1], tip];
+        if next(12) == 0 {
+            let len = 1 + next(2);
+            ps.push(topic(&mut nodes, Some(base), len)); // octopus
+        }
+        if next(40) == 0 {
+            let len = 1 + next(3);
+            ps.push(topic(&mut nodes, None, len)); // another root
+        }
+        main.push(add(&mut nodes, ps));
+    }
+    (Dag(nodes), main)
+}
+
 struct Oracle {
     ids: Vec<ObjectId>,
     generation: Vec<u64>,
@@ -216,6 +268,76 @@ proptest! {
             check(&b, &o, (0..n).flat_map(|x| (0..n).map(move |y| (x, y))), limit).await
         });
         prop_assert!(result.is_ok(), "{:?} on {:?}", result, d);
+    }
+}
+
+/// Query pairs for a merge-heavy DAG: first-parent commits far apart (both
+/// ways), topic commits against first-parent commits (both ways), and
+/// random pairs.
+fn merge_heavy_pairs(n: usize, main: &[usize], mut seed: u64, count: usize) -> Vec<(usize, usize)> {
+    let mut next = move |m: usize| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % m.max(1)
+    };
+    let tip = main[main.len() - 1];
+    (0..count)
+        .map(|k| {
+            let on_main = main[next(main.len())];
+            let any = next(n);
+            match k % 6 {
+                0 => (on_main, tip),
+                1 => (tip, on_main),
+                2 => (any, tip),
+                3 => (any, on_main),
+                4 => (on_main, any),
+                _ => (any, next(n)),
+            }
+        })
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(common::config(12))]
+
+    /// Merge-heavy histories (every first-parent commit a merge), long
+    /// enough for the skip index and windowed walks to come into play.
+    #[test]
+    fn ancestry_queries_match_the_oracle_on_merge_heavy_histories(
+        merges in 100usize..220,
+        seed in any::<u64>(),
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result: Result<(), String> = rt.block_on(async {
+            let b = Backend::in_memory();
+            let (d, main) = merge_heavy_dag(merges, seed);
+            let ids = build(&b, &d).await;
+            let o = Oracle::new(&d, ids);
+            check(&b, &o, merge_heavy_pairs(d.0.len(), &main, seed, 30), 0).await
+        });
+        prop_assert!(result.is_ok(), "{:?} with {} merges, seed {}", result, merges, seed);
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs postgres: docker compose up -d"]
+async fn ancestry_queries_match_the_oracle_on_merge_heavy_histories_postgres() {
+    let b = common::pg::scratch_backend("query_props_mh").await;
+    let result = tokio::spawn({
+        let b = b.clone();
+        async move {
+            let (d, main) = merge_heavy_dag(600, 11);
+            let ids = build(&b, &d).await;
+            let o = Oracle::new(&d, ids);
+            let pairs = merge_heavy_pairs(d.0.len(), &main, 11, 120);
+            check(&b, &o, pairs, 0).await
+        }
+    })
+    .await;
+    // The scratch store drops the schema with the last handle to it.
+    drop(b);
+    match result {
+        Ok(r) => r.unwrap(),
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
     }
 }
 
