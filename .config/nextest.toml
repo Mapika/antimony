@@ -11,3 +11,8 @@ fail-fast = false
 filter = 'test(rw_write_bench)'
 slow-timeout = { period = "60s", terminate-after = 30 }
 
+# One full Postgres concurrency case per proptest case (~0.5 s each): deep
+# runs (PROPTEST_CASES=1000) take several minutes.
+[[profile.default.overrides]]
+filter = 'test(concurrent_lands_postgres)'
+slow-timeout = { period = "60s", terminate-after = 30 }
