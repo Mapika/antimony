@@ -42,11 +42,10 @@
 //! Concurrency limits derive from the Postgres query-pool size `P`
 //! (`--pg-max-connections`, default 64): `read` 4P, `write` 2P, `land` 16P,
 //! `admin` 8; the queue holds as many waiters as the gate has slots; `shed_wait`
-//! is 2 s. Rates default to `read` 2000/s (burst 4000), `write` 500/s (1000),
-//! `admin` 20/s (40) *per principal* and are unlimited for open-mode/IP
-//! callers unless `--rate-*` is given explicitly (an explicit flag applies to
-//! every caller). A policy's `[principal.limits]` overrides per principal.
-//! The in-memory fleet benchmark (16 agents, open mode) is unaffected.
+//! is 2 s. Rates are **opt-in**: unlimited by default for everyone, since a
+//! token may be shared by hundreds of agents. `--rate-*` sets a rate for every
+//! caller (principals, and client IPs in open mode); a policy's
+//! `[principal.limits]` sets or overrides it per principal.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
@@ -171,11 +170,7 @@ impl LimitConfig {
         let max_inflight = [4 * p, 2 * p, 16 * p, 8];
         Self {
             enabled: true,
-            principal: [
-                Some(RateSpec { rps: 2000.0, burst: 4000.0 }),
-                Some(RateSpec { rps: 500.0, burst: 1000.0 }),
-                Some(RateSpec { rps: 20.0, burst: 40.0 }),
-            ],
+            principal: [None; 3],
             anonymous: [None; 3],
             max_inflight,
             queue: max_inflight,
@@ -1033,7 +1028,7 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.max_inflight, [40, 20, 160, 8]);
         assert!(cfg.anonymous.iter().all(Option::is_none));
-        assert_eq!(cfg.principal[0].unwrap().rps, 2000.0);
+        assert!(cfg.principal.iter().all(Option::is_none), "rates are opt-in");
         let cfg = Cli::parse_from([
             "x",
             "--rate-read",

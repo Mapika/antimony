@@ -466,14 +466,17 @@ purpose: lands on one ref are queued and group-committed by the server, and a
 waiting land holds no Postgres connection, so the gate never limits batching
 (the 16-agent in-memory fleet and a 96-agent concurrent-land test batch the
 same with and without limits); it only caps how many land requests a replica
-accepts at once. The default rates are per **principal** and unlimited for
-open-mode/IP callers (a fleet behind one NAT must not share a bucket):
+accepts at once. Rates are **opt-in** and unlimited by default for everyone:
+a token is often shared by a whole team or pool of agents, so a default per
+principal would throttle real fleets. Enable them with the flags below (they
+apply to every caller, open-mode IPs included) or per principal in the policy,
+sized to the agents per token (agents x requests/s each, with headroom):
 
 | flag (env) | default | meaning |
 |---|---|---|
-| `--rate-read` (`ANT_RATE_READ`) | `2000:4000` per principal | `<rps>[:<burst>]` or `off`; when given it also applies to open-mode IPs |
-| `--rate-write` (`ANT_RATE_WRITE`) | `500:1000` per principal | changesets, lands, ref updates, uploads |
-| `--rate-admin` (`ANT_RATE_ADMIN`) | `20:40` per principal | |
+| `--rate-read` (`ANT_RATE_READ`) | off | `<rps>[:<burst>]` or `off`; applies to every principal and to open-mode IPs |
+| `--rate-write` (`ANT_RATE_WRITE`) | off | changesets, lands, ref updates, uploads |
+| `--rate-admin` (`ANT_RATE_ADMIN`) | off | |
 | `--max-inflight-{read,write,land,admin}` (`ANT_MAX_INFLIGHT_*`) | 4P, 2P, 16P, 8 | `0` = unlimited; queue length = the same number |
 | `--shed-wait` (`ANT_SHED_WAIT`) | `2s` | longest queue wait before shedding |
 | `--no-limits` (`ANT_NO_LIMITS`) | off | disable both mechanisms |
@@ -775,9 +778,9 @@ exists in the services directory.
    in section 4.
 5. `--log-format json`, logs shipped, Prometheus scraping each replica, alerts
    from section 5.
-6. Rate limits: the defaults are per principal (section 4, "Rate limits and
-   load shedding"); give bridge/CI principals explicit `[principal.limits]`
-   and alert on 14 and 15.
+6. Rate limits: off by default; set per-principal rates sized to the agents
+   per token (section 4, "Rate limits and load shedding"), especially for
+   bridge/CI principals, and alert on 14 and 15. Concurrency gates are on.
 7. Harness: retries on `aborted`/`unavailable` (`ant`/`antd` already honour
    the server's `retry-after-ms`), `ws update` + `ws resolve`
    loop on exit code 2, backoff with jitter, sparse workspaces by default, one
