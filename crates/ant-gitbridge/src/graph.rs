@@ -149,28 +149,32 @@ pub(crate) fn discover(
     let mut chunk = PRECHECK_START;
     while next < ids.len() {
         let end = (next + chunk).min(ids.len());
-        let keys: Vec<&[u8]> = ids[next..end].iter().map(|s| s.as_slice()).collect();
-        let found = handle.block_on(backend.meta.get_derived_many(COMMIT_KIND, &keys))?;
-        let mut unknown = Vec::with_capacity(end - next);
+        // Look the chunk up while its commits are read: on a fresh import
+        // nothing is known and the lookup would otherwise only add latency.
+        // Heads of commits that turn out to be known are discarded.
+        let owned: Vec<Vec<u8>> = ids[next..end].iter().map(|s| s.to_vec()).collect();
+        let meta = backend.meta.clone();
+        let lookup = handle.spawn(async move {
+            let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+            meta.get_derived_many(COMMIT_KIND, &keys).await
+        });
+        let chunk_ids: Vec<Oid> = ids[next..end].iter().map(oid).collect();
+        let heads = read_heads(repo, &chunk_ids, threads);
+        let found = handle.block_on(lookup).context("commit lookup task")??;
+        let heads = heads?;
+        crate::rss::trim_mapped_packs(64 << 20);
         for (i, value) in (next..end).zip(found) {
-            match value {
-                Some(bytes) => {
-                    known.insert(
-                        i as u32,
-                        Known { ant: ObjectId::from_bytes(&bytes)?, generation: 0 },
-                    );
-                }
-                None => unknown.push(oid(&ids[i])),
+            if let Some(bytes) = value {
+                known.insert(i as u32, Known { ant: ObjectId::from_bytes(&bytes)?, generation: 0 });
             }
         }
-        let mut heads = read_heads(repo, &unknown, threads)?.into_iter();
-        crate::rss::trim_mapped_packs(64 << 20);
+        let mut heads = heads.into_iter();
         for i in next..end {
+            let head = heads.next().ok_or_else(|| anyhow!("commit reader lost a commit"))?;
             par_off.push(par.len() as u32);
             if known.contains_key(&(i as u32)) {
                 continue;
             }
-            let head = heads.next().ok_or_else(|| anyhow!("commit reader lost a commit"))?;
             trees[i] = head.tree;
             for p in head.parents {
                 let idx = *index.entry(p).or_insert_with(|| {

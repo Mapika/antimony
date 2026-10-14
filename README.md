@@ -172,6 +172,16 @@ Postgres, so S3 sees thousands of large requests instead of millions of small on
 For a one-off bulk load, `ANT_PG_BULK=1` commits object inserts without waiting for the
 WAL flush; commit records and refs still commit synchronously, so a crash can only lose
 objects that nothing references yet. `ANT_IMPORT_WORKERS` sets the conversion threads.
+The ref is published with a compare-and-swap against the tip the import started from: a
+land that moves the ref meanwhile is never overwritten (the import fails; its commits are
+recorded and a re-run publishes them). With `ANT_IMPORT_DEFERRED=1` on Postgres, objects,
+commits, changesets and mappings are acknowledged before their WAL flush. Each target ref
+gets a private witness lock (`import-witness/<ref>`, taken before any write; lands on the
+ref are not blocked), and before the swap the witness session commits a marker ref
+synchronously, which proves that no database crash happened and flushes everything before
+it. A crash mid-import leaves a consistent prefix and a re-run continues incrementally.
+It is off by default: it cuts `put_commits` about 10x but, in measurements on a
+disk-bound machine, the wait moved to the object writes without a net gain.
 
 ### Docker
 
