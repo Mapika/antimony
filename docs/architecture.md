@@ -52,9 +52,26 @@ when the ref has moved:
    merge, and genuine conflicts are reported per request without affecting
    the rest of the batch.
 3. Every request gets its own tree and commit, so history stays linear. The
-   batch is written with one `put_many`, one `put_commits` and one ref
-   compare-and-swap, then the `landed-as` mappings that make retries
-   idempotent.
+   batch is written with one `put_many` and one `put_commits`, then
+   published: one ref compare-and-swap plus the `landed-as` mappings that
+   make retries idempotent.
+4. Batches are pipelined: while one batch publishes, the next is replayed
+   and written against its tentative tip. The speculative batch publishes
+   only after its predecessor (its CAS expects the predecessor's tip) and is
+   redone from the real tip if the predecessor's publish mismatches or fails.
+
+**Durability of a land (Postgres).** The leader holds the ref's advisory
+lock on a dedicated session. The batch's objects, changesets and commit
+records are written with `synchronous_commit = off`; the publish (ref CAS
+plus mappings, one statement) is a synchronous commit *on the lock's
+session*. That gives one WAL flush per batch instead of four, and stays
+crash-safe: writes acknowledged before the publish precede it in the WAL,
+so its flush makes them durable too; and losing unflushed WAL takes a
+database crash or restart, which ends every session, so a publish that
+succeeds proves no such loss happened since the lock was taken. If the
+session died, the publish fails, the batch is aborted, and no ref ever
+points at lost objects. Without the lock (in-memory stores, lock
+unavailable) the writes, CAS and mappings are each durable on their own.
 
 `batch_equivalence` property tests prove that a batch gives exactly the same
 trees, commits and conflicts as landing the same requests one at a time.

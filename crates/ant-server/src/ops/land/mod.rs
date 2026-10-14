@@ -24,21 +24,25 @@
 //! descendant of the tip fast-forwards; anything else is rebased (with its
 //! whole unlanded first-parent stack, up to [`MAX_STACK`] commits).
 //!
-//! Concurrent requests are queued per backend and ref (`queue`). Before each
-//! batch the worker takes the store's writer lock for the ref
-//! (`RefStore::lock_ref`: a Postgres advisory lock, so server replicas on
-//! one database take turns instead of racing their CAS; requests arriving
-//! during the wait join the batch) and releases it after the CAS and the
-//! landed-as mappings; when the lock is unavailable it lands with CAS only.
-//! The detached worker replays up to 64 queued requests in arrival order in memory (`replay`),
-//! writes the new objects and commit records, then publishes the final tip
-//! with one CAS. Conflicts do not advance the tentative tip; each reply
-//! carries the request's own resulting commit (or the tip it conflicted
-//! with). On CAS mismatch the batch is replayed from the new tip, rebasing
-//! the original commits again; after [`MAX_LAND_ATTEMPTS`] attempts every
-//! request is `Aborted`. Landed-as mappings become durable after the CAS and
-//! before replying. Caller cancellation never cancels the worker. Under a
-//! policy, permissions are checked per request before it joins a batch
+//! Concurrent requests are queued per backend and ref (`queue`). A detached
+//! worker takes the store's writer lock for the ref (`RefStore::lock_ref`: a
+//! Postgres advisory lock, so server replicas on one database take turns
+//! instead of racing their CAS) and holds it for a short turn of batches;
+//! when the lock is unavailable it lands with CAS only. Each batch replays up
+//! to 64 queued requests in arrival order in memory (`replay`), writes the
+//! new objects and commit records, then publishes the final tip with one
+//! CAS. Batches are pipelined: the next batch is replayed and written
+//! against the tentative tip while the previous one publishes, and is
+//! redone if that publish mismatches or fails. Conflicts do not advance the
+//! tentative tip; each reply carries the request's own resulting commit (or
+//! the tip it conflicted with). On CAS mismatch the batch is replayed from
+//! the new tip, rebasing the original commits again; after
+//! [`MAX_LAND_ATTEMPTS`] attempts every request is `Aborted`. Landed-as
+//! mappings are durable before replying: on Postgres they are committed
+//! together with the ref move, on the lock's session, in the one durable
+//! commit that also makes the batch's deferred-durability writes durable
+//! (`RefLock::publish`). Caller cancellation never cancels the worker. Under
+//! a policy, permissions are checked per request before it joins a batch
 //! (`verify`).
 
 mod queue;
@@ -150,3 +154,6 @@ mod group_tests;
 
 #[cfg(test)]
 mod batch_equivalence;
+
+#[cfg(test)]
+mod pipeline_tests;
