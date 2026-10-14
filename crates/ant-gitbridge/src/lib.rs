@@ -62,6 +62,7 @@ mod read;
 mod rss;
 mod tree;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -110,18 +111,42 @@ pub struct ImportStats {
     pub blobs: u64,
 }
 
+/// Called by the recorder after each object batch is stored (argument: the
+/// number of batches so far), once everything pending has been recorded.
+/// Tests use it to fail or pause an import at a known point.
+#[derive(Clone)]
+pub(crate) struct BatchHook(pub Arc<dyn Fn(usize) -> anyhow::Result<()> + Send + Sync>);
+
+impl std::fmt::Debug for BatchHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BatchHook")
+    }
+}
+
 /// Knobs for benchmarking and tests; the defaults suit production. Environment:
-/// `ANT_IMPORT_WORKERS`, `ANT_IMPORT_MEMO_ENTRIES`.
+/// `ANT_IMPORT_WORKERS`, `ANT_IMPORT_MEMO_ENTRIES`, `ANT_IMPORT_DEFERRED`.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Tuning {
     pub workers: Option<usize>,
     pub memo_entries: Option<usize>,
+    /// Commits per `put_commits` (default [`RECORD_COMMITS`]).
+    pub record_commits: Option<usize>,
+    /// Use deferred durability where the store supports it (see [`Publisher`]).
+    /// Off by default: it makes commit recording 10x cheaper but, on the
+    /// machines measured, only moves the wait to the object writes.
+    pub deferred: bool,
+    pub on_batch: Option<BatchHook>,
 }
 
 impl Tuning {
     fn from_env() -> Self {
         let get = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok());
-        Self { workers: get("ANT_IMPORT_WORKERS"), memo_entries: get("ANT_IMPORT_MEMO_ENTRIES") }
+        Self {
+            workers: get("ANT_IMPORT_WORKERS"),
+            memo_entries: get("ANT_IMPORT_MEMO_ENTRIES"),
+            deferred: std::env::var_os("ANT_IMPORT_DEFERRED").is_some_and(|v| v != "0"),
+            ..Self::default()
+        }
     }
 
     fn workers(&self) -> usize {
@@ -173,7 +198,11 @@ pub(crate) async fn import_tuned(
     tuning: Tuning,
 ) -> anyhow::Result<ImportStats> {
     let batch_objects = opts.batch_objects.max(1);
-    let locks = Locks::acquire(backend, &opts.refs).await?;
+    let publisher = Publisher::acquire(backend, &opts.refs, tuning.deferred).await?;
+    let recorder = Recorder {
+        commits: tuning.record_commits.unwrap_or(RECORD_COMMITS).max(1),
+        hook: tuning.on_batch.clone(),
+    };
     let (tx, rx) = mpsc::channel::<Msg>(4);
     let producer = {
         let repo = repo.to_path_buf();
@@ -185,7 +214,7 @@ pub(crate) async fn import_tuned(
         })
     };
     let mut stats = ImportStats::default();
-    let written = write(backend, rx, &mut stats, locks).await;
+    let written = write(backend, rx, &mut stats, publisher, recorder).await;
     let produced = producer.await?;
     written?;
     produced?;
@@ -203,58 +232,138 @@ struct Counts {
     blobs: u64,
 }
 
-/// Writer locks on the refs being imported.
-///
-/// When the store can publish through a lock (Postgres: a session opened
-/// before any write below), the import runs with deferred durability:
-/// objects, commits, changesets and mappings are acknowledged before their
-/// WAL flush, which removes a synchronous flush per statement from the
-/// serial recording path. Crash safety:
-/// - The database log is sequential and a crash loses only a suffix of it.
-///   Every write below is acknowledged before the writes that depend on it
-///   are sent (objects before the commits naming them, commits before their
-///   mappings), so whatever survives a crash is a consistent prefix: a
-///   re-run finds the surviving mappings and continues incrementally.
-/// - A ref moves only through [`ant_store::RefLock::publish`], one
-///   synchronous commit on the lock's own session. That session predates the
-///   deferred writes and a crash ends it, so a successful publish proves no
-///   crash happened and flushes every earlier write with it. Nothing is
-///   reachable from a ref before it is durable.
-///
-/// Stores without such locks write synchronously, as before.
-struct Locks {
-    held: Vec<(String, ant_store::RefLock)>,
+struct Recorder {
+    commits: usize,
+    hook: Option<BatchHook>,
 }
 
-impl Locks {
-    async fn acquire(backend: &Backend, refs: &[(String, String)]) -> anyhow::Result<Self> {
+/// Moves the imported refs, and decides whether the import may use deferred
+/// durability.
+///
+/// When the store has real ref locks (Postgres) every target ref gets a
+/// *witness*: a lock on the private name `import-witness/<ref>`, taken before
+/// any write and held to the end. It is not the target ref's own lock, so
+/// lands on the target ref are not blocked while the import runs.
+///
+/// With witnesses the import runs with deferred durability: objects,
+/// commits, changesets and mappings are acknowledged before their WAL flush,
+/// which removes a synchronous flush per statement from the serial recording
+/// path. Crash safety:
+/// - The database log is sequential and a crash loses only a suffix of it.
+///   Every write is acknowledged before the writes that depend on it are sent
+///   (objects before the commits naming them, commits before their
+///   mappings), so whatever survives a crash is a consistent prefix: a
+///   re-run finds the surviving mappings and continues incrementally.
+/// - Before a ref moves, the witness publishes a marker ref (one synchronous
+///   commit on the witness session, then removed). The session predates the
+///   deferred writes and a crash ends it, so this proves that no crash
+///   happened and flushes every earlier write with it. Only then is the
+///   target ref's lock taken, for the length of one compare-and-swap.
+///
+/// The swap is against the tip the import started from (per ref, updated as
+/// the import moves it): if the ref moved meanwhile (a land), the import
+/// stops with an error. Its commits stay recorded and a re-run publishes
+/// them without converting anything. Two imports of one ref exclude each
+/// other through the witness. Stores without real locks write synchronously.
+struct Publisher {
+    witnesses: Vec<Witness>,
+    /// Tip of each ref as this import last saw it.
+    expected: HashMap<String, Option<ObjectId>>,
+}
+
+struct Witness {
+    ant_ref: String,
+    marker: String,
+    lock: ant_store::RefLock,
+}
+
+impl Publisher {
+    async fn acquire(
+        backend: &Backend,
+        refs: &[(String, String)],
+        defer: bool,
+    ) -> anyhow::Result<Self> {
         let mut names: Vec<&str> = refs.iter().map(|(_, a)| a.as_str()).collect();
         names.sort_unstable();
         names.dedup();
-        let mut held = Vec::with_capacity(names.len());
+        let mut witnesses = Vec::new();
+        let mut expected = HashMap::new();
         for name in names {
-            let lock = backend
-                .refs
-                .lock_ref(name)
-                .await
-                .with_context(|| format!("locking ref {name} for import"))?;
-            held.push((name.to_string(), lock));
+            if defer {
+                let marker = format!("import-witness/{name}");
+                let lock = backend
+                    .refs
+                    .lock_ref(&marker)
+                    .await
+                    .with_context(|| format!("locking import witness for ref {name}"))?;
+                if lock.can_publish() {
+                    // Left behind by an import that died between marker and removal.
+                    if let Some(stale) = backend.refs.get_ref(&marker).await? {
+                        backend.refs.cas_ref(&marker, Some(stale), None).await?;
+                    }
+                    witnesses.push(Witness { ant_ref: name.to_string(), marker, lock });
+                }
+            }
+            expected.insert(name.to_string(), backend.refs.get_ref(name).await?);
         }
-        Ok(Self { held })
+        Ok(Self { witnesses, expected })
     }
 
-    /// Whether every ref can be published through its lock.
+    /// Whether every ref has a witness (deferred durability is safe).
     fn deferred(&self) -> bool {
-        !self.held.is_empty() && self.held.iter().all(|(_, l)| l.can_publish())
+        !self.witnesses.is_empty() && self.witnesses.len() == self.expected.len()
     }
 
-    fn get(&mut self, name: &str) -> Option<&mut ant_store::RefLock> {
-        self.held.iter_mut().find(|(n, _)| n == name).map(|(_, l)| l)
+    /// Point `ant_ref` at `id`, durably, if it still is where the import left it.
+    async fn publish(
+        &mut self,
+        backend: &Backend,
+        ant_ref: &str,
+        id: ObjectId,
+    ) -> anyhow::Result<()> {
+        let expected = self.expected.get(ant_ref).copied().flatten();
+        let outcome = if self.deferred() {
+            let w = self
+                .witnesses
+                .iter_mut()
+                .find(|w| w.ant_ref == ant_ref)
+                .ok_or_else(|| anyhow!("no import witness for ref {ant_ref}"))?;
+            match w.lock.publish(None, id, "import.witness", Vec::new()).await? {
+                CasOutcome::Updated => {}
+                CasOutcome::Mismatch { .. } => bail!("marker ref {} already exists", w.marker),
+            }
+            let marker = w.marker.clone();
+            let mut real = backend
+                .refs
+                .lock_ref(ant_ref)
+                .await
+                .with_context(|| format!("locking ref {ant_ref} to publish the import"))?;
+            let swapped = if real.can_publish() {
+                real.publish(expected, id, "import.tip", Vec::new()).await
+            } else {
+                backend.refs.cas_ref(ant_ref, expected, Some(id)).await
+            };
+            let _ = real.release().await;
+            backend.refs.cas_ref(&marker, Some(id), None).await?;
+            swapped?
+        } else {
+            backend.refs.cas_ref(ant_ref, expected, Some(id)).await?
+        };
+        match outcome {
+            CasOutcome::Updated => {
+                self.expected.insert(ant_ref.to_string(), Some(id));
+                Ok(())
+            }
+            CasOutcome::Mismatch { actual } => bail!(
+                "ref {ant_ref} moved during the import (now {actual:?}); the imported commits are \
+                 recorded, re-run the import to publish them"
+            ),
+        }
     }
 
     async fn release(self) {
-        for (_, lock) in self.held {
-            let _ = lock.release().await;
+        for w in self.witnesses {
+            let _ = w.lock.release().await;
         }
     }
 }
@@ -268,11 +377,12 @@ async fn write(
     backend: &Backend,
     mut rx: mpsc::Receiver<Msg>,
     stats: &mut ImportStats,
-    locks: Locks,
+    publisher: Publisher,
+    config: Recorder,
 ) -> anyhow::Result<()> {
-    let deferred = locks.deferred();
+    let deferred = publisher.deferred();
     let (rec_tx, rec_rx) = mpsc::channel::<Item>(RECORD_QUEUE);
-    let recorder = tokio::spawn(record(backend.clone(), rec_rx, locks));
+    let recorder = tokio::spawn(record(backend.clone(), rec_rx, publisher, config));
     let budget = Arc::new(Semaphore::new(INFLIGHT_BYTES >> 20));
     while let Some(msg) = rx.recv().await {
         let item = match msg {
@@ -308,23 +418,26 @@ async fn write(
 async fn record(
     backend: Backend,
     rx: mpsc::Receiver<Item>,
-    mut locks: Locks,
+    mut publisher: Publisher,
+    config: Recorder,
 ) -> anyhow::Result<ImportStats> {
-    let result = if locks.deferred() {
-        ant_store::deferred_durability(record_inner(&backend, rx, &mut locks)).await
+    let result = if publisher.deferred() {
+        ant_store::deferred_durability(record_inner(&backend, rx, &mut publisher, &config)).await
     } else {
-        record_inner(&backend, rx, &mut locks).await
+        record_inner(&backend, rx, &mut publisher, &config).await
     };
-    locks.release().await;
+    publisher.release().await;
     result
 }
 
 async fn record_inner(
     backend: &Backend,
     mut rx: mpsc::Receiver<Item>,
-    locks: &mut Locks,
+    publisher: &mut Publisher,
+    config: &Recorder,
 ) -> anyhow::Result<ImportStats> {
-    let deferred = locks.deferred();
+    let deferred = publisher.deferred();
+    let mut batches = 0usize;
     let mut stats = ImportStats::default();
     let mut pending: Vec<NewCommit> = Vec::new();
     let mut mapping_task: Option<JoinHandle<anyhow::Result<()>>> = None;
@@ -370,8 +483,16 @@ async fn record_inner(
                 stats.trees += counts.trees;
                 stats.blobs += counts.blobs;
                 pending.extend(commits);
-                if pending.len() >= RECORD_COMMITS {
+                batches += 1;
+                if pending.len() >= config.commits {
                     flush(deferred, backend, &mut pending, &mut mapping_task, &mut stats).await?;
+                }
+                if let Some(hook) = &config.hook {
+                    flush(deferred, backend, &mut pending, &mut mapping_task, &mut stats).await?;
+                    if let Some(prev) = mapping_task.take() {
+                        prev.await.context("mapping writer")??;
+                    }
+                    tokio::task::block_in_place(|| (hook.0)(batches))?;
                 }
             }
             Item::Tip { ant_ref, id, ack } => {
@@ -379,17 +500,7 @@ async fn record_inner(
                 if let Some(prev) = mapping_task.take() {
                     prev.await.context("mapping writer")??;
                 }
-                let expected = backend.refs.get_ref(&ant_ref).await?;
-                let outcome = match locks.get(&ant_ref).filter(|l| l.can_publish()) {
-                    Some(lock) => lock.publish(expected, id, "import.tip", Vec::new()).await?,
-                    None => backend.refs.cas_ref(&ant_ref, expected, Some(id)).await?,
-                };
-                match outcome {
-                    CasOutcome::Updated => {}
-                    CasOutcome::Mismatch { actual } => {
-                        bail!("ref {ant_ref} changed during import (now {actual:?})")
-                    }
-                }
+                publisher.publish(backend, &ant_ref, id).await?;
                 let _ = ack.send(());
             }
         }
@@ -898,7 +1009,7 @@ mod tests {
         let mut first_tip = None;
         for (workers, memo_entries) in [(1, Some(1024)), (4, None), (3, Some(1024))] {
             let b = Backend::in_memory();
-            let tuning = Tuning { workers: Some(workers), memo_entries };
+            let tuning = Tuning { workers: Some(workers), memo_entries, ..Tuning::default() };
             let mut opts = ImportOptions::single("refs/heads/main", "main");
             opts.batch_objects = 7;
             let stats = import_tuned(&src, &b, &opts, tuning).await.unwrap();
@@ -923,5 +1034,235 @@ mod tests {
                 assert_eq!(b.meta.get_changeset(id).await.unwrap().unwrap(), want, "{id}");
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Postgres: deferred durability, interruption, concurrent lands
+    // -----------------------------------------------------------------------
+
+    use ant_store::postgres::PgStore;
+    use std::sync::Mutex;
+    use std::sync::mpsc as std_mpsc;
+
+    async fn pg_backend() -> Backend {
+        let url = std::env::var("ANT_TEST_PG_URL")
+            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let schema = format!("t_imp_{}_{nanos}", std::process::id());
+        let pg = Arc::new(
+            PgStore::connect_scratch(&url, &schema)
+                .await
+                .expect("connect (is `scripts/dev-services.sh start` running?)"),
+        );
+        Backend { objects: pg.clone(), refs: pg.clone(), meta: pg }
+    }
+
+    /// `n` commits in a line, each touching one of a few files.
+    fn make_linear(root: &Path, n: usize) -> PathBuf {
+        let r = root.join("lin");
+        std::fs::create_dir(&r).unwrap();
+        git(&r, &["init", "-q", "-b", "main"]);
+        for i in 0..n {
+            std::fs::write(r.join(format!("f{}.txt", i % 4)), format!("content {i}\n")).unwrap();
+            git(&r, &["add", "-A"]);
+            git(&r, &["commit", "-qm", &format!("commit {i}")]);
+        }
+        r
+    }
+
+    type Snapshot =
+        (Vec<ObjectId>, Vec<Option<ant_store::CommitNode>>, Vec<Option<Vec<PathChange>>>);
+
+    async fn snapshot(b: &Backend) -> Snapshot {
+        let log: Vec<ObjectId> =
+            b.meta.tail(0, usize::MAX).await.unwrap().into_iter().map(|(_, id)| id).collect();
+        let nodes = b.meta.get_commits(&log).await.unwrap();
+        let sets = b.meta.get_changesets(&log).await.unwrap();
+        (log, nodes, sets)
+    }
+
+    fn small_batches(workers: usize) -> (ImportOptions, Tuning) {
+        let mut opts = ImportOptions::single("refs/heads/main", "main");
+        opts.batch_objects = 1;
+        (
+            opts,
+            Tuning {
+                workers: Some(workers),
+                record_commits: Some(2),
+                deferred: true,
+                ..Tuning::default()
+            },
+        )
+    }
+
+    /// The deferred path stores exactly what the synchronous path stores.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs postgres: scripts/dev-services.sh start"]
+    async fn pg_deferred_import_equals_synchronous_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = make_linear(tmp.path(), 12);
+        let (opts, tuning) = small_batches(2);
+
+        let deferred = pg_backend().await;
+        let p = Publisher::acquire(&deferred, &opts.refs, true).await.unwrap();
+        assert!(p.deferred(), "postgres must take the deferred path");
+        p.release().await;
+        let a = import_tuned(&src, &deferred, &opts, tuning.clone()).await.unwrap();
+
+        let sync = pg_backend().await;
+        let sync_tuning = Tuning { deferred: false, ..tuning };
+        let b = import_tuned(&src, &sync, &opts, sync_tuning).await.unwrap();
+
+        assert_eq!(a, b);
+        assert_eq!(a.commits, 12);
+        assert_eq!(snapshot(&deferred).await, snapshot(&sync).await);
+        let tip = deferred.refs.get_ref("main").await.unwrap();
+        assert!(tip.is_some());
+        assert_eq!(tip, sync.refs.get_ref("main").await.unwrap());
+        assert_eq!(deferred.refs.get_ref("import-witness/main").await.unwrap(), None);
+        assert_eq!(deferred.refs.list_refs("").await.unwrap().len(), 1, "no marker refs remain");
+    }
+
+    /// An import that dies midway publishes nothing; a re-run continues
+    /// from what was recorded and ends in the same state as an undisturbed one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs postgres: scripts/dev-services.sh start"]
+    async fn pg_interrupted_import_resumes_incrementally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = make_linear(tmp.path(), 12);
+        let (opts, tuning) = small_batches(2);
+
+        let b = pg_backend().await;
+        let fail = Tuning {
+            on_batch: Some(BatchHook(Arc::new(|n| {
+                if n == 6 { Err(anyhow!("failpoint")) } else { Ok(()) }
+            }))),
+            ..tuning.clone()
+        };
+        let err = import_tuned(&src, &b, &opts, fail).await.unwrap_err();
+        assert!(format!("{err:#}").contains("failpoint"), "{err:#}");
+        assert_eq!(b.refs.get_ref("main").await.unwrap(), None, "ref must not move");
+        assert_eq!(b.refs.get_ref("import-witness/main").await.unwrap(), None);
+        let recorded = b.meta.tail(0, usize::MAX).await.unwrap().len();
+        assert!((1..12).contains(&recorded), "partial prefix recorded, got {recorded}");
+
+        let resumed = import_tuned(&src, &b, &opts, tuning.clone()).await.unwrap();
+        assert_eq!(resumed.commits as usize, 12 - recorded, "only the rest is converted");
+
+        let clean = pg_backend().await;
+        import_tuned(&src, &clean, &opts, tuning).await.unwrap();
+        // Same commits, nodes, changesets and tip (the log order of the resumed
+        // run is its own parents-first order).
+        let (mut log_a, ..) = snapshot(&b).await;
+        let (mut log_b, ..) = snapshot(&clean).await;
+        log_a.sort();
+        log_b.sort();
+        assert_eq!(log_a, log_b);
+        let tip = b.refs.get_ref("main").await.unwrap();
+        assert_eq!(tip, clean.refs.get_ref("main").await.unwrap());
+        let tip = tip.unwrap();
+        assert_eq!(
+            b.meta.get_commits(&[tip]).await.unwrap(),
+            clean.meta.get_commits(&[tip]).await.unwrap()
+        );
+        assert_eq!(
+            b.meta.get_changesets(&log_a).await.unwrap(),
+            clean.meta.get_changesets(&log_a).await.unwrap()
+        );
+    }
+
+    /// Stops the import at its second batch, runs `during`, then lets it go on.
+    async fn import_paused<F, Fut>(
+        src: &Path,
+        b: &Backend,
+        during: F,
+    ) -> anyhow::Result<ImportStats>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let (opts, tuning) = small_batches(2);
+        let (at_tx, at_rx) = std_mpsc::channel::<()>();
+        let (go_tx, go_rx) = std_mpsc::channel::<()>();
+        let (at_tx, go_rx) = (Mutex::new(at_tx), Mutex::new(go_rx));
+        let tuning = Tuning {
+            on_batch: Some(BatchHook(Arc::new(move |n| {
+                if n == 2 {
+                    let _ = at_tx.lock().unwrap().send(());
+                    let _ = go_rx.lock().unwrap().recv();
+                }
+                Ok(())
+            }))),
+            ..tuning
+        };
+        let (src, bb) = (src.to_path_buf(), b.clone());
+        let import = tokio::spawn(async move { import_tuned(&src, &bb, &opts, tuning).await });
+        tokio::task::spawn_blocking(move || at_rx.recv()).await.unwrap().unwrap();
+        during().await;
+        go_tx.send(()).unwrap();
+        import.await.unwrap()
+    }
+
+    /// Lands on other refs, and lock + swap on the imported ref, proceed
+    /// while the import is running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs postgres: scripts/dev-services.sh start"]
+    async fn pg_lands_proceed_during_an_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = make_linear(tmp.path(), 8);
+        let b = pg_backend().await;
+        let id = ObjectId::from_bytes(&[7u8; 32]).unwrap();
+        let during = || async {
+            let wait = std::time::Duration::from_secs(5);
+            // Another ref: lock, swap.
+            let mut other = tokio::time::timeout(wait, b.refs.lock_ref("other"))
+                .await
+                .expect("lock on another ref")
+                .unwrap();
+            assert!(other.publish(None, id, "t", vec![]).await.is_ok());
+            other.release().await.unwrap();
+            // The imported ref itself: a land takes its lock freely.
+            let lock = tokio::time::timeout(wait, b.refs.lock_ref("main"))
+                .await
+                .expect("lock on the imported ref")
+                .unwrap();
+            assert_eq!(b.refs.get_ref("main").await.unwrap(), None);
+            lock.release().await.unwrap();
+        };
+        import_paused(&src, &b, during).await.unwrap();
+        assert!(b.refs.get_ref("main").await.unwrap().is_some());
+        assert_eq!(b.refs.get_ref("other").await.unwrap(), Some(id));
+    }
+
+    /// A land that moves the imported ref meanwhile is never overwritten: the
+    /// import fails clearly, and a re-run publishes without converting again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs postgres: scripts/dev-services.sh start"]
+    async fn pg_import_does_not_overwrite_a_ref_that_moved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = make_linear(tmp.path(), 8);
+        let b = pg_backend().await;
+        let id = ObjectId::from_bytes(&[9u8; 32]).unwrap();
+        let during = || async {
+            let lock = b.refs.lock_ref("main").await.unwrap();
+            assert!(matches!(
+                b.refs.cas_ref("main", None, Some(id)).await.unwrap(),
+                CasOutcome::Updated
+            ));
+            lock.release().await.unwrap();
+        };
+        let err = import_paused(&src, &b, during).await.unwrap_err();
+        assert!(format!("{err:#}").contains("moved during the import"), "{err:#}");
+        assert_eq!(b.refs.get_ref("main").await.unwrap(), Some(id));
+        assert_eq!(b.refs.get_ref("import-witness/main").await.unwrap(), None);
+
+        // The operator resets the ref; nothing is converted again.
+        b.refs.cas_ref("main", Some(id), None).await.unwrap();
+        let (opts, tuning) = small_batches(2);
+        let again = import_tuned(&src, &b, &opts, tuning).await.unwrap();
+        assert_eq!(again.commits, 0);
+        assert!(b.refs.get_ref("main").await.unwrap().is_some());
     }
 }
