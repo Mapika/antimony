@@ -26,13 +26,16 @@
 //! acknowledged before its copy into the upper file (`overlay::Pending`), so
 //! a sequential writer's next request overlaps it; reads, attributes, flush,
 //! fsync and truncation of that inode wait for writes in flight, and
-//! overlapping writes apply in order. Namespace operations serialize on the
-//! overlay mutex; mutations also hold the state lock so `status`/`reset`
-//! (other processes) see whole operations. `reset` on a live mount appends a
-//! journal record; the daemon notices the journal size change with one
-//! `fstat` per namespace operation and reloads. If `reset` prunes an upper
-//! file that is still open for writing, the next write, flush or fsync on it
-//! sees `nlink == 0` and publishes the file again, with its writes.
+//! overlapping writes apply in order. `status` reads upper files directly, so
+//! it sees a write once that copy completes (microseconds after the reply),
+//! and always once the file is closed or synced. Namespace operations
+//! serialize on the overlay mutex; mutations also hold the state lock so
+//! `status`/`reset` (other processes) see whole operations. `reset` on a
+//! live mount appends a journal record; the daemon notices the journal size
+//! change with one `fstat` per namespace operation and reloads. If `reset`
+//! prunes an upper file that is still open for writing, the next write,
+//! flush or fsync on it sees `nlink == 0` and publishes the file again, with
+//! its writes.
 //!
 //! # Crash semantics
 //!
