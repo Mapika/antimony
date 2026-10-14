@@ -154,10 +154,12 @@ pub trait ObjectStoreExt: ObjectStore {
         Ok(Tree::decode(o.body())?)
     }
 
+    /// Stored commits are read leniently: imported history keeps its exact
+    /// bytes, which may hold signature lines the strict decoder rejects.
     async fn read_commit(&self, id: &ObjectId) -> Result<Commit> {
         let o = self.get_required(id).await?;
         expect_kind(id, &o, ObjectKind::Commit)?;
-        Ok(Commit::decode(o.body())?)
+        Ok(Commit::decode_lenient(o.body())?)
     }
 
     async fn read_blob(&self, id: &ObjectId) -> Result<Bytes> {

@@ -8,12 +8,12 @@
 
 use std::sync::Arc;
 
-use ant_core::{Commit, EncodedObject, EntryMode, ObjectId, ObjectKind, Tree, TreeEntry};
+use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, Tree, TreeEntry};
 use ant_store::{CommitNode, PathChange};
 use anyhow::{anyhow, bail};
 use tokio::sync::mpsc;
 
-use crate::commit::Oid;
+use crate::commit::{Oid, rewrite_ids};
 use crate::graph::Graph;
 use crate::memo::{Memo, Sha1};
 use crate::prep::Prep;
@@ -169,16 +169,8 @@ impl<'g> Converter<'g> {
             out.push(PathChange { path: c.path, kind: c.kind, old, new });
         }
 
-        let committer_time = raw.committer.time;
-        let commit = Commit {
-            tree,
-            parents: parents.clone(),
-            author: raw.author,
-            committer: raw.committer,
-            extra_headers: raw.extra_headers,
-            message: raw.message,
-        };
-        let obj = EncodedObject::new(ObjectKind::Commit, &commit.encode());
+        let committer_time = raw.committer_time;
+        let obj = EncodedObject::new(ObjectKind::Commit, &rewrite_ids(&raw, &tree, &parents)?);
         let id = obj.id();
         self.ant[idx as usize] = id;
         self.generation[idx as usize] = generation;
