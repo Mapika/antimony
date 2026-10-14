@@ -87,8 +87,8 @@ cache hit can never hide a missing object.
   `Blame` over gRPC.
 - **Path history:** each ref has an index (`history` table) of which commits
   touched which paths along its first-parent chain. It is maintained in the
-  background after lands (`ops/history.rs`, coalesced per ref) and makes
-  `log --path` and blame independent of history length. On a busy ref the
+  background after lands and ref updates (`ops/history.rs`, coalesced per
+  ref) and makes `log --path` and blame independent of history length. On a busy ref the
   index trails the tip by the commits landed since the last catch-up; a path
   log scans only that lag and takes the rest from the index.
 - **Diff:** tree diffs walk both trees breadth first with one batched read
@@ -142,8 +142,8 @@ and an axum middleware around the HTTP router assign the request id (incoming
 `x-request-id` or a ULID, a tracing span field, echoed on the response),
 record `ant_rpc_*` / `ant_http_*` and log slow requests. Stores are wrapped
 once by `Metrics::instrument` (per-op timing and error counts). Landing and
-history report through `Option<Arc<Metrics>>` parameters (`land_observed`,
-`catch_up_observed`); state that lives in process-wide statics (cache sizes
+history report through `Option<&Arc<Metrics>>` parameters (`land_observed`,
+`schedule_catch_up`); state that lives in process-wide statics (cache sizes
 and lookup counters, land queues) is read at scrape time. See
 `operations.md` for the exposed series.
 
