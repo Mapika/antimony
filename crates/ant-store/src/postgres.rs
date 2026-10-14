@@ -34,9 +34,11 @@
 //!   derived writes commit with `SET LOCAL synchronous_commit = off`.
 //! - Garbage collection ([`gc`]): objects, packed-object index rows, commits
 //!   and changesets carry their write time (`written_at`). Readers treat ids
-//!   condemned by a collection run (`gc_condemned`) as missing; storing an
-//!   object that already exists refreshes an old write time and takes the id
-//!   back from `gc_condemned` (see [`gc`] for why that makes deletion safe).
+//!   condemned by a collection run (`gc_condemned`) as missing (object and
+//!   index rows only while older than the run's cutoff); storing an object
+//!   that already exists refreshes an old write time and takes the id back
+//!   from `gc_condemned` in one transaction (see [`gc`] for why that makes
+//!   deletion safe and reads see every completed write).
 
 use std::collections::{HashMap, HashSet};
 
@@ -283,16 +285,32 @@ impl PgStore {
         query: PgQuery<'_>,
         deferred: bool,
     ) -> Result<Vec<sqlx::postgres::PgRow>> {
-        #[cfg(test)]
-        let _ = gc::tests::WRITES.try_with(|n| n.set(n.get() + 1));
+        self.count_write();
         if !deferred {
             return query.fetch_all(&self.pool).await.map_err(be);
         }
-        let mut tx =
-            self.pool.begin_with("BEGIN; SET LOCAL synchronous_commit = off").await.map_err(be)?;
+        let mut tx = self.begin_write(true).await?;
         let rows = query.fetch_all(&mut *tx).await.map_err(be)?;
         tx.commit().await.map_err(be)?;
         Ok(rows)
+    }
+
+    /// Begin a write transaction (`deferred`: see [`Self::write`]).
+    async fn begin_write(
+        &self,
+        deferred: bool,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+        if deferred {
+            self.pool.begin_with("BEGIN; SET LOCAL synchronous_commit = off").await.map_err(be)
+        } else {
+            self.pool.begin().await.map_err(be)
+        }
+    }
+
+    /// Count a write statement (tests pin how many a call issues).
+    fn count_write(&self) {
+        #[cfg(test)]
+        let _ = gc::tests::WRITES.try_with(|n| n.set(n.get() + 1));
     }
 
     /// Whether object writes are deferred (bulk mode or a deferred scope).
@@ -351,7 +369,8 @@ impl PgStore {
     ) -> Result<HashMap<ObjectId, IndexEntry>> {
         let sql = if gc::hiding() {
             "SELECT id, pack, off, len FROM object_index x WHERE id = ANY($1) \
-             AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = x.id)"
+             AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = x.id \
+                 AND x.written_at < (SELECT coalesce(max(cutoff), 'infinity') FROM gc_state))"
         } else {
             "SELECT id, pack, off, len FROM object_index WHERE id = ANY($1)"
         };
@@ -659,7 +678,8 @@ impl ObjectStore for PgStore {
         }
         let sql = if gc::hiding() {
             "SELECT id, data FROM objects o WHERE id = ANY($1) \
-             AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = o.id)"
+             AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = o.id \
+                 AND o.written_at < (SELECT coalesce(max(cutoff), 'infinity') FROM gc_state))"
         } else {
             "SELECT id, data FROM objects WHERE id = ANY($1)"
         };
@@ -762,7 +782,8 @@ impl ObjectStore for PgStore {
         }
         let sql = if gc::hiding() {
             "SELECT id FROM objects o WHERE id = ANY($1) \
-             AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = o.id)"
+             AND NOT EXISTS (SELECT 1 FROM gc_condemned g WHERE g.id = o.id \
+                 AND o.written_at < (SELECT coalesce(max(cutoff), 'infinity') FROM gc_state))"
         } else {
             "SELECT id FROM objects WHERE id = ANY($1)"
         };

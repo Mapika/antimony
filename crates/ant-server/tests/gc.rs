@@ -533,6 +533,17 @@ async fn gc_races_a_fleet_of_writers_without_losing_reachable_data() {
         b.objects.put_many(std::slice::from_ref(&blob)).await.unwrap();
         old_blobs.push(blob);
     }
+    // Old garbage nobody touches. The writers can bring back all of theirs
+    // before a collection marks (they cycle through it within a few dozen
+    // operations each), so only this is certain to be deleted.
+    let mut untouched = Vec::new();
+    for i in 0..4 {
+        let content = format!("untouched {i}\n").into_bytes();
+        untouched.push(changeset(&b, Some(tip), &[(&format!("untouched/c{i}"), &content)]).await);
+    }
+    let stray = EncodedObject::new(ObjectKind::Blob, b"untouched blob\n");
+    b.objects.put_many(std::slice::from_ref(&stray)).await.unwrap();
+    untouched.push(stray.id());
     age(&r.schema, 30).await;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -617,6 +628,10 @@ async fn gc_races_a_fleet_of_writers_without_losing_reachable_data() {
     for _ in 0..2 {
         let report = gc(&r, &o).await;
         assert!(report.finished, "{report:?}");
+        eprintln!(
+            "collection: condemned {}, deleted {} objects and {} commits, kept {}",
+            report.condemned, report.objects, report.commits, report.kept
+        );
         total += report.objects + report.commits;
     }
     stop.store(true, Ordering::Relaxed);
@@ -624,6 +639,9 @@ async fn gc_races_a_fleet_of_writers_without_losing_reachable_data() {
         w.await.unwrap();
     }
     assert!(total > 0, "the collections deleted nothing");
+    for id in &untouched {
+        assert_eq!(stored(&r.schema, id).await, 0, "untouched garbage {id} was kept");
+    }
     assert!(lands.load(Ordering::Relaxed) > 0 && reused.load(Ordering::Relaxed) > 0);
     eprintln!(
         "deleted {total}; landed old {}, reused blobs {}, pointed refs {}, lands {}",
