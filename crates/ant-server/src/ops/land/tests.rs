@@ -4,11 +4,7 @@ use ant_store::ObjectStoreExt;
 use ant_store::graph::is_ancestor;
 
 use super::*;
-use crate::ops::test_support::{commit, delete, read, write};
-
-async fn tip(b: &Backend) -> ObjectId {
-    b.refs.get_ref("main").await.unwrap().unwrap()
-}
+use crate::ops::test_support::{commit, delete, read, tip, write};
 
 #[tokio::test]
 async fn create_and_fast_forward() {

@@ -1,13 +1,19 @@
-//! Shared helpers for the property tests: an independent tree builder/reader
-//! (does not use the code under test) and commit helpers.
+//! Shared helpers for the integration tests: an independent tree
+//! builder/reader (does not use the code under test), commit and changeset
+//! helpers, Postgres scratch stores and a counting ref store (`pg`), and
+//! protobuf request builders (`wire`).
 #![allow(dead_code)]
+
+pub mod pg;
+pub mod wire;
 
 use std::collections::BTreeMap;
 
 use ant_core::{
-    Commit, EncodedObject, EntryMode, Object, ObjectId, ObjectKind, Signature, Tree, TreeEntry,
-    hash_object,
+    Commit, EncodedObject, EntryMode, Object, ObjectId, ObjectKind, RepoPath, Signature, Tree,
+    TreeEntry, hash_object,
 };
+use ant_server::ops::changeset::{FileOp, WriteContent};
 use ant_store::graph::write_commit;
 use ant_store::{Backend, ObjectStoreExt};
 
@@ -64,6 +70,15 @@ pub async fn store_model(b: &Backend, model: &Model) -> ObjectId {
     let id = build(&nest(model), &mut objs);
     b.objects.put_many(&objs).await.unwrap();
     id
+}
+
+/// An inline write of a regular file (an `ops::changeset` op).
+pub fn write(path: &str, content: impl Into<bytes::Bytes>) -> FileOp {
+    FileOp::Write {
+        path: RepoPath::new(path).unwrap(),
+        mode: EntryMode::File,
+        content: WriteContent::Inline(content.into()),
+    }
 }
 
 pub fn sig() -> Signature {

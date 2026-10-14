@@ -3,90 +3,13 @@
 //! predecessor's CAS mismatches or fails, and sees the predecessor's
 //! unpublished landed-as mappings.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::Ordering;
 
-use ant_store::{CasOutcome, ObjectStoreExt, RefStore, StoreError};
-use tokio::sync::{Notify, Semaphore};
 use tokio::time::timeout;
 
 use super::queue::enqueue;
 use super::*;
-use crate::ops::test_support::{commit, read, write};
-
-const DEADLINE: Duration = Duration::from_secs(20);
-
-/// Ref store whose next `get_ref` and/or `cas_ref` can be held, and whose
-/// next CAS can be made to mismatch (another writer moves the ref first) or
-/// to fail.
-struct GatedRefs {
-    inner: Arc<dyn RefStore>,
-    cas_calls: AtomicUsize,
-    hold_get: AtomicBool,
-    get_entered: Notify,
-    get_release: Semaphore,
-    hold_cas: AtomicBool,
-    cas_entered: Notify,
-    cas_release: Semaphore,
-    move_to: Mutex<Option<ObjectId>>,
-    fail_cas: AtomicBool,
-}
-
-impl GatedRefs {
-    fn install(b: &mut Backend) -> Arc<Self> {
-        let refs = Arc::new(Self {
-            inner: b.refs.clone(),
-            cas_calls: AtomicUsize::new(0),
-            hold_get: AtomicBool::new(false),
-            get_entered: Notify::new(),
-            get_release: Semaphore::new(0),
-            hold_cas: AtomicBool::new(false),
-            cas_entered: Notify::new(),
-            cas_release: Semaphore::new(0),
-            move_to: Mutex::new(None),
-            fail_cas: AtomicBool::new(false),
-        });
-        b.refs = refs.clone();
-        refs
-    }
-}
-
-#[async_trait::async_trait]
-impl RefStore for GatedRefs {
-    async fn get_ref(&self, name: &str) -> ant_store::Result<Option<ObjectId>> {
-        if self.hold_get.swap(false, Ordering::SeqCst) {
-            self.get_entered.notify_one();
-            self.get_release.acquire().await.unwrap().forget();
-        }
-        self.inner.get_ref(name).await
-    }
-
-    async fn cas_ref(
-        &self,
-        name: &str,
-        expected: Option<ObjectId>,
-        new: Option<ObjectId>,
-    ) -> ant_store::Result<CasOutcome> {
-        self.cas_calls.fetch_add(1, Ordering::SeqCst);
-        if self.hold_cas.swap(false, Ordering::SeqCst) {
-            self.cas_entered.notify_one();
-            self.cas_release.acquire().await.unwrap().forget();
-        }
-        if self.fail_cas.swap(false, Ordering::SeqCst) {
-            return Err(StoreError::InvalidArgument("injected CAS failure".into()));
-        }
-        let move_to = self.move_to.lock().unwrap().take();
-        if let Some(id) = move_to {
-            assert_eq!(self.inner.cas_ref(name, expected, Some(id)).await?, CasOutcome::Updated);
-        }
-        self.inner.cas_ref(name, expected, new).await
-    }
-
-    async fn list_refs(&self, prefix: &str) -> ant_store::Result<Vec<(String, ObjectId)>> {
-        self.inner.list_refs(prefix).await
-    }
-}
+use crate::ops::test_support::{DEADLINE, GatedRefs, commit, history, read, replies, write};
 
 type Receiver = tokio::sync::oneshot::Receiver<OpResult<LandOutcome>>;
 
@@ -104,26 +27,6 @@ async fn pipelined(
     let then: Vec<_> = then.iter().map(|id| enqueue(b, "main", *id)).collect();
     refs.get_release.add_permits(1);
     (first, then)
-}
-
-async fn replies(receivers: Vec<Receiver>) -> Vec<OpResult<LandOutcome>> {
-    timeout(DEADLINE, futures::future::join_all(receivers))
-        .await
-        .unwrap()
-        .into_iter()
-        .map(Result::unwrap)
-        .collect()
-}
-
-async fn history(b: &Backend, root: ObjectId) -> Vec<ObjectId> {
-    let mut current = b.refs.get_ref("main").await.unwrap().unwrap();
-    let mut chain = Vec::new();
-    while current != root {
-        chain.push(current);
-        current = b.objects.read_commit(&current).await.unwrap().parents[0];
-    }
-    chain.reverse();
-    chain
 }
 
 /// Whether some recorded commit has exactly `parents` (evidence that a

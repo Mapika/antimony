@@ -24,13 +24,9 @@ use ant_store::s3::{S3Config, S3ObjectStore};
 use ant_store::{Backend, ChangeKind, ObjectStore, PathChange, StoreError};
 use bytes::Bytes;
 use clap::Parser;
+use common::pg::pg_url;
 use common::{Model, build, nest, sig};
 use sqlx::Connection;
-
-fn pg_url() -> String {
-    std::env::var("ANT_TEST_PG_URL")
-        .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into())
-}
 
 #[derive(Parser)]
 struct Cli {

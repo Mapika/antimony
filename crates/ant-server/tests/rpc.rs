@@ -1,6 +1,8 @@
 //! End-to-end tests for the gRPC and HTTP transports, run against
 //! `Backend::in_memory()` on ephemeral ports.
 
+mod common;
+
 use std::collections::HashMap;
 
 use ant_core::{EncodedObject, ObjectId, ObjectKind};
@@ -9,6 +11,7 @@ use ant_proto::v1::ant_client::AntClient;
 use ant_server::acl::Acl;
 use ant_server::serve::spawn_local;
 use ant_store::{Backend, ObjectStoreExt};
+use common::wire::{delete_file, hex, sig, write_file};
 use tonic::Code;
 use tonic::transport::Channel;
 
@@ -340,29 +343,6 @@ async fn grpc_and_http_see_the_same_objects() {
 // queries and writes (depend on the ops layer)
 // ---------------------------------------------------------------------------
 
-fn sig(name: &str) -> pb::Signature {
-    pb::Signature {
-        name: name.into(),
-        email: format!("{name}@example.com").into_bytes(),
-        time: 1_700_000_000,
-        tz_offset_minutes: 0,
-    }
-}
-
-fn write_file(path: &str, content: &str) -> pb::FileOp {
-    pb::FileOp {
-        path: path.into(),
-        op: Some(pb::file_op::Op::Write(pb::WriteOp {
-            mode: pb::EntryMode::File as i32,
-            content: Some(pb::write_op::Content::Inline(content.as_bytes().to_vec())),
-        })),
-    }
-}
-
-fn delete_file(path: &str) -> pb::FileOp {
-    pb::FileOp { path: path.into(), op: Some(pb::file_op::Op::Delete(pb::DeleteOp {})) }
-}
-
 #[tokio::test]
 async fn delete_op_removes_entry() {
     let mut s = spawn_server().await;
@@ -374,7 +354,7 @@ async fn delete_op_removes_entry() {
     )
     .await;
     let c2 = commit(&mut s, Some(c1), vec![delete_file("gone.txt")], "delete").await;
-    let rev: String = c2.iter().map(|b| format!("{b:02x}")).collect();
+    let rev = hex(&c2);
     let gone = s
         .grpc
         .read_path(pb::ReadPathRequest { rev, path: "gone.txt".into(), include_content: false })
