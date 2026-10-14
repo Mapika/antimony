@@ -499,6 +499,23 @@ several replicas behind one balancer a principal's real ceiling is
 read the whole stream, so a stalled client occupies one `read` slot (not more)
 until its connection drops.
 
+Measured (dev machine, 2 replicas x 300 agents, Postgres + S3, 120 s, plus 32
+hostile read loops from a second address ignoring every retry hint; agents'
+overall p99 in ms, `ant-bench soak --hostile 32`):
+
+| run | cat | create | get_ref | land | hostile served |
+|---|---|---|---|---|---|
+| no hostile caller | 5.8 | 12.0 | 1.2 | 72 | - |
+| hostile, `--no-limits` | 24.6 | 25.6 | 9.0 | 102 | 15,300/s |
+| hostile, `--rate-read 1500:3000` | 14.3 | 13.1 | 4.6 | 180 | 3,000/s |
+
+Limits cap the hostile caller at its budget and halve the read-side damage, but
+the flood (167,000 rejected requests/s here, on the same machine as the
+servers) still costs CPU, which is why the land tail is not better than
+without limits in this run: rejecting is cheap, not free. In production put
+a network-level limiter in front for floods of that size. The in-memory fleet
+(16 agents) lands 322k/243k (before, noisy) vs 328k/331k (after) in 20 s.
+
 Metrics: `ant_ratelimit_rejected_total{class,reason}` (`rate`, `queue_full`,
 `queue_timeout`), `ant_ratelimit_inflight{class}`,
 `ant_ratelimit_queued{class}`, `ant_ratelimit_inflight_limit{class}`.
