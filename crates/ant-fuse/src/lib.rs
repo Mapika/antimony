@@ -1,28 +1,13 @@
-//! Lazy, read-only FUSE view of a tree. Nothing is downloaded until it is
-//! looked up or read, so an agent can "check out" a huge monorepo instantly
-//! and only pay for what it touches.
+//! Lazy FUSE views of a tree. Nothing is downloaded until it is looked up
+//! or read, so an agent can "check out" a huge monorepo instantly and only
+//! pay for what it touches.
 //!
-//! [`mount`] uses `fuser` without libfuse (mounting goes through
-//! `fusermount3`); [`mount_rw`] adds a copy-on-write layer (see [`rw`]).
+//! - [`mount`]: a read-only view (`filesystem`).
+//! - [`mount_rw`]: a persistent copy-on-write workspace on top of the same
+//!   view, with status, reset and update from its state directory ([`rw`]).
 //!
-//! - Inodes: root = 1; numbers are assigned on first lookup and stay stable
-//!   for the life of the mount. Identical objects at different paths get
-//!   different inodes (no hard-link semantics).
-//! - Directories 0o555, files 0o444, executables 0o555, symlinks 0o777,
-//!   gitlinks appear as empty directories. `nlink` is 1 for files and 2 for
-//!   directories; uid/gid are the mounting process's; mtime is UNIX_EPOCH or
-//!   the timestamp in [`MountOptions`].
-//! - `getattr` reports exact sizes; a blob is fetched (and its size cached)
-//!   to learn its size.
-//! - Read-only mounts answer every mutation, and opening for write, with
-//!   `EROFS`.
-//! - FUSE callbacks run on fuser's threads and block on the given Tokio
-//!   runtime handle, which must belong to a multi-thread runtime.
-//! - Caches: decoded trees (unbounded) and blob contents (LRU bounded by
-//!   `MountOptions::blob_cache_bytes`). Listing a directory prefetches its
-//!   subtrees with one `get_many`; `readdir` supports offsets.
-//! - Store errors become `EIO` (logged with tracing).
-//! - Dropping the returned `BackgroundSession` unmounts.
+//! Both use `fuser` without libfuse (mounting goes through `fusermount3`).
+//! Dropping the returned `BackgroundSession` unmounts.
 
 use std::path::Path;
 use std::sync::Arc;

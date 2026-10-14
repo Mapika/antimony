@@ -19,7 +19,14 @@
 //!   interpreting or repairing it;
 //! - `staging/`, `conflicts`: files prepared by an in-progress [`update`]
 //!   and the unresolved conflicts it left (see `update`);
-//! - `lock` / `mount.lock`: the state lock and the exclusive mount marker.
+//! - `lock` / `mount.lock`: the state lock and the exclusive mount marker;
+//! - `meta/` (created by the CLI, `ant ws new --lazy`): the workspace's
+//!   `.ant` directory as the CLI sees it. `meta/lazy` holds the state
+//!   directory's path, `meta/track` the followed ref, and `meta/workspace`
+//!   is a symlink to `../base`, so the `base` snapshot doubles as the
+//!   workspace config `antd::workspace` reads. `upper/.ant` and the
+//!   mountpoint's `.ant` are symlinks to `meta/`; [`changes`] skips
+//!   `upper/.ant`.
 //!
 //! Snapshots are replaced atomically (write temp + fsync + rename + fsync).
 //!
