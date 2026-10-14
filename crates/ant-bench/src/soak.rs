@@ -29,27 +29,26 @@
 //! - Afterwards the schema is dropped and the run's S3 prefix deleted
 //!   (unless `--keep`).
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use ant_core::ObjectId;
-use ant_proto::MAX_MESSAGE_BYTES;
 use ant_proto::v1 as pb;
-use ant_proto::v1::ant_client::AntClient;
 use ant_store::MetaStore;
 use ant_store::postgres::{PgOptions, PgStore};
 use ant_store::s3::S3Config;
 use anyhow::{Context as _, Result, anyhow, bail};
+use rand::Rng;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use sqlx::Connection as _;
 use tonic::transport::Channel;
 
 use crate::json::J;
 use crate::replicas::{PgMonitor, Replica};
+use crate::rpc::{Client, agent_rng, channel, client, hex, read_back, seed_ref, sig, write_op};
 use crate::util::{Lat, mib, write_json};
 
 /// Agent directories are sharded so no tree grows past a few KiB.
@@ -136,46 +135,6 @@ pub struct Args {
     pub json: Option<PathBuf>,
 }
 
-type Client = AntClient<Channel>;
-
-fn client(channel: Channel) -> Client {
-    AntClient::new(channel)
-        .max_decoding_message_size(MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_MESSAGE_BYTES)
-}
-
-async fn connect(url: &str) -> Result<Channel> {
-    Channel::from_shared(url.to_owned())?
-        .connect()
-        .await
-        .with_context(|| format!("connecting to {url}"))
-}
-
-fn sig() -> pb::Signature {
-    let time =
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    pb::Signature {
-        name: "soak".into(),
-        email: "soak@example.com".into(),
-        time,
-        tz_offset_minutes: 0,
-    }
-}
-
-fn write_op(path: String, content: Vec<u8>) -> pb::FileOp {
-    pb::FileOp {
-        path,
-        op: Some(pb::file_op::Op::Write(pb::WriteOp {
-            mode: pb::EntryMode::File as i32,
-            content: Some(pb::write_op::Content::Inline(content)),
-        })),
-    }
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
 fn agent_dir(i: usize) -> String {
     format!("agents/{:02}/{i}", i % SHARDS)
 }
@@ -256,89 +215,29 @@ struct AgentCfg {
 
 async fn agent(
     i: usize,
-    mut c: Client,
+    c: Client,
     cfg: Arc<AgentCfg>,
     rec: Arc<Recorder>,
     agents: usize,
 ) -> AgentOut {
-    let mut rng = StdRng::seed_from_u64(cfg.seed.wrapping_mul(1_000_003).wrapping_add(i as u64));
-    let mut out = AgentOut::default();
-    let mut base = cfg.start.clone();
+    let mut rng = agent_rng(cfg.seed, i);
+    let mut a =
+        Agent { i, c, rec, dir: agent_dir(i), base: cfg.start.clone(), out: AgentOut::default() };
     let mut seq = 0u64;
-    let dir = agent_dir(i);
     // Spread the start so agents do not move in lockstep.
     let jitter = rng.random_range(0..=cfg.think_ms.max(1));
     tokio::time::sleep(Duration::from_millis(jitter)).await;
-    while !rec.stop.load(Ordering::Relaxed) {
+    while !a.rec.stop.load(Ordering::Relaxed) {
         let u: f64 = rng.random_range(f64::EPSILON..1.0);
         let think = (-u.ln() * cfg.think_ms as f64).min(cfg.think_ms as f64 * 10.0);
         tokio::time::sleep(Duration::from_micros((think * 1000.0) as u64)).await;
-        if rec.stop.load(Ordering::Relaxed) {
+        if a.rec.stop.load(Ordering::Relaxed) {
             break;
         }
         seq += 1;
         let pick = rng.random_range(0..100);
         if pick < 35 {
-            let mut ops = Vec::new();
-            let mut written = Vec::new();
-            let first = rng.random_range(0..FILES_PER_AGENT);
-            for k in 0..rng.random_range(1..=2) {
-                let path = format!("{dir}/f{}.txt", (first + k) % FILES_PER_AGENT);
-                let content = format!("agent={i} seq={seq}\n").into_bytes();
-                ops.push(write_op(path.clone(), content.clone()));
-                written.push((path, content));
-            }
-            if rng.random_bool(cfg.conflict_rate.clamp(0.0, 1.0)) {
-                let path = format!("shared/c{}.txt", rng.random_range(0..SHARED_FILES));
-                ops.push(write_op(path, format!("agent {i} seq {seq}\n").into_bytes()));
-            }
-            let t = Instant::now();
-            let created = c
-                .create_changeset(pb::CreateChangesetRequest {
-                    base: Some(base.clone()),
-                    ops,
-                    author: Some(sig()),
-                    committer: None,
-                    message: format!("agent {i} change {seq}"),
-                })
-                .await;
-            let commit = match created {
-                Ok(r) => {
-                    rec.ok("create", t);
-                    r.into_inner().commit
-                }
-                Err(e) => {
-                    rec.err("create", &e);
-                    continue;
-                }
-            };
-            let t = Instant::now();
-            match c.land(pb::LandRequest { ref_name: REF.into(), commit }).await {
-                Ok(r) => {
-                    rec.ok("land", t);
-                    match r.into_inner().outcome {
-                        Some(pb::land_response::Outcome::Landed(l)) => {
-                            rec.with(|w| w.landed += 1);
-                            out.landed += 1;
-                            base = l.new_tip;
-                            out.last.extend(written);
-                        }
-                        Some(pb::land_response::Outcome::Conflict(conflict)) => {
-                            rec.with(|w| w.conflicts += 1);
-                            base = conflict.tip;
-                        }
-                        None => rec.with(|w| {
-                            w.errors += 1;
-                            w.first_errors.push("land: empty outcome".into());
-                        }),
-                    }
-                }
-                Err(e) => {
-                    rec.err("land", &e);
-                    out.uncertain += 1;
-                    out.unknown.extend(written.into_iter().map(|(p, _)| p));
-                }
-            }
+            a.change(&mut rng, cfg.conflict_rate, seq).await;
         } else if pick < 55 {
             let other = rng.random_range(0..agents);
             let path = if rng.random_bool(0.1) {
@@ -346,54 +245,138 @@ async fn agent(
             } else {
                 format!("{}/f{}.txt", agent_dir(other), rng.random_range(0..FILES_PER_AGENT))
             };
-            let t = Instant::now();
-            let req = pb::ReadPathRequest { rev: REF.into(), path, include_content: true };
-            match c.read_path(req).await {
-                Ok(_) => rec.ok("cat", t),
-                Err(e) => rec.err("cat", &e),
-            }
+            a.read("cat", path, true).await;
         } else if pick < 70 {
             let path = format!("agents/{:02}", rng.random_range(0..SHARDS));
-            let t = Instant::now();
-            let req = pb::ReadPathRequest { rev: REF.into(), path, include_content: false };
-            match c.read_path(req).await {
-                Ok(_) => rec.ok("ls", t),
-                Err(e) => rec.err("ls", &e),
-            }
+            a.read("ls", path, false).await;
         } else if pick < 80 {
-            let path = rng.random_bool(0.5).then(|| dir.clone());
-            let op = if path.is_some() { "log_path" } else { "log" };
-            let t = Instant::now();
-            match c.log(pb::LogRequest { rev: REF.into(), path, limit: 20 }).await {
-                Ok(_) => rec.ok(op, t),
-                Err(e) => rec.err(op, &e),
-            }
+            let path = rng.random_bool(0.5).then(|| a.dir.clone());
+            a.log(path).await;
         } else {
-            // Workspace status: where is the ref, what changed since my base.
-            let t = Instant::now();
-            let tip = match c.get_ref(pb::GetRefRequest { name: REF.into() }).await {
-                Ok(r) => {
-                    rec.ok("get_ref", t);
-                    r.into_inner().target
+            a.status().await;
+        }
+    }
+    a.out
+}
+
+/// One agent's connection and state between operations.
+struct Agent {
+    i: usize,
+    c: Client,
+    rec: Arc<Recorder>,
+    dir: String,
+    /// Base of the next change and of the next status diff.
+    base: Vec<u8>,
+    out: AgentOut,
+}
+
+impl Agent {
+    /// Rewrite one or two own files (sometimes also a shared one) on the base
+    /// and land the change.
+    async fn change(&mut self, rng: &mut StdRng, conflict_rate: f64, seq: u64) {
+        let (i, dir) = (self.i, &self.dir);
+        let mut ops = Vec::new();
+        let mut written = Vec::new();
+        let first = rng.random_range(0..FILES_PER_AGENT);
+        for k in 0..rng.random_range(1..=2) {
+            let path = format!("{dir}/f{}.txt", (first + k) % FILES_PER_AGENT);
+            let content = format!("agent={i} seq={seq}\n").into_bytes();
+            ops.push(write_op(path.clone(), content.clone()));
+            written.push((path, content));
+        }
+        if rng.random_bool(conflict_rate.clamp(0.0, 1.0)) {
+            let path = format!("shared/c{}.txt", rng.random_range(0..SHARED_FILES));
+            ops.push(write_op(path, format!("agent {i} seq {seq}\n").into_bytes()));
+        }
+        let t = Instant::now();
+        let created = self
+            .c
+            .create_changeset(pb::CreateChangesetRequest {
+                base: Some(self.base.clone()),
+                ops,
+                author: Some(sig("soak")),
+                committer: None,
+                message: format!("agent {i} change {seq}"),
+            })
+            .await;
+        let commit = match created {
+            Ok(r) => {
+                self.rec.ok("create", t);
+                r.into_inner().commit
+            }
+            Err(e) => return self.rec.err("create", &e),
+        };
+        let t = Instant::now();
+        match self.c.land(pb::LandRequest { ref_name: REF.into(), commit }).await {
+            Ok(r) => {
+                self.rec.ok("land", t);
+                match r.into_inner().outcome {
+                    Some(pb::land_response::Outcome::Landed(l)) => {
+                        self.rec.with(|w| w.landed += 1);
+                        self.out.landed += 1;
+                        self.base = l.new_tip;
+                        self.out.last.extend(written);
+                    }
+                    Some(pb::land_response::Outcome::Conflict(conflict)) => {
+                        self.rec.with(|w| w.conflicts += 1);
+                        self.base = conflict.tip;
+                    }
+                    None => self.rec.with(|w| {
+                        w.errors += 1;
+                        w.first_errors.push("land: empty outcome".into());
+                    }),
                 }
-                Err(e) => {
-                    rec.err("get_ref", &e);
-                    continue;
-                }
-            };
-            let Some(tip) = tip else { continue };
-            let t = Instant::now();
-            let req = pb::DiffRequest { from_rev: hex(&base), to_rev: hex(&tip) };
-            match c.diff(req).await {
-                Ok(_) => {
-                    rec.ok("status", t);
-                    base = tip;
-                }
-                Err(e) => rec.err("status", &e),
+            }
+            Err(e) => {
+                self.rec.err("land", &e);
+                self.out.uncertain += 1;
+                self.out.unknown.extend(written.into_iter().map(|(p, _)| p));
             }
         }
     }
-    out
+
+    /// `ReadPath` at the ref, recorded as `op` (`cat` or `ls`).
+    async fn read(&mut self, op: &'static str, path: String, include_content: bool) {
+        let t = Instant::now();
+        let req = pb::ReadPathRequest { rev: REF.into(), path, include_content };
+        match self.c.read_path(req).await {
+            Ok(_) => self.rec.ok(op, t),
+            Err(e) => self.rec.err(op, &e),
+        }
+    }
+
+    /// The ref's log, path-filtered when `path` is given.
+    async fn log(&mut self, path: Option<String>) {
+        let op = if path.is_some() { "log_path" } else { "log" };
+        let t = Instant::now();
+        match self.c.log(pb::LogRequest { rev: REF.into(), path, limit: 20 }).await {
+            Ok(_) => self.rec.ok(op, t),
+            Err(e) => self.rec.err(op, &e),
+        }
+    }
+
+    /// Workspace status: where is the ref, what changed since my base. The
+    /// base then moves to the tip.
+    async fn status(&mut self) {
+        let t = Instant::now();
+        let tip = match self.c.get_ref(pb::GetRefRequest { name: REF.into() }).await {
+            Ok(r) => {
+                self.rec.ok("get_ref", t);
+                r.into_inner().target
+            }
+            Err(e) => return self.rec.err("get_ref", &e),
+        };
+        let Some(tip) = tip else { return };
+        let t = Instant::now();
+        let req = pb::DiffRequest { from_rev: hex(&self.base), to_rev: hex(&tip) };
+        match self.c.diff(req).await {
+            Ok(_) => {
+                self.rec.ok("status", t);
+                self.base = tip;
+            }
+            Err(e) => self.rec.err("status", &e),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -553,12 +536,25 @@ fn with_param(url: &str, key: &str, value: &str) -> String {
     format!("{url}{sep}{key}={value}")
 }
 
+/// What `run` derives from the arguments for one soak.
+struct Plan {
+    schema: String,
+    s3: Option<S3Config>,
+    /// Executable run as `<exe> serve ...` for each replica.
+    exe: PathBuf,
+    log_dir: PathBuf,
+    /// Query-pool Postgres connections per replica.
+    max_conns: u32,
+    /// Ref-lock Postgres connections per replica.
+    lock_conns: u32,
+}
+
 pub async fn run(args: Args) -> Result<i32> {
     if args.replicas == 0 || args.agents == 0 || args.window == 0 {
         bail!("--replicas, --agents and --window must be positive");
     }
     if let Ok(home) = std::env::var("HOME")
-        && std::path::Path::new(&home).join(".local/share/antimony-services/DISK_LOW").exists()
+        && Path::new(&home).join(".local/share/antimony-services/DISK_LOW").exists()
     {
         bail!("disk is low (antimony-services DISK_LOW marker present); not starting a soak");
     }
@@ -600,13 +596,15 @@ pub async fn run(args: Args) -> Result<i32> {
         args.pg_budget,
     );
 
-    let result = drive(&args, &schema, &s3, &exe, &log_dir, max_conns, lock_conns).await;
+    let plan = Plan { schema, s3, exe, log_dir, max_conns, lock_conns };
+    let result = drive(&args, &plan).await;
 
     if !args.keep {
-        if let Err(e) = drop_schema(&args.pg_url, &schema).await {
+        let schema = &plan.schema;
+        if let Err(e) = drop_schema(&args.pg_url, schema).await {
             eprintln!("warning: dropping schema {schema}: {e:#}");
         }
-        if let Some(cfg) = &s3 {
+        if let Some(cfg) = &plan.s3 {
             match crate::s3clean::delete_prefix(cfg).await {
                 Ok(n) => println!("cleanup: dropped schema {schema}, deleted {n} S3 objects"),
                 Err(e) => eprintln!("warning: deleting S3 prefix {}: {e:#}", cfg.prefix),
@@ -626,104 +624,34 @@ async fn drop_schema(url: &str, schema: &str) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn drive(
-    args: &Args,
-    schema: &str,
-    s3: &Option<S3Config>,
-    exe: &std::path::Path,
-    log_dir: &std::path::Path,
-    max_conns: u32,
-    lock_conns: u32,
-) -> Result<i32> {
-    // ---- replicas ----
-    let mut replicas = Vec::with_capacity(args.replicas);
-    for i in 0..args.replicas {
-        let mut argv = vec![
-            "--pg-url".to_string(),
-            with_param(&args.pg_url, "application_name", &format!("soak-r{i}")),
-            "--pg-schema".into(),
-            schema.into(),
-            "--pg-max-connections".into(),
-            max_conns.to_string(),
-            "--pg-lock-connections".into(),
-            lock_conns.to_string(),
-        ];
-        if let Some(cfg) = s3 {
-            argv.extend([
-                "--s3-endpoint".into(),
-                cfg.endpoint.clone(),
-                "--s3-bucket".into(),
-                cfg.bucket.clone(),
-                "--s3-prefix".into(),
-                cfg.prefix.clone(),
-                "--s3-access-key".into(),
-                cfg.access_key.clone(),
-                "--s3-secret-key".into(),
-                cfg.secret_key.clone(),
-            ]);
-        }
-        let log = log_dir.join(format!("{schema}-r{i}.log"));
-        let mut env = vec![("RUST_LOG".to_string(), "warn".to_string())];
-        for kv in &args.replica_env {
-            // `<index>:KEY=VALUE` applies to one replica only (A/B runs).
-            let (only, kv) = match kv.split_once(':') {
-                Some((n, rest)) if n.parse::<usize>().is_ok() => (n.parse::<usize>().ok(), rest),
-                _ => (None, kv.as_str()),
-            };
-            let (k, v) = kv
-                .split_once('=')
-                .ok_or_else(|| anyhow!("--replica-env wants [INDEX:]KEY=VALUE"))?;
-            if only.is_none_or(|n| n == i) {
-                env.push((k.to_string(), v.to_string()));
-            }
-        }
-        replicas.push(Replica::spawn(i, exe, &argv, &env, &log).await?);
-        println!(
-            "replica {i}: pid {} grpc {} log {}",
-            replicas[i].pid,
-            replicas[i].grpc_url,
-            log.display()
-        );
-    }
-    let mut pg = PgMonitor::connect(&args.pg_url).await.ok();
+/// Run totals over all windows plus the operations finishing after the last.
+struct Totals {
+    ops: u64,
+    errors: u64,
+    aborts: u64,
+    conflicts: u64,
+    landed: u64,
+    uncertain: u64,
+    error_rate: f64,
+}
 
-    // ---- channels and seed ----
-    let mut channels = Vec::new();
-    for r in &replicas {
-        let mut per = Vec::new();
-        for _ in 0..args.channels_per_replica.max(1) {
-            per.push(connect(&r.grpc_url).await?);
-        }
-        channels.push(per);
-    }
+/// Everything the final report needs besides the totals.
+struct Outcome {
+    wall: f64,
+    verify_s: f64,
+    growth: Option<u64>,
+    files_checked: usize,
+    rss_slopes: Vec<f64>,
+    windows: Vec<WindowReport>,
+    failures: Vec<String>,
+}
+
+async fn drive(args: &Args, plan: &Plan) -> Result<i32> {
+    let mut replicas = spawn_replicas(args, plan).await?;
+    let mut pg = PgMonitor::connect(&args.pg_url).await.ok();
+    let channels = open_channels(args, &replicas).await?;
     let mut admin = client(channels[0][0].clone());
-    let mut ops = vec![write_op("README.md".into(), b"soak seed\n".to_vec())];
-    for k in 0..SHARED_FILES {
-        ops.push(write_op(format!("shared/c{k}.txt"), b"init\n".to_vec()));
-    }
-    let seed = admin
-        .create_changeset(pb::CreateChangesetRequest {
-            base: None,
-            ops,
-            author: Some(sig()),
-            committer: None,
-            message: "soak seed".into(),
-        })
-        .await?
-        .into_inner()
-        .commit;
-    let r = admin
-        .update_ref(pb::UpdateRefRequest {
-            name: REF.into(),
-            expected: None,
-            new_target: Some(seed.clone()),
-        })
-        .await?
-        .into_inner();
-    if !r.updated {
-        bail!("schema {schema} already has ref {REF}; use a fresh --pg-schema");
-    }
+    let seed = seed(&mut admin, &plan.schema).await?;
 
     // ---- agents ----
     let rec = Arc::new(Recorder::default());
@@ -743,7 +671,140 @@ async fn drive(
         })
         .collect();
 
-    // ---- windows ----
+    let windows = run_windows(args, &rec, start, &mut replicas, &mut pg).await;
+    rec.stop.store(true, Ordering::Relaxed);
+    let mut outs = Vec::new();
+    let mut failures = Vec::new();
+    for (i, h) in handles.into_iter().enumerate() {
+        match tokio::time::timeout(Duration::from_secs(120), h).await {
+            Ok(Ok(o)) => outs.push(o),
+            Ok(Err(e)) => failures.push(format!("agent {i} panicked: {e}")),
+            Err(_) => failures.push(format!("agent {i} did not stop within 120 s")),
+        }
+    }
+    // Operations finishing after the last window count toward the totals.
+    let tail = rec.take();
+    let wall = start.elapsed().as_secs_f64();
+
+    let ops: u64 = windows.iter().map(|w| w.ops).sum::<u64>() + tail.ops;
+    let errors: u64 = windows.iter().map(|w| w.errors).sum::<u64>() + tail.errors;
+    let tot = Totals {
+        ops,
+        errors,
+        aborts: windows.iter().map(|w| w.aborts).sum::<u64>() + tail.aborts,
+        conflicts: windows.iter().map(|w| w.conflicts).sum::<u64>() + tail.conflicts,
+        landed: outs.iter().map(|o| o.landed).sum(),
+        uncertain: outs.iter().map(|o| o.uncertain).sum(),
+        error_rate: if ops == 0 { 0.0 } else { errors as f64 / ops as f64 },
+    };
+
+    let (growth, files_checked, verify_s) =
+        verify(args, plan, &admin, &seed, outs, &tot, &mut failures).await?;
+    let rss_slopes = check_health(args, &tot, &windows, &mut replicas, &mut failures);
+
+    for r in replicas {
+        r.shutdown().await;
+    }
+    let outcome = Outcome { wall, verify_s, growth, files_checked, rss_slopes, windows, failures };
+    report(args, plan, &tot, &outcome)
+}
+
+/// `--replica-env` entries for replica `i` (`INDEX:KEY=VALUE` applies to one
+/// replica only, for A/B runs), after `RUST_LOG=warn`.
+fn replica_env(args: &Args, i: usize) -> Result<Vec<(String, String)>> {
+    let mut env = vec![("RUST_LOG".to_string(), "warn".to_string())];
+    for kv in &args.replica_env {
+        let (only, kv) = match kv.split_once(':') {
+            Some((n, rest)) if n.parse::<usize>().is_ok() => (n.parse::<usize>().ok(), rest),
+            _ => (None, kv.as_str()),
+        };
+        let (k, v) =
+            kv.split_once('=').ok_or_else(|| anyhow!("--replica-env wants [INDEX:]KEY=VALUE"))?;
+        if only.is_none_or(|n| n == i) {
+            env.push((k.to_string(), v.to_string()));
+        }
+    }
+    Ok(env)
+}
+
+/// Start the replica processes, each with its own Postgres pools.
+async fn spawn_replicas(args: &Args, plan: &Plan) -> Result<Vec<Replica>> {
+    let schema = &plan.schema;
+    let mut replicas = Vec::with_capacity(args.replicas);
+    for i in 0..args.replicas {
+        let mut argv = vec![
+            "--pg-url".to_string(),
+            with_param(&args.pg_url, "application_name", &format!("soak-r{i}")),
+            "--pg-schema".into(),
+            schema.clone(),
+            "--pg-max-connections".into(),
+            plan.max_conns.to_string(),
+            "--pg-lock-connections".into(),
+            plan.lock_conns.to_string(),
+        ];
+        if let Some(cfg) = &plan.s3 {
+            argv.extend([
+                "--s3-endpoint".into(),
+                cfg.endpoint.clone(),
+                "--s3-bucket".into(),
+                cfg.bucket.clone(),
+                "--s3-prefix".into(),
+                cfg.prefix.clone(),
+                "--s3-access-key".into(),
+                cfg.access_key.clone(),
+                "--s3-secret-key".into(),
+                cfg.secret_key.clone(),
+            ]);
+        }
+        let log = plan.log_dir.join(format!("{schema}-r{i}.log"));
+        let env = replica_env(args, i)?;
+        let replica = Replica::spawn(i, &plan.exe, &argv, &env, &log).await?;
+        println!(
+            "replica {i}: pid {} grpc {} log {}",
+            replica.pid,
+            replica.grpc_url,
+            log.display()
+        );
+        replicas.push(replica);
+    }
+    Ok(replicas)
+}
+
+/// `--channels-per-replica` gRPC channels to each replica.
+async fn open_channels(args: &Args, replicas: &[Replica]) -> Result<Vec<Vec<Channel>>> {
+    let mut channels = Vec::new();
+    for r in replicas {
+        let mut per = Vec::new();
+        for _ in 0..args.channels_per_replica.max(1) {
+            per.push(channel(&r.grpc_url).await?);
+        }
+        channels.push(per);
+    }
+    Ok(channels)
+}
+
+/// Create `REF` at a seed commit with a README and the shared files.
+async fn seed(admin: &mut Client, schema: &str) -> Result<Vec<u8>> {
+    let mut ops = vec![write_op("README.md".into(), b"soak seed\n".to_vec())];
+    for k in 0..SHARED_FILES {
+        ops.push(write_op(format!("shared/c{k}.txt"), b"init\n".to_vec()));
+    }
+    let (seed, created) = seed_ref(admin, REF, ops, "soak", "soak seed").await?;
+    if !created {
+        bail!("schema {schema} already has ref {REF}; use a fresh --pg-schema");
+    }
+    Ok(seed)
+}
+
+/// Print one line per `--window` until the duration ends (or a replica dies)
+/// and return the window reports.
+async fn run_windows(
+    args: &Args,
+    rec: &Recorder,
+    start: Instant,
+    replicas: &mut [Replica],
+    pg: &mut Option<PgMonitor>,
+) -> Vec<WindowReport> {
     print_header(args.replicas);
     let mut windows: Vec<WindowReport> = Vec::new();
     let n_windows = args.duration.div_ceil(args.window);
@@ -755,7 +816,7 @@ async fn drive(
         let now = Instant::now();
         let secs = now.duration_since(last).as_secs_f64();
         last = now;
-        let (samples, pg_total) = sample(&mut replicas, &mut pg).await;
+        let (samples, pg_total) = sample(replicas, pg).await;
         let lat = w.lat.into_iter().map(|(op, v)| (op, Lat::from_micros(v))).collect();
         let report = WindowReport {
             end_s: now.duration_since(start).as_secs_f64(),
@@ -771,52 +832,48 @@ async fn drive(
             first_errors: w.first_errors,
         };
         print_window(&report);
+        let died = report.replicas.iter().any(|r| !r.alive);
         windows.push(report);
-        if windows.last().is_some_and(|w| w.replicas.iter().any(|r| !r.alive)) {
+        if died {
             println!("a replica died; stopping early");
             break;
         }
     }
-    rec.stop.store(true, Ordering::Relaxed);
-    let mut outs = Vec::new();
-    let mut failures = Vec::new();
-    for (i, h) in handles.into_iter().enumerate() {
-        match tokio::time::timeout(Duration::from_secs(120), h).await {
-            Ok(Ok(o)) => outs.push(o),
-            Ok(Err(e)) => failures.push(format!("agent {i} panicked: {e}")),
-            Err(_) => failures.push(format!("agent {i} did not stop within 120 s")),
-        }
-    }
-    // Operations finishing after the last window count toward the totals.
-    let tail = rec.take();
-    let wall = start.elapsed().as_secs_f64();
+    windows
+}
 
-    // ---- totals ----
-    let ops: u64 = windows.iter().map(|w| w.ops).sum::<u64>() + tail.ops;
-    let errors: u64 = windows.iter().map(|w| w.errors).sum::<u64>() + tail.errors;
-    let aborts: u64 = windows.iter().map(|w| w.aborts).sum::<u64>() + tail.aborts;
-    let conflicts: u64 = windows.iter().map(|w| w.conflicts).sum::<u64>() + tail.conflicts;
-    let landed: u64 = outs.iter().map(|o| o.landed).sum();
-    let uncertain: u64 = outs.iter().map(|o| o.uncertain).sum();
-    let error_rate = if ops == 0 { 0.0 } else { errors as f64 / ops as f64 };
-
-    // ---- invariants ----
+/// Invariants at the final tip: the first-parent history from the seed is
+/// linear and grew by the successful lands (plus at most the uncertain ones),
+/// and every agent file not touched by an uncertain land holds its last
+/// landed content. Returns the growth, the number of files checked and the
+/// seconds spent verifying after reading the final tip.
+async fn verify(
+    args: &Args,
+    plan: &Plan,
+    admin: &Client,
+    seed: &[u8],
+    outs: Vec<AgentOut>,
+    tot: &Totals,
+    failures: &mut Vec<String>,
+) -> Result<(Option<u64>, usize, f64)> {
+    let (landed, uncertain) = (tot.landed, tot.uncertain);
     let final_tip = admin
+        .clone()
         .get_ref(pb::GetRefRequest { name: REF.into() })
         .await?
         .into_inner()
         .target
         .ok_or_else(|| anyhow!("ref {REF} vanished"))?;
-    let verify_start = Instant::now();
+    let start = Instant::now();
     let store = PgStore::connect_with(
         &args.pg_url,
-        schema,
+        &plan.schema,
         &PgOptions { max_connections: 4, ..PgOptions::default() },
     )
     .await
     .context("connecting the verifier")?;
     let (growth, linear) =
-        chain_growth(&store, ObjectId::from_bytes(&final_tip)?, ObjectId::from_bytes(&seed)?)
+        chain_growth(&store, ObjectId::from_bytes(&final_tip)?, ObjectId::from_bytes(seed)?)
             .await?;
     match growth {
         Some(g) if g >= landed && g <= landed + uncertain => {}
@@ -828,57 +885,49 @@ async fn drive(
     if !linear {
         failures.push("history is not linear (a commit with != 1 parent)".into());
     }
-    let unknown: std::collections::HashSet<String> =
-        outs.iter().flat_map(|o| o.unknown.iter().cloned()).collect();
+    let unknown: HashSet<String> = outs.iter().flat_map(|o| o.unknown.iter().cloned()).collect();
     let mut expected: Vec<(String, Vec<u8>)> = outs
         .into_iter()
         .flat_map(|o| o.last.into_iter())
         .filter(|(p, _)| !unknown.contains(p))
         .collect();
     expected.sort();
-    let final_hex = hex(&final_tip);
     let mut bad = 0u64;
-    for chunk in expected.chunks(64) {
-        let mut set = tokio::task::JoinSet::new();
-        for (path, content) in chunk.iter().cloned() {
-            let mut c = admin.clone();
-            let rev = final_hex.clone();
-            set.spawn(async move {
-                let r = c
-                    .read_path(pb::ReadPathRequest {
-                        rev,
-                        path: path.clone(),
-                        include_content: true,
-                    })
-                    .await;
-                (path, content, r.map(|r| r.into_inner()))
-            });
-        }
-        while let Some(joined) = set.join_next().await {
-            let (path, want, r) = joined?;
-            match r {
-                Ok(r) if r.found && r.content == want => {}
-                Ok(_) => {
-                    bad += 1;
-                    if bad <= 3 {
-                        failures.push(format!("{path}: missing or not its last landed content"));
-                    }
-                }
-                Err(e) => failures.push(format!("{path}: read failed: {e}")),
+    read_back(admin, &hex(&final_tip), &expected, |path, want, r| match r {
+        Ok(r) if r.found && r.content == want => {}
+        Ok(_) => {
+            bad += 1;
+            if bad <= 3 {
+                failures.push(format!("{path}: missing or not its last landed content"));
             }
         }
-    }
+        Err(e) => failures.push(format!("{path}: read failed: {e}")),
+    })
+    .await?;
     if bad > 0 {
         failures.push(format!("{bad} of {} agent files wrong at the final tip", expected.len()));
     }
-    let verify_s = verify_start.elapsed().as_secs_f64();
+    Ok((growth, expected.len(), start.elapsed().as_secs_f64()))
+}
 
-    // ---- health criteria ----
-    if error_rate > args.max_error_rate {
+/// Health criteria: error rate, dead replicas, RSS growth after warm-up and
+/// p99 drift against the first window. Returns each replica's RSS trend in
+/// MiB per hour.
+fn check_health(
+    args: &Args,
+    tot: &Totals,
+    windows: &[WindowReport],
+    replicas: &mut [Replica],
+    failures: &mut Vec<String>,
+) -> Vec<f64> {
+    if tot.error_rate > args.max_error_rate {
         failures.push(format!(
-            "error rate {:.4}% > {:.4}% ({errors} errors, {aborts} aborts of {ops} ops)",
-            error_rate * 100.0,
-            args.max_error_rate * 100.0
+            "error rate {:.4}% > {:.4}% ({} errors, {} aborts of {} ops)",
+            tot.error_rate * 100.0,
+            args.max_error_rate * 100.0,
+            tot.errors,
+            tot.aborts,
+            tot.ops
         ));
     }
     for (i, r) in replicas.iter_mut().enumerate() {
@@ -892,7 +941,7 @@ async fn drive(
             Some(secs) => secs as f64,
             None => {
                 let half = args.duration as f64 / 2.0;
-                rss_warmup(&windows, i).map_or(half, |rolled| rolled.max(half))
+                rss_warmup(windows, i).map_or(half, |rolled| rolled.max(half))
             }
         };
         let pts: Vec<(f64, f64)> = windows
@@ -925,83 +974,91 @@ async fn drive(
             }
         }
     }
+    rss_slopes
+}
 
-    for r in replicas {
-        r.shutdown().await;
+fn window_json(w: &WindowReport) -> J {
+    let mut lat = J::obj();
+    for (op, l) in &w.lat {
+        lat = lat.with(op, l.json());
     }
+    let reps: Vec<J> = w
+        .replicas
+        .iter()
+        .map(|r| {
+            J::obj()
+                .with("rss_bytes", r.rss)
+                .with("alive", r.alive)
+                .with("pg_connections", r.pg_conns)
+                .with("cache_bytes", r.cache_bytes)
+                .with("cache_entries", r.cache_entries)
+                .with("land_queued", r.queued)
+                .with("catch_ups", r.catch_ups)
+        })
+        .collect();
+    J::obj()
+        .with("end_s", w.end_s)
+        .with("ops_per_s", w.ops as f64 / w.secs)
+        .with("lands_per_s", w.landed as f64 / w.secs)
+        .with("errors", w.errors)
+        .with("aborts", w.aborts)
+        .with("conflicts", w.conflicts)
+        .with("latency", lat)
+        .with("replicas", J::Arr(reps))
+        .with("pg_connections_total", w.pg_total)
+}
 
-    // ---- report ----
-    let pass = failures.is_empty();
+/// Print the summary, write `--json`, and return the exit code.
+fn report(args: &Args, plan: &Plan, tot: &Totals, o: &Outcome) -> Result<i32> {
+    let wall = o.wall;
+    let pass = o.failures.is_empty();
     println!();
     println!("== soak summary ==");
-    println!("wall            {wall:.0}s (verification {verify_s:.1}s)");
-    println!("ops             {ops} ({:.1}/s)", ops as f64 / wall);
-    println!("lands           {landed} ({:.1}/s), uncertain {uncertain}", landed as f64 / wall);
-    println!("history growth  {}", growth.map_or("-".into(), |g| g.to_string()));
-    println!("conflicts       {conflicts}");
-    println!("errors          {errors} ({:.4}%), aborts {aborts}", error_rate * 100.0);
-    let slopes: Vec<String> = rss_slopes.iter().map(|s| format!("{s:.0}")).collect();
+    println!("wall            {wall:.0}s (verification {:.1}s)", o.verify_s);
+    println!("ops             {} ({:.1}/s)", tot.ops, tot.ops as f64 / wall);
+    println!(
+        "lands           {} ({:.1}/s), uncertain {}",
+        tot.landed,
+        tot.landed as f64 / wall,
+        tot.uncertain
+    );
+    println!("history growth  {}", o.growth.map_or("-".into(), |g| g.to_string()));
+    println!("conflicts       {}", tot.conflicts);
+    println!(
+        "errors          {} ({:.4}%), aborts {}",
+        tot.errors,
+        tot.error_rate * 100.0,
+        tot.aborts
+    );
+    let slopes: Vec<String> = o.rss_slopes.iter().map(|s| format!("{s:.0}")).collect();
     println!("RSS trend       {} MiB/h (after warm-up, per replica)", slopes.join(", "));
-    println!("files checked   {}", expected.len());
+    println!("files checked   {}", o.files_checked);
     println!("result: {}", if pass { "PASS" } else { "FAIL" });
-    for f in &failures {
+    for f in &o.failures {
         println!("  - {f}");
     }
 
-    let windows_json: Vec<J> = windows
-        .iter()
-        .map(|w| {
-            let mut lat = J::obj();
-            for (op, l) in &w.lat {
-                lat = lat.with(op, l.json());
-            }
-            let reps: Vec<J> = w
-                .replicas
-                .iter()
-                .map(|r| {
-                    J::obj()
-                        .with("rss_bytes", r.rss)
-                        .with("alive", r.alive)
-                        .with("pg_connections", r.pg_conns)
-                        .with("cache_bytes", r.cache_bytes)
-                        .with("cache_entries", r.cache_entries)
-                        .with("land_queued", r.queued)
-                        .with("catch_ups", r.catch_ups)
-                })
-                .collect();
-            J::obj()
-                .with("end_s", w.end_s)
-                .with("ops_per_s", w.ops as f64 / w.secs)
-                .with("lands_per_s", w.landed as f64 / w.secs)
-                .with("errors", w.errors)
-                .with("aborts", w.aborts)
-                .with("conflicts", w.conflicts)
-                .with("latency", lat)
-                .with("replicas", J::Arr(reps))
-                .with("pg_connections_total", w.pg_total)
-        })
-        .collect();
     let json = J::obj()
         .with("command", "soak")
         .with("replicas", args.replicas)
         .with("agents", args.agents)
         .with("duration_s", args.duration)
         .with("think_ms", args.think_ms)
-        .with("pg_max_connections_per_replica", max_conns)
-        .with("pg_lock_connections_per_replica", lock_conns)
+        .with("pg_max_connections_per_replica", plan.max_conns)
+        .with("pg_lock_connections_per_replica", plan.lock_conns)
         .with("wall_s", wall)
-        .with("ops", ops)
-        .with("landed", landed)
-        .with("uncertain", uncertain)
-        .with("history_growth", growth)
-        .with("conflicts", conflicts)
-        .with("errors", errors)
-        .with("aborts", aborts)
-        .with("error_rate", error_rate)
-        .with("rss_growth_mib_per_hour", J::Arr(rss_slopes.into_iter().map(J::from).collect()))
-        .with("windows", J::Arr(windows_json))
+        .with("ops", tot.ops)
+        .with("landed", tot.landed)
+        .with("uncertain", tot.uncertain)
+        .with("history_growth", o.growth)
+        .with("conflicts", tot.conflicts)
+        .with("errors", tot.errors)
+        .with("aborts", tot.aborts)
+        .with("error_rate", tot.error_rate)
+        .with("rss_growth_mib_per_hour", J::Arr(o.rss_slopes.iter().map(|&s| J::from(s)).collect()))
+        .with("windows", J::Arr(o.windows.iter().map(window_json).collect()))
         .with("pass", pass)
-        .with("failures", J::Arr(failures.iter().map(|f| J::from(f.as_str())).collect()));
+        .with("failures", J::Arr(o.failures.iter().map(|f| J::from(f.as_str())).collect()));
     write_json(&args.json, &json)?;
     Ok(if pass { 0 } else { 1 })
 }
