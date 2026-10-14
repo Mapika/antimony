@@ -295,6 +295,52 @@ fn live_reset_cleans_landed_entries_and_preserves_other_edits() {
     assert!(!f.state.join("upper/file").exists());
 }
 
+#[test]
+fn reset_pruning_an_open_file_keeps_later_writes() {
+    let f = Fixture::new();
+    // Opening for write copies "file" up unchanged; a reset to an identical
+    // base prunes that copy while it is still open.
+    let file = OpenOptions::new().write(true).open(f.mount.join("file")).unwrap();
+    assert!(f.state.join("upper/file").exists());
+    f.rt.block_on(reset(f.objects.clone(), &f.state, ObjectId([2; 32]), f.tree)).unwrap();
+    assert!(!f.state.join("upper/file").exists());
+    file.write_all_at(b"OR", 0).unwrap();
+    assert_eq!(fs::read(f.mount.join("file")).unwrap(), b"ORiginal");
+    file.write_all_at(b"!", 8).unwrap();
+    drop(file);
+    assert_eq!(fs::read(f.mount.join("file")).unwrap(), b"ORiginal!");
+    assert_eq!(f.summary(), [("file".into(), Modified)]);
+}
+
+#[test]
+fn writes_are_visible_to_reads_stat_and_status_immediately() {
+    // Writes are acknowledged before they reach the upper file; nothing that
+    // observes the file may see them missing.
+    let f = Fixture::new();
+    let path = f.mount.join("grow");
+    let file = File::create(&path).unwrap();
+    let chunk = vec![7u8; 128 << 10];
+    for i in 0..64u64 {
+        file.write_all_at(&chunk, i * chunk.len() as u64).unwrap();
+        let len = (i + 1) * chunk.len() as u64;
+        assert_eq!(file.metadata().unwrap().len(), len);
+        assert_eq!(fs::metadata(&path).unwrap().len(), len);
+        let mut tail = [0u8; 1];
+        File::open(&path).unwrap().read_exact_at(&mut tail, len - 1).unwrap();
+        assert_eq!(tail, [7]);
+    }
+    // Rewrites of one region apply in order.
+    for i in 0..200u8 {
+        file.write_all_at(&[i; 4096], 4096).unwrap();
+    }
+    let data = fs::read(&path).unwrap();
+    assert!(data[4096..8192].iter().all(|&b| b == 199));
+    file.sync_all().unwrap();
+    drop(file);
+    assert_eq!(fs::read(f.state.join("upper/grow")).unwrap(), data);
+    assert_eq!(f.summary(), [("grow".into(), Added)]);
+}
+
 #[derive(Default)]
 pub(super) struct CountingStore {
     pub(super) inner: MemoryObjectStore,

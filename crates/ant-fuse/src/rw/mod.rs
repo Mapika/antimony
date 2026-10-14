@@ -22,19 +22,27 @@
 //! The mount is exclusive (`MountGuard`): recovery runs and base/whiteouts
 //! are loaded once at mount and kept in memory. `read`/`write`/`fsync` on an
 //! open upper file use positional I/O on the handle's own descriptor, without
-//! the overlay mutex or the state lock, on several FUSE threads. Namespace
-//! operations serialize on the overlay mutex; mutations also hold the state
-//! lock so `status`/`reset` (other processes) see whole operations. `reset`
-//! on a live mount appends a journal record; the daemon notices the journal
-//! size change with one `fstat` per namespace operation and reloads.
+//! the overlay mutex or the state lock, on several FUSE threads. A write is
+//! acknowledged before its copy into the upper file (`overlay::Pending`), so
+//! a sequential writer's next request overlaps it; reads, attributes, flush,
+//! fsync and truncation of that inode wait for writes in flight, and
+//! overlapping writes apply in order. Namespace operations serialize on the
+//! overlay mutex; mutations also hold the state lock so `status`/`reset`
+//! (other processes) see whole operations. `reset` on a live mount appends a
+//! journal record; the daemon notices the journal size change with one
+//! `fstat` per namespace operation and reloads. If `reset` prunes an upper
+//! file that is still open for writing, the next write, flush or fsync on it
+//! sees `nlink == 0` and publishes the file again, with its writes.
 //!
 //! # Crash semantics
 //!
 //! - **Daemon crash** (killed, panics; the kernel survives): the workspace
 //!   reflects every completed metadata operation, i.e. a prefix of them, and
 //!   the interrupted one is either applied or not (a trailing journal rename
-//!   is rolled forward; a torn journal record is dropped). File data written
-//!   before the crash is kept by the kernel page cache.
+//!   is rolled forward; a torn journal record is dropped). File data is kept
+//!   by the kernel page cache once its file was closed (FUSE flush) or
+//!   synced; the last acknowledged writes to a file still open may be lost
+//!   or partially applied, like any unsynced data.
 //! - **System crash**: metadata changes are made durable in batches, by an
 //!   explicit `fsync`/`fsyncdir`, at unmount, and at most 100 ms later by a
 //!   background flusher; only changes acknowledged after the last such point

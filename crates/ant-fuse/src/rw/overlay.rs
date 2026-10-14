@@ -26,15 +26,6 @@ use super::journal::{COMPACT_BYTES, Journal, Record, compact, load};
 use super::state::*;
 use super::{error, file_kind, fuse_error, hidden, metadata, mode, other, under};
 
-pub(super) static PROBE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
-struct Probe(std::time::Instant, bool);
-impl Drop for Probe {
-    fn drop(&mut self) {
-        let i = if self.1 { 2 } else { 3 };
-        PROBE[i].fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        PROBE[i + 2].fetch_add(1, Ordering::Relaxed);
-    }
-}
 pub(super) struct Overlay {
     pub(super) paths: HashMap<INodeNo, String>,
     pub(super) directories: HashMap<u64, Vec<(INodeNo, FileType, String)>>,
@@ -133,6 +124,8 @@ pub(super) struct Writable {
     pub(super) handles: RwLock<HashMap<u64, Arc<Handle>>>,
     files: Mutex<HashMap<INodeNo, std::sync::Weak<Pending>>>,
     next_handle: AtomicU64,
+    /// Compact the journal past this size ([`COMPACT_BYTES`]).
+    pub(super) compact_bytes: u64,
     pub(super) journal: Arc<Journal>,
     flusher: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -172,6 +165,7 @@ impl Writable {
             handles: RwLock::new(HashMap::new()),
             files: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
+            compact_bytes: COMPACT_BYTES,
             journal,
             flusher: Mutex::new(Some(flusher)),
         })
@@ -196,14 +190,8 @@ impl Writable {
         exclusive: bool,
         f: impl FnOnce(&mut Operation<'_>) -> io::Result<T>,
     ) -> io::Result<T> {
-        let t0 = std::time::Instant::now();
         let mut overlay = self.overlay.lock();
-        let t1 = std::time::Instant::now();
         let _lock = if exclusive { Some(self.journal.lock()?) } else { None };
-        let t2 = std::time::Instant::now();
-        let _probe = Probe(t1, exclusive);
-        PROBE[0].fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
-        PROBE[1].fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
         if self.journal.size()? != overlay.journal_len {
             // `reset` replaced the base (or a crashed writer left a tail).
             let _relock = if exclusive { None } else { Some(self.journal.lock()?) };
@@ -223,7 +211,7 @@ impl Writable {
             deleted,
             journal_len,
         });
-        if exclusive && overlay.journal_len > COMPACT_BYTES {
+        if exclusive && overlay.journal_len > self.compact_bytes {
             compact(&self.dir, self.journal.file())?;
             self.journal.compacted();
             overlay.journal_len = 0;
@@ -231,18 +219,6 @@ impl Writable {
         result
     }
 
-    pub(super) fn probe_report() {
-        let v: Vec<u64> = PROBE.iter().map(|a| a.load(Ordering::Relaxed)).collect();
-        eprintln!(
-            "PROBE wait_ms={} flock_ms={} hold_excl_ms={} hold_ro_ms={} n_excl={} n_ro={}",
-            v[0] / 1000000,
-            v[1] / 1000000,
-            v[2] / 1000000,
-            v[3] / 1000000,
-            v[4],
-            v[5]
-        );
-    }
     pub(super) fn handle(&self, fh: FileHandle) -> io::Result<Arc<Handle>> {
         self.handles.read().get(&fh.0).cloned().ok_or_else(|| error(libc::EBADF))
     }
@@ -308,7 +284,6 @@ impl Writable {
 
     /// Final compaction and sync at unmount.
     pub(super) fn shutdown(&self) -> io::Result<()> {
-        Self::probe_report();
         self.journal.stop();
         if let Some(flusher) = self.flusher.lock().take() {
             let _ = flusher.join();
