@@ -79,6 +79,21 @@ The image is `debian:bookworm-slim` + `fuse3`. Containers that use FUSE mounts
 need `--device /dev/fuse --cap-add SYS_ADMIN`. Any `ant` command works as the
 container command, e.g. `docker run antimony import ...`.
 
+## Running several server replicas
+
+Any number of `ant serve` processes can share one Postgres (and S3). A server
+keeps no state that matters across requests besides caches of immutable data,
+so replicas are interchangeable. Lands on one ref are batched per process;
+the batch leaders of different processes take turns through a per-ref
+Postgres advisory lock, held across reading the tip, replaying and the CAS.
+The ref CAS remains the correctness guarantee; the lock only avoids racing.
+
+Each process opens up to `--pg-max-connections` (default 64) query connections
+plus `--pg-lock-connections` (default 8) lock connections. Size them so that
+replicas × (both) stays under the database's `max_connections`. Setting
+`--pg-lock-connections 0` disables the locks, which is fine for a single
+process. `ant-bench soak` exercises this setup end to end.
+
 ## Status
 
 Early prototype, built in the open with AI agents. Working end to end against
