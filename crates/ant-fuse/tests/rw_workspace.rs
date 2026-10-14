@@ -272,6 +272,9 @@ fn cargo_build(dir: &Path) -> Duration {
 #[ignore = "benchmark; real FUSE; ANT_RW_BENCH=1 for full size and targets"]
 fn rw_write_bench() {
     let full = std::env::var("ANT_RW_BENCH").is_ok_and(|v| v == "1");
+    // Comma-separated subset of: seq, small, build, status.
+    let only = std::env::var("ANT_RW_BENCH_ONLY").ok();
+    let run = |name: &str| only.as_ref().is_none_or(|o| o.split(',').any(|s| s == name));
     let (seq_bytes, files) = if full { (1u64 << 30, 10_000) } else { (64u64 << 20, 1_000) };
     let tmp = scratch("rwperf");
     let mount = tmp.path().join("mnt");
@@ -281,62 +284,87 @@ fn rw_write_bench() {
     let mut report = Report(Vec::new());
 
     // 1. Sequential write, 128 KiB chunks, new file: mount vs upper dir.
-    let mut direct = Duration::MAX;
-    let mut fuse = Duration::MAX;
-    for _ in 0..if full { 3 } else { 1 } {
-        direct = direct.min(sequential_write(&state.join("upper/direct.bin"), seq_bytes));
-        fuse = fuse.min(sequential_write(&mount.join("seq.bin"), seq_bytes));
+    let mut seq_ratio = None;
+    if run("seq") {
+        let mut direct = Duration::MAX;
+        let mut fuse = Duration::MAX;
+        for _ in 0..if full { 5 } else { 1 } {
+            direct = direct.min(sequential_write(&state.join("upper/direct.bin"), seq_bytes));
+            fuse = fuse.min(sequential_write(&mount.join("seq.bin"), seq_bytes));
+        }
+        let ratio = direct.as_secs_f64() / fuse.as_secs_f64();
+        report.push(format!(
+            "sequential write {} MiB: direct {:.0} MiB/s, mount {:.0} MiB/s, ratio {:.0}% (target >= 60%)",
+            seq_bytes >> 20,
+            rate(seq_bytes, direct),
+            rate(seq_bytes, fuse),
+            ratio * 100.0
+        ));
+        seq_ratio = Some(ratio);
     }
-    let seq_ratio = direct.as_secs_f64() / fuse.as_secs_f64();
-    report.push(format!(
-        "sequential write {} MiB: direct {:.0} MiB/s, mount {:.0} MiB/s, ratio {:.0}% (target >= 60%)",
-        seq_bytes >> 20,
-        rate(seq_bytes, direct),
-        rate(seq_bytes, fuse),
-        seq_ratio * 100.0
-    ));
 
     // 2. Small files, 8 threads.
-    let took = small_files(&mount.join("small"), files, 8);
-    let files_per_sec = files as f64 / took.as_secs_f64();
-    report.push(format!(
-        "{files} x 4 KiB create+write+close, 8 threads: {files_per_sec:.0} files/s (target >= 5000)"
-    ));
+    let mut files_per_sec = None;
+    if run("small") {
+        let mut took = Duration::MAX;
+        for _ in 0..if full { 3 } else { 1 } {
+            took = took.min(small_files(&mount.join("small"), files, 8));
+            fs::remove_dir_all(mount.join("small")).unwrap();
+        }
+        let rate = files as f64 / took.as_secs_f64();
+        report.push(format!(
+            "{files} x 4 KiB create+write+close, 8 threads: {rate:.0} files/s (target >= 5000)"
+        ));
+        files_per_sec = Some(rate);
+    }
 
     // 3. cargo build of a small crate: lazy workspace vs regular directory.
-    let regular = tmp.path().join("regular");
-    for (path, data) in small_crate() {
-        let p = regular.join(path);
-        fs::create_dir_all(p.parent().unwrap()).unwrap();
-        fs::write(p, data).unwrap();
+    let mut build_ratio = None;
+    if run("build") {
+        let regular = tmp.path().join("regular");
+        for (path, data) in small_crate() {
+            let p = regular.join(path);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, data).unwrap();
+        }
+        // Alternate to spread machine noise evenly; keep the best of each.
+        let (mut in_regular, mut in_mount) = (Duration::MAX, Duration::MAX);
+        for _ in 0..if full { 3 } else { 1 } {
+            in_regular = in_regular.min(cargo_build(&regular.join("crate")));
+            in_mount = in_mount.min(cargo_build(&mount.join("crate")));
+            fs::remove_dir_all(regular.join("crate/target")).unwrap();
+            fs::remove_dir_all(mount.join("crate/target")).unwrap();
+        }
+        let ratio = in_mount.as_secs_f64() / in_regular.as_secs_f64();
+        report.push(format!(
+            "cargo build: regular {:.2}s, lazy {:.2}s, ratio {ratio:.2}x (target <= 1.5x)",
+            in_regular.as_secs_f64(),
+            in_mount.as_secs_f64()
+        ));
+        fs::remove_dir_all(&regular).unwrap();
+        fs::remove_file(mount.join("crate/Cargo.lock")).unwrap();
+        build_ratio = Some(ratio);
     }
-    let in_regular = cargo_build(&regular.join("crate"));
-    let in_mount = cargo_build(&mount.join("crate"));
-    let build_ratio = in_mount.as_secs_f64() / in_regular.as_secs_f64();
-    report.push(format!(
-        "cargo build: regular {:.2}s, lazy {:.2}s, ratio {build_ratio:.2}x (target <= 1.5x)",
-        in_regular.as_secs_f64(),
-        in_mount.as_secs_f64()
-    ));
-    fs::remove_dir_all(&regular).unwrap();
-    fs::remove_dir_all(mount.join("crate/target")).unwrap();
-    fs::remove_dir_all(mount.join("small")).unwrap();
 
     // 4. Status after editing 2 files of the 20k-file tree.
-    fs::write(mount.join("tree/d001/f001"), b"one").unwrap();
-    fs::write(mount.join("tree/d199/f099"), b"two").unwrap();
-    let rt = runtime();
-    let (objects, _) = build(&rt, "bench");
-    let mut status = Duration::MAX;
-    for _ in 0..5 {
-        let start = Instant::now();
-        let changes = rt.block_on(ant_fuse::rw::changes(objects.clone(), &state)).unwrap();
-        status = status.min(start.elapsed());
-        let paths = changes.iter().map(|c| c.path.to_string()).collect::<Vec<_>>();
-        assert!(paths.iter().any(|p| p == "tree/d001/f001"), "{paths:?}");
-        assert!(paths.iter().any(|p| p == "tree/d199/f099"), "{paths:?}");
+    if run("status") {
+        fs::write(mount.join("tree/d001/f001"), b"one").unwrap();
+        fs::write(mount.join("tree/d199/f099"), b"two").unwrap();
+        let rt = runtime();
+        let (objects, _) = build(&rt, "bench");
+        let mut status = Duration::MAX;
+        for _ in 0..5 {
+            let start = Instant::now();
+            let changes = rt.block_on(ant_fuse::rw::changes(objects.clone(), &state)).unwrap();
+            status = status.min(start.elapsed());
+            let paths = changes.iter().map(|c| c.path.to_string()).collect::<Vec<_>>();
+            assert_eq!(paths, ["tree/d001/f001", "tree/d199/f099"]);
+        }
+        report.push(format!(
+            "status after 2 edits in 20k files: {:.2} ms",
+            status.as_secs_f64() * 1e3
+        ));
     }
-    report.push(format!("status after 2 edits in 20k files: {:.2} ms", status.as_secs_f64() * 1e3));
     daemon.stop();
     eprintln!(
         "rw_write_bench ({}):\n  {}",
@@ -344,9 +372,9 @@ fn rw_write_bench() {
         report.0.join("\n  ")
     );
     if full {
-        assert!(seq_ratio >= 0.6, "sequential write below target");
-        assert!(files_per_sec >= 5000.0, "small files below target");
-        assert!(build_ratio <= 1.5, "cargo build below target");
+        assert!(seq_ratio.is_none_or(|r| r >= 0.6), "sequential write below target");
+        assert!(files_per_sec.is_none_or(|r| r >= 5000.0), "small files below target");
+        assert!(build_ratio.is_none_or(|r| r <= 1.5), "cargo build below target");
     }
 }
 

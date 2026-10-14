@@ -15,6 +15,12 @@ use fuser::*;
 use super::overlay::*;
 use super::{error, file_kind, metadata, other};
 
+/// Wait for the handle's inode's acknowledged writes; report a deferred
+/// write error.
+fn written(handle: &Handle) -> io::Result<()> {
+    handle.pending.as_ref().map_or(Ok(()), |p| p.written())
+}
+
 impl Writable {
     fn read_lower(
         &self,
@@ -26,6 +32,7 @@ impl Writable {
     ) -> io::Result<bytes::Bytes> {
         // A lower file may have been copied up since this read handle opened.
         let path = o.path(ino)?;
+        self.settle(ino);
         if o.active(ino)
             && let Some(m) = metadata(&o.upper(&path))?
             && m.is_file()
@@ -104,6 +111,12 @@ impl Filesystem for Writable {
         }
         reply.ok();
     }
+    fn init(&mut self, _: &Request, config: &mut KernelConfig) -> io::Result<()> {
+        // Lookups and readdir in one directory may run concurrently; the
+        // overlay serializes what needs it.
+        let _ = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS);
+        Ok(())
+    }
     fn destroy(&mut self) {
         if let Err(error) = self.shutdown() {
             tracing::error!(%error, "lazy workspace shutdown failed");
@@ -139,6 +152,9 @@ impl Filesystem for Writable {
             let lower = match &handle.file {
                 OpenFile::Upper(f) => {
                     // Fast path: positional read, no overlay or state lock.
+                    if let Some(p) = &handle.pending {
+                        p.settle();
+                    }
                     let mut out = vec![0; size as usize];
                     let n = f.read_at(&mut out, offset)?;
                     out.truncate(n);
@@ -166,41 +182,51 @@ impl Filesystem for Writable {
         reply: ReplyWrite,
     ) {
         // Fast path: positional write on the handle's own file, no overlay or
-        // state lock; different files proceed in parallel.
-        let result = self.handle(fh).and_then(|handle| {
-            let OpenFile::Upper(f) = &handle.file else {
-                return Err(error(libc::EBADF));
-            };
-            f.write_all_at(data, offset)?;
-            self.check_attached(ino, fh, &handle, Some((offset, data)))?;
-            Ok(data.len() as u32)
-        });
-        match result {
-            Ok(n) => reply.written(n),
-            Err(e) => reply.error(e.into()),
+        // state lock; different files proceed in parallel. Acknowledged
+        // before the copy into the upper file (see `Pending`).
+        let handle = match self.handle(fh) {
+            Ok(h) => h,
+            Err(e) => return reply.error(e.into()),
+        };
+        let (OpenFile::Upper(f), Some(pending)) = (&handle.file, &handle.pending) else {
+            return reply.error(Errno::EBADF);
+        };
+        if let Err(e) = pending.begin(offset, data.len()) {
+            return reply.error(e.into());
+        }
+        reply.written(data.len() as u32);
+        let result = f.write_all_at(data, offset);
+        pending.end(offset, data.len(), result);
+        if let Err(e) = self.check_attached(ino, fh, &handle, Some((offset, data))) {
+            pending.fail(e);
         }
     }
     fn release(
         &self,
         _: &Request,
-        _: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _: OpenFlags,
         _: Option<LockOwner>,
         _: bool,
         reply: ReplyEmpty,
     ) {
-        self.handles.write().remove(&fh.0);
+        self.release_handle(ino, fh);
         reply.ok();
     }
     fn flush(&self, _: &Request, ino: INodeNo, fh: FileHandle, _: LockOwner, reply: ReplyEmpty) {
-        match self.handle(fh).and_then(|h| self.check_attached(ino, fh, &h, None)) {
+        let result = self.handle(fh).and_then(|h| {
+            written(&h)?;
+            self.check_attached(ino, fh, &h, None)
+        });
+        match result {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.into()),
         }
     }
     fn fsync(&self, _: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
         let result = self.handle(fh).and_then(|h| {
+            written(&h)?;
             self.check_attached(ino, fh, &h, None)?;
             if let OpenFile::Upper(f) = &self.handle(fh)?.file {
                 if datasync { f.sync_data()? } else { f.sync_all()? }
@@ -236,11 +262,11 @@ impl Filesystem for Writable {
         reply: ReplyCreate,
     ) {
         match self.run_mut(|o| {
-            let (ino, file) = o.create_entry(parent, name, mode & !umask, None, false)?;
+            let (ino, file, m) = o.create_entry(parent, name, mode & !umask, None, false)?;
             let file = file.ok_or_else(|| other("created file not open"))?;
-            let attr = o.created_attr(ino, &file)?;
+            let attr = o.created_attr(ino, &m)?;
             let write = flags & libc::O_ACCMODE != libc::O_RDONLY;
-            Ok((attr, self.insert_handle(OpenFile::Upper(file), write)))
+            Ok((attr, self.insert_handle(ino, OpenFile::Upper(file), write)))
         }) {
             Ok((a, h)) => reply.created(&TTL, &a, Generation(0), h, FopenFlags::FOPEN_DIRECT_IO),
             Err(e) => reply.error(e.into()),
@@ -356,6 +382,7 @@ impl Filesystem for Writable {
         }
         let result = self.run_mut(|o| {
             let path = o.copy_up(&o.path(ino)?)?;
+            self.settle(ino);
             if let Some(size) = size {
                 let handle = fh.and_then(|h| self.handles.read().get(&h.0).cloned());
                 if let Some(OpenFile::Upper(f)) = handle.as_ref().map(|h| &h.file) {

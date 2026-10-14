@@ -10,7 +10,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt, symlink};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,7 +18,7 @@ use std::time::SystemTime;
 
 use ant_core::{EntryMode, ObjectId, ObjectKind, Tree, TreeEntry};
 use fuser::*;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::filesystem::{State, View};
 
@@ -26,6 +26,15 @@ use super::journal::{COMPACT_BYTES, Journal, Record, compact, load};
 use super::state::*;
 use super::{error, file_kind, fuse_error, hidden, metadata, mode, other, under};
 
+pub(super) static PROBE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+struct Probe(std::time::Instant, bool);
+impl Drop for Probe {
+    fn drop(&mut self) {
+        let i = if self.1 { 2 } else { 3 };
+        PROBE[i].fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        PROBE[i + 2].fetch_add(1, Ordering::Relaxed);
+    }
+}
 pub(super) struct Overlay {
     pub(super) paths: HashMap<INodeNo, String>,
     pub(super) directories: HashMap<u64, Vec<(INodeNo, FileType, String)>>,
@@ -45,6 +54,75 @@ pub(super) struct Handle {
     pub(super) writable: bool,
     /// The inode left the namespace (unlinked or replaced): never reattach.
     pub(super) detached: AtomicBool,
+    /// Write ordering for the inode (upper files only).
+    pub(super) pending: Option<Arc<Pending>>,
+}
+
+/// Writes are acknowledged before they reach the upper file, so the next
+/// request's trip through the kernel (and several writes' copies into the
+/// page cache) overlap. Every upper handle of an inode shares one `Pending`
+/// tracking the byte ranges in flight: a write waits only for overlapping
+/// in-flight writes (so rewrites of a region apply in order), and anything
+/// that observes the file's content or size (reads, attributes, flush,
+/// fsync, truncate) waits until nothing is in flight, so no one can see a
+/// write missing. An I/O error after the reply is kept and reported by the
+/// next write, flush or fsync (like a writeback error). A daemon crash can
+/// lose such writes unless the file was closed (flushed) or synced since:
+/// unsynced data, as documented in `rw`.
+#[derive(Default)]
+pub(super) struct Pending {
+    state: Mutex<InFlight>,
+    idle: Condvar,
+}
+#[derive(Default)]
+struct InFlight {
+    ranges: Vec<(u64, u64)>,
+    error: Option<io::Error>,
+}
+impl Pending {
+    /// Register a write of `len` bytes at `offset`, after overlapping ones.
+    pub(super) fn begin(&self, offset: u64, len: usize) -> io::Result<()> {
+        let end = offset.saturating_add(len as u64);
+        let mut s = self.state.lock();
+        if let Some(e) = s.error.take() {
+            return Err(e);
+        }
+        while s.ranges.iter().any(|&(a, b)| a < end && offset < b) {
+            self.idle.wait(&mut s);
+        }
+        s.ranges.push((offset, end));
+        Ok(())
+    }
+    pub(super) fn end(&self, offset: u64, len: usize, result: io::Result<()>) {
+        let end = offset.saturating_add(len as u64);
+        let mut s = self.state.lock();
+        if let Some(i) = s.ranges.iter().position(|&r| r == (offset, end)) {
+            s.ranges.swap_remove(i);
+        }
+        if let Err(e) = result {
+            s.error.get_or_insert(e);
+        }
+        drop(s);
+        self.idle.notify_all();
+    }
+    /// Wait until no acknowledged write is in flight.
+    pub(super) fn settle(&self) {
+        let mut s = self.state.lock();
+        while !s.ranges.is_empty() {
+            self.idle.wait(&mut s);
+        }
+    }
+    /// Settle and report (once) a write error that happened after its reply.
+    pub(super) fn written(&self) -> io::Result<()> {
+        let mut s = self.state.lock();
+        while !s.ranges.is_empty() {
+            self.idle.wait(&mut s);
+        }
+        s.error.take().map_or(Ok(()), Err)
+    }
+    pub(super) fn fail(&self, e: io::Error) {
+        self.state.lock().error.get_or_insert(e);
+    }
 }
 
 pub(super) struct Writable {
@@ -53,6 +131,7 @@ pub(super) struct Writable {
     pub(super) dir: PathBuf,
     pub(super) overlay: Mutex<Overlay>,
     pub(super) handles: RwLock<HashMap<u64, Arc<Handle>>>,
+    files: Mutex<HashMap<INodeNo, std::sync::Weak<Pending>>>,
     next_handle: AtomicU64,
     pub(super) journal: Arc<Journal>,
     flusher: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -91,6 +170,7 @@ impl Writable {
             }),
             dir,
             handles: RwLock::new(HashMap::new()),
+            files: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
             journal,
             flusher: Mutex::new(Some(flusher)),
@@ -116,8 +196,14 @@ impl Writable {
         exclusive: bool,
         f: impl FnOnce(&mut Operation<'_>) -> io::Result<T>,
     ) -> io::Result<T> {
+        let t0 = std::time::Instant::now();
         let mut overlay = self.overlay.lock();
+        let t1 = std::time::Instant::now();
         let _lock = if exclusive { Some(self.journal.lock()?) } else { None };
+        let t2 = std::time::Instant::now();
+        let _probe = Probe(t1, exclusive);
+        PROBE[0].fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+        PROBE[1].fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
         if self.journal.size()? != overlay.journal_len {
             // `reset` replaced the base (or a crashed writer left a tail).
             let _relock = if exclusive { None } else { Some(self.journal.lock()?) };
@@ -145,14 +231,54 @@ impl Writable {
         result
     }
 
+    pub(super) fn probe_report() {
+        let v: Vec<u64> = PROBE.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        eprintln!(
+            "PROBE wait_ms={} flock_ms={} hold_excl_ms={} hold_ro_ms={} n_excl={} n_ro={}",
+            v[0] / 1000000,
+            v[1] / 1000000,
+            v[2] / 1000000,
+            v[3] / 1000000,
+            v[4],
+            v[5]
+        );
+    }
     pub(super) fn handle(&self, fh: FileHandle) -> io::Result<Arc<Handle>> {
         self.handles.read().get(&fh.0).cloned().ok_or_else(|| error(libc::EBADF))
     }
-    pub(super) fn insert_handle(&self, file: OpenFile, writable: bool) -> FileHandle {
+    pub(super) fn insert_handle(&self, ino: INodeNo, file: OpenFile, writable: bool) -> FileHandle {
+        let pending = match file {
+            OpenFile::Upper(_) => {
+                let mut files = self.files.lock();
+                let slot = files.entry(ino).or_default();
+                Some(slot.upgrade().unwrap_or_else(|| {
+                    let p = Arc::new(Pending::default());
+                    *slot = Arc::downgrade(&p);
+                    p
+                }))
+            }
+            OpenFile::Lower(_) => None,
+        };
         let fh = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        let handle = Arc::new(Handle { file, writable, detached: AtomicBool::new(false) });
+        let handle = Arc::new(Handle { file, writable, detached: AtomicBool::new(false), pending });
         self.handles.write().insert(fh, handle);
         FileHandle(fh)
+    }
+    pub(super) fn release_handle(&self, ino: INodeNo, fh: FileHandle) {
+        let handle = self.handles.write().remove(&fh.0);
+        if handle.is_some_and(|h| h.pending.is_some()) {
+            let mut files = self.files.lock();
+            if files.get(&ino).is_some_and(|w| w.strong_count() == 0) {
+                files.remove(&ino);
+            }
+        }
+    }
+    /// Wait until acknowledged writes to `ino` have reached its upper file.
+    pub(super) fn settle(&self, ino: INodeNo) {
+        let pending = self.files.lock().get(&ino).and_then(std::sync::Weak::upgrade);
+        if let Some(p) = pending {
+            p.settle();
+        }
     }
     pub(super) fn next_handle(&self) -> u64 {
         self.next_handle.fetch_add(1, Ordering::Relaxed)
@@ -182,6 +308,7 @@ impl Writable {
 
     /// Final compaction and sync at unmount.
     pub(super) fn shutdown(&self) -> io::Result<()> {
+        Self::probe_report();
         self.journal.stop();
         if let Some(flusher) = self.flusher.lock().take() {
             let _ = flusher.join();
@@ -300,6 +427,7 @@ impl Operation<'_> {
     }
     pub(super) fn attr(&mut self, ino: INodeNo) -> io::Result<FileAttr> {
         let path = self.path(ino)?;
+        self.view.settle(ino);
         let m = metadata(&self.upper(&path))?;
         let entry = match &m {
             Some(m) => Self::upper_entry(&path, m),
@@ -532,9 +660,10 @@ impl Operation<'_> {
         perm: u32,
         target: Option<&Path>,
         directory: bool,
-    ) -> io::Result<(INodeNo, Option<File>)> {
+    ) -> io::Result<(INodeNo, Option<File>, fs::Metadata)> {
         let path = self.child(parent, name)?;
-        match self.entry(&path) {
+        // An existing upper entry fails the exclusive create below (EEXIST).
+        match self.lower_entry(&path) {
             Ok(_) => return Err(error(libc::EEXIST)),
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
             Err(e) => return Err(e),
@@ -542,26 +671,35 @@ impl Operation<'_> {
         self.copy_up(&self.path(parent)?)?;
         self.physical()?;
         let full = self.upper(&path);
-        let mut file = None;
-        if let Some(target) = target {
+        let (file, m) = if let Some(target) = target {
             symlink(target, &full)?;
+            (None, fs::symlink_metadata(&full)?)
         } else if directory {
             fs::create_dir(&full)?;
             fs::set_permissions(&full, fs::Permissions::from_mode(perm))?;
+            (None, fs::symlink_metadata(&full)?)
         } else {
-            let f = OpenOptions::new().read(true).write(true).create_new(true).open(&full)?;
-            f.set_permissions(fs::Permissions::from_mode(perm))?;
-            file = Some(f);
-        }
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(perm)
+                .open(&full)?;
+            let mut m = f.metadata()?;
+            if m.mode() & 0o7777 != perm & 0o7777 {
+                // The daemon's umask narrowed the mode.
+                f.set_permissions(fs::Permissions::from_mode(perm))?;
+                m = f.metadata()?;
+            }
+            (Some(f), m)
+        };
         self.dirty(&full);
-        let m = fs::symlink_metadata(&full)?;
         let ino = self.bind(parent, path.clone(), &Self::upper_entry(&path, &m));
-        Ok((ino, file))
+        Ok((ino, file, m))
     }
-    pub(super) fn created_attr(&self, ino: INodeNo, f: &File) -> io::Result<FileAttr> {
-        let m = f.metadata()?;
+    pub(super) fn created_attr(&self, ino: INodeNo, m: &fs::Metadata) -> io::Result<FileAttr> {
         let path = self.path(ino)?;
-        Ok(self.file_attr(ino, &Self::upper_entry(&path, &m), Some(&m), m.len()))
+        Ok(self.file_attr(ino, &Self::upper_entry(&path, m), Some(m), m.len()))
     }
     pub(super) fn open(&mut self, ino: INodeNo, flags: i32) -> io::Result<FileHandle> {
         let path = self.path(ino)?;
@@ -581,7 +719,7 @@ impl Operation<'_> {
         } else {
             OpenFile::Lower(entry.id)
         };
-        Ok(self.view.insert_handle(file, write))
+        Ok(self.view.insert_handle(ino, file, write))
     }
     /// See [`Writable::check_attached`].
     fn reattach(
@@ -605,6 +743,10 @@ impl Operation<'_> {
         let OpenFile::Upper(orphan) = &handle.file else {
             return Ok(());
         };
+        // Copy the orphan only once concurrent acknowledged writes are in.
+        if let Some(p) = &handle.pending {
+            p.settle();
+        }
         if !self.active(ino) {
             handle.detached.store(true, Ordering::Relaxed);
             return Ok(());
@@ -637,6 +779,7 @@ impl Operation<'_> {
             file: OpenFile::Upper(file),
             writable: true,
             detached: AtomicBool::new(false),
+            pending: handle.pending.clone(),
         });
         self.view.handles.write().insert(fh.0, new);
         Ok(())

@@ -89,6 +89,17 @@ enum Op {
     Fsync(String),
 }
 
+/// Close and report errors: a write is complete once the file is closed
+/// (FUSE flush) or synced, not when `write` returns.
+fn close(f: fs::File) -> std::io::Result<()> {
+    use std::os::fd::IntoRawFd;
+    // SAFETY: we own the descriptor and close it exactly once.
+    if unsafe { libc::close(f.into_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn under(path: &str, dir: &str) -> bool {
     path == dir || path.strip_prefix(dir).is_some_and(|r| r.starts_with('/'))
 }
@@ -145,10 +156,12 @@ impl Op {
             Op::WriteNew { path, data } => {
                 let mut f = fs::File::create(root.join(path))?;
                 f.write_all(data)?;
+                close(f)?;
             }
             Op::Overwrite { path, offset, data } => {
                 let f = fs::OpenOptions::new().write(true).open(root.join(path))?;
                 f.write_all_at(data, *offset)?;
+                close(f)?;
             }
             Op::Truncate { path, len } => {
                 fs::OpenOptions::new().write(true).open(root.join(path))?.set_len(*len)?;
