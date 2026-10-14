@@ -130,10 +130,7 @@ pub async fn resolve_commit(client: &mut AntRpcClient, rev: &str) -> Result<Obje
 }
 
 pub fn mode_from_pb(v: i32) -> Result<EntryMode> {
-    pb::EntryMode::try_from(v)
-        .ok()
-        .and_then(ant_proto::entry_mode)
-        .ok_or_else(|| anyhow!("server sent unknown entry mode {v}"))
+    ant_proto::entry_mode_from_i32(v).ok_or_else(|| anyhow!("server sent unknown entry mode {v}"))
 }
 
 pub fn kind_name(m: EntryMode) -> &'static str {
