@@ -14,7 +14,7 @@ use super::verify::Verified;
 use super::{LANDED_AS, LandOutcome, MAX_STACK};
 use crate::acl;
 use crate::ops::tree_edit::{
-    apply_write, deepest_first, entry, leaf_change, load_directories, prune_empty,
+    Directories, apply_write, deepest_first, entry, leaf_change, load_directories, prune_empty,
 };
 use crate::ops::{OpError, OpResult, cache};
 
@@ -244,6 +244,40 @@ impl BatchState {
         Ok(LandOutcome::Landed { new_tip: onto, rebased: true })
     }
 
+    /// The blobs `ids`, from this batch's blobs or one `get_many`.
+    async fn blobs(
+        &self,
+        b: &Backend,
+        ids: BTreeSet<ObjectId>,
+    ) -> OpResult<BTreeMap<ObjectId, EncodedObject>> {
+        let mut blobs = BTreeMap::new();
+        let fetch: Vec<_> = ids
+            .into_iter()
+            .filter(|id| match self.blobs.get(id) {
+                Some(blob) => {
+                    blobs.insert(*id, blob.clone());
+                    false
+                }
+                None => true,
+            })
+            .collect();
+        if !fetch.is_empty() {
+            for (id, object) in fetch.iter().copied().zip(b.objects.get_many(&fetch).await?) {
+                let object = object.ok_or(StoreError::NotFound(id))?;
+                if object.kind() != ObjectKind::Blob {
+                    return Err(StoreError::WrongKind {
+                        id,
+                        expected: ObjectKind::Blob,
+                        actual: object.kind(),
+                    }
+                    .into());
+                }
+                blobs.insert(id, object);
+            }
+        }
+        Ok(blobs)
+    }
+
     /// Rebase `commit` onto `onto` in memory; on success the new trees,
     /// blobs and commit are queued in `self.writes` (see [`Self::flush`]).
     pub(super) async fn rebase(
@@ -292,31 +326,7 @@ impl BatchState {
                 }
             }
         }
-        let mut blobs = BTreeMap::new();
-        let fetch: Vec<_> = blob_ids
-            .into_iter()
-            .filter(|id| match self.blobs.get(id) {
-                Some(blob) => {
-                    blobs.insert(*id, blob.clone());
-                    false
-                }
-                None => true,
-            })
-            .collect();
-        if !fetch.is_empty() {
-            for (id, object) in fetch.iter().copied().zip(b.objects.get_many(&fetch).await?) {
-                let object = object.ok_or(StoreError::NotFound(id))?;
-                if object.kind() != ObjectKind::Blob {
-                    return Err(StoreError::WrongKind {
-                        id,
-                        expected: ObjectKind::Blob,
-                        actual: object.kind(),
-                    }
-                    .into());
-                }
-                blobs.insert(id, object);
-            }
-        }
+        let blobs = self.blobs(b, blob_ids).await?;
         let mut objects = Vec::new();
         // (path, id) of every new blob/tree, for zone tagging.
         let mut written = Vec::new();
@@ -360,31 +370,7 @@ impl BatchState {
             return Ok(Err(conflicts.into_iter().collect()));
         }
         let mut new_trees = Vec::new();
-        let mut root = target.tree;
-        for path in deepest_first(&dirs) {
-            let tree = dirs
-                .remove(&path)
-                .ok_or_else(|| OpError::InvalidArgument(format!("missing directory {path}")))?;
-            let object = EncodedObject::new(ObjectKind::Tree, &tree.encode());
-            let id = object.id();
-            if let Some((parent, name)) = path.split_last() {
-                let parent_tree = dirs.get_mut(&parent).ok_or_else(|| {
-                    OpError::InvalidArgument(format!("missing directory {parent}"))
-                })?;
-                if parent_tree.get(name).is_some_and(|e| e.id == id) {
-                    continue;
-                }
-                parent_tree.upsert(TreeEntry { name: name.into(), mode: EntryMode::Tree, id })?;
-            } else {
-                root = id;
-                if root == target.tree {
-                    continue;
-                }
-            }
-            objects.push(object);
-            written.push((path, id));
-            new_trees.push((id, Arc::new(tree)));
-        }
+        let root = encode_changed(dirs, target.tree, &mut objects, &mut written, &mut new_trees)?;
         let original = cache::read_commits(b, &[commit]).await?;
         let mut rebased = original
             .first()
@@ -462,4 +448,43 @@ impl BatchState {
         meta.changesets.insert_many(entries.into_iter().map(|(n, c, w)| (n.id, c, w)));
         Ok(())
     }
+}
+
+/// Encode the edited directories deepest first into a new root tree,
+/// skipping trees whose id did not change (`root` is the unedited root).
+/// New trees go to `objects`, `written` (with their path) and `new_trees`
+/// (decoded, for the caches); returns the new root.
+fn encode_changed(
+    mut dirs: Directories,
+    root: ObjectId,
+    objects: &mut Vec<EncodedObject>,
+    written: &mut Vec<(RepoPath, ObjectId)>,
+    new_trees: &mut Vec<(ObjectId, Arc<Tree>)>,
+) -> OpResult<ObjectId> {
+    let mut new_root = root;
+    for path in deepest_first(&dirs) {
+        let tree = dirs
+            .remove(&path)
+            .ok_or_else(|| OpError::InvalidArgument(format!("missing directory {path}")))?;
+        let object = EncodedObject::new(ObjectKind::Tree, &tree.encode());
+        let id = object.id();
+        if let Some((parent, name)) = path.split_last() {
+            let parent_tree = dirs
+                .get_mut(&parent)
+                .ok_or_else(|| OpError::InvalidArgument(format!("missing directory {parent}")))?;
+            if parent_tree.get(name).is_some_and(|e| e.id == id) {
+                continue;
+            }
+            parent_tree.upsert(TreeEntry { name: name.into(), mode: EntryMode::Tree, id })?;
+        } else {
+            new_root = id;
+            if new_root == root {
+                continue;
+            }
+        }
+        objects.push(object);
+        written.push((path, id));
+        new_trees.push((id, Arc::new(tree)));
+    }
+    Ok(new_root)
 }
