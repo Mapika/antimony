@@ -10,6 +10,16 @@ release of the 0.x series may change.
 
 ### Added
 
+- Overload protection (`ant-server` limits): per-class concurrency gates with
+  a bounded queue that shed load (gRPC `UNAVAILABLE` / HTTP 503) are on by
+  default, sized from `--pg-max-connections`. Per-caller token-bucket rate
+  limits (`RESOURCE_EXHAUSTED` / 429) are opt-in and unlimited by default:
+  `--rate-{read,write,admin}` or `[principal.limits]` in the policy (additive
+  field). Rejections carry `retry-after-ms` (gRPC metadata) and `Retry-After`;
+  `ant`/`antd` retry such hinted rejections with jittered, bounded backoff.
+  Metrics `ant_ratelimit_*`; `--no-limits` disables everything. The gRPC
+  client buffers each request body once so it can be replayed, a memory cost
+  proportional to the request size for large `PutObjects`/`CreateChangeset`.
 - History queries for CI, bisect, revert and "did it merge" tooling, without
   a checkout or a client-side log walk: RPCs `MergeBase`, `IsAncestor`
   (optionally first-parent only), `LogRange` (`from..to`, first parents,

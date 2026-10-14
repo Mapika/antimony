@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::par::par_map;
+use crate::retry::{RetryPolicy, Retrying, send_get};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use tonic::metadata::{Ascii, MetadataValue};
@@ -86,7 +87,7 @@ impl Interceptor for BearerAuth {
 }
 
 /// The generated client with [`BearerAuth`].
-pub type AntRpcClient = AntClient<InterceptedService<Channel, BearerAuth>>;
+pub type AntRpcClient = AntClient<InterceptedService<Retrying<Channel>, BearerAuth>>;
 
 #[derive(Clone)]
 pub struct RemoteObjectStore {
@@ -96,6 +97,7 @@ pub struct RemoteObjectStore {
     /// `Bearer <token>` for HTTP object reads.
     authorization: Option<String>,
     state: Arc<HttpState>,
+    retry: RetryPolicy,
 }
 
 impl RemoteObjectStore {
@@ -109,6 +111,18 @@ impl RemoteObjectStore {
         http_base: Option<&str>,
         token: Option<&str>,
     ) -> anyhow::Result<Self> {
+        Self::connect_with_retry(grpc_url, http_base, token, RetryPolicy::default()).await
+    }
+
+    /// [`Self::connect_with_token`] with an explicit policy for requests the
+    /// server rejects with a retry hint (`crate::retry`; the default retries
+    /// up to 8 times within 30 s, [`RetryPolicy::none`] never).
+    pub async fn connect_with_retry(
+        grpc_url: &str,
+        http_base: Option<&str>,
+        token: Option<&str>,
+        retry: RetryPolicy,
+    ) -> anyhow::Result<Self> {
         let authorization = token.map(|t| format!("Bearer {t}"));
         let auth = match &authorization {
             Some(a) => BearerAuth(Some(
@@ -117,7 +131,7 @@ impl RemoteObjectStore {
             None => BearerAuth(None),
         };
         let channel = Channel::from_shared(grpc_url.to_owned())?.connect().await?;
-        let client = AntClient::with_interceptor(channel, auth)
+        let client = AntClient::with_interceptor(Retrying::new(channel, retry), auth)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
         Ok(Self {
@@ -126,6 +140,7 @@ impl RemoteObjectStore {
             http: reqwest::Client::new(),
             authorization,
             state: Arc::default(),
+            retry,
         })
     }
 
@@ -188,7 +203,7 @@ impl RemoteObjectStore {
             req = req.header(reqwest::header::AUTHORIZATION, a);
         }
         self.state.bundles.fetch_add(1, Ordering::Relaxed);
-        let resp = req.send().await.map_err(StoreError::backend)?;
+        let resp = send_get(req, &self.retry).await.map_err(StoreError::backend)?;
         let status = resp.status();
         if !status.is_success() {
             let has_route = resp.headers().contains_key(ant_proto::bundle::HEADER);
@@ -220,6 +235,7 @@ impl RemoteObjectStore {
         let http = self.http.clone();
         let base = base.to_owned();
         let auth = self.authorization.clone();
+        let retry = self.retry;
         let raw: Vec<Option<Bytes>> = stream::iter(ids.iter().copied())
             .map(move |id| {
                 let http = http.clone();
@@ -228,7 +244,7 @@ impl RemoteObjectStore {
                 let state = self.state.clone();
                 async move {
                     state.objects.fetch_add(1, Ordering::Relaxed);
-                    fetch_http_object(&http, &url, auth.as_deref()).await
+                    fetch_http_object(&http, &url, auth.as_deref(), &retry).await
                 }
             })
             .buffered(HTTP_CONCURRENCY)
@@ -320,12 +336,13 @@ async fn fetch_http_object(
     http: &reqwest::Client,
     url: &str,
     authorization: Option<&str>,
+    retry: &RetryPolicy,
 ) -> Result<Option<Bytes>> {
     let mut req = http.get(url);
     if let Some(a) = authorization {
         req = req.header(reqwest::header::AUTHORIZATION, a);
     }
-    let resp = req.send().await.map_err(StoreError::backend)?;
+    let resp = send_get(req, retry).await.map_err(StoreError::backend)?;
     match resp.status() {
         s if s == reqwest::StatusCode::NOT_FOUND => Ok(None),
         s if s.is_success() => Ok(Some(resp.bytes().await.map_err(StoreError::backend)?)),

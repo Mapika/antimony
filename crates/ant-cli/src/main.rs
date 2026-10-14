@@ -219,6 +219,12 @@ fn static_hint(e: &anyhow::Error) -> Option<&'static str> {
                 Some("your token's principal lacks access to this path or ref; check the policy")
             }
             Code::NotFound if rpc.message.starts_with("ref ") => Some(LIST_REFS_HINT),
+            Code::ResourceExhausted => Some(
+                "the server rate-limited this principal and retries ran out; slow down or ask the operator to raise its limits",
+            ),
+            Code::Unavailable if rpc.message.starts_with("server overloaded") => {
+                Some("the server is shedding load and retries ran out; try again shortly")
+            }
             Code::Unavailable => Some("is `ant serve` running? set ANT_SERVER (or --server)"),
             _ => None,
         };

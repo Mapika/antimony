@@ -173,6 +173,14 @@ impl Acl {
         Ok(Some(Access { policy: policy.clone(), principal }))
     }
 
+    /// The principal a credentialed `Authorization` header names (without
+    /// cloning it); `None` in open mode or for missing/unknown credentials.
+    pub fn principal_for_header<'a>(&'a self, header: Option<&str>) -> Option<&'a Principal> {
+        let policy = self.policy.as_ref()?;
+        let token = header.and_then(token_from_authorization)?;
+        policy.authenticate(&token)
+    }
+
     /// Authenticate from an `Authorization` header value (`Bearer <token>`,
     /// or `Basic` with the token as the password).
     pub fn authenticate_header(&self, header: Option<&str>) -> Result<Option<Access>, AuthError> {

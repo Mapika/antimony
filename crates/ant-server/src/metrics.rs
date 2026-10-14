@@ -26,6 +26,10 @@
 //!   `ant_http_duration_seconds{route}`: routes `objects`, `git`, `healthz`, `readyz`,
 //!   plus `metrics` and `other` (`/debug/stats`, 404s) so the label set stays
 //!   closed. The duration runs until the response headers are ready.
+//! - `ant_ratelimit_rejected_total{class,reason}` (class `read|write|land|admin`;
+//!   reason `rate|queue_full|queue_timeout`), `ant_ratelimit_inflight{class}`,
+//!   `ant_ratelimit_queued{class}`, `ant_ratelimit_inflight_limit{class}`
+//!   (`crate::limits`).
 //! - `ant_land_batch_size` (histogram, requests per group-commit batch),
 //!   `ant_land_outcomes_total{outcome=landed|rebased|conflict|aborted|denied}`
 //!   (one per land request), `ant_land_cas_retries_total` (batches that lost
@@ -126,6 +130,17 @@ struct StoreOpLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RejectLabels {
+    class: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ClassLabels {
+    class: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct CacheLabels {
     cache: &'static str,
 }
@@ -205,6 +220,10 @@ pub struct Metrics {
     cache_bytes: Family<CacheLabels, Gauge>,
     history_lag: Family<RefLabels, Gauge>,
     history_catch_up: Histogram,
+    ratelimit_rejected: Family<RejectLabels, Counter>,
+    inflight: Family<ClassLabels, Gauge>,
+    queued: Family<ClassLabels, Gauge>,
+    inflight_limit: Family<ClassLabels, Gauge>,
     pg_size: Gauge,
     pg_idle: Gauge,
     pg_in_use: Gauge,
@@ -315,6 +334,39 @@ impl Metrics {
             Histogram::new(exponential_buckets(0.001, 2.0, 16)),
         );
 
+        let ratelimit_rejected = register(
+            &mut registry,
+            "ant_ratelimit_rejected",
+            "Requests rejected before running: reason rate (token bucket, 429), queue_full or queue_timeout (load shed, 503)",
+            Family::<RejectLabels, Counter>::default(),
+        );
+        let inflight = register(
+            &mut registry,
+            "ant_ratelimit_inflight",
+            "Requests currently admitted per class (holding a concurrency slot)",
+            Family::<ClassLabels, Gauge>::default(),
+        );
+        let queued = register(
+            &mut registry,
+            "ant_ratelimit_queued",
+            "Requests waiting for a concurrency slot per class",
+            Family::<ClassLabels, Gauge>::default(),
+        );
+        let inflight_limit = register(
+            &mut registry,
+            "ant_ratelimit_inflight_limit",
+            "Configured concurrency limit per class (0 = unlimited)",
+            Family::<ClassLabels, Gauge>::default(),
+        );
+        for class in ["read", "write", "land", "admin"] {
+            let _ = inflight.get_or_create(&ClassLabels { class });
+            let _ = queued.get_or_create(&ClassLabels { class });
+            let _ = inflight_limit.get_or_create(&ClassLabels { class });
+            for reason in ["rate", "queue_full", "queue_timeout"] {
+                let _ = ratelimit_rejected.get_or_create(&RejectLabels { class, reason });
+            }
+        }
+
         let build = register(
             &mut registry,
             "ant_build_info",
@@ -382,6 +434,10 @@ impl Metrics {
             cache_bytes,
             history_lag,
             history_catch_up,
+            ratelimit_rejected,
+            inflight,
+            queued,
+            inflight_limit,
             pg_size,
             pg_idle,
             pg_in_use,
@@ -413,6 +469,26 @@ impl Metrics {
     pub(crate) fn record_http(&self, route: &'static str, status: u16, secs: f64) {
         self.http_requests.get_or_create(&HttpLabels { route, status }).inc();
         self.http_duration.get_or_create(&RouteLabels { route }).observe(secs);
+    }
+
+    // -- rate limits and load shedding -------------------------------------
+
+    pub(crate) fn record_rejected(&self, class: &'static str, reason: &'static str) {
+        self.ratelimit_rejected.get_or_create(&RejectLabels { class, reason }).inc();
+    }
+
+    /// The `ant_ratelimit_inflight{class}` gauge (shared state).
+    pub(crate) fn inflight_gauge(&self, class: &'static str) -> Gauge {
+        self.inflight.get_or_create(&ClassLabels { class }).clone()
+    }
+
+    /// The `ant_ratelimit_queued{class}` gauge (shared state).
+    pub(crate) fn queued_gauge(&self, class: &'static str) -> Gauge {
+        self.queued.get_or_create(&ClassLabels { class }).clone()
+    }
+
+    pub(crate) fn set_inflight_limit(&self, class: &'static str, limit: usize) {
+        self.inflight_limit.get_or_create(&ClassLabels { class }).set(limit as i64);
     }
 
     // -- landing ----------------------------------------------------------

@@ -60,6 +60,7 @@ use axum::routing::get;
 
 use crate::acl::{self, Access, Acl, AuthError};
 use crate::bundle::{self, Limits};
+use crate::limits::{LimitConfig, Limiter, http_limit};
 use crate::metrics::Metrics;
 use crate::observe::{Observer, http_observe};
 
@@ -84,13 +85,28 @@ pub async fn serve_with_metrics(
     metrics: Arc<Metrics>,
     expose_metrics: bool,
 ) -> std::io::Result<()> {
+    let limiter = Limiter::new(LimitConfig::default(), acl.clone(), metrics.clone());
+    serve_with_limiter(backend, acl, listener, metrics, expose_metrics, limiter).await
+}
+
+/// [`serve_with_metrics`] with an explicit [`Limiter`] (rate limits and load
+/// shedding, `crate::limits`), shared with the gRPC front end. Rejections
+/// are `429` / `503` with `Retry-After`.
+pub async fn serve_with_limiter(
+    backend: Backend,
+    acl: Acl,
+    listener: tokio::net::TcpListener,
+    metrics: Arc<Metrics>,
+    expose_metrics: bool,
+    limiter: Arc<Limiter>,
+) -> std::io::Result<()> {
     use axum::serve::ListenerExt;
-    let app = app_with_metrics(backend, acl, metrics, expose_metrics);
+    let app = app_with_metrics(backend, acl, metrics, expose_metrics, limiter);
     let listener = listener.tap_io(|tcp| {
         // Avoid Nagle/delayed-ACK stalls on small responses.
         let _ = tcp.set_nodelay(true);
     });
-    axum::serve(listener, app).await
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await
 }
 
 /// Serve only `GET /metrics` of `metrics` on a dedicated listener
@@ -111,6 +127,7 @@ fn app_with_metrics(
     acl: Acl,
     metrics: Arc<Metrics>,
     expose_metrics: bool,
+    limiter: Arc<Limiter>,
 ) -> Router {
     let observer = Arc::new(Observer::new(metrics.clone(), acl.clone()));
     let git = ant_gitserve::router(backend.clone());
@@ -121,7 +138,9 @@ fn app_with_metrics(
         // `--metrics-listen`); guarding by prefix keeps those a plain 404.
         app = app.layer(axum::middleware::from_fn_with_state(acl, git_auth));
     }
-    app.layer(axum::middleware::from_fn_with_state(observer, http_observe))
+    // Limits sit inside the observer so rejections are counted and timed.
+    app.layer(axum::middleware::from_fn_with_state(limiter, http_limit))
+        .layer(axum::middleware::from_fn_with_state(observer, http_observe))
 }
 
 /// `GET /metrics`: the OpenMetrics text of the scrape.
