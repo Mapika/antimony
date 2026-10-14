@@ -74,7 +74,11 @@
 //!   ant submit -m <msg>            uploads changed blobs (PutObjects), then
 //!       CreateChangeset with base = workspace base commit and blob_id ops.
 //!       Records the id in `.ant/last_submit`. stdout: `<commit-id>`.
-//!       Nothing to submit, or unresolved conflicts: exit 1.
+//!       Nothing to submit, or unresolved conflicts: exit 1. A blob the local
+//!       cache evicted meanwhile is re-read from the workspace file (working
+//!       tree / lazy upper layer) and uploaded only if it still hashes to the
+//!       scanned id; a file edited in that window fails with exit 1 and a
+//!       hint to run `ant status` and `ant submit` again.
 //!   ant land [--ref main] [<commit>]   default commit = `.ant/last_submit`.
 //!       Landed: stdout `landed <new-tip-id>` (+ ` rebased` if rebased), then
 //!       resets the workspace to the new tip. Conflict: stdout `conflict`
