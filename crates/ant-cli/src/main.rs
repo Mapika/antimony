@@ -1,11 +1,14 @@
 //! The `ant` command: client for an antimony server, plus `ant serve`. This
-//! doc comment is the output contract; `tests/e2e.rs` checks it.
+//! doc comment is the output contract; the end-to-end tests (`tests/*.rs`)
+//! exercise it.
 //!
 //! Global flags (each also an env var):
 //!   --server <url>     ANT_SERVER   gRPC url, default http://127.0.0.1:7420
 //!   --http <url>       ANT_HTTP     optional HTTP object base url (e.g. http://127.0.0.1:7421)
 //!   --cache <dir>      ANT_CACHE    default ~/.cache/antimony
 //!   --cache-bytes <n>  ANT_CACHE_BYTES  default 20 GiB
+//!   --token <t>        ANT_TOKEN    bearer token (see below)
+//!   -C <dir>                        start directory for workspace discovery
 //! Object reads go through `ReadThrough(DiskObjectStore(cache), RemoteObjectStore)`.
 //!
 //! Output contract (stdout, one record per line, no decoration). Ids are
@@ -33,6 +36,10 @@
 //!       CAS update; mismatch: exit 1. A move to a commit that does not
 //!       descend from the current (or `--expect`ed) target is refused
 //!       (exit 1) unless `--force`. stdout: `<id>`
+//!   ant ref init [<name>] [-m <msg>]
+//!       Creates ref <name> (default `main`) at a new root commit with the empty
+//!       tree: the first commit of an empty server. stdout: `<commit-id>`.
+//!       Refused (exit 1) if the ref exists.
 //!   ant ws new <dir> [--at <rev>] [--sparse <pattern>]... [--lazy]
 //!       rev default `main`. stdout: `<commit-id>`. If <rev> is a ref name the
 //!       workspace tracks it (`ws update` default).
@@ -44,10 +51,8 @@
 //!       daemon on the same state (upper layer and journal recovered, edits
 //!       kept). <dir> defaults to the dead mount or workspace found from
 //!       cwd / `-C`. stdout: `<base-commit-id>`.
-//!   ant ref init [<name>] [-m <msg>]
-//!       Creates ref <name> (default `main`) at a new root commit with the empty
-//!       tree: the first commit of an empty server. stdout: `<commit-id>`.
-//!       Refused (exit 1) if the ref exists.
+//!   ant ws unmount <dir>           unmounts a lazy workspace, keeping its
+//!       state (`ws remount` brings it back). stdout: empty.
 //!   ant ws update [--to <rev>]
 //!       Moves the workspace to <rev> (default: the tracked ref, else
 //!       `main`), carrying local edits over: paths changed on one side take
@@ -77,6 +82,8 @@
 //!       stderr then carries a `hint: ...` line on how to proceed
 //!       (`ant ws update`, resolve, submit and land again).
 //!   ant mount <rev> <mountpoint>   read-only FUSE view, foreground until SIGINT/SIGTERM
+//!   ant serve <server flags>       the server (`ant_server::serve`), foreground
+//!   ant completions <shell>        shell completion script on stdout
 //!   ant admin reindex-acl <rev> --policy <file> [--full] [--history] <store flags>
 //!       Zone-tag objects for access control straight in the stores (after
 //!       imports / policy path-rule changes). stdout:
@@ -118,6 +125,8 @@ mod rev;
 use std::io::Write as _;
 use std::process::ExitCode;
 
+const LIST_REFS_HINT: &str = "list the existing refs with `ant ref list`";
+
 /// A one-line hint for failures with an obvious remedy.
 fn hint_for(e: &anyhow::Error) -> Option<String> {
     if let Some(dead) = e.downcast_ref::<discover::DeadMount>() {
@@ -144,9 +153,7 @@ fn static_hint(e: &anyhow::Error) -> Option<&'static str> {
             Code::PermissionDenied => {
                 Some("your token's principal lacks access to this path or ref; check the policy")
             }
-            Code::NotFound if rpc.message.starts_with("ref ") => {
-                Some("list the existing refs with `ant ref list`")
-            }
+            Code::NotFound if rpc.message.starts_with("ref ") => Some(LIST_REFS_HINT),
             Code::Unavailable => Some("is `ant serve` running? set ANT_SERVER (or --server)"),
             _ => None,
         };
@@ -157,7 +164,7 @@ fn static_hint(e: &anyhow::Error) -> Option<&'static str> {
     } else if first.contains("HOME is not set") {
         Some("pass --cache <dir> or set ANT_CACHE")
     } else if first.starts_with("ref ") && first.ends_with(" not found") {
-        Some("list the existing refs with `ant ref list`")
+        Some(LIST_REFS_HINT)
     } else if first.starts_with("not inside an ant workspace") {
         Some("create one with `ant ws new <dir>`, or point at one with -C <dir>")
     } else if first.starts_with("workspace has unresolved conflicts") {

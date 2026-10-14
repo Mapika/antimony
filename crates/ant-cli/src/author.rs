@@ -34,6 +34,13 @@ pub fn current_author() -> Signature {
     resolve_author(&env, &git, now)
 }
 
+/// [`current_author`] (which may run `git`, so off the async threads) as a
+/// protobuf signature.
+pub async fn author_signature() -> anyhow::Result<ant_proto::v1::Signature> {
+    let author = tokio::task::spawn_blocking(current_author).await?;
+    Ok(ant_proto::v1::Signature::from(&author))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

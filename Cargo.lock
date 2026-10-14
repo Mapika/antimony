@@ -130,6 +130,7 @@ dependencies = [
  "ant-store",
  "antd",
  "anyhow",
+ "async-trait",
  "clap",
  "clap_complete",
  "sqlx",

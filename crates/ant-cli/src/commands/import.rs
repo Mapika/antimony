@@ -1,3 +1,5 @@
+//! `ant import`: git history straight into the stores (no server).
+
 use std::fmt::Write as _;
 
 use ant_gitbridge::ImportOptions;

@@ -1,4 +1,4 @@
-//! Shared connection/cache context.
+//! Shared connection/cache context, command outcomes and RPC helpers.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,7 +7,7 @@ use ant_core::{EntryMode, ObjectId};
 use ant_proto::v1 as pb;
 use antd::disk::DiskObjectStore;
 use antd::readthrough::ReadThrough;
-use antd::remote::RemoteObjectStore;
+use antd::remote::{AntRpcClient, RemoteObjectStore};
 use anyhow::{Context as _, Result, anyhow};
 
 use crate::args::Cli;
@@ -25,6 +25,16 @@ impl Outcome {
     pub fn empty() -> Self {
         Self::ok(Vec::new())
     }
+    /// Output with a non-zero "partial" exit code (e.g. 2 for conflicts).
+    pub fn with_code(stdout: impl Into<Vec<u8>>, code: i32) -> Self {
+        Self { stdout: stdout.into(), code }
+    }
+}
+
+/// Print a `hint: ...` line on stderr for a successful command whose result
+/// needs follow-up (errors get theirs from `main::hint_for`).
+pub fn print_hint(hint: &str) {
+    eprintln!("hint: {hint}");
 }
 
 pub struct Ctx {
@@ -111,6 +121,12 @@ impl std::error::Error for RpcError {}
 
 pub fn id_from(bytes: &[u8]) -> Result<ObjectId> {
     Ok(ObjectId::from_bytes(bytes)?)
+}
+
+/// Resolve `rev` on the server to a commit id.
+pub async fn resolve_commit(client: &mut AntRpcClient, rev: &str) -> Result<ObjectId> {
+    let r = client.resolve_rev(pb::ResolveRevRequest { rev: rev.into() }).await.rpc()?;
+    id_from(&r.into_inner().commit)
 }
 
 pub fn mode_from_pb(v: i32) -> Result<EntryMode> {
