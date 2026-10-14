@@ -212,9 +212,15 @@ impl Writable {
             journal_len,
         });
         if exclusive && overlay.journal_len > self.compact_bytes {
-            compact(&self.dir, self.journal.file())?;
-            self.journal.compacted();
-            overlay.journal_len = 0;
+            // The operation itself is complete; a failed compaction only
+            // leaves a longer journal, retried after the next mutation.
+            match compact(&self.dir, self.journal.file()) {
+                Ok(_) => {
+                    self.journal.compacted();
+                    overlay.journal_len = 0;
+                }
+                Err(error) => tracing::error!(%error, "lazy workspace journal compaction failed"),
+            }
         }
         result
     }
