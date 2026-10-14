@@ -19,6 +19,8 @@ use ant_core::{Commit, Object, ObjectId, ObjectKind, Tree};
 use ant_store::graph::TreeSource;
 use ant_store::{Backend, CommitNode, MetaStore, ObjectStore, PathChange, StoreError};
 
+use super::{OpError, OpResult};
+
 /// Cache names, indexed by [`Cache`] slot.
 pub(crate) const CACHE_NAMES: [&str; 4] = ["trees", "commits", "nodes", "changesets"];
 
@@ -286,6 +288,11 @@ pub(crate) async fn get_nodes(
         }
     }
     Ok(out)
+}
+
+/// One recorded commit node through the node cache; unrecorded → `NotFound`.
+pub(crate) async fn get_node(b: &Backend, id: ObjectId) -> OpResult<CommitNode> {
+    get_nodes(b, &[id]).await?.pop().flatten().ok_or_else(|| OpError::not_found_commit(id))
 }
 
 /// Index-aligned `get_changesets` through the changeset cache.

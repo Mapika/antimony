@@ -89,10 +89,7 @@ pub async fn create_changeset_as(
         access.check_writable(req.ops.iter().map(FileOp::path))?;
     }
     let base = match req.base {
-        Some(id) => {
-            let node = cache::get_nodes(b, &[id]).await?.pop().flatten();
-            Some(node.ok_or_else(|| OpError::NotFound(format!("commit {id}")))?)
-        }
+        Some(id) => Some(cache::get_node(b, id).await?),
         None => None,
     };
     let base_tree = base.as_ref().map(|n| n.tree);

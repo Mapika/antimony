@@ -1,9 +1,11 @@
 //! Path history and blame, backed by the per-ref history index
 //! (`MetaStore::{index_history, query_history, ...}`).
 //!
-//! - `catch_up(b, ref)` runs after every successful `land` and `UpdateRef`
-//!   (best effort: errors are logged; queries fall back, see `log`).
-//! - `ops::query::log` with a path: a rev naming a ref goes to
+//! - `schedule_catch_up(b, ref, metrics)` runs `catch_up` in the background,
+//!   coalesced per ref, after every successful `Land` and every `UpdateRef`
+//!   to a new target (best effort: errors are logged; queries fall back, see
+//!   `log`).
+//! - `ops::query::log_as` with a path: a rev naming a ref goes to
 //!   `lagging_path_log`, which reads that ref's watermark once — rev at or
 //!   behind it → index only; rev ahead of it (a busy ref between catch-ups)
 //!   → scan only the unindexed commits and take the rest from the index. A
@@ -21,7 +23,7 @@
 //!   `tip` → index only commits after it. Otherwise (ref moved non-FF) →
 //!   `clear_history` and rebuild from scratch.
 //! - Rows: for each commit on the chain, one row per path in its recorded
-//!   changeset (`MetaStore::get_changeset`), with the commit's generation.
+//!   changeset (one batched `MetaStore::get_changesets` per batch), with the commit's generation.
 //! - Batches of ≤ 1000 commits; write rows then CAS the watermark forward
 //!   (a concurrent catch-up winning the CAS is fine — rows are idempotent;
 //!   loops until the watermark is `tip` or the ref moves again).
@@ -93,21 +95,21 @@ async fn walk_chain(
         }
         let chunk = b.meta.first_parent_chain(from, stop, CHAIN_CHUNK).await?;
         let Some(last) = chunk.last() else {
-            return Err(OpError::NotFound(format!("commit {from}")));
+            return Err(OpError::not_found_commit(from));
         };
         out.extend(chunk.iter().map(|n| (n.id, n.generation)));
         match last.parents.first() {
             None => return Ok((out, false)),
             Some(p) if Some(*p) == stop => return Ok((out, true)),
             Some(p) if chunk.len() == CHAIN_CHUNK => from = *p,
-            Some(p) => return Err(OpError::NotFound(format!("commit {p}"))),
+            Some(p) => return Err(OpError::not_found_commit(*p)),
         }
     }
 }
 
 /// True if `ancestor` lies on the first-parent chain of `descendant`
 /// (inclusive). Prunes by generation.
-pub async fn is_first_parent_ancestor(
+pub(crate) async fn is_first_parent_ancestor(
     b: &Backend,
     ancestor: ObjectId,
     descendant: ObjectId,
@@ -148,7 +150,7 @@ pub async fn catch_up(b: &Backend, ref_name: &str) -> OpResult<usize> {
 
 /// [`catch_up`] reporting the index lag and the duration of runs that indexed
 /// something to `metrics`.
-pub async fn catch_up_observed(
+async fn catch_up_observed(
     b: &Backend,
     ref_name: &str,
     metrics: Option<&Metrics>,
@@ -241,15 +243,11 @@ pub(crate) fn running_catch_ups() -> usize {
     crate::lock(&CATCH_UPS).len()
 }
 
-/// Fire-and-forget `catch_up`, coalesced per (backend, ref): if one is already
-/// running it is told to run once more instead of starting a second. Errors
-/// are logged; queries fall back to changeset scans.
-pub fn schedule_catch_up(b: &Backend, ref_name: &str) {
-    schedule_catch_up_observed(b, ref_name, None);
-}
-
-/// [`schedule_catch_up`] reporting to `metrics`.
-pub fn schedule_catch_up_observed(b: &Backend, ref_name: &str, metrics: Option<Arc<Metrics>>) {
+/// Fire-and-forget [`catch_up`], coalesced per (backend, ref): if one is
+/// already running it is told to run once more instead of starting a second.
+/// Reports to `metrics` like [`catch_up_observed`]. Errors are logged;
+/// queries fall back to changeset scans.
+pub fn schedule_catch_up(b: &Backend, ref_name: &str, metrics: Option<&Arc<Metrics>>) {
     let key = (Arc::as_ptr(&b.meta).cast::<()>() as usize, ref_name.to_string());
     {
         let mut running = crate::lock(&CATCH_UPS);
@@ -261,6 +259,7 @@ pub fn schedule_catch_up_observed(b: &Backend, ref_name: &str, metrics: Option<A
     }
     let b = b.clone();
     let ref_name = ref_name.to_string();
+    let metrics = metrics.cloned();
     tokio::spawn(async move {
         loop {
             if let Err(error) = catch_up_observed(&b, &ref_name, metrics.as_deref()).await {
@@ -729,7 +728,6 @@ mod tests {
             blame(&b, "main", &RepoPath::new("nope").unwrap()).await,
             Err(crate::ops::OpError::NotFound(_))
         ));
-        let _ = delete; // keep helper import used across variants
     }
 
     #[tokio::test]

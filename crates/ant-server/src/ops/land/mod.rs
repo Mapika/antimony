@@ -116,31 +116,24 @@ pub async fn land_observed(
     commit: ObjectId,
     metrics: Option<&Arc<Metrics>>,
 ) -> OpResult<LandOutcome> {
-    let result = land_inner(b, access, ref_name, commit, metrics).await;
+    let result = async {
+        ant_store::validate_ref_name(ref_name)?;
+        if let Some(m) = metrics {
+            m.touch_ref(ref_name);
+        }
+        let (verified, policy) = match access {
+            Some(a) => (verify_land(b, a, ref_name, commit).await?, Some(a.policy.clone())),
+            None => (Verified::All, None),
+        };
+        enqueue_checked(b, ref_name, commit, verified, policy, metrics.cloned())
+            .await
+            .map_err(|_| OpError::Aborted("land worker stopped before replying".into()))?
+    }
+    .await;
     if let Some(m) = metrics {
         m.record_land(&result);
     }
     result
-}
-
-async fn land_inner(
-    b: &Backend,
-    access: Option<&Access>,
-    ref_name: &str,
-    commit: ObjectId,
-    metrics: Option<&Arc<Metrics>>,
-) -> OpResult<LandOutcome> {
-    ant_store::validate_ref_name(ref_name)?;
-    if let Some(m) = metrics {
-        m.touch_ref(ref_name);
-    }
-    let (verified, policy) = match access {
-        Some(a) => (verify_land(b, a, ref_name, commit).await?, Some(a.policy.clone())),
-        None => (Verified::All, None),
-    };
-    enqueue_checked(b, ref_name, commit, verified, policy, metrics.cloned())
-        .await
-        .map_err(|_| OpError::Aborted("land worker stopped before replying".into()))?
 }
 
 #[cfg(test)]

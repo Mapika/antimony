@@ -1,6 +1,6 @@
-//! Transport-independent server operations. The gRPC/HTTP layers are thin
-//! adapters over these functions; tests exercise them directly against
-//! `Backend::in_memory()`.
+//! Transport-independent server operations. The gRPC layer (`rpc`) is a thin
+//! adapter over these functions (the HTTP object endpoint reads the store
+//! directly); tests exercise them directly against `Backend::in_memory()`.
 
 pub(crate) mod cache;
 pub mod changeset;
@@ -36,6 +36,10 @@ pub enum OpError {
 impl OpError {
     pub fn not_found_object(id: ObjectId) -> Self {
         OpError::NotFound(format!("object {id}"))
+    }
+
+    pub fn not_found_commit(id: ObjectId) -> Self {
+        OpError::NotFound(format!("commit {id}"))
     }
 }
 

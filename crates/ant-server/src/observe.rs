@@ -36,10 +36,10 @@ use crate::acl::Acl;
 use crate::metrics::Metrics;
 
 /// Requests at least this slow are logged at WARN.
-pub const SLOW_REQUEST: Duration = Duration::from_secs(1);
+const SLOW_REQUEST: Duration = Duration::from_secs(1);
 
 /// Request id header, honoured on requests and set on responses.
-pub const REQUEST_ID_HEADER: &str = "x-request-id";
+const REQUEST_ID_HEADER: &str = "x-request-id";
 
 const MAX_REQUEST_ID_LEN: usize = 128;
 
@@ -81,10 +81,6 @@ impl Observer {
         self
     }
 
-    pub fn metrics(&self) -> &Arc<Metrics> {
-        &self.metrics
-    }
-
     /// WARN when `elapsed` reaches the threshold. The principal is resolved
     /// only then, from the request's `authorization` header.
     fn log_if_slow(
@@ -116,7 +112,7 @@ impl Observer {
 }
 
 /// The caller's request id, or a fresh ULID.
-pub fn request_id(headers: &HeaderMap) -> HeaderValue {
+fn request_id(headers: &HeaderMap) -> HeaderValue {
     headers
         .get(REQUEST_ID_HEADER)
         .filter(|v| {
@@ -329,7 +325,7 @@ impl<B: Body> Body for ObservedBody<B> {
 // ---------------------------------------------------------------------------
 
 /// Closed-set route label for an HTTP path.
-pub fn http_route(path: &str) -> &'static str {
+fn http_route(path: &str) -> &'static str {
     if path.starts_with("/o/") {
         "objects"
     } else if path == "/repo.git" || path.starts_with("/repo.git/") {

@@ -22,7 +22,7 @@
 //!   map 1:1 onto `ops::query`, `ops::history`, `ops::land`,
 //!   `ops::changeset`. A successful `Land`, or an `UpdateRef` to a new
 //!   target, schedules a background history-index catch-up
-//!   (`ops::history::schedule_catch_up_observed`).
+//!   (`ops::history::schedule_catch_up`).
 //! - Max decoding/encoding message size is `ant_proto::MAX_MESSAGE_BYTES`.
 //!
 //! Access control (`crate::acl`): with a policy, every RPC authenticates the
@@ -379,11 +379,7 @@ impl Ant for AntService {
         Ok(Response::new(match outcome {
             CasOutcome::Updated => {
                 if new.is_some() {
-                    history::schedule_catch_up_observed(
-                        &self.backend,
-                        &req.name,
-                        Some(self.metrics.clone()),
-                    );
+                    history::schedule_catch_up(&self.backend, &req.name, Some(&self.metrics));
                 }
                 pb::UpdateRefResponse { updated: true, actual: None }
             }
@@ -436,11 +432,7 @@ impl Ant for AntService {
         if matches!(outcome, LandOutcome::Landed { .. }) {
             // Coalesced per ref, so a burst of lands in one leader batch (or
             // across batches) costs one background catch-up, not one each.
-            history::schedule_catch_up_observed(
-                &self.backend,
-                &req.ref_name,
-                Some(self.metrics.clone()),
-            );
+            history::schedule_catch_up(&self.backend, &req.ref_name, Some(&self.metrics));
         }
         let outcome = match outcome {
             LandOutcome::Landed { new_tip, rebased } => {
