@@ -18,9 +18,13 @@
 //!   `HasObjects` reject > 100_000 ids.
 //! - `PutObjects`: parse each with `EncodedObject::from_bytes`, store with one
 //!   `put_many`, return ids in order.
-//! - `Log`/`Diff`/`ReadPath`/`ResolveRev`/`Blame`/`Land`/`CreateChangeset`:
-//!   map 1:1 onto `ops::query`, `ops::history`, `ops::land`,
-//!   `ops::changeset`. A successful `Land`, or an `UpdateRef` to a new
+//! - `Log`/`Diff`/`ReadPath`/`ResolveRev`/`Blame`/`Land`/`CreateChangeset`/
+//!   `MergeBase`/`IsAncestor`/`LogRange`/`LandedAs`: map 1:1 onto
+//!   `ops::query`, `ops::history`, `ops::land`, `ops::changeset`,
+//!   `ops::ancestry` (`Diff` with `patch` adds `ops::patch` hunks;
+//!   `context_lines` is capped at `patch::MAX_CONTEXT`; `LogRange` page
+//!   tokens are `ancestry::encode_page_token`, a malformed one is
+//!   `invalid_argument`). A successful `Land`, or an `UpdateRef` to a new
 //!   target, schedules a background history-index catch-up
 //!   (`ops::history::schedule_catch_up`).
 //! - Max decoding/encoding message size is `ant_proto::MAX_MESSAGE_BYTES`.
@@ -48,7 +52,7 @@ use crate::ops::OpError;
 use crate::ops::changeset::{self, ChangesetRequest, FileOp, WriteContent};
 use crate::ops::history;
 use crate::ops::land::{self, LandOutcome};
-use crate::ops::query;
+use crate::ops::{ancestry, patch, query};
 
 /// Ids per `get_many` call when serving `GetObjects`.
 const OBJECT_CHUNK: usize = 256;
@@ -204,6 +208,24 @@ fn commit_info_to_pb(e: query::LogEntry) -> pb::CommitInfo {
     }
 }
 
+fn patch_to_pb(p: patch::FilePatch) -> pb::FilePatch {
+    pb::FilePatch {
+        binary: p.binary,
+        too_large: p.too_large,
+        hunks: p
+            .hunks
+            .into_iter()
+            .map(|h| pb::Hunk {
+                old_start: h.old_start,
+                old_lines: h.old_lines,
+                new_start: h.new_start,
+                new_lines: h.new_lines,
+                lines: h.lines,
+            })
+            .collect(),
+    }
+}
+
 fn path_change_to_pb(c: PathChange) -> pb::PathChange {
     let side = |s: Option<(EntryMode, ObjectId)>| match s {
         Some((m, id)) => (mode_to_pb(m), id.0.to_vec()),
@@ -218,6 +240,7 @@ fn path_change_to_pb(c: PathChange) -> pb::PathChange {
         old_id,
         new_mode,
         new_id,
+        patch: None,
     }
 }
 
@@ -544,10 +567,106 @@ impl Ant for AntService {
         let access = self.access(&request)?;
         let req = request.into_inner();
         let from = if req.from_rev.is_empty() { None } else { Some(req.from_rev.as_str()) };
-        let changes = query::diff_as(&self.backend, access.as_ref(), from, &req.to_rev)
+        let prefixes = req.path_prefixes.iter().map(|p| parse_path(p)).collect::<Result<_, _>>()?;
+        let context = req
+            .context_lines
+            .map_or(patch::DEFAULT_CONTEXT, |c| (c as usize).min(patch::MAX_CONTEXT));
+        let opts = query::DiffOptions {
+            prefixes,
+            merge_base: req.merge_base,
+            patch: req.patch.then_some(context),
+        };
+        let result = query::diff_with(&self.backend, access.as_ref(), from, &req.to_rev, &opts)
             .await
             .map_err(op_status)?;
-        let changes = changes.into_iter().map(path_change_to_pb).collect();
-        Ok(Response::new(pb::DiffResponse { changes }))
+        let mut patches = result.patches.map(Vec::into_iter);
+        let changes = result
+            .changes
+            .into_iter()
+            .map(|c| {
+                let mut pc = path_change_to_pb(c);
+                pc.patch = patches.as_mut().and_then(Iterator::next).flatten().map(patch_to_pb);
+                pc
+            })
+            .collect();
+        Ok(Response::new(pb::DiffResponse {
+            changes,
+            from_commit: result.from_commit.map(|id| id.0.to_vec()),
+            patch_truncated: result.patch_truncated,
+        }))
+    }
+
+    async fn merge_base(
+        &self,
+        request: Request<pb::MergeBaseRequest>,
+    ) -> Result<Response<pb::MergeBaseResponse>, Status> {
+        self.access(&request)?;
+        let req = request.into_inner();
+        let base = ancestry::merge_base(&self.backend, &req.a, &req.b).await.map_err(op_status)?;
+        Ok(Response::new(pb::MergeBaseResponse { commit: base.map(|id| id.0.to_vec()) }))
+    }
+
+    async fn is_ancestor(
+        &self,
+        request: Request<pb::IsAncestorRequest>,
+    ) -> Result<Response<pb::IsAncestorResponse>, Status> {
+        self.access(&request)?;
+        let req = request.into_inner();
+        let is_ancestor = ancestry::is_ancestor(
+            &self.backend,
+            &req.ancestor,
+            &req.descendant,
+            req.first_parent_only,
+        )
+        .await
+        .map_err(op_status)?;
+        Ok(Response::new(pb::IsAncestorResponse { is_ancestor }))
+    }
+
+    async fn log_range(
+        &self,
+        request: Request<pb::LogRangeRequest>,
+    ) -> Result<Response<pb::LogRangeResponse>, Status> {
+        let access = self.access(&request)?;
+        let req = request.into_inner();
+        let path = req.path.as_deref().map(parse_path).transpose()?;
+        let page_start = ancestry::decode_page_token(&req.page_token).map_err(op_status)?;
+        let from =
+            if req.from_exclusive.is_empty() { None } else { Some(req.from_exclusive.as_str()) };
+        let page = ancestry::log_range_as(
+            &self.backend,
+            access.as_ref(),
+            from,
+            &req.to,
+            path.as_ref(),
+            req.limit as usize,
+            page_start,
+        )
+        .await
+        .map_err(op_status)?;
+        Ok(Response::new(pb::LogRangeResponse {
+            commits: page.entries.into_iter().map(commit_info_to_pb).collect(),
+            next_page_token: page.next.map(ancestry::encode_page_token).unwrap_or_default(),
+        }))
+    }
+
+    async fn landed_as(
+        &self,
+        request: Request<pb::LandedAsRequest>,
+    ) -> Result<Response<pb::LandedAsResponse>, Status> {
+        self.access(&request)?;
+        let req = request.into_inner();
+        let ref_name = if req.ref_name.is_empty() { None } else { Some(req.ref_name.as_str()) };
+        let landed =
+            ancestry::landed_as(&self.backend, &req.commit, ref_name).await.map_err(op_status)?;
+        Ok(Response::new(match landed {
+            None => pb::LandedAsResponse::default(),
+            Some(l) => pb::LandedAsResponse {
+                landed: true,
+                ref_name: l.ref_name,
+                landed_commit: l.landed_commit.0.to_vec(),
+                rebased: l.rebased,
+            },
+        }))
     }
 }

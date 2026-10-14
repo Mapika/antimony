@@ -368,7 +368,8 @@ impl Agent {
         };
         let Some(tip) = tip else { return };
         let t = Instant::now();
-        let req = pb::DiffRequest { from_rev: hex(&self.base), to_rev: hex(&tip) };
+        let req =
+            pb::DiffRequest { from_rev: hex(&self.base), to_rev: hex(&tip), ..Default::default() };
         match self.c.diff(req).await {
             Ok(_) => {
                 self.rec.ok("status", t);

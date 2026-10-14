@@ -489,7 +489,11 @@ async fn changeset_resolve_read_log_diff_land() {
 
     let diff = s
         .grpc
-        .diff(pb::DiffRequest { from_rev: "main~1".into(), to_rev: "main".into() })
+        .diff(pb::DiffRequest {
+            from_rev: "main~1".into(),
+            to_rev: "main".into(),
+            ..Default::default()
+        })
         .await
         .unwrap()
         .into_inner()
@@ -500,7 +504,11 @@ async fn changeset_resolve_read_log_diff_land() {
 
     let from_empty = s
         .grpc
-        .diff(pb::DiffRequest { from_rev: String::new(), to_rev: "main".into() })
+        .diff(pb::DiffRequest {
+            from_rev: String::new(),
+            to_rev: "main".into(),
+            ..Default::default()
+        })
         .await
         .unwrap()
         .into_inner()
@@ -633,4 +641,195 @@ async fn blame_rpc() {
         .await
         .unwrap_err();
     assert_eq!(e.code(), Code::NotFound);
+}
+
+async fn spawn_server_on(backend: Backend) -> Server {
+    let server = spawn_local(backend.clone(), Acl::open()).await.unwrap();
+    let grpc = AntClient::connect(server.grpc_url()).await.unwrap();
+    Server { grpc, http_base: server.http_url(), http: reqwest::Client::new(), backend }
+}
+
+/// MergeBase, IsAncestor, LogRange (pages, paths), LandedAs and Diff with
+/// prefixes, merge base and patches, through gRPC against `backend`.
+async fn query_api_scenario(backend: Backend) {
+    let mut s = spawn_server_on(backend).await;
+    let c1 = commit(&mut s, None, vec![write_file("a.txt", "one\ntwo\nthree\n")], "c1").await;
+    s.grpc.land(pb::LandRequest { ref_name: "main".into(), commit: c1.clone() }).await.unwrap();
+    // A two-commit stack off c1, landed after main moved: rebased.
+    let f1 = commit(&mut s, Some(c1.clone()), vec![write_file("src/f", "f\n")], "f1").await;
+    let f2 = commit(&mut s, Some(f1.clone()), vec![write_file("src/g", "g\n")], "f2").await;
+    let c2_ops = vec![write_file("a.txt", "one\n2\nthree\n")];
+    let c2 = commit(&mut s, Some(c1.clone()), c2_ops, "c2").await;
+    s.grpc.land(pb::LandRequest { ref_name: "main".into(), commit: c2.clone() }).await.unwrap();
+    let mb = s
+        .grpc
+        .merge_base(pb::MergeBaseRequest { a: "main".into(), b: hex(&f2) })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(mb.commit, Some(c1.clone()));
+    let is = |a: &[u8], d: &str, fp| pb::IsAncestorRequest {
+        ancestor: hex(a),
+        descendant: d.into(),
+        first_parent_only: fp,
+    };
+    assert!(s.grpc.is_ancestor(is(&c1, "main", true)).await.unwrap().into_inner().is_ancestor);
+    assert!(!s.grpc.is_ancestor(is(&f1, "main", false)).await.unwrap().into_inner().is_ancestor);
+
+    // Diff main...f2 (merge base): only the stack's files, with patches.
+    let d = s
+        .grpc
+        .diff(pb::DiffRequest {
+            from_rev: "main".into(),
+            to_rev: hex(&f2),
+            merge_base: true,
+            patch: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(d.from_commit, Some(c1.clone()));
+    let paths: Vec<_> = d.changes.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(paths, ["src/f", "src/g"]);
+    assert_eq!(d.changes[0].patch.as_ref().unwrap().hunks[0].lines, ["+f"]);
+    // Prefix + patch with context 0.
+    let d = s
+        .grpc
+        .diff(pb::DiffRequest {
+            from_rev: hex(&c1),
+            to_rev: "main".into(),
+            path_prefixes: vec!["a.txt".into()],
+            patch: true,
+            context_lines: Some(0),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let h = &d.changes[0].patch.as_ref().unwrap().hunks[0];
+    assert_eq!((h.old_start, h.old_lines, h.new_start, h.new_lines), (2, 1, 2, 1));
+    assert_eq!(h.lines, ["-two", "+2"]);
+    // Binary files are flagged.
+    let bin = commit(&mut s, Some(c2.clone()), vec![write_file("b.bin", "x\0y")], "bin").await;
+    let d = s
+        .grpc
+        .diff(pb::DiffRequest {
+            from_rev: "main".into(),
+            to_rev: hex(&bin),
+            patch: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(d.changes[0].patch.as_ref().unwrap().binary);
+    let e = s
+        .grpc
+        .diff(pb::DiffRequest {
+            from_rev: String::new(),
+            to_rev: "main".into(),
+            path_prefixes: vec!["../x".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument);
+
+    let landed = s
+        .grpc
+        .land(pb::LandRequest { ref_name: "main".into(), commit: f2.clone() })
+        .await
+        .unwrap()
+        .into_inner();
+    let Some(pb::land_response::Outcome::Landed(l)) = landed.outcome else { panic!() };
+    assert!(l.rebased);
+    let r = s
+        .grpc
+        .landed_as(pb::LandedAsRequest { commit: hex(&f2), ref_name: String::new() })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (r.landed, r.ref_name.as_str(), r.landed_commit.clone(), r.rebased),
+        (true, "main", l.new_tip.clone(), true)
+    );
+    let r = s
+        .grpc
+        .landed_as(pb::LandedAsRequest { commit: hex(&bin), ref_name: "main".into() })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(r, pb::LandedAsResponse::default());
+
+    // LogRange c1..main in pages of one: f2', f1', c2.
+    let mut got = Vec::new();
+    let mut token = String::new();
+    loop {
+        let page = s
+            .grpc
+            .log_range(pb::LogRangeRequest {
+                from_exclusive: hex(&c1),
+                to: "main".into(),
+                path: None,
+                limit: 1,
+                page_token: token,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(page.commits.len() <= 1);
+        got.extend(page.commits.into_iter().map(|c| c.message));
+        if page.next_page_token.is_empty() {
+            break;
+        }
+        token = page.next_page_token;
+    }
+    assert_eq!(got, [b"f2".to_vec(), b"f1".to_vec(), b"c2".to_vec()]);
+    let src = s
+        .grpc
+        .log_range(pb::LogRangeRequest {
+            from_exclusive: hex(&c1),
+            to: "main".into(),
+            path: Some("src/g".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(src.commits.len(), 1);
+    assert_eq!(src.commits[0].id, l.new_tip);
+    let e = s
+        .grpc
+        .log_range(pb::LogRangeRequest {
+            to: "main".into(),
+            page_token: "garbage".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument);
+    let e = s
+        .grpc
+        .merge_base(pb::MergeBaseRequest { a: "nope".into(), b: "main".into() })
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn query_api_rpcs() {
+    query_api_scenario(Backend::in_memory()).await;
+}
+
+#[tokio::test]
+#[ignore = "needs postgres: docker compose up -d"]
+async fn query_api_rpcs_postgres() {
+    let b = common::pg::scratch_backend("query_api").await;
+    let result = tokio::spawn(query_api_scenario(b.clone())).await;
+    // The scratch store drops the schema with the last handle to it.
+    drop(b);
+    if let Err(e) = result {
+        std::panic::resume_unwind(e.into_panic());
+    }
 }

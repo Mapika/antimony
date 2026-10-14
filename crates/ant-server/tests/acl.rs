@@ -276,7 +276,7 @@ async fn log_paths(c: &mut Client, rev: &str, path: Option<&str>) -> Vec<ObjectI
 }
 
 async fn diff_paths(c: &mut Client, from: &str, to: &str) -> Vec<String> {
-    c.diff(pb::DiffRequest { from_rev: from.into(), to_rev: to.into() })
+    c.diff(pb::DiffRequest { from_rev: from.into(), to_rev: to.into(), ..Default::default() })
         .await
         .unwrap()
         .into_inner()
@@ -348,12 +348,40 @@ async fn unauthenticated_and_unknown_tokens() {
             c.log(pb::LogRequest { rev: "main".into(), path: None, limit: 0 }).await.unwrap_err();
         assert_eq!(e.code(), Code::Unauthenticated);
         let e = c
-            .diff(pb::DiffRequest { from_rev: String::new(), to_rev: "main".into() })
+            .diff(pb::DiffRequest {
+                from_rev: String::new(),
+                to_rev: "main".into(),
+                ..Default::default()
+            })
             .await
             .unwrap_err();
         assert_eq!(e.code(), Code::Unauthenticated);
         let e = c
             .blame(pb::BlameRequest { rev: "main".into(), path: "README".into() })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::Unauthenticated);
+        let e = c
+            .merge_base(pb::MergeBaseRequest { a: "main".into(), b: "main".into() })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::Unauthenticated);
+        let e = c
+            .is_ancestor(pb::IsAncestorRequest {
+                ancestor: "main".into(),
+                descendant: "main".into(),
+                first_parent_only: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::Unauthenticated);
+        let e = c
+            .log_range(pb::LogRangeRequest { to: "main".into(), ..Default::default() })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::Unauthenticated);
+        let e = c
+            .landed_as(pb::LandedAsRequest { commit: tip.to_hex(), ref_name: String::new() })
             .await
             .unwrap_err();
         assert_eq!(e.code(), Code::Unauthenticated);
@@ -529,6 +557,217 @@ async fn read_path_log_diff_blame_filtering() {
         w.blame(pb::BlameRequest { rev: "main".into(), path: "secrets/key".into() }).await.unwrap();
     assert_eq!(lines.into_inner().lines[0].commit, c2.0.to_vec());
     r.blame(pb::BlameRequest { rev: "main".into(), path: "src/a.rs".into() }).await.unwrap();
+}
+
+async fn range_ids(c: &mut Client, from: &str, to: &str, path: Option<&str>) -> Vec<ObjectId> {
+    let (mut out, mut token) = (Vec::new(), String::new());
+    loop {
+        let r = c
+            .log_range(pb::LogRangeRequest {
+                from_exclusive: from.into(),
+                to: to.into(),
+                path: path.map(Into::into),
+                limit: 1,
+                page_token: token,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        out.extend(r.commits.iter().map(|e| ObjectId::from_bytes(&e.id).unwrap()));
+        if r.next_page_token.is_empty() {
+            return out;
+        }
+        token = r.next_page_token;
+    }
+}
+
+/// Paths and patch text of a `Diff` with the given options.
+async fn diff_patch(
+    c: &mut Client,
+    from: &str,
+    to: &str,
+    prefixes: &[&str],
+    merge_base: bool,
+) -> (Vec<String>, String) {
+    let r = c
+        .diff(pb::DiffRequest {
+            from_rev: from.into(),
+            to_rev: to.into(),
+            path_prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+            merge_base,
+            patch: true,
+            context_lines: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let paths = r.changes.iter().map(|c| c.path.clone()).collect();
+    let text = r
+        .changes
+        .iter()
+        .flat_map(|c| c.patch.iter().flat_map(|p| &p.hunks).flat_map(|h| &h.lines))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    (paths, text)
+}
+
+/// The graph queries see the whole history (commits are not path
+/// restricted, as with `Log`); path-filtered ranges count only readable
+/// changes; diffs with prefixes, merge bases and patches never list or
+/// read restricted files; unknown commits are missing for everyone.
+#[tokio::test]
+async fn graph_queries_ranges_and_patches_filtering() {
+    let (s, c1) = seeded().await;
+    let mut r = s.client(Some(READER));
+    let mut w = s.client(Some(WRITER));
+    let c2 =
+        changeset(&mut w, Some(c1), vec![write_file("secrets/key", "rotated\n")]).await.unwrap();
+    let c2 = landed_tip(&mut w, "main", c2).await;
+    let c3 =
+        changeset(&mut r, Some(c2), vec![write_file("src/a.rs", "pub fn b() {}\n")]).await.unwrap();
+    let c3 = landed_tip(&mut r, "main", c3).await;
+    // A reader's branch off c1, touching src/ only.
+    let f = changeset(&mut r, Some(c1), vec![write_file("src/f.rs", "f\n")]).await.unwrap();
+    let fh = f.to_hex();
+
+    for c in [&mut r, &mut w] {
+        let mb = c
+            .merge_base(pb::MergeBaseRequest { a: "main".into(), b: fh.clone() })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(mb.commit, Some(c1.0.to_vec()));
+        let anc = c
+            .is_ancestor(pb::IsAncestorRequest {
+                ancestor: c2.to_hex(),
+                descendant: "main".into(),
+                first_parent_only: true,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(anc.is_ancestor);
+        let landed = c
+            .landed_as(pb::LandedAsRequest { commit: c3.to_hex(), ref_name: "main".into() })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(landed.landed);
+        assert_eq!(landed.landed_commit, c3.0.to_vec());
+        // Unknown commits: not found, whoever asks.
+        let ghost = ObjectId([7; 32]).to_hex();
+        let e = c
+            .merge_base(pb::MergeBaseRequest { a: ghost.clone(), b: "main".into() })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::NotFound);
+        let e = c
+            .is_ancestor(pb::IsAncestorRequest {
+                ancestor: ghost.clone(),
+                descendant: "main".into(),
+                first_parent_only: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::NotFound);
+        let e = c
+            .landed_as(pb::LandedAsRequest { commit: ghost.clone(), ref_name: String::new() })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::NotFound);
+        let e = c
+            .log_range(pb::LogRangeRequest {
+                from_exclusive: ghost.clone(),
+                to: "main".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Code::NotFound);
+    }
+
+    // LogRange: the whole range is visible; a path counts readable changes
+    // only, by scan and through the index.
+    let c1h = c1.to_hex();
+    for indexed in [false, true] {
+        if indexed {
+            ant_server::ops::history::catch_up(&s.backend, "main").await.unwrap();
+        }
+        assert_eq!(range_ids(&mut r, &c1h, "main", None).await, [c3, c2]);
+        assert_eq!(range_ids(&mut r, &c1h, "main", Some("secrets")).await, Vec::<ObjectId>::new());
+        assert_eq!(range_ids(&mut r, &c1h, "main", Some("secrets/key")).await, []);
+        assert_eq!(range_ids(&mut r, &c1h, "main", Some("")).await, [c3]);
+        assert_eq!(range_ids(&mut w, &c1h, "main", Some("secrets")).await, [c2]);
+        assert_eq!(range_ids(&mut w, &c1h, "main", Some("")).await, [c3, c2]);
+        assert_eq!(range_ids(&mut r, "", "main", Some("secrets")).await, []);
+        assert_eq!(range_ids(&mut w, "", "main", Some("secrets")).await, [c2, c1]);
+    }
+
+    // Diff with patches: restricted files are neither listed nor diffed.
+    let (paths, text) = diff_patch(&mut r, "", "main", &[], false).await;
+    assert_eq!(paths, ["README", "src/a.rs"]);
+    assert!(!text.contains("TOPSECRET") && !text.contains("rotated"), "{text}");
+    let (paths, text) = diff_patch(&mut w, "", "main", &[], false).await;
+    assert_eq!(paths.len(), 4);
+    assert!(text.contains("+rotated"), "{text}");
+    // Prefixes: the restricted subtree is empty for the reader.
+    assert_eq!(diff_patch(&mut r, "", "main", &["secrets"], false).await.0, Vec::<String>::new());
+    assert_eq!(
+        diff_patch(&mut r, "", "main", &["secrets/key"], false).await.0,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        diff_patch(&mut w, "", "main", &["secrets", "src"], false).await.0,
+        ["secrets/dir/x", "secrets/key", "src/a.rs"]
+    );
+    // Merge-base diffs: main...f is f's own change; f...main hides secrets.
+    assert_eq!(diff_patch(&mut r, "main", &fh, &[], true).await.0, ["src/f.rs"]);
+    let (paths, text) = diff_patch(&mut r, &fh, "main", &[], true).await;
+    assert_eq!(paths, ["src/a.rs"]);
+    assert!(!text.contains("rotated"), "{text}");
+    assert_eq!(diff_patch(&mut w, &fh, "main", &[], true).await.0, ["secrets/key", "src/a.rs"]);
+}
+
+/// The ops-level API applies the same filters (`log_range_as`, `diff_with`).
+#[tokio::test]
+async fn ops_level_ranges_and_patches() {
+    let (s, c1) = seeded().await;
+    let reader = access(READER);
+    let writer = access(WRITER);
+    let b = &s.backend;
+    let secrets = p("secrets");
+    let page = ant_server::ops::ancestry::log_range_as(
+        b,
+        Some(&reader),
+        None,
+        "main",
+        Some(&secrets),
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(page.entries.is_empty());
+    let page = ant_server::ops::ancestry::log_range_as(
+        b,
+        Some(&writer),
+        None,
+        "main",
+        Some(&secrets),
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.entries.iter().map(|e| e.id).collect::<Vec<_>>(), [c1]);
+    let opts =
+        query::DiffOptions { prefixes: vec![secrets.clone()], merge_base: false, patch: Some(3) };
+    let d = query::diff_with(b, Some(&reader), None, "main", &opts).await.unwrap();
+    assert!(d.changes.is_empty() && d.patches.unwrap().is_empty());
+    let d = query::diff_with(b, Some(&writer), None, "main", &opts).await.unwrap();
+    assert_eq!(d.changes.len(), 2);
+    assert!(d.patches.unwrap().iter().flatten().any(|p| p.hunks[0].lines[0] == "+TOPSECRET"));
 }
 
 // ---------------------------------------------------------------------------

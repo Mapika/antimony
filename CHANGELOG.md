@@ -8,7 +8,31 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+### Added
+
+- History queries for CI, bisect, revert and "did it merge" tooling, without
+  a checkout or a client-side log walk: RPCs `MergeBase`, `IsAncestor`
+  (optionally first-parent only), `LogRange` (`from..to`, first parents,
+  path filter through the history index, paged) and `LandedAs` (follows the
+  server-side rebase mapping); `Diff` takes `path_prefixes` (only those
+  subtrees are diffed), `merge_base` (`from...to`) and `patch` (unified
+  hunks per text file computed on the server, binary files flagged, with
+  per-file and per-response size limits). Access control filters them like
+  `Log` and `Diff`. CLI: `ant merge-base`, `ant log <a>..<b> [-- <path>]`,
+  `ant diff --patch [-U N] [--merge-base] <a> <b> [-- <path>...]`,
+  `ant landed-as <commit> [--ref <name>]`.
+
+### Changed
+
+- `ant ref set` checks fast-forwards with one `IsAncestor` call instead of
+  paging through `Log` (still the fallback against older servers).
+
 ### Performance
+
+- Ancestry walks (`graph::merge_base`, `graph::is_ancestor`) read commit nodes a first-parent segment per store call
+  (`first_parent_chain`, bounded by the generation gap) instead of one
+  round trip per commit: a merge base 10,000 commits back takes 7 store
+  calls instead of about 10,000.
 
 - First (uncached) `blame` of a long-lived file is 10-25x faster, with
   byte-identical output: changes between versions are diffed on the changed

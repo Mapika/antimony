@@ -29,14 +29,41 @@
 //!       Missing path: exit 1.
 //!   ant cat <rev>:<path>        raw blob bytes. Missing/not a blob: exit 1.
 //!   ant blame <rev>:<path>                    `<commit-id> <line-no>\t<line>` per line
-//!   ant log [<rev>] [-n N] [--path <path>]   `<id> <subject>` newest first; rev default `main`
-//!   ant diff <from-rev> <to-rev>   `A|M|D\t<path>`
+//!   ant log [<rev>] [-n N] [--path <path> | -- <path>]
+//!       `<id> <subject>` newest first, first parents; rev default `main`.
+//!       `<rev>` may be a range `<a>..<b>`: the first-parent history of <b>
+//!       down to the first commit reachable from <a> (LogRange, paged by
+//!       the server; `-n` caps the total). Both ends are required.
+//!       More than one path: exit 1.
+//!   ant diff [--patch [-U N]] [--merge-base] <from-rev> <to-rev> [-- <path>...]
+//!       `A|M|D\t<path>` per changed path, sorted. `-- <path>...`: only
+//!       changes at or under those paths. `--merge-base`: diff from the
+//!       merge base of the two revs (no common ancestor: exit 1).
+//!       `--patch`: instead a unified diff computed by the server, per file
+//!       `diff --git a/<p> b/<p>`, then `new file mode <m>` / `deleted file
+//!       mode <m>` / `old mode <m>` + `new mode <m>` when applicable, then
+//!       `--- a/<p>|/dev/null`, `+++ b/<p>|/dev/null` and `@@ -a[,b] +c[,d] @@`
+//!       hunks (`-U N` context lines, default 3; ` `/`-`/`+` lines and
+//!       `\ No newline at end of file`), as `git apply` reads them. Files
+//!       with a non-text side print `Binary files <old> and <new> differ`;
+//!       files over the server's size limits print `Large files <old> and
+//!       <new> differ` (with a `hint:` on stderr when the response budget
+//!       ran out). Mode-only changes have no `---`/`+++` lines.
+//!   ant merge-base <a> <b>         `<id>` of the best common ancestor (the
+//!       highest generation, then the larger id). Unrelated histories: exit 1.
+//!   ant landed-as <commit> [--ref <name>]
+//!       Whether <commit> (as submitted to `land`) is in a ref's history,
+//!       itself or as the commit a server-side rebase landed it as (every
+//!       commit of a landed stack is mapped). stdout: `<landed-id> <ref>`,
+//!       plus ` rebased` when the landed commit differs. Without `--ref`, the
+//!       first 64 refs in name order are tried. Not landed: exit 1.
 //!   ant ref get <name>             `<id>` (missing: exit 1)
 //!   ant ref list [<prefix>]        `<id> <name>`
 //!   ant ref set <name> <rev> [--expect <id>|--create] [--force]
 //!       CAS update; mismatch: exit 1. A move to a commit that does not
 //!       descend from the current (or `--expect`ed) target is refused
-//!       (exit 1) unless `--force`. stdout: `<id>`
+//!       (exit 1) unless `--force` (checked with IsAncestor; against servers
+//!       without it, by walking Log pages). stdout: `<id>`
 //!   ant ref init [<name>] [-m <msg>]
 //!       Creates ref <name> (default `main`) at a new root commit with the empty
 //!       tree: the first commit of an empty server. stdout: `<commit-id>`.

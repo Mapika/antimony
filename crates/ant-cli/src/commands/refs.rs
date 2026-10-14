@@ -10,14 +10,37 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::ctx::{Ctx, Outcome, RpcResult, id_from, resolve_commit};
 
-/// First-parent commits fetched per `Log` call while checking ancestry.
+/// First-parent commits fetched per `Log` call while checking ancestry
+/// against servers without `IsAncestor`.
 const LOG_PAGE: u32 = 1000;
 
-/// Is `ancestor` reachable from `descendant`? Walks first-parent chains with
-/// `Log` pages (each commit carries its generation), following other parents
-/// as new chains, and stops every chain at the ancestor's generation, so the
-/// cost follows the distance between the two commits.
+/// Is `ancestor` reachable from `descendant`? One `IsAncestor` call (the
+/// server walks the graph); servers older than that RPC (`unimplemented`)
+/// get the client-side walk over `Log` pages.
 async fn is_ancestor(
+    client: &mut Client,
+    ancestor: ObjectId,
+    descendant: ObjectId,
+) -> Result<bool> {
+    let req = pb::IsAncestorRequest {
+        ancestor: ancestor.to_hex(),
+        descendant: descendant.to_hex(),
+        first_parent_only: false,
+    };
+    match client.is_ancestor(req).await {
+        Ok(r) => Ok(r.into_inner().is_ancestor),
+        Err(s) if s.code() == tonic::Code::Unimplemented => {
+            is_ancestor_by_log(client, ancestor, descendant).await
+        }
+        Err(s) => Err(s).rpc(),
+    }
+}
+
+/// [`is_ancestor`] for servers without `IsAncestor`: walks first-parent
+/// chains with `Log` pages (each commit carries its generation), following
+/// other parents as new chains, and stops every chain at the ancestor's
+/// generation, so the cost follows the distance between the two commits.
+async fn is_ancestor_by_log(
     client: &mut Client,
     ancestor: ObjectId,
     descendant: ObjectId,

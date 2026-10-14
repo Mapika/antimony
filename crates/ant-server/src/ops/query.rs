@@ -15,12 +15,16 @@
 //! - `diff`: changes between two revs' trees (`from = None` = empty tree),
 //!   via `ant_store::graph::diff_trees_with` over the tree cache (one
 //!   batched read of the cache misses per depth).
+//! - `diff_with`: `diff` plus path prefixes (only those subtrees are
+//!   diffed), merge-base diffs (`from...to`) and per-file line patches
+//!   (`ops::patch`).
 
 use ant_core::{Commit, EntryMode, ObjectId, RepoPath, TreeEntry};
-use ant_store::{Backend, CommitNode, ObjectStoreExt, PathChange, StoreError, graph};
+use ant_store::graph::TreeSource;
+use ant_store::{Backend, ChangeKind, CommitNode, ObjectStoreExt, PathChange, StoreError, graph};
 use bytes::Bytes;
 
-use super::{OpError, OpResult, cache, history};
+use super::{OpError, OpResult, cache, history, patch};
 use crate::acl::Access;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +239,158 @@ pub async fn diff_as(
         changes.retain(|c| access.can_read(&c.path));
     }
     Ok(changes)
+}
+
+/// What [`diff_with`] computes besides the changed paths.
+#[derive(Debug, Clone, Default)]
+pub struct DiffOptions {
+    /// Only changes at or under one of these paths (empty = everything).
+    pub prefixes: Vec<RepoPath>,
+    /// Diff from the merge base of `from` and `to` instead of `from`.
+    pub merge_base: bool,
+    /// Line diffs of the changed files ([`patch`]); `Some(context lines)`.
+    pub patch: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiffResult {
+    pub changes: Vec<PathChange>,
+    /// Index-aligned with `changes` when patches were asked for (`None` for
+    /// gitlinks).
+    pub patches: Option<Vec<Option<patch::FilePatch>>>,
+    /// The merge base the diff starts from (`DiffOptions::merge_base`).
+    pub from_commit: Option<ObjectId>,
+    /// The patch budget ran out (`patch::MAX_PATCH_BYTES`).
+    pub patch_truncated: bool,
+}
+
+/// [`diff_as`] with path prefixes, merge-base diffs and content patches:
+/// - `prefixes`: only the subtrees at those paths are diffed (each looked up
+///   in both trees through the tree cache), not the whole trees;
+/// - `merge_base`: `from` becomes `merge_base(from, to)`
+///   (`ant_store::graph::merge_base`); it needs a `from`, and unrelated
+///   histories are `NotFound`;
+/// - `patch`: hunks per changed file (`ops::patch`), after the access
+///   filter, so unreadable files are neither listed nor read.
+pub async fn diff_with(
+    b: &Backend,
+    access: Option<&Access>,
+    from: Option<&str>,
+    to: &str,
+    opts: &DiffOptions,
+) -> OpResult<DiffResult> {
+    let to_id = resolve_rev(b, to).await?;
+    let mut from_id = match from {
+        Some(rev) => Some(resolve_rev(b, rev).await?),
+        None => None,
+    };
+    let mut from_commit = None;
+    if opts.merge_base {
+        let (Some(from_rev), Some(f)) = (from, from_id) else {
+            return Err(OpError::InvalidArgument("a merge-base diff needs a from rev".into()));
+        };
+        let base = graph::merge_base(b, f, to_id).await?.ok_or_else(|| {
+            OpError::NotFound(format!("{from_rev} and {to} have no common ancestor"))
+        })?;
+        from_id = Some(base);
+        from_commit = Some(base);
+    }
+    let new = cache::get_node(b, to_id).await?.tree;
+    let old = match from_id {
+        Some(id) => Some(cache::get_node(b, id).await?.tree),
+        None => None,
+    };
+    let trees = cache::CachedTrees(b);
+    let mut changes = if opts.prefixes.iter().all(|p| !p.is_root()) && !opts.prefixes.is_empty() {
+        diff_under(&trees, old, new, &opts.prefixes).await?
+    } else {
+        graph::diff_trees_with(&trees, old, Some(new)).await?
+    };
+    if let Some(access) = access
+        && !access.can_read_everything()
+    {
+        changes.retain(|c| access.can_read(&c.path));
+    }
+    let (patches, patch_truncated) = match opts.patch {
+        Some(context) => {
+            let (p, t) = patch::patches(b, &changes, context).await?;
+            (Some(p), t)
+        }
+        None => (None, false),
+    };
+    Ok(DiffResult { changes, patches, from_commit, patch_truncated })
+}
+
+/// The entry at `path` under the tree `root`, read through `source`.
+async fn lookup_in(
+    source: &cache::CachedTrees<'_>,
+    root: ObjectId,
+    path: &RepoPath,
+) -> OpResult<Option<(EntryMode, ObjectId)>> {
+    let mut cur = (EntryMode::Tree, root);
+    for comp in path.components() {
+        if !cur.0.is_tree() {
+            return Ok(None);
+        }
+        let tree = source.read_trees(&[cur.1]).await?.pop();
+        match tree.as_ref().and_then(|t| t.get(comp)) {
+            Some(e) => cur = (e.mode.class(), e.id),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(cur))
+}
+
+/// Changes between `old` and `new` at or under `prefixes` (none of them the
+/// root), sorted by path: each prefix's subtrees are diffed on their own,
+/// with the same semantics as `graph::diff_trees_with` on the whole trees.
+async fn diff_under(
+    source: &cache::CachedTrees<'_>,
+    old: Option<ObjectId>,
+    new: ObjectId,
+    prefixes: &[RepoPath],
+) -> OpResult<Vec<PathChange>> {
+    let mut prefixes = prefixes.to_vec();
+    prefixes.sort();
+    prefixes.dedup();
+    // A prefix under another one adds nothing.
+    let mut kept: Vec<RepoPath> = Vec::new();
+    for p in prefixes {
+        if !kept.iter().any(|k| p.starts_with(k)) {
+            kept.push(p);
+        }
+    }
+    let mut out = Vec::new();
+    for prefix in kept {
+        let o = match old {
+            Some(old) => lookup_in(source, old, &prefix).await?,
+            None => None,
+        };
+        let n = lookup_in(source, new, &prefix).await?;
+        if o == n {
+            continue;
+        }
+        let o_tree = o.filter(|(m, _)| m.is_tree()).map(|(_, id)| id);
+        let n_tree = n.filter(|(m, _)| m.is_tree()).map(|(_, id)| id);
+        let o_leaf = o.filter(|(m, _)| !m.is_tree());
+        let n_leaf = n.filter(|(m, _)| !m.is_tree());
+        if o_leaf != n_leaf {
+            let kind = match (o_leaf, n_leaf) {
+                (None, Some(_)) => ChangeKind::Added,
+                (Some(_), None) => ChangeKind::Deleted,
+                _ => ChangeKind::Modified,
+            };
+            out.push(PathChange { path: prefix.clone(), kind, old: o_leaf, new: n_leaf });
+        }
+        if o_tree.is_some() || n_tree.is_some() {
+            for mut c in graph::diff_trees_with(source, o_tree, n_tree).await? {
+                c.path = prefix.join(c.path.as_str())?;
+                out.push(c);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
 }
 
 async fn diff_unfiltered(b: &Backend, from: Option<&str>, to: &str) -> OpResult<Vec<PathChange>> {

@@ -107,8 +107,12 @@ cache hit can never hide a missing object.
 
 ## Read path
 
-- **Queries without a checkout:** `ResolveRev`, `ReadPath`, `Log`, `Diff`,
-  `Blame` over gRPC.
+- **Queries without a checkout:** `ResolveRev`, `ReadPath`, `Log`, `Diff`
+  (path prefixes, merge-base diffs, server-side patches), `Blame`,
+  `MergeBase`, `IsAncestor`, `LogRange` and `LandedAs` over gRPC
+  (`ops/query.rs`, `ops/ancestry.rs`, `ops/patch.rs`). Ancestry walks go in
+  generation order and read the commit graph a first-parent segment per
+  store call (`graph.rs`).
 - **Path history:** each ref has an index (`history` table) of which commits
   touched which paths along its first-parent chain. It is maintained in the
   background after lands and ref updates (`ops/history.rs`, coalesced per

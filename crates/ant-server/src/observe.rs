@@ -45,7 +45,7 @@ const MAX_REQUEST_ID_LEN: usize = 128;
 
 /// gRPC methods of `ant.v1.Ant` (kept equal to `proto/ant.proto` by a test);
 /// any other path is recorded as `unknown` to keep label cardinality closed.
-const GRPC_METHODS: [&str; 13] = [
+const GRPC_METHODS: [&str; 17] = [
     "GetObjects",
     "HasObjects",
     "PutObjects",
@@ -59,6 +59,10 @@ const GRPC_METHODS: [&str; 13] = [
     "Log",
     "Diff",
     "Blame",
+    "MergeBase",
+    "IsAncestor",
+    "LogRange",
+    "LandedAs",
 ];
 
 const GRPC_PREFIX: &str = "/ant.v1.Ant/";

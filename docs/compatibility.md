@@ -40,6 +40,24 @@ Client/server skew: a client works against a server of the same minor
 version and, for as long as the rules above hold, one minor version older or
 newer. Upgrade servers first, then clients.
 
+Additions since 0.1.0 (all additive; an older server answers a new RPC with
+`unimplemented` and ignores new request fields):
+
+| addition | what |
+|---|---|
+| `MergeBase` | best common ancestor of two revs (`MergeBaseRequest`/`Response`) |
+| `IsAncestor` | reachability, optionally first-parent only |
+| `LogRange` | first-parent `from..to` history with a path filter, paged (`page_token`) |
+| `LandedAs` | whether, and as which commit, a submitted commit landed on a ref |
+| `DiffRequest` fields 3-6 | `path_prefixes`, `merge_base`, `patch`, `context_lines` |
+| `DiffResponse` fields 2-3, `PathChange.patch` (7), `FilePatch`, `Hunk` | merge base used, per-file unified hunks, truncation flag |
+
+Clients detect an older server instead of misreading its answer: `ant ref
+set` falls back to walking `Log` pages when `IsAncestor` is unimplemented;
+`ant diff --merge-base` / `--patch` fail with `error:` when the response
+lacks `from_commit` / patches, and `ant diff -- <path>` also filters on the
+client.
+
 ## 2. Postgres schema
 
 The schema is versioned (`schema_version` table, `ant admin schema`). The

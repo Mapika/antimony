@@ -117,39 +117,13 @@ async fn walk_chain(
 }
 
 /// True if `ancestor` lies on the first-parent chain of `descendant`
-/// (inclusive). Prunes by generation.
+/// (inclusive; `ant_store::graph::is_first_parent_ancestor`).
 pub(crate) async fn is_first_parent_ancestor(
     b: &Backend,
     ancestor: ObjectId,
     descendant: ObjectId,
 ) -> OpResult<bool> {
-    const CHUNK: usize = 1024;
-    if ancestor == descendant {
-        return Ok(true);
-    }
-    let [Some(target), Some(desc)] =
-        <[_; 2]>::try_from(b.meta.get_commits(&[ancestor, descendant]).await?)
-            .unwrap_or([None, None])
-    else {
-        return Ok(false);
-    };
-    // Generations strictly decrease along a chain: a newer `ancestor` (the
-    // common case of a tip ahead of a lagging watermark) needs no walk, and
-    // otherwise the walk is at most the generation gap long.
-    if desc.generation <= target.generation {
-        return Ok(false);
-    }
-    let gap = usize::try_from(desc.generation - target.generation).unwrap_or(usize::MAX);
-    let mut from = descendant;
-    loop {
-        let chunk = b.meta.first_parent_chain(from, Some(ancestor), CHUNK.min(gap)).await?;
-        let Some(last) = chunk.last() else { return Ok(false) };
-        match last.parents.first() {
-            Some(p) if *p == ancestor => return Ok(true),
-            Some(p) if chunk.len() == CHUNK && last.generation > target.generation + 1 => from = *p,
-            _ => return Ok(false),
-        }
-    }
+    Ok(ant_store::graph::is_first_parent_ancestor(b, ancestor, descendant).await?)
 }
 
 /// Bring `ref_name`'s history index up to date. Returns commits indexed.
@@ -321,7 +295,10 @@ pub async fn path_log(
 
 /// Read the commit objects of `(generation, id)` hits through the commit
 /// cache (recent commits are read by every log): at most one round trip.
-async fn log_entries(b: &Backend, hits: Vec<(u64, ObjectId)>) -> OpResult<Vec<LogEntry>> {
+pub(crate) async fn log_entries(
+    b: &Backend,
+    hits: Vec<(u64, ObjectId)>,
+) -> OpResult<Vec<LogEntry>> {
     let ids: Vec<ObjectId> = hits.iter().map(|(_, id)| *id).collect();
     let commits = cache::read_commits(b, &ids).await?;
     Ok(hits
@@ -609,7 +586,7 @@ impl LcsRows {
 /// if the line was introduced. Common prefix/suffix are trimmed, then an LCS
 /// runs on the middle (counted as fully replaced if too large). Same result
 /// as the quadratic reference `line_map`, including its tie-breaking.
-fn line_map_ids(old: &[u32], new: &[u32]) -> Vec<Option<usize>> {
+pub(crate) fn line_map_ids(old: &[u32], new: &[u32]) -> Vec<Option<usize>> {
     let mut map = vec![None; new.len()];
     let pre = old.iter().zip(new).take_while(|(a, b)| a == b).count();
     let suf =

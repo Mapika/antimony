@@ -48,7 +48,12 @@
 //! - ReadPath: denied path → not found. Tree listings still show restricted
 //!   entry names and ids (documented v1 limitation: clients need ids to
 //!   sparse-skip; it is content access we protect). Log `--path` / Diff: drop
-//!   changes under unreadable paths.
+//!   changes under unreadable paths. LogRange with a path counts only
+//!   readable changes (as Log); Diff with `path_prefixes`, `merge_base` or
+//!   `patch` filters before any blob is read, so hunks of unreadable files
+//!   are never computed. MergeBase / IsAncestor / LandedAs reveal commit
+//!   graph facts only, which (like Log without a path) every authenticated
+//!   caller may see; unknown revs are `not_found` for everyone.
 //! - CreateChangeset: every op path must be writable, else permission_denied.
 //! - Land: principal must `can_land(ref)`, and every path changed by every
 //!   replayed commit must be writable by the principal.

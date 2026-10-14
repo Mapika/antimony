@@ -31,8 +31,17 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
         Command::Ls { target } => query::ls(&ctx, &target).await,
         Command::Cat { target } => query::cat(&ctx, &target).await,
         Command::Blame { target } => query::blame(&ctx, &target).await,
-        Command::Log { rev, limit, path } => query::log(&ctx, &rev, limit, path).await,
-        Command::Diff { from, to } => query::diff(&ctx, &from, &to).await,
+        Command::Log { rev, limit, path, paths } => {
+            query::log(&ctx, &rev, limit, query::one_path(path, paths)?).await
+        }
+        Command::Diff { from, to, patch, merge_base, context, paths } => {
+            let flags = query::DiffFlags { patch, merge_base, context, paths };
+            query::diff(&ctx, &from, &to, flags).await
+        }
+        Command::MergeBase { a, b } => query::merge_base(&ctx, &a, &b).await,
+        Command::LandedAs { commit, ref_name } => {
+            query::landed_as(&ctx, &commit, ref_name.as_deref()).await
+        }
         Command::Ref { cmd } => match cmd {
             RefCmd::Get { name } => refs::get(&ctx, &name).await,
             RefCmd::List { prefix } => refs::list(&ctx, &prefix).await,
