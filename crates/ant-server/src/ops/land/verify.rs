@@ -8,7 +8,7 @@ use ant_store::{Backend, graph};
 use super::MAX_STACK;
 use super::replay::BatchState;
 use crate::acl::Access;
-use crate::ops::{OpError, OpResult};
+use crate::ops::{OpError, OpResult, cache};
 
 /// What a land request's permission pre-check (run against the ref tip seen
 /// before joining a batch) proved the caller may do.
@@ -115,7 +115,8 @@ pub(super) async fn verify_land(
     // other people's changes): what changes is the trees' net diff.
     state.nodes(b, &[tip]).await?;
     let (old, new) = (state.nodes[&tip].tree, state.nodes[&commit].tree);
-    let changes = graph::diff_trees(b.objects.as_ref(), Some(old), Some(new)).await?;
+    let trees = cache::CachedTrees(b);
+    let changes = graph::diff_trees_with(&trees, Some(old), Some(new)).await?;
     access.check_writable(changes.iter().map(|c| &c.path))?;
     Ok(Verified::Exact { from: tip })
 }

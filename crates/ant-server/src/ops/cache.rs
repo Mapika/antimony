@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use ant_core::{Commit, Object, ObjectId, ObjectKind, Tree};
+use ant_store::graph::TreeSource;
 use ant_store::{Backend, CommitNode, MetaStore, ObjectStore, PathChange, StoreError};
 
 /// Cache names, indexed by [`Cache`] slot.
@@ -351,6 +352,44 @@ pub(crate) async fn read_commits(
             None => found.get(id).cloned().ok_or(StoreError::NotFound(*id)),
         })
         .collect()
+}
+
+/// Index-aligned tree reads through the tree cache: one `get_many` for the
+/// distinct misses, none when everything is cached. Missing objects are
+/// `NotFound`; non-trees are `WrongKind`.
+pub(crate) async fn read_trees(b: &Backend, ids: &[ObjectId]) -> ant_store::Result<Vec<Arc<Tree>>> {
+    let caches = objects(&b.objects);
+    let cached = caches.trees.get_many(ids);
+    let mut missing: Vec<ObjectId> =
+        ids.iter().zip(&cached).filter(|(_, t)| t.is_none()).map(|(id, _)| *id).collect();
+    let mut found = HashMap::with_capacity(missing.len());
+    if !missing.is_empty() {
+        missing.sort_unstable();
+        missing.dedup();
+        let fetched = TreeSource::read_trees(b.objects.as_ref(), &missing).await?;
+        caches.trees.insert_many(
+            missing.iter().zip(&fetched).map(|(id, t)| (*id, t.clone(), tree_weight(t))),
+        );
+        found.extend(missing.into_iter().zip(fetched));
+    }
+    ids.iter()
+        .zip(cached)
+        .map(|(id, t)| match t {
+            Some(t) => Ok(t),
+            None => found.get(id).cloned().ok_or(StoreError::NotFound(*id)),
+        })
+        .collect()
+}
+
+/// A [`TreeSource`] over a backend's object store through its tree cache,
+/// for `graph::diff_trees_with`.
+pub(crate) struct CachedTrees<'a>(pub &'a Backend);
+
+#[async_trait::async_trait]
+impl TreeSource for CachedTrees<'_> {
+    async fn read_trees(&self, ids: &[ObjectId]) -> ant_store::Result<Vec<Arc<Tree>>> {
+        read_trees(self.0, ids).await
+    }
 }
 
 #[cfg(test)]

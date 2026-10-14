@@ -3,13 +3,15 @@
 //!
 //! - `catch_up(b, ref)` runs after every successful `land` and `UpdateRef`
 //!   (best effort: errors are logged; queries fall back, see `log`).
-//! - `ops::query::log` with a path uses `path_log` when the rev is on an
-//!   indexed ref's first-parent chain (rev resolved from a ref name, or a
-//!   commit id that `is_first_parent_ancestor` of that ref's watermark), else
-//!   it scans recorded changesets. When the watermark merely trails the tip
-//!   (a busy ref between catch-ups), `lagging_path_log` scans only the
-//!   unindexed commits and takes the rest from the index; without this every
-//!   path log on a ref under constant landing scanned its whole history.
+//! - `ops::query::log` with a path: a rev naming a ref goes to
+//!   `lagging_path_log`, which reads that ref's watermark once — rev at or
+//!   behind it → index only; rev ahead of it (a busy ref between catch-ups)
+//!   → scan only the unindexed commits and take the rest from the index. A
+//!   commit-id rev uses `path_log` when it `is_first_parent_ancestor` of an
+//!   indexed ref's watermark (`indexed_ref_for`). Anything else scans
+//!   recorded changesets — on a ref under constant landing that scan walks
+//!   the whole history, so the index paths must cover every race between
+//!   resolving the rev and a concurrent catch-up.
 //! - Exposed as the `Blame` RPC and `ant blame <rev>:<path>` (output per
 //!   line: `<commit-id> <line-no>\t<line>`).
 //!
@@ -27,7 +29,8 @@
 //!   loading all commits at once.
 //!
 //! `path_log(b, ref_name, rev_generation, path, limit)`: `query_history` →
-//! `LogEntry`s (read the commit objects in one `get_many`).
+//! `LogEntry`s (commit objects through the commit cache, misses in one
+//! `get_many`).
 //!
 //! `blame(b, rev, path)`: per-line attribution of the file at `rev`.
 //! Walks the file's history newest→oldest (the index when available, else
@@ -41,12 +44,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use ant_core::{Commit, ObjectId, RepoPath};
+use ant_core::{ObjectId, RepoPath};
 use ant_store::{Backend, ChangeKind, HistoryRow, PathChange};
 use bytes::Bytes;
 
 use super::query::{self, LogEntry};
-use super::{OpError, OpResult};
+use super::{OpError, OpResult, cache};
 use crate::acl::Access;
 use crate::metrics::Metrics;
 
@@ -278,9 +281,8 @@ pub fn schedule_catch_up_observed(b: &Backend, ref_name: &str, metrics: Option<A
 /// An indexed ref whose first-parent chain (as indexed so far) contains `id`.
 /// `rev` is the user's revision string; a leading ref name is tried first.
 pub async fn indexed_ref_for(b: &Backend, rev: &str, id: ObjectId) -> OpResult<Option<String>> {
-    let base = rev.rsplit_once('~').map_or(rev, |(base, _)| base);
     let mut candidates = Vec::new();
-    if base.parse::<ObjectId>().is_err() && ant_store::validate_ref_name(base).is_ok() {
+    if let Some(base) = rev_ref(rev) {
         candidates.push(base.to_string());
     } else {
         candidates.extend(
@@ -309,25 +311,39 @@ pub async fn path_log(
     log_entries(b, hits).await
 }
 
-/// Read the commit objects of `(generation, id)` hits in one round trip.
+/// Read the commit objects of `(generation, id)` hits through the commit
+/// cache (recent commits are read by every log): at most one round trip.
 async fn log_entries(b: &Backend, hits: Vec<(u64, ObjectId)>) -> OpResult<Vec<LogEntry>> {
     let ids: Vec<ObjectId> = hits.iter().map(|(_, id)| *id).collect();
-    let objects = b.objects.get_many(&ids).await?;
-    hits.into_iter()
-        .zip(objects)
-        .map(|((generation, id), o)| {
-            let o = o.ok_or_else(|| OpError::not_found_object(id))?;
-            Ok(LogEntry { id, generation, commit: Commit::decode(o.body())? })
-        })
-        .collect()
+    let commits = cache::read_commits(b, &ids).await?;
+    Ok(hits
+        .into_iter()
+        .zip(commits)
+        .map(|((generation, id), commit)| LogEntry { id, generation, commit: (*commit).clone() })
+        .collect())
 }
 
-/// `log --path` for a `tip` the index has not caught up with yet: the usual
-/// case on a busy ref, where the watermark trails the tip by the commits
-/// landed since the last catch-up. When `rev` names a ref whose watermark is
-/// on `tip`'s first-parent chain at most [`MAX_LAG`] commits back, the
-/// unindexed commits are scanned (one chain read and one changeset read) and
-/// the rest comes from the index. `None` when that does not apply.
+/// The ref a revision string names (`main`, `main~3`), or None for commit
+/// ids and anything that is not a valid ref name.
+fn rev_ref(rev: &str) -> Option<&str> {
+    let base = rev.rsplit_once('~').map_or(rev, |(base, _)| base);
+    (base.parse::<ObjectId>().is_err() && ant_store::validate_ref_name(base).is_ok())
+        .then_some(base)
+}
+
+/// `log --path` for a `rev` naming a ref (`tip` = the commit it resolved
+/// to), decided by one read of that ref's watermark:
+/// - `tip` at or behind the watermark on its first-parent chain (caught up,
+///   `main~N`, or a catch-up that finished after `tip` was resolved): served
+///   from the index alone.
+/// - `tip` ahead of it, the usual case on a busy ref where the watermark
+///   trails by the commits landed since the last catch-up: when the
+///   watermark is at most [`MAX_LAG`] first parents back, the unindexed
+///   commits are scanned (one chain read, changesets through the cache) and
+///   the rest comes from the index.
+///
+/// `None` when that does not apply (commit-id rev, no index, ref moved
+/// non-fast-forward, lag too long); the caller then scans changesets.
 pub async fn lagging_path_log(
     b: &Backend,
     rev: &str,
@@ -335,21 +351,31 @@ pub async fn lagging_path_log(
     path: &RepoPath,
     limit: usize,
 ) -> OpResult<Option<Vec<LogEntry>>> {
-    let base = rev.rsplit_once('~').map_or(rev, |(base, _)| base);
-    if base.parse::<ObjectId>().is_ok() || ant_store::validate_ref_name(base).is_err() {
-        return Ok(None);
-    }
+    let Some(base) = rev_ref(rev) else { return Ok(None) };
     let Some(wm) = b.meta.history_watermark(base).await? else { return Ok(None) };
-    let chain = b.meta.first_parent_chain(tip, Some(wm), MAX_LAG).await?;
+    let limit = if limit == 0 { usize::MAX } else { limit };
+    let [Some(tip_node), Some(wm_node)] =
+        <[_; 2]>::try_from(cache::get_nodes(b, &[tip, wm]).await?).unwrap_or([None, None])
+    else {
+        return Ok(None);
+    };
+    if tip_node.generation <= wm_node.generation {
+        // Without this, a watermark that caught up between resolving `tip`
+        // and reading it sent the query to a full changeset scan.
+        if !is_first_parent_ancestor(b, tip, wm).await? {
+            return Ok(None);
+        }
+        let hits = b.meta.query_history(base, path, tip_node.generation, limit).await?;
+        return log_entries(b, hits).await.map(Some);
+    }
+    // Generations strictly decrease along the chain: it is at most the gap long.
+    let gap = usize::try_from(tip_node.generation - wm_node.generation).unwrap_or(usize::MAX);
+    let chain = b.meta.first_parent_chain(tip, Some(wm), MAX_LAG.min(gap)).await?;
     if chain.last().and_then(|n| n.parents.first()) != Some(&wm) {
         return Ok(None);
     }
-    let Some(wm_node) = b.meta.get_commits(&[wm]).await?.pop().flatten() else {
-        return Ok(None);
-    };
-    let limit = if limit == 0 { usize::MAX } else { limit };
     let ids: Vec<ObjectId> = chain.iter().map(|n| n.id).collect();
-    let sets = b.meta.get_changesets(&ids).await?;
+    let sets = cache::get_changesets(b, &ids).await?;
     let mut hits = Vec::new();
     for (node, set) in chain.iter().zip(sets) {
         if hits.len() >= limit {

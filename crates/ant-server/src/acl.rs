@@ -303,8 +303,8 @@ pub async fn check_update_ref(
             OpError::PermissionDenied(format!("{name} does not point at a recorded commit"))
         })?
         .tree;
-    let changes =
-        ant_store::graph::diff_trees(b.objects.as_ref(), Some(old_tree), Some(new_tree)).await?;
+    let trees = crate::ops::cache::CachedTrees(b);
+    let changes = ant_store::graph::diff_trees_with(&trees, Some(old_tree), Some(new_tree)).await?;
     access.check_writable(changes.iter().map(|c| &c.path))?;
     Ok(())
 }
