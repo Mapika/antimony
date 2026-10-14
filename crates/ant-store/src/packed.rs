@@ -363,4 +363,67 @@ mod tests {
         store.put_many(&big[..2]).await.unwrap();
         assert_eq!(store.get_many(&ids[..2]).await.unwrap().len(), 2);
     }
+
+    /// A store whose S3 side is a scripted fake (index in scratch Postgres).
+    async fn fake_backed(
+        script: Vec<crate::s3_fake::Act>,
+        attempts: u32,
+    ) -> (PackedS3Store, crate::s3_fake::Fake) {
+        use crate::s3_fake::{config, fast_timeouts, spawn};
+        let url = std::env::var("ANT_TEST_PG_URL")
+            .unwrap_or_else(|_| "postgres://ant:ant@localhost:54329/ant".into());
+        let pg =
+            PgStore::connect_scratch(&url, &format!("t_{}", rand::random::<u64>())).await.unwrap();
+        let fake = spawn(script).await;
+        let s3 = S3ObjectStore::connect(&config(&fake, fast_timeouts(attempts))).await.unwrap();
+        (PackedS3Store::new(pg, s3), fake)
+    }
+
+    fn run_of(len: u64) -> Run {
+        // The fake serves byte(i) = i % 251; these entries are never decoded
+        // because the reads below fail.
+        let id = ObjectId::from_bytes(&[9; 32]).unwrap();
+        Run {
+            pack: [1; 16],
+            start: 0,
+            end: len,
+            entries: vec![IndexEntry { id, pack: [1; 16], off: 0, len: len as u32 }],
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn stalled_reads_release_their_read_budget() {
+        use std::sync::atomic::Ordering;
+        let (store, fake) = fake_backed(vec![crate::s3_fake::Act::Stall], 2).await;
+        assert_eq!(store.reading.available_permits(), READ_PERMITS);
+        // More concurrent stalled reads than the budget admits at once (each
+        // costs READ_MIN_COST): they queue on permits, time out, and give the
+        // permits back.
+        let n = READ_BUDGET / READ_MIN_COST + 8;
+        let t = std::time::Instant::now();
+        let results = futures::future::join_all((0..n).map(|_| {
+            let store = store.clone();
+            async move { store.get_run(run_of(4096)).await }
+        }))
+        .await;
+        assert!(results.iter().all(|r| matches!(r, Err(StoreError::Backend(_)))));
+        assert_eq!(store.reading.available_permits(), READ_PERMITS, "permits leaked");
+        assert!(fake.hits.load(Ordering::SeqCst) >= n as usize);
+        // Bounded: queued waves of (2 attempts x 300 ms), not a hang.
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "{:?}", t.elapsed());
+
+        // A caller that gives up mid-read (future dropped) releases too.
+        let s2 = store.clone();
+        let h = tokio::spawn(async move { s2.get_run(run_of(4096)).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        h.abort();
+        let _ = h.await;
+        assert_eq!(store.reading.available_permits(), READ_PERMITS, "permits leaked on cancel");
+
+        // The store is still usable: a good response goes through.
+        let (store, _) = fake_backed(vec![crate::s3_fake::Act::Ok], 2).await;
+        let body = store.s3.get_range("x", 0, 100).await.unwrap();
+        assert_eq!(body.len(), 100);
+    }
 }

@@ -637,6 +637,7 @@ pub async fn run(args: Args) -> Result<i32> {
         prefix: format!("{schema}/"),
         access_key: args.s3_access_key.clone(),
         secret_key: args.s3_secret_key.clone(),
+        timeouts: Default::default(),
     });
     let exe = match &args.server_exe {
         Some(p) => p.clone(),

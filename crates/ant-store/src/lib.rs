@@ -15,6 +15,8 @@ pub mod memory;
 pub mod packed;
 pub mod postgres;
 pub mod s3;
+#[cfg(test)]
+mod s3_fake;
 pub mod tiered;
 
 use std::sync::Arc;

@@ -105,6 +105,7 @@ async fn unreachable_s3_is_not_ready() {
         prefix: String::new(),
         access_key: "a".into(),
         secret_key: "b".into(),
+        timeouts: Default::default(),
     };
     let s3 = S3ObjectStore::connect(&cfg).await.unwrap();
     let (url, _) = serve(Acl::open(), Probes { pg: None, s3: Some(s3) }, true).await;
