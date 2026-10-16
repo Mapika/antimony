@@ -178,15 +178,27 @@ impl Worker {
                     }
                 },);
             match published {
-                Ok(CasOutcome::Updated) => {
+                Ok((CasOutcome::Updated, durable)) => {
                     known = Some(Some(tip));
-                    current.succeed();
+                    match durable {
+                        // Answered once the publish is durable; the next
+                        // batch publishes meanwhile (`RefLock::publish_pipelined`).
+                        Some(durable) => {
+                            tokio::spawn(async move {
+                                match durable.await {
+                                    Ok(()) => current.succeed(),
+                                    Err(error) => current.fail(error.into()),
+                                }
+                            });
+                        }
+                        None => current.succeed(),
+                    }
                     match (next, speculated) {
                         (Some(next), Some(Err(error))) => next.fail(error),
                         (next, _) => ready = next,
                     }
                 }
-                Ok(CasOutcome::Mismatch { actual }) => {
+                Ok((CasOutcome::Mismatch { actual }, _)) => {
                     if let Some(m) = current.requests.iter().find_map(|r| r.metrics.as_deref()) {
                         m.record_land_cas_retry();
                     }
@@ -237,7 +249,8 @@ impl Worker {
 }
 
 /// Move the ref from `start` to `tip` and record the batch's landed-as
-/// mappings, durably, before anyone is replied to.
+/// mappings, durably before anyone is replied to: either now, or (a
+/// pipelined publish) once the returned durability resolves.
 async fn publish(
     b: &Backend,
     ref_name: &str,
@@ -246,17 +259,18 @@ async fn publish(
     start: Option<ObjectId>,
     tip: ObjectId,
     mappings: Vec<(Vec<u8>, bytes::Bytes)>,
-) -> OpResult<CasOutcome> {
+) -> OpResult<(CasOutcome, Option<ant_store::Durability>)> {
     if deferred {
         // One commit for both, which also makes the batch's deferred writes
         // durable (or fails if the database lost them).
-        return Ok(lock.publish(start, tip, LANDED_AS, mappings).await?);
+        let (out, durable) = lock.publish_pipelined(start, tip, LANDED_AS, mappings).await?;
+        return Ok((out, Some(durable)));
     }
     let cas = ant_store::feed::landing(b.refs.cas_ref(ref_name, start, Some(tip))).await?;
     if cas == CasOutcome::Updated {
         b.meta.put_derived_many(LANDED_AS, mappings).await?;
     }
-    Ok(cas)
+    Ok((cas, None))
 }
 
 /// One group-commit batch: its requests, the replay state (kept across CAS

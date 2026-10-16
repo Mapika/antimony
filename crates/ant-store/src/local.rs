@@ -683,28 +683,61 @@ impl RefLockRelease for LocalRefLock {
         kind: &str,
         derived: Vec<(Vec<u8>, Bytes)>,
     ) -> Result<CasOutcome> {
-        let (name, kind) = (self.name.clone(), kind.to_owned());
-        self.store
-            .db()
-            .write(true, move |c, fx| {
-                let actual = cas_in(c, &name, expected, Some(new))?;
-                if actual != expected {
-                    return Ok(CasOutcome::Mismatch { actual });
-                }
-                insert_derived(c, &kind, &derived)?;
-                if expected != Some(new) {
-                    fx.moves.push(RefMove {
-                        name,
-                        old: expected,
-                        new: Some(new),
-                        cause: MoveCause::Land,
-                        nonce: crate::feed::nonce(),
-                    });
-                }
-                Ok(CasOutcome::Updated)
-            })
-            .await
+        publish_in(&self.store, &self.name, expected, new, kind, derived, true).await
     }
+
+    /// The same transaction, answered at commit; the [`crate::Durability`]
+    /// is an empty durable write queued after it, which the syncer answers
+    /// only after an fsync that covers the publish.
+    async fn publish_pipelined(
+        &mut self,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+        kind: &str,
+        derived: Vec<(Vec<u8>, Bytes)>,
+    ) -> Result<(CasOutcome, crate::Durability)> {
+        let out = publish_in(&self.store, &self.name, expected, new, kind, derived, false).await?;
+        let store = self.store.clone();
+        // Queued now, behind the publish: its group commits later.
+        let synced = tokio::spawn(async move { store.db().write(true, |_, _| Ok(())).await });
+        let durable: crate::Durability =
+            Box::pin(async move { synced.await.map_err(StoreError::backend)? });
+        Ok((out, durable))
+    }
+}
+
+/// The publish transaction of [`LocalRefLock`]: CAS plus derived rows; the
+/// ref move is announced once it is durable.
+async fn publish_in(
+    store: &LocalStore,
+    name: &str,
+    expected: Option<ObjectId>,
+    new: ObjectId,
+    kind: &str,
+    derived: Vec<(Vec<u8>, Bytes)>,
+    durable: bool,
+) -> Result<CasOutcome> {
+    let (name, kind) = (name.to_owned(), kind.to_owned());
+    store
+        .db()
+        .write(durable, move |c, fx| {
+            let actual = cas_in(c, &name, expected, Some(new))?;
+            if actual != expected {
+                return Ok(CasOutcome::Mismatch { actual });
+            }
+            insert_derived(c, &kind, &derived)?;
+            if expected != Some(new) {
+                fx.moves.push(RefMove {
+                    name,
+                    old: expected,
+                    new: Some(new),
+                    cause: MoveCause::Land,
+                    nonce: crate::feed::nonce(),
+                });
+            }
+            Ok(CasOutcome::Updated)
+        })
+        .await
 }
 
 #[async_trait]
