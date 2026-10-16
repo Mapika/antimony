@@ -107,6 +107,10 @@ pub(crate) enum Authz {
     Unsupported,
 }
 
+/// The answer of an object flight that found the object already on disk
+/// (a fetch never sends a condition, so the upstream does not answer 304).
+const ON_DISK: StatusCode = StatusCode::NOT_MODIFIED;
+
 type FlightOut = Result<Arc<Reply>, Arc<String>>;
 type FlightFut = Shared<BoxFuture<'static, FlightOut>>;
 
@@ -516,7 +520,15 @@ impl CacheServe {
     }
 
     /// Join the fetch of `id` in flight, or start one under `auth`.
-    fn object_flight(self: &Arc<Self>, id: ObjectId, auth: Option<String>) -> (Role, FlightFut) {
+    ///
+    /// With `recheck`, a new flight first looks at the disk cache and, when
+    /// the object is there, answers [`ON_DISK`] without asking the upstream.
+    fn object_flight(
+        self: &Arc<Self>,
+        id: ObjectId,
+        auth: Option<String>,
+        recheck: bool,
+    ) -> (Role, FlightFut) {
         let mut map = self.objects.lock();
         if let Some(f) = map.get(&id) {
             let role = if f.auth == auth { Role::Joined } else { Role::Foreign };
@@ -525,9 +537,26 @@ impl CacheServe {
         let me = self.clone();
         let creds = auth.clone();
         let fut: FlightFut = async move {
-            me.metrics.inflight(1);
-            let out = me.fetch_object(id, creds).await;
-            me.metrics.inflight(-1);
+            let on_disk = recheck
+                && matches!(
+                    me.disk
+                        .get_many(std::slice::from_ref(&id))
+                        .await
+                        .map(|mut v| v.pop().flatten()),
+                    Ok(Some(_))
+                );
+            let out = if on_disk {
+                Ok(Arc::new(Reply {
+                    status: ON_DISK,
+                    headers: HeaderMap::new(),
+                    body: Bytes::new(),
+                }))
+            } else {
+                me.metrics.inflight(1);
+                let out = me.fetch_object(id, creds).await;
+                me.metrics.inflight(-1);
+                out
+            };
             me.objects.lock().remove(&id);
             out
         }
@@ -789,7 +818,19 @@ async fn get_object(
     let Ok(id) = ObjectId::from_str(&hex) else {
         return text(StatusCode::BAD_REQUEST, "malformed object id");
     };
-    let auth = me.credentials(&headers);
+    serve_object(&me, id, &headers, true).await
+}
+
+/// `GET /o/<id>`. With `recheck`, a miss whose object lands on disk before
+/// its fetch starts (another request's fetch just finished) is served from
+/// disk again instead of being fetched twice.
+async fn serve_object(
+    me: &Arc<CacheServe>,
+    id: ObjectId,
+    headers: &HeaderMap,
+    recheck: bool,
+) -> Response {
+    let auth = me.credentials(headers);
     let local = match me.disk.get_many(std::slice::from_ref(&id)).await {
         Ok(mut v) => v.pop().flatten(),
         Err(e) => {
@@ -799,9 +840,13 @@ async fn get_object(
     };
     match (me.auth, local) {
         (AuthMode::Open, Some(obj)) => {
-            object_response(&me, &id, obj, CACHE_IMMUTABLE, "hit", &headers)
+            object_response(me, &id, obj, CACHE_IMMUTABLE, "hit", headers)
         }
-        (AuthMode::Open, None) => fill_object(&me, id, None).await,
+        (AuthMode::Open, None) => match fill_object(me, id, None, recheck).await {
+            Some(res) => res,
+            None if recheck => Box::pin(serve_object(me, id, headers, false)).await,
+            None => bad_gateway("object vanished from the cache while being served"),
+        },
         (AuthMode::Forward, Some(obj)) => {
             // Never serve on our own authority: the origin must confirm,
             // by a batched permission check or, for an origin without one,
@@ -809,12 +854,12 @@ async fn get_object(
             match me.authorize(auth.as_deref(), &[id], "objects", true).await {
                 Ok(Authz::Verdicts(v)) => match v.first() {
                     Some(Verdict::Allowed { private }) => object_response(
-                        &me,
+                        me,
                         &id,
                         obj,
                         cache_control_of(*private),
                         "revalidated",
-                        &headers,
+                        headers,
                     ),
                     _ => {
                         // Exactly the origin's answer for a hidden object.
@@ -826,10 +871,10 @@ async fn get_object(
                 },
                 Ok(Authz::Refused(r)) => {
                     let tag = tag_for(&r, true);
-                    reply_response(&me, "objects", &r, tag)
+                    reply_response(me, "objects", &r, tag)
                 }
                 Ok(Authz::Unsupported) => {
-                    revalidated_hit(&me, &id, obj, auth.as_deref(), &headers).await
+                    revalidated_hit(me, &id, obj, auth.as_deref(), headers).await
                 }
                 Err(e) => {
                     me.metrics.request("objects", "error");
@@ -837,7 +882,11 @@ async fn get_object(
                 }
             }
         }
-        (AuthMode::Forward, None) => fill_object(&me, id, auth).await,
+        (AuthMode::Forward, None) => match fill_object(me, id, auth, recheck).await {
+            Some(res) => res,
+            None if recheck => Box::pin(serve_object(me, id, headers, false)).await,
+            None => bad_gateway("object vanished from the cache while being served"),
+        },
     }
 }
 
@@ -873,15 +922,25 @@ async fn revalidated_hit(
 
 /// Local miss: fetch under the caller's credentials (sharing a fetch in
 /// flight where that is safe).
-async fn fill_object(me: &Arc<CacheServe>, id: ObjectId, auth: Option<String>) -> Response {
+async fn fill_object(
+    me: &Arc<CacheServe>,
+    id: ObjectId,
+    auth: Option<String>,
+    recheck: bool,
+) -> Option<Response> {
     let forward = me.auth == AuthMode::Forward;
-    let (role, fut) = me.object_flight(id, auth.clone());
+    let (role, fut) = me.object_flight(id, auth.clone(), recheck);
     if matches!(role, Role::Foreign) {
         // Someone else's fetch is in flight: the caller must first prove
         // access to the origin, then may take the bytes from that fetch.
         match me.revalidate(&id, auth.as_deref()).await {
             Ok(r) if r.status == StatusCode::NOT_MODIFIED => {
-                if let Ok(done) = fut.await
+                let done = fut.await;
+                if done.as_ref().is_ok_and(|d| d.status == ON_DISK) {
+                    // It was already on disk: serve it the normal way.
+                    return None;
+                }
+                if let Ok(done) = done
                     && done.status == StatusCode::OK
                     && let Ok(Some(obj)) =
                         me.disk.get_many(&[id]).await.map(|mut v| v.pop().flatten())
@@ -892,10 +951,17 @@ async fn fill_object(me: &Arc<CacheServe>, id: ObjectId, auth: Option<String>) -
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or(CACHE_PRIVATE)
                         .to_owned();
-                    return object_response(me, &id, obj, &cache, "joined", &HeaderMap::new());
+                    return Some(object_response(
+                        me,
+                        &id,
+                        obj,
+                        &cache,
+                        "joined",
+                        &HeaderMap::new(),
+                    ));
                 }
                 // The shared fetch failed: fetch under our own credentials.
-                return match me.fetch_object(id, auth).await {
+                return Some(match me.fetch_object(id, auth).await {
                     Ok(r) => {
                         let tag = tag_for(&r, forward);
                         reply_response(me, "objects", &r, tag)
@@ -904,24 +970,25 @@ async fn fill_object(me: &Arc<CacheServe>, id: ObjectId, auth: Option<String>) -
                         me.metrics.request("objects", "error");
                         bad_gateway(&e)
                     }
-                };
+                });
             }
             Ok(r) if r.status == StatusCode::OK => {
                 // Origin sent the bytes itself (it ignored the condition).
                 let tag = tag_for(&r, forward);
-                return reply_response(me, "objects", &r, tag);
+                return Some(reply_response(me, "objects", &r, tag));
             }
             Ok(r) => {
                 let tag = tag_for(&r, forward);
-                return reply_response(me, "objects", &r, tag);
+                return Some(reply_response(me, "objects", &r, tag));
             }
             Err(e) => {
                 me.metrics.request("objects", "error");
-                return bad_gateway(&e);
+                return Some(bad_gateway(&e));
             }
         }
     }
-    match fut.await {
+    Some(match fut.await {
+        Ok(r) if r.status == ON_DISK => return None,
         Ok(r) => {
             let tag = if matches!(role, Role::Joined) && r.status == StatusCode::OK {
                 "joined"
@@ -934,7 +1001,7 @@ async fn fill_object(me: &Arc<CacheServe>, id: ObjectId, auth: Option<String>) -
             me.metrics.request("objects", "error");
             bad_gateway(&e)
         }
-    }
+    })
 }
 
 async fn get_bundle(
