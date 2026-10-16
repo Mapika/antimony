@@ -90,7 +90,9 @@ Landing and import on cloud boxes (Hetzner ccx43 + ccx33, same-box A/B,
     Another replica or an import still gets the lock within a turn.
   - Batches go through three overlapping stages: in-memory replay, writes
     (on their own task), publish. Up to two batches are prepared behind the
-    one publishing, each seeded with its predecessor's unwritten state.
+    one publishing, each seeded with its predecessor's unwritten state. A
+    publish starts as soon as its batch's writes are done, alongside the
+    next batch's replay (see Fixed).
   - The batch-wide prefetch runs concurrently with the ref and mapping reads.
 - Postgres:
   - A quarter of `--pg-max-connections` (from four up) forms a
@@ -115,6 +117,31 @@ Landing and import on cloud boxes (Hetzner ccx43 + ccx33, same-box A/B,
   about 40 % of the serial conversion time.
 - `deploy/postgres.conf`: `track_io_timing` and `track_wal_io_timing` on,
   notes for cloud disks. The operator guide gains "On cloud boxes".
+
+### Fixed
+
+- **Landing regression on boxes with slow commits** (introduced by the
+  land pipeline above, never released). In steady state the land worker
+  replayed the next batch *before* publishing the current one, instead of
+  during the publish, so every publish waited for a replay, and each
+  request waited behind two of those slower cycles. Where the durable
+  publish is the bottleneck (a local disk: fdatasync about 0.8 ms on the
+  WSL dev box, against 0.12 ms on Hetzner NVMe) batches shrank and lands
+  slowed by a quarter or more. The worker now publishes as soon as the
+  batch's writes are done, while the next batch is replayed beside it.
+  Same-machine A/B (embedded fleet, Postgres + S3, three interleaved
+  rounds, `0.2.2` / before the fix / after):
+  - 16 agents: 2,296 / 1,739 / **2,472** lands/s, land p50 3.9 / 6.6 /
+    3.9 ms, p99 10.3 / 12.3 / 8.0 ms
+  - 64 agents: 3,518 / 2,933 / **4,199** lands/s, land p50 11.9 / 16.0 /
+    9.3 ms, p99 30.1 / 54.9 / 30.6 ms
+
+  Runs that degraded across rounds (old and new alike) were the dev box's
+  disk: after a few minutes of back-to-back runs fdatasync slowed from
+  0.8 to 3 ms. Interleaved A/B runs now need idle gaps between them.
+- `history_bench_postgres` (benchmark test) no longer races the
+  background catch-up its unindexed query starts: it waits for it and
+  clears the index before timing a catch-up of the whole history.
 
 ### Changed
 
