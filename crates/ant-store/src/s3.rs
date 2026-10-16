@@ -231,12 +231,16 @@ impl S3Config {
 
     /// Local S3 (SeaweedFS) from docker-compose.yml, overridable via `ANT_TEST_S3_*`.
     ///
-    /// The prefix becomes `<prefix>-t<unix secs>` (unique per run; old ones
+    /// The prefix becomes `<prefix>-t<unix secs>-<random>` (unique per run; old ones
     /// are swept by `testing::sweep_s3_prefixes`); tests that write hold a
     /// `testing::S3PrefixGuard` on the returned config.
     pub fn for_tests(prefix: &str) -> Self {
         crate::testing::sweep_s3_once();
-        Self::for_tests_raw(&format!("{prefix}-t{}", crate::testing::unix_secs()))
+        Self::for_tests_raw(&format!(
+            "{prefix}-t{}-{}",
+            crate::testing::unix_secs(),
+            rand::random::<u64>()
+        ))
     }
 
     /// [`Self::for_tests`] with the prefix exactly as given.
