@@ -13,6 +13,7 @@ pub mod conformance;
 pub mod derive;
 pub mod feed;
 pub mod graph;
+pub mod local;
 pub mod memory;
 pub mod packed;
 pub mod postgres;

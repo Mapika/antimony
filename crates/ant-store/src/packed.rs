@@ -1,4 +1,11 @@
-//! Large objects bundled into few S3 objects.
+//! Large objects bundled into few S3 objects (or local pack files).
+//!
+//! [`PackedStore`] is generic over where the index lives ([`PackIndex`]:
+//! Postgres's `object_index` table, or the local store's SQLite) and where
+//! the packs live ([`PackFiles`]: S3, or append-only files of a local data
+//! directory, `crate::local`). [`PackedS3Store`] is the Postgres + S3 pair
+//! the docs below describe; the local pair differs only where noted in
+//! `crate::local`.
 //!
 //! One S3 `PUT` per object is what limits bulk loads: an S3-compatible server
 //! spends far more on a request than on a few kilobytes of body (measured on a
@@ -46,7 +53,9 @@ use futures::{StreamExt, TryStreamExt, stream};
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 
-use crate::postgres::{IndexEntry, PgStore};
+use bytes::Bytes;
+
+use crate::postgres::PgStore;
 use crate::s3::S3ObjectStore;
 use crate::{BLOCKING_THRESHOLD, ObjectStore, Result, StoreError};
 
@@ -82,6 +91,93 @@ const READ_BUDGET: u64 = 48 * 1024 * 1024;
 const READ_MIN_COST: u64 = 1024 * 1024;
 const READ_UNIT: u64 = 4096;
 const READ_PERMITS: usize = (READ_BUDGET / READ_UNIT) as usize;
+
+/// Location of a packed object: the record of `len` bytes at `off` of pack
+/// `pack` (a frame shared with other objects, or the object alone).
+#[derive(Debug, Clone, Copy)]
+pub struct IndexEntry {
+    pub id: ObjectId,
+    pub pack: [u8; 16],
+    pub off: u64,
+    pub len: u32,
+    /// The part of a shared frame's bytes attributed to this object (`None`:
+    /// the whole record). Written, never read back by readers.
+    pub share: Option<u32>,
+}
+
+/// The `id -> (pack, offset, length)` index of a [`PackedStore`].
+#[async_trait]
+pub trait PackIndex: Clone + Send + Sync + 'static {
+    /// Index rows of those `ids` that are stored (and readable).
+    async fn lookup_index(&self, ids: &[ObjectId]) -> Result<HashMap<ObjectId, IndexEntry>>;
+    /// Record where objects live; first writer wins (identical content).
+    /// Called only after the packs they point into are durable.
+    async fn index_objects(&self, entries: &[IndexEntry]) -> Result<()>;
+    /// Those `ids` that a collection run condemned (readers treat them as
+    /// missing); only asked about objects stored outside packs.
+    async fn condemned_among(&self, ids: &[ObjectId]) -> Result<HashSet<ObjectId>>;
+}
+
+/// Storage of the packs of a [`PackedStore`].
+#[async_trait]
+pub trait PackFiles: Clone + Send + Sync + 'static {
+    /// Store each body as (part of) a pack and make it durable; returns,
+    /// index-aligned, the pack holding it and the offset of its first byte.
+    async fn write_packs(&self, bodies: Vec<Vec<u8>>) -> Result<Vec<([u8; 16], u64)>>;
+    /// `len` bytes at `offset` of pack `pack`.
+    async fn read_range(&self, pack: &[u8; 16], offset: u64, len: u64) -> Result<Bytes>;
+    /// Whether objects may also be stored one per key, outside packs (S3
+    /// stores written before packs existed).
+    fn may_hold_unpacked(&self) -> bool {
+        false
+    }
+    /// Objects stored one per key (see [`Self::may_hold_unpacked`]).
+    async fn get_unpacked(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
+        Ok(vec![None; ids.len()])
+    }
+    /// Index-aligned existence of objects stored one per key.
+    async fn has_unpacked(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {
+        Ok(vec![false; ids.len()])
+    }
+}
+
+#[async_trait]
+impl PackIndex for PgStore {
+    async fn lookup_index(&self, ids: &[ObjectId]) -> Result<HashMap<ObjectId, IndexEntry>> {
+        PgStore::lookup_index(self, ids).await
+    }
+    async fn index_objects(&self, entries: &[IndexEntry]) -> Result<()> {
+        PgStore::index_objects(self, entries).await
+    }
+    async fn condemned_among(&self, ids: &[ObjectId]) -> Result<HashSet<ObjectId>> {
+        PgStore::condemned_among(self, ids).await
+    }
+}
+
+#[async_trait]
+impl PackFiles for S3ObjectStore {
+    /// One S3 object per pack, under a random id: a pack is only ever
+    /// indexed by the upload that wrote it (see the module docs).
+    async fn write_packs(&self, bodies: Vec<Vec<u8>>) -> Result<Vec<([u8; 16], u64)>> {
+        let placed: Vec<([u8; 16], u64)> = bodies.iter().map(|_| (rand::random(), 0)).collect();
+        let keys: Vec<String> = placed.iter().map(|(pack, _)| self.pack_key(pack)).collect();
+        let puts = bodies.into_iter().zip(keys).map(|(body, key)| self.put_raw(key, body));
+        stream::iter(puts).buffer_unordered(FANOUT).try_collect::<Vec<()>>().await?;
+        Ok(placed)
+    }
+    async fn read_range(&self, pack: &[u8; 16], offset: u64, len: u64) -> Result<Bytes> {
+        self.get_range(&self.pack_key(pack), offset, len).await
+    }
+    fn may_hold_unpacked(&self) -> bool {
+        true
+    }
+    async fn get_unpacked(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
+        ObjectStore::get_many(self, ids).await
+    }
+    async fn has_unpacked(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {
+        ObjectStore::has_many(self, ids).await
+    }
+}
 
 /// One ranged GET: `entries` (sorted by offset, all in `pack`) lie within
 /// `start..end`. Members of one frame share an offset.
@@ -201,10 +297,13 @@ fn member(f: &Decoded, e: &IndexEntry) -> Result<EncodedObject> {
     })
 }
 
+/// Large objects in packs of Postgres-indexed S3 objects.
+pub type PackedS3Store = PackedStore<PgStore, S3ObjectStore>;
+
 #[derive(Clone)]
-pub struct PackedS3Store {
-    index: PgStore,
-    s3: S3ObjectStore,
+pub struct PackedStore<I, F> {
+    index: I,
+    files: F,
     /// Range bytes being downloaded, in `READ_UNIT`s (see `READ_BUDGET`).
     reading: Arc<Semaphore>,
     /// Uncompressed frame bytes being decoded, in `DECODE_UNIT`s.
@@ -215,18 +314,24 @@ pub struct PackedS3Store {
     frame_raw: usize,
 }
 
-impl PackedS3Store {
-    /// `index` holds the `object_index` table; `s3` receives the packs and is
+impl<I: PackIndex, F: PackFiles> PackedStore<I, F> {
+    /// `index` holds the object index; `files` receives the packs and (S3) is
     /// also consulted for objects stored one per key.
-    pub fn new(index: PgStore, s3: S3ObjectStore) -> Self {
+    pub fn new(index: I, files: F) -> Self {
         Self {
             index,
-            s3,
+            files,
             reading: Arc::new(Semaphore::new(READ_PERMITS)),
             decoding: Arc::new(Semaphore::new(DECODE_PERMITS)),
             frames: Arc::new(Mutex::new(FrameCache::new(FRAME_CACHE_BYTES))),
             frame_raw: FRAME_RAW,
         }
+    }
+
+    /// Keep at most `bytes` of decoded frames (default [`FRAME_CACHE_BYTES`]).
+    pub fn with_frame_cache_bytes(mut self, bytes: usize) -> Self {
+        self.frames = Arc::new(Mutex::new(FrameCache::new(bytes)));
+        self
     }
 
     /// Write frames of at most `bytes` uncompressed bytes; 0 stores every
@@ -241,7 +346,7 @@ impl PackedS3Store {
         let len = run.end - run.start;
         let units = len.max(READ_MIN_COST).div_ceil(READ_UNIT).clamp(1, READ_PERMITS as u64) as u32;
         let permit = self.reading.acquire_many(units).await.map_err(StoreError::backend)?;
-        let body = self.s3.get_range(&self.s3.pack_key(&run.pack), run.start, len).await?;
+        let body = self.files.read_range(&run.pack, run.start, len).await?;
         drop(permit);
         // Every frame's uncompressed size: decoding memory, and CPU work.
         let raw = run
@@ -328,7 +433,7 @@ fn encode_task(
 }
 
 #[async_trait]
-impl ObjectStore for PackedS3Store {
+impl<I: PackIndex, F: PackFiles> ObjectStore for PackedStore<I, F> {
     async fn get_many(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -373,14 +478,17 @@ impl ObjectStore for PackedS3Store {
             .await?;
         got.extend(fetched.into_iter().flatten());
         // Objects stored one per key (before packs existed).
-        let mut legacy_ids: Vec<ObjectId> =
-            wanted.iter().filter(|id| !got.contains_key(id)).copied().collect();
+        let mut legacy_ids: Vec<ObjectId> = if self.files.may_hold_unpacked() {
+            wanted.iter().filter(|id| !got.contains_key(id)).copied().collect()
+        } else {
+            Vec::new()
+        };
         if !legacy_ids.is_empty() {
             let condemned = self.index.condemned_among(&legacy_ids).await?;
             legacy_ids.retain(|id| !condemned.contains(id));
         }
         if !legacy_ids.is_empty() {
-            for (id, obj) in legacy_ids.iter().zip(self.s3.get_many(&legacy_ids).await?) {
+            for (id, obj) in legacy_ids.iter().zip(self.files.get_unpacked(&legacy_ids).await?) {
                 if let Some(obj) = obj {
                     got.insert(*id, obj);
                 }
@@ -459,25 +567,20 @@ impl ObjectStore for PackedS3Store {
             packs.push(cur);
         }
 
-        // Packs first, then the index rows that point into them.
+        // Packs first (durable), then the index rows that point into them.
+        let (bodies, layouts): (Vec<Vec<u8>>, Vec<_>) =
+            packs.into_iter().map(|p| (p.body, p.entries)).unzip();
+        let placed = self.files.write_packs(bodies).await?;
         let mut entries: Vec<IndexEntry> = Vec::new();
-        let uploads: Vec<(String, Vec<u8>)> = packs
-            .into_iter()
-            .map(|p| {
-                let pack: [u8; 16] = rand::random();
-                entries.extend(p.entries.into_iter().map(|(id, off, len, share)| IndexEntry {
-                    id,
-                    pack,
-                    off,
-                    len,
-                    share,
-                }));
-                (self.s3.pack_key(&pack), p.body)
-            })
-            .collect();
-        let puts =
-            uploads.into_iter().map(|(key, body)| async move { self.s3.put_raw(key, body).await });
-        stream::iter(puts).buffer_unordered(FANOUT).try_collect::<Vec<()>>().await?;
+        for ((pack, base), layout) in placed.into_iter().zip(layouts) {
+            entries.extend(layout.into_iter().map(|(id, off, len, share)| IndexEntry {
+                id,
+                pack,
+                off: base + off,
+                len,
+                share,
+            }));
+        }
         self.index.index_objects(&entries).await
     }
 
@@ -489,10 +592,10 @@ impl ObjectStore for PackedS3Store {
         let mut out: Vec<bool> = ids.iter().map(|id| index.contains_key(id)).collect();
         let misses: Vec<usize> =
             out.iter().enumerate().filter(|(_, p)| !**p).map(|(i, _)| i).collect();
-        if !misses.is_empty() {
+        if !misses.is_empty() && self.files.may_hold_unpacked() {
             let miss_ids: Vec<ObjectId> = misses.iter().map(|&i| ids[i]).collect();
             let condemned = self.index.condemned_among(&miss_ids).await?;
-            for (i, present) in misses.into_iter().zip(self.s3.has_many(&miss_ids).await?) {
+            for (i, present) in misses.into_iter().zip(self.files.has_unpacked(&miss_ids).await?) {
                 out[i] = present && !condemned.contains(&ids[i]);
             }
         }
@@ -661,7 +764,7 @@ mod tests {
 
         // The store is still usable: a good response goes through.
         let (store, _) = fake_backed(vec![crate::s3_fake::Act::Ok], 2).await;
-        let body = store.s3.get_range("x", 0, 100).await.unwrap();
+        let body = store.files.get_range("x", 0, 100).await.unwrap();
         assert_eq!(body.len(), 100);
     }
 
