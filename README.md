@@ -89,25 +89,22 @@ paths, tree bundles, access control) and the
 Measured on one WSL2 development machine (20 cores) with Postgres and
 SeaweedFS S3 running locally on the same host. They are indicative, not
 guarantees: real networks, managed Postgres and real S3 will move them.
-Sources: the [final pre-release scorecard](docs/scorecard/2026-10-14-final.md)
-(27 of 27 rows pass), [CHANGELOG](CHANGELOG.md) and [ROADMAP](ROADMAP.md).
-
-| measure (v0.1.0) | result |
-|---|---|
-| Landing on one ref, 64 concurrent agents, Postgres + S3 | 4,138 lands/s, p99 26.5 ms, 0 aborts, exact history |
-| `create_changeset` p50, 16 agents | 2.0 ms |
-| Soak: 4 replicas × 1,000 agents × 30 min | 266k lands, 0 errors, exact history, flat RSS |
-| Import rust-lang/rust (343k commits, 1.1 GB pack) | 110 s (3,124 commits/s), 1.6 GiB peak RSS |
-| Queries on rust-lang/rust | path log 18 ms; blame 363 ms first, 10 ms cached; `merge-base main main~2000` 10 ms; sparse workspace 134 ms |
-| Checkout, synthetic 96k-file tree (medians) | cold 2.5 s, warm 1.1 s, `status` 0.1 s |
-| git export, `clone --filter=blob:none` | git/git 7.0 s (native git 5.9 s); rust-lang/rust 33 s (native git 30 s) |
-
-On `main`, unreleased (planned 0.2.0):
+Sources: the [v0.2.0 scorecard](docs/scorecard/2026-10-16-v0.2.0.md)
+(27 of 27 rows pass), the [v0.1.0 scorecard](docs/scorecard/2026-10-14-final.md),
+[CHANGELOG](CHANGELOG.md) and [ROADMAP](ROADMAP.md).
 
 | measure | result |
 |---|---|
-| Stored size of a git/git import vs its git pack (303 MiB) | 901 MiB, 3.0× (v0.1.0: 4,094 MiB, 13.5×) |
-| Blame after landing 1–100 commits elsewhere (1,700-line file, 1,200 versions) | 3.3–3.9 ms (v0.1.0: 95–168 ms) |
+| Landing on one ref, 64 concurrent agents, Postgres + S3 | 3,791 lands/s, p99 30.7 ms, 0 aborts, exact history (v0.1.0 run: 4,138/s, 26.5 ms) |
+| `create_changeset` p50, 16 agents | 2.0 ms |
+| Soak: 4 replicas × 1,000 agents × 30 min | 266k lands, 0 errors, exact history, flat RSS |
+| Import git/git (82k commits) | 7,216 commits/s, 0.9 GiB peak RSS |
+| Import rust-lang/rust (343k commits, 1.1 GB pack) | 110 s (3,124 commits/s), 1.6 GiB peak RSS |
+| Queries on git/git | path log 9 ms (6.7 ms full history, git: 101 ms); blame 47 ms first, 14 ms cached; diverged merge-base 9.3 ms (git: 54 ms) |
+| Queries on rust-lang/rust | path log 18 ms; blame 363 ms first, 10 ms cached; `merge-base main main~2000` 10 ms; sparse workspace 134 ms |
+| Checkout, synthetic 96k-file tree (medians) | cold 4.7 s, warm 1.1 s, `status` 0.1 s (cold was 2.5 s in v0.1.0; under investigation) |
+| git export, `clone --filter=blob:none` of git/git | 5.9 s |
+| Stored size of git/git vs its git pack | 901 MiB after import (3.0×; v0.1.0: 13.5×); 361 MiB after `ant admin repack` and GC (298 MiB for `git gc`, 94 MiB for `git gc --aggressive`) |
 
 ## How it compares to git
 
@@ -125,11 +122,11 @@ checkout, partial clone) measured:
 | sparse checkout, cold / warm | 2.9 s / 1.5 s | 1.05 s / 0.19 s |
 | blame, repeated / after a new commit | 323 ms / 307 ms | 19 ms / 16 ms |
 | merge-base, ancestor 12k commits back | 56 ms | 10 ms |
-| path log, full history | 101 ms | 210 ms |
-| merge-base, diverged branches | 54 ms | 193 ms |
+| path log, full history | 101 ms | 6.7 ms (210 ms before 0.2.0) |
+| merge-base, diverged branches | 54 ms | 9.3 ms (193 ms before 0.2.0) |
 | status, clean, repeated | 78 ms | 118 ms |
-| storage (git/git) | 105 MiB (`gc --aggressive`) | 901 MiB (Postgres + S3) |
-| `git clone --filter=blob:none` | 1.5 s | 32 s (from antimony's git export) |
+| storage (git/git) | 105 MiB (`gc --aggressive`) | 901 MiB after import, 361 MiB after `ant admin repack` (Postgres + S3) |
+| `git clone --filter=blob:none` | 1.5 s | 5.9 s quiet machine, 32 s in the loaded head-to-head run (from antimony's git export) |
 
 Where antimony is ahead: concurrent landing (the server rebases and lands;
 agents never fetch, rebase and retry a rejected push), checkout and sparse
@@ -137,8 +134,7 @@ workspaces, and repeated history queries, which come from server-side
 indexes and caches with no history on the client.
 
 Where git is ahead: storage size, serving clones (git reuses its packs;
-antimony's export builds packs on the fly), path log and diverged merge-base
-on mid-size histories, offline work, and the ecosystem (hosting, code review,
+antimony's export builds packs on the fly), offline work, and the ecosystem (hosting, code review,
 tooling; antimony's export accepts no pushes). antimony is 0.x; lazy FUSE
 workspaces are Linux only. The report lists the caveats: one shared machine,
 different work per change in the storm, and git's weaker default durability.
@@ -254,18 +250,19 @@ every flag; `ant completions <shell>` prints a completion script.
 
 ## Status
 
-- **v0.1.0** (2026-10-16) is the first release: working end to end against
+- **v0.2.0** (2026-10-16): storage format change (look-alike objects
+  compressed together in S3 packs, whole-history repacking with
+  `ant admin repack`; schema version 7, see the upgrade notes in
+  [operations](docs/operations.md)), incremental blame, faster path log and
+  merge-base, a cache tier (`ant cache-serve`) with batched permission
+  checks, and S3 throttling handled with backoff.
+- **v0.1.0** (2026-10-16) was the first release: working end to end against
   real Postgres and S3, FUSE included, covered by unit, integration and
   property tests (codecs, changesets, landing single and multi-replica,
   garbage collection).
-- **0.2.0 is in progress on `main`**: a storage format change (look-alike
-  objects compressed together in S3 packs, offline whole-history repacking
-  with `ant admin repack`; schema version 7), incremental blame, and a
-  cache tier that batches permission checks
-  (`POST /o/check`). See [Unreleased](CHANGELOG.md#unreleased).
 - **Known limitations**: one Postgres primary (no multi-region); FUSE
   workspaces are Linux only; the git export is read-only; no code review;
-  storage is larger than a git pack; commit latency is bounded by one
+  storage is larger than an aggressively packed git repository; commit latency is bounded by one
   durable Postgres commit; restricted tree entry names and commit metadata
   are visible to every authenticated principal. Full list:
   [CHANGELOG, known limitations](CHANGELOG.md#known-limitations).
