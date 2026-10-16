@@ -52,7 +52,9 @@ start() {
         mkdir -p "$S3DATA"
         setsid nohup "$BASE/bin/weed" server -s3 -s3.port=9009 -dir="$S3DATA" \
             -ip=127.0.0.1 -ip.bind=127.0.0.1 -master.port=19333 -volume.port=18080 \
-            -filer.port=18888 -volume.max=0 > "$BASE/weed.log" 2>&1 < /dev/null &
+            -filer.port=18888 -volume.max=0 \
+            -volume.concurrentDownloadLimitMB=512 -volume.concurrentUploadLimitMB=256 \
+            -filer.concurrentUploadLimitMB=256 > "$BASE/weed.log" 2>&1 < /dev/null &
         i=0; until s3_up; do i=$((i + 1)); [ $i -gt 120 ] && { echo "seaweedfs did not start"; exit 1; }; sleep 0.5; done
     fi
     status
