@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{KillOnDrop, PG_URL, ant, free_ports, unique_suffix};
+use common::{KillOnDrop, PG_URL, ant, free_ports};
 
 const READER: &str = "reader-token";
 const WRITER: &str = "writer-token";
@@ -305,7 +305,7 @@ fn git(repo: &Path, args: &[&str]) {
 #[test]
 #[ignore = "needs docker compose up -d"]
 fn import_and_reindex_with_policy_postgres() {
-    let schema = format!("acl_e2e_{}", unique_suffix());
+    let schema = ant_store::testing::scratch_schema("acl_e2e");
     // Declared first, so it drops last (after the server) and also on panic.
     let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
     let tmp = tempfile::tempdir().expect("tempdir");

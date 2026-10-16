@@ -723,10 +723,7 @@ mod tests {
 
     async fn pg_backend() -> Backend {
         let url = ant_store::testing::pg_url();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let schema = format!("t_imp_{}_{nanos}", std::process::id());
+        let schema = ant_store::testing::scratch_schema("imp");
         let pg = Arc::new(
             PgStore::connect_scratch(&url, &schema)
                 .await

@@ -2175,12 +2175,7 @@ mod tests {
 
         const N: usize = 20_000;
         let url = ant_store::testing::pg_url();
-        let schema = format!(
-            "hist_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos())
-        );
+        let schema = ant_store::testing::scratch_schema("hist");
         let pg = Arc::new(PgStore::connect_scratch(&url, &schema).await.unwrap());
         let b = Backend { objects: pg.clone(), refs: pg.clone(), meta: pg.clone() };
 

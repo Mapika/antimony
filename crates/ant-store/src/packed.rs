@@ -512,9 +512,9 @@ mod tests {
     async fn fresh() -> (PackedS3Store, S3ObjectStore) {
         let url = crate::testing::pg_url();
         let pg =
-            PgStore::connect_scratch(&url, &format!("t_{}", rand::random::<u64>())).await.unwrap();
+            PgStore::connect_scratch(&url, &crate::testing::scratch_schema("s")).await.unwrap();
         let cfg = S3Config::for_tests(&format!("p{}", rand::random::<u64>()));
-        let s3 = S3ObjectStore::connect(&cfg).await.unwrap();
+        let s3 = S3ObjectStore::connect_scratch(&cfg).await.unwrap();
         s3.ensure_bucket().await.unwrap();
         (PackedS3Store::new(pg, s3.clone()), s3)
     }
@@ -611,7 +611,7 @@ mod tests {
         use crate::s3_fake::{config, fast_timeouts, spawn};
         let url = crate::testing::pg_url();
         let pg =
-            PgStore::connect_scratch(&url, &format!("t_{}", rand::random::<u64>())).await.unwrap();
+            PgStore::connect_scratch(&url, &crate::testing::scratch_schema("s")).await.unwrap();
         let fake = spawn(script).await;
         let s3 = S3ObjectStore::connect(&config(&fake, fast_timeouts(attempts))).await.unwrap();
         (PackedS3Store::new(pg, s3), fake)

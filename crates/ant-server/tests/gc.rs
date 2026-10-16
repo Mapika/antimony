@@ -35,7 +35,7 @@ async fn repo() -> Repo {
     // These tests collect with no quiesce wait, so the server caches (shared
     // with the collector in this process) must not outlive it either.
     ant_server::ops::set_cache_max_age(Duration::ZERO);
-    let schema = format!("t_gc_{}", rand::random::<u64>());
+    let schema = ant_store::testing::scratch_schema("gc");
     let pg = Arc::new(PgStore::connect_scratch(&pg_url(), &schema).await.unwrap());
     let b = Backend { objects: pg.clone(), refs: pg.clone(), meta: pg.clone() };
     Repo { b, pg, schema }

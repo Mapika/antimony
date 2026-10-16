@@ -230,13 +230,24 @@ impl S3Config {
     }
 
     /// Local S3 (SeaweedFS) from docker-compose.yml, overridable via `ANT_TEST_S3_*`.
+    ///
+    /// The prefix becomes `<prefix>-t<unix secs>` (unique per run; old ones
+    /// are swept by `testing::sweep_s3_prefixes`); tests that write hold a
+    /// `testing::S3PrefixGuard` on the returned config.
     pub fn for_tests(prefix: &str) -> Self {
+        crate::testing::sweep_s3_once();
+        Self::for_tests_raw(&format!("{prefix}-t{}", crate::testing::unix_secs()))
+    }
+
+    /// [`Self::for_tests`] with the prefix exactly as given.
+    pub(crate) fn for_tests_raw(prefix: &str) -> Self {
+        let prefix = prefix.to_string();
         let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
         Self {
             endpoint: env("ANT_TEST_S3_ENDPOINT", "http://localhost:9009"),
             region: "us-east-1".into(),
             bucket: env("ANT_TEST_S3_BUCKET", "ant-test"),
-            prefix: prefix.to_string(),
+            prefix,
             access_key: env("ANT_TEST_S3_ACCESS_KEY", "ant"),
             secret_key: env("ANT_TEST_S3_SECRET_KEY", "ant"),
             timeouts: S3Timeouts::default(),
@@ -261,6 +272,8 @@ pub struct S3ObjectStore {
     timeouts: S3Timeouts,
     /// Request slots (`max_concurrency`).
     slots: Arc<Semaphore>,
+    /// Deletes the prefix's objects with the last clone (scratch stores only).
+    _cleanup: Option<Arc<crate::testing::S3PrefixGuard>>,
 }
 
 /// Outcome of one failed attempt.
@@ -336,7 +349,17 @@ impl S3ObjectStore {
             prefix: cfg.prefix.clone(),
             timeouts: cfg.timeouts,
             slots: Arc::new(Semaphore::new(cfg.timeouts.max_concurrency.max(1))),
+            _cleanup: None,
         })
+    }
+
+    /// [`Self::connect`] to a throw-away prefix whose objects are deleted when
+    /// the last clone of the store is dropped, even on panic. Meant for tests
+    /// (pass a [`S3Config::for_tests`] config).
+    pub async fn connect_scratch(cfg: &S3Config) -> Result<Self> {
+        let mut store = Self::connect(cfg).await?;
+        store._cleanup = Some(Arc::new(crate::testing::S3PrefixGuard(cfg.clone())));
+        Ok(store)
     }
 
     /// Requests this store keeps in flight at most.
@@ -772,7 +795,7 @@ mod tests {
 
     async fn fresh() -> S3ObjectStore {
         let cfg = S3Config::for_tests(&format!("t{}", rand::random::<u64>()));
-        let s = S3ObjectStore::connect(&cfg).await.expect("connect");
+        let s = S3ObjectStore::connect_scratch(&cfg).await.expect("connect");
         s.ensure_bucket().await.expect("bucket (is `docker compose up -d` running?)");
         s
     }

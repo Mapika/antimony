@@ -498,7 +498,7 @@ async fn upgrade_body(schema: String, s3_cfg: S3Config) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs postgres and s3: docker compose up -d"]
 async fn pre_versioning_store_upgrades_in_place() {
-    let schema = format!("t_upgrade_{}", rand::random::<u64>());
+    let schema = ant_store::testing::scratch_schema("upgrade");
     let _guard = SchemaGuard::new(&pg_url(), &schema);
     let s3_cfg = S3Config::for_tests(&format!("upgrade{}", rand::random::<u64>()));
     // Run the body as a task so the S3 data is removed even when it fails.
