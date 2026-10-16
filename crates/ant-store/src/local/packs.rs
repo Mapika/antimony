@@ -56,6 +56,9 @@ pub fn parse_pack_file_name(name: &str) -> Option<[u8; 16]> {
     bytes.try_into().ok()
 }
 
+/// Where a body went: its pack and the offset of its first byte.
+type Placed = ([u8; 16], u64);
+
 struct Active {
     id: [u8; 16],
     file: Arc<File>,
@@ -135,7 +138,7 @@ impl LocalPacks {
 
     /// Append `bodies` (blocking); returns where each went and the append
     /// sequence number to sync up to.
-    fn append(&self, bodies: &[Vec<u8>]) -> Result<(Vec<([u8; 16], u64)>, u64)> {
+    fn append(&self, bodies: &[Vec<u8>]) -> Result<(Vec<Placed>, u64)> {
         let mut guard = self.inner.active.lock();
         let (active, seq) = &mut *guard;
         let mut placed = Vec::with_capacity(bodies.len());

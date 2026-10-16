@@ -513,7 +513,7 @@ impl ObjectStore for LocalStore {
         for part in futures::future::try_join_all(tasks).await.map_err(StoreError::backend)? {
             rows.extend(part?);
         }
-        rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        rows.sort_unstable_by_key(|a| a.0);
         rows.dedup_by(|a, b| a.0 == b.0);
         // Made durable by the commit or ref move that references it (see
         // "Durability" in the module docs).
@@ -790,15 +790,18 @@ impl RefStore for LocalStore {
     }
 }
 
-/// A `commits` row read by [`COMMIT_COLUMNS`].
-fn commit_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(Vec<u8>, Vec<u8>, Vec<u8>, i64, i64)> {
+/// A `commits` row: id, tree, parents, generation, committer time.
+type CommitRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, i64);
+
+/// A `commits` row read by [`GET_COMMIT`].
+fn commit_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CommitRow> {
     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
 }
 
 const GET_COMMIT: &str =
     "SELECT id, tree, parents, generation, committer_time FROM commits WHERE id = ?1";
 
-fn node_of(row: (Vec<u8>, Vec<u8>, Vec<u8>, i64, i64)) -> Result<CommitNode> {
+fn node_of(row: CommitRow) -> Result<CommitNode> {
     let (id, tree, parents, generation, committer_time) = row;
     Ok(CommitNode {
         id: id_of(&id)?,
