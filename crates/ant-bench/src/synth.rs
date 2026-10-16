@@ -11,6 +11,7 @@ use ant_store::Backend;
 use ant_store::graph::write_commit;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::path::{Path, PathBuf};
 
 const FANOUT: usize = 6;
 const BATCH: usize = 1024;
@@ -51,13 +52,86 @@ fn body(rng: &mut StdRng, size: usize, index: usize) -> Vec<u8> {
     out
 }
 
+/// Relative path of directory `d` (empty for the root; `d3/d19` and so on).
+fn dir_rel_path(d: usize) -> PathBuf {
+    let mut parts = Vec::new();
+    let mut cur = d;
+    while cur != 0 {
+        parts.push(format!("d{cur}"));
+        cur = (cur - 1) / FANOUT;
+    }
+    parts.iter().rev().collect()
+}
+
+fn export_file(
+    root: &Path,
+    dir: usize,
+    name: &str,
+    mode: EntryMode,
+    content: &[u8],
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir_path = root.join(dir_rel_path(dir));
+    std::fs::create_dir_all(&dir_path).with_context(|| format!("mkdir {}", dir_path.display()))?;
+    let path = dir_path.join(name);
+    if mode == EntryMode::Symlink {
+        symlink(String::from_utf8_lossy(content).as_ref(), &path)
+            .with_context(|| format!("symlink {}", path.display()))?;
+    } else {
+        std::fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
+        if mode == EntryMode::Executable {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(())
+}
+
+/// `ant-bench synth`: build the synthetic tree into a store (and optionally
+/// export identical files to a directory, for head-to-head runs).
+#[derive(clap::Args, Debug)]
+pub struct Args {
+    /// Files in the tree.
+    #[arg(long, default_value_t = 96000)]
+    pub files: usize,
+    /// Directories (default 70% of files).
+    #[arg(long)]
+    pub dirs: Option<usize>,
+    /// Ref to create at the synthetic commit.
+    #[arg(long = "ref", default_value = "synth")]
+    pub ref_name: String,
+    /// Also write the files into this (new or empty) directory.
+    #[arg(long)]
+    pub export: Option<PathBuf>,
+    #[command(flatten)]
+    pub store: ant_server::config::StoreArgs,
+}
+
+pub async fn run(args: Args) -> anyhow::Result<()> {
+    let backend = args.store.backend().await?;
+    let dirs = args.dirs.unwrap_or(args.files * 7 / 10);
+    let start = std::time::Instant::now();
+    let bytes = build(&backend, args.files, dirs, &args.ref_name, args.export.as_deref()).await?;
+    println!(
+        "synthetic tree: {} files, {} dirs, {:.1} MiB of blobs, ref {} in {:.1}s",
+        args.files,
+        dirs,
+        bytes as f64 / 1048576.0,
+        args.ref_name,
+        start.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 /// Populate `backend` with the synthetic tree, a commit and the ref `ref_name`.
+/// With `export`, the same files are also written under that directory.
 /// Returns the total blob bytes.
 pub async fn build(
     backend: &Backend,
     files: usize,
     dirs: usize,
     ref_name: &str,
+    export: Option<&Path>,
 ) -> anyhow::Result<u64> {
     let dirs = dirs.max(1);
     let mut rng = StdRng::seed_from_u64(0xa17);
@@ -76,6 +150,11 @@ pub async fn build(
             _ => (EntryMode::File, body(&mut rng, size, i)),
         };
         total += content.len() as u64;
+        if let Some(root) = export {
+            tokio::task::block_in_place(|| {
+                export_file(root, d, &format!("f{i}.c"), mode, &content)
+            })?;
+        }
         let obj = EncodedObject::new(ObjectKind::Blob, &content);
         dir_files[d].push(TreeEntry { mode, name: format!("f{i}.c"), id: obj.id() });
         batch.push(obj);

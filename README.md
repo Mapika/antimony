@@ -225,6 +225,22 @@ garbage collection. Measured performance is in `docs/scorecard/`; open work
 and known limitations are in `ROADMAP.md` and `CHANGELOG.md`; compatibility
 guarantees are in `docs/compatibility.md`.
 
+### vs git
+
+`scripts/vs-git.sh` runs the same operations against plain git (aggressive
+pack, bitmaps, commit-graph with changed-path filters, untracked cache, partial
+clone and sparse checkout) on one machine and corpus (git/git, plus a 96k-file
+synthetic tree). In the
+[2026-10-16 run](docs/scorecard/2026-10-16-vs-git.md), antimony was faster at
+repeated and incremental blame (10-20x), checkout of a large tree (2.7x cold,
+2-9x warm across runs, 8x sparse warm) and many agents landing on one branch (about 130x the
+commits/s of push + rebase retries at 16 and 64 agents, a workload git is not
+built for). git was faster at path history (about 2x), `status` with a primed
+untracked cache (1.4x), diverged merge-base and cloning from antimony's git
+export (12-21x slower), and stores the history in about an eighth of the space after
+`git gc --aggressive` (105 MiB vs 901 MiB). Single run on a shared host; the
+report lists what is and is not apples-to-apples.
+
 ## Access control and threat model
 
 `ant serve --policy policy.toml` (or `ANT_POLICY`) turns on access control;
