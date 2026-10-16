@@ -122,6 +122,70 @@ fn merge_heavy_dag(merges: usize, mut seed: u64) -> (Dag, Vec<usize>) {
     (Dag(nodes), main)
 }
 
+/// Branches off a long first-parent chain, recorded interleaved with it
+/// (as agents' work is): branches start far back or recently, off the
+/// chain or off other commits, grow, merge the chain in (sync) and get
+/// merged into it; a few more start after its tip (new work on an old
+/// base). Long enough that the two sides of a query are more than the
+/// walks' first window apart, so `merge_base` decides from the first
+/// parents where it can. Returns the DAG, its first-parent chain and the
+/// branch tips (indices).
+fn diverged_dag(steps: usize, late: usize, mut seed: u64) -> (Dag, Vec<usize>, Vec<usize>) {
+    let mut next = move |m: usize| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % m.max(1)
+    };
+    let mut nodes: Vec<Vec<usize>> = vec![vec![]];
+    let mut main = vec![0usize];
+    let mut tips: Vec<usize> = Vec::new();
+    let add = |nodes: &mut Vec<Vec<usize>>, ps: Vec<usize>| {
+        nodes.push(ps);
+        nodes.len() - 1
+    };
+    for _ in 0..steps {
+        match next(12) {
+            0..=6 => {
+                let mut ps = vec![main[main.len() - 1]];
+                if !tips.is_empty() && next(4) == 0 {
+                    // Merge a branch into the chain.
+                    ps.push(tips.swap_remove(next(tips.len())));
+                }
+                main.push(add(&mut nodes, ps));
+            }
+            7 => {
+                let base = match next(4) {
+                    0 => next(nodes.len()),
+                    1 => main[main.len() - 1 - next(8).min(main.len() - 1)],
+                    _ => main[next(main.len())],
+                };
+                tips.push(add(&mut nodes, vec![base]));
+            }
+            8..=10 if !tips.is_empty() => {
+                let i = next(tips.len());
+                tips[i] = add(&mut nodes, vec![tips[i]]);
+            }
+            _ if !tips.is_empty() => {
+                // Sync: the branch merges a chain commit.
+                let i = next(tips.len());
+                let m = main[next(main.len())];
+                if m != tips[i] {
+                    tips[i] = add(&mut nodes, vec![tips[i], m]);
+                }
+            }
+            _ => {}
+        }
+    }
+    for _ in 0..late {
+        let base = main[next(main.len())];
+        let mut tip = add(&mut nodes, vec![base]);
+        for _ in 0..next(3) {
+            tip = add(&mut nodes, vec![tip]);
+        }
+        tips.push(tip);
+    }
+    (Dag(nodes), main, tips)
+}
+
 struct Oracle {
     ids: Vec<ObjectId>,
     generation: Vec<u64>,
@@ -315,6 +379,82 @@ proptest! {
             check(&b, &o, merge_heavy_pairs(d.0.len(), &main, seed, 30), 0).await
         });
         prop_assert!(result.is_ok(), "{:?} with {} merges, seed {}", result, merges, seed);
+    }
+}
+
+/// Query pairs for a diverged DAG: branch tips against the chain's tip
+/// (both ways), then branch tips against chain commits (both ways) and
+/// against each other, and random pairs.
+fn diverged_pairs(
+    n: usize,
+    main: &[usize],
+    tips: &[usize],
+    mut seed: u64,
+    count: usize,
+) -> Vec<(usize, usize)> {
+    let mut next = move |m: usize| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % m.max(1)
+    };
+    let tip = main[main.len() - 1];
+    let mut pairs: Vec<(usize, usize)> = tips.iter().flat_map(|&t| [(t, tip), (tip, t)]).collect();
+    for k in 0..count {
+        let branch = if tips.is_empty() { next(n) } else { tips[next(tips.len())] };
+        let on_main = main[next(main.len())];
+        pairs.push(match k % 4 {
+            0 => (branch, on_main),
+            1 => (on_main, branch),
+            2 => (branch, if tips.is_empty() { next(n) } else { tips[next(tips.len())] }),
+            _ => (next(n), next(n)),
+        });
+    }
+    pairs
+}
+
+proptest! {
+    #![proptest_config(common::config(12))]
+
+    /// Branches based far back on a long first-parent chain, recorded
+    /// before or after the chain moved on: `merge_base`'s first-parent
+    /// shortcut and its fallbacks against the oracle.
+    #[test]
+    fn ancestry_queries_match_the_oracle_on_diverged_branches(
+        steps in 500usize..900,
+        late in 0usize..6,
+        seed in any::<u64>(),
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result: Result<(), String> = rt.block_on(async {
+            let b = Backend::in_memory();
+            let (d, main, tips) = diverged_dag(steps, late, seed);
+            let ids = build(&b, &d).await;
+            let o = Oracle::new(&d, ids);
+            check(&b, &o, diverged_pairs(d.0.len(), &main, &tips, seed, 30), 0).await
+        });
+        prop_assert!(result.is_ok(), "{:?} with {} steps, {} late, seed {}", result, steps, late, seed);
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs postgres: docker compose up -d"]
+async fn ancestry_queries_match_the_oracle_on_diverged_branches_postgres() {
+    let b = common::pg::scratch_backend("query_props_dv").await;
+    let result = tokio::spawn({
+        let b = b.clone();
+        async move {
+            let (d, main, tips) = diverged_dag(1500, 8, 5);
+            let ids = build(&b, &d).await;
+            let o = Oracle::new(&d, ids);
+            let pairs = diverged_pairs(d.0.len(), &main, &tips, 5, 120);
+            check(&b, &o, pairs, 0).await
+        }
+    })
+    .await;
+    // The scratch store drops the schema with the last handle to it.
+    drop(b);
+    match result {
+        Ok(r) => r.unwrap(),
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
     }
 }
 

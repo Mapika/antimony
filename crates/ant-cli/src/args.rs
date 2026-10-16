@@ -286,6 +286,52 @@ pub enum AdminCmd {
     /// commit records and S3 packs of aborted lands, abandoned changesets
     /// and failed imports. Safe while servers run; interrupted runs resume.
     Gc(GcArgs),
+    /// Rewrite stored objects with deltas chosen across the whole history
+    /// (git-gc-style), keeping recent revisions one decode away. Postgres +
+    /// S3 stores; safe while servers run; run again to resume.
+    Repack(RepackArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct RepackArgs {
+    /// Read and compress everything, write nothing: report the savings.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Leave rows written within this period as they are (`0` repacks
+    /// everything, e.g. right after an import).
+    #[arg(long, default_value = "1d", value_parser = parse_duration)]
+    pub min_age: Duration,
+    /// First-parent commits per ref whose trees stay one decode away (not
+    /// delta-compressed).
+    #[arg(long, default_value_t = ant_store::postgres::repack::DEFAULT_KEEP_RECENT)]
+    pub keep_recent: usize,
+    /// Also rewrite objects an earlier repack wrote (a full repack).
+    #[arg(long)]
+    pub all: bool,
+    /// Leave objects stored in Postgres where they are.
+    #[arg(long)]
+    pub no_small: bool,
+    /// Objects tried as delta bases for each object.
+    #[arg(long, default_value_t = 10)]
+    pub window: usize,
+    /// Longest delta chain (0: no deltas).
+    #[arg(long, default_value_t = 16)]
+    pub depth: u32,
+    /// Uncompressed bytes of one record (what reading one object
+    /// decompresses at most).
+    #[arg(long, default_value_t = 2 * 1024 * 1024)]
+    pub record_bytes: usize,
+    /// zstd level of the new records (1..=22).
+    #[arg(long, default_value_t = 19, value_parser = clap::value_parser!(i32).range(1..=22))]
+    pub level: i32,
+    /// Parallel jobs (default: CPU count, at most 8).
+    #[arg(long)]
+    pub jobs: Option<usize>,
+    /// Stop after this many packs (run again to continue).
+    #[arg(long)]
+    pub max_packs: Option<usize>,
+    #[command(flatten)]
+    pub store: StoreArgs,
 }
 
 #[derive(Args, Debug)]
@@ -497,6 +543,35 @@ mod tests {
             (Duration::from_secs(7 * 86400), Duration::from_secs(1800))
         );
         assert!(Cli::try_parse_from(["ant", "admin", "gc", "--dry-run", "--abort"]).is_err());
+    }
+
+    #[test]
+    fn repack_flags_and_defaults() {
+        let cli = Cli::try_parse_from(["ant", "admin", "repack", "--memory"]).unwrap();
+        let Command::Admin { cmd: AdminCmd::Repack(a) } = cli.command else { panic!() };
+        assert!(!a.dry_run && !a.all && !a.no_small);
+        assert_eq!(a.min_age, Duration::from_secs(86400));
+        assert_eq!((a.keep_recent, a.window, a.depth, a.level), (100, 10, 16, 19));
+        assert_eq!((a.record_bytes, a.jobs, a.max_packs), (2 * 1024 * 1024, None, None));
+        let cli = Cli::try_parse_from([
+            "ant",
+            "admin",
+            "repack",
+            "--dry-run",
+            "--min-age",
+            "0",
+            "--all",
+            "--depth",
+            "0",
+            "--max-packs",
+            "3",
+            "--memory",
+        ])
+        .unwrap();
+        let Command::Admin { cmd: AdminCmd::Repack(a) } = cli.command else { panic!() };
+        assert!(a.dry_run && a.all);
+        assert_eq!((a.min_age, a.depth, a.max_packs), (Duration::ZERO, 0, Some(3)));
+        assert!(Cli::try_parse_from(["ant", "admin", "repack", "--level", "23"]).is_err());
     }
 
     #[test]

@@ -35,34 +35,65 @@ terminate TLS. Put a reverse proxy (or a gRPC-aware load balancer) in front
 of both ports.
 
 
-### S3 timeouts and retries
+### S3 timeouts, retries and throttling
 
 Every S3 request is bounded, so a stalled or throttling object store fails a
 request with an error instead of hanging it (and the read budget it holds).
 An attempt covers the request **and the whole response body**; it may take
-`--s3-timeout + size / --s3-min-throughput`. Throttling (429, 503,
-`SlowDown`), 5xx, connection resets, timeouts and truncated bodies are retried
-with jittered exponential backoff (100 ms doubling to 5 s; a `Retry-After`
-header is honoured, up to 30 s). Only GET, HEAD, PUT and DELETE of
-content-addressed or idempotent keys are issued, so retries are safe. After
-the last attempt the caller gets a `backend error: s3 <op> <key>: gave up
-after N attempt(s) ...` (clone and RPC fail cleanly). `/readyz` probes S3
-with one attempt.
+`--s3-timeout + size / --s3-min-throughput`.
+
+**Retries.** Throttling (429, 503, `SlowDown`), other 5xx, connection errors,
+timeouts and bodies that break off or come up short are retried with
+exponential backoff and full jitter: the pause after attempt *n* is random
+in 0 .. min(5 s, 100 ms x 2^(n-1)); a longer `Retry-After` is honoured (up
+to 30 s). An operation keeps retrying for `--s3-retry-budget` (60 s),
+counted from its first failure, so a few seconds of throttling cost latency,
+not a failed clone or `ant admin gc`. Client errors (403, 404, ...) and
+corrupt data fail at once. Only GET, HEAD, PUT and DELETE of
+content-addressed or idempotent keys are issued, so retries are safe. When
+the budget (or `--s3-max-attempts`, or `--s3-operation-timeout`) runs out
+the caller gets a `backend error: s3 <op> <key>: gave up after N attempt(s)
+...` (clone and RPC fail cleanly). `/readyz` probes S3 with one attempt.
+
+**Concurrency.** A process keeps at most `--s3-max-concurrency` (32) S3
+requests in flight; more wait for a slot (a retry waits again; its pause
+holds none). Bursts such as the `ant admin gc` mark, `ant admin repack`,
+clone planning and checkout bundles therefore queue in the process instead
+of overrunning the store. Object stores throttle beyond some in-flight
+volume: SeaweedFS answers 429 once a volume server has more than
+`-volume.concurrentDownloadLimitMB` (default 64 MiB) of downloads in flight,
+counting whole storage chunks (`-filer.maxMB`, 4 MiB) rather than requested
+ranges, so with its defaults about 16 concurrent range reads saturate one
+volume server; the filer then breaks the response off mid-body. Raise that
+limit on a dedicated SeaweedFS, or lower `--s3-max-concurrency`; AWS S3
+sustains thousands of GETs per second per prefix, so a server there may
+raise it (64-128). Several processes (replicas, `ant admin gc`, imports)
+share the store's limits: budget their sum.
 
 | flag | env | default |
 |---|---|---|
 | `--s3-connect-timeout` | `ANT_S3_CONNECT_TIMEOUT` | `5s` |
 | `--s3-timeout` (fixed part of an attempt) | `ANT_S3_TIMEOUT` | `30s` |
 | `--s3-min-throughput` (bytes/s) | `ANT_S3_MIN_THROUGHPUT` | `10000000` |
-| `--s3-operation-timeout` (retries included) | `ANT_S3_OPERATION_TIMEOUT` | `5m` |
-| `--s3-max-attempts` (1 = no retries) | `ANT_S3_MAX_ATTEMPTS` | `5` |
+| `--s3-retry-budget` (retrying after the first failure) | `ANT_S3_RETRY_BUDGET` | `60s` |
+| `--s3-max-attempts` (1 = no retries, 0 = no limit) | `ANT_S3_MAX_ATTEMPTS` | `0` |
+| `--s3-operation-timeout` (slot wait and retries included) | `ANT_S3_OPERATION_TIMEOUT` | `5m` |
+| `--s3-max-concurrency` (requests in flight per process) | `ANT_S3_MAX_CONCURRENCY` | `32` |
+
+Watch `ant_s3_retries_total{reason}` (`throttled`, `server_error`,
+`network`, `body`, `timeout`): a steady trickle under load is the backoff
+doing its job; `ant_s3_gave_up_total` rising means operations failed after
+the budget (S3 down or throttling for longer than the budget). A sustained
+`ant_s3_requests_queued` with `ant_s3_requests_in_flight` at
+`ant_s3_max_concurrency` means S3 requests are the bottleneck.
 
 Large objects of one write (an import batch, a land) that look alike
 (versions of one file or directory) are compressed together in frames of at
 most 2 MiB uncompressed; a read decodes the whole frame, and servers keep
 the last 64 MiB of decoded frames. `--pack-frames false`
 (`ANT_PACK_FRAMES`) writes every object alone, the format servers before
-schema version 6 read (see Upgrading).
+schema version 6 read (see Upgrading). `ant admin repack` rewrites the
+history as delta frames afterwards (`docs/operator-guide.md`, Repacking).
 
 ## Metrics and logs
 
@@ -101,6 +132,9 @@ balancer checks should use `/readyz`; see the operator guide.
 | `ant_ref_watch_events_total`, `ant_ref_watch_coalesced_events_total` | | ref events sent to watchers; of those, events covering an unknown number of moves (catch-ups, gap fills, slow watchers) |
 | `ant_build_info` | `version`, `git` | always 1 |
 | `ant_pg_pool_size`, `_idle`, `_in_use`, `_max` | | Postgres query pool (0 without Postgres) |
+| `ant_s3_retries_total` | `reason` (`throttled`, `server_error`, `network`, `body`, `timeout`) | S3 attempts retried (see S3 timeouts, retries and throttling) |
+| `ant_s3_gave_up_total` | | S3 operations that failed after retrying |
+| `ant_s3_requests_in_flight`, `ant_s3_requests_queued`, `ant_s3_max_concurrency` | | S3 requests in flight, waiting for a slot, and the slots (0 without S3) |
 
 `ref` labels are capped: the 64 most recently landed-on or indexed refs get
 their own value, all others report as `ref="other"`. Useful starting alerts:
@@ -213,6 +247,7 @@ ant admin schema --migrate --pg-url ... --pg-schema ant  # apply now
 | 4 | `storage_tuning` | out-of-line storage and insert-only autovacuum settings |
 | 5 | `gc` | write times (`written_at`, BRIN-indexed) on objects, packed-object index rows, commits and changesets; garbage-collection state (`gc_condemned`, `gc_live`, `gc_state`) |
 | 6 | `pack_frames` | `object_index.share` (a nullable column, no table rewrite); marks that S3 packs may hold multi-object frames, which servers supporting only version 5 cannot read |
+| 7 | `repack` | the `packs` table (`ant admin repack` state: packs it wrote, packs it moved rows out of; a new table, no rewrite); marks that S3 packs may hold delta frames, which servers supporting only version 6 cannot read |
 
 To control when migrations run, start servers with `--no-migrate`
 (`ANT_NO_MIGRATE=1`) and run `ant admin schema --migrate` yourself; a
@@ -250,8 +285,9 @@ keep serving:
 2. Run every 0.2 `ant serve` *and* `ant import` with `--pack-frames false`
    (`ANT_PACK_FRAMES=false`): they read frames but write every object
    alone, in the old format.
-3. Start the first 0.2 server. It migrates the schema to version 6 at once,
-   whatever the flag (`ant admin schema` prints `version 6`). The 0.1.x
+3. Start the first 0.2 server. It migrates the schema to version 7 at once
+   (migrations 6 and 7), whatever the flag (`ant admin schema` prints
+   `version 7`). The 0.1.x
    servers already running keep serving reads and writes, including
    objects the 0.2 servers wrote, but none of them can be started again: a
    0.1.x `ant serve`, `ant import` or `ant admin` now exits 1 with `hint:
@@ -264,11 +300,12 @@ keep serving:
 
 After step 3 the only way back to 0.1.x is the backup: nothing a 0.1.x
 server cannot read is written before step 5, but the 0.1.x binary refuses
-the version 6 schema. A 0.1.x server still running after step 5 fails the
+the migrated schema. A 0.1.x server still running after step 5 fails the
 reads of framed objects (the client gets `error:` and exit 1; the server
 logs `backend error: ... Unknown frame descriptor` or `corrupt pack
-record`); it never returns wrong bytes. Objects written while frames were
-off are not recompressed later. Clients need no particular order: 0.1.x and
+record`); it never returns wrong bytes. `ant admin repack` (delta frames,
+`docs/operator-guide.md`, Repacking) recompresses objects written while
+frames were off; run it only once no 0.1.x process is left. Clients need no particular order: 0.1.x and
 0.2 `ant` (and `ant cache-serve`) work against servers of either version,
 and keep using caches and workspaces the other one wrote.
 `scripts/upgrade-test.sh` checks all of this against a real Postgres and

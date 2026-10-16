@@ -209,11 +209,13 @@ A run marks reachable data (in a working table in Postgres, so memory use is
 flat), condemns the rest (servers then report it as missing), waits
 `--quiesce` (default `30m`; it must exceed the servers' 10 minute cache
 lifetime plus your longest request), marks again, then deletes in small
-transactions, and finally deletes S3 packs without live objects. Packs that
-are only partly dead are kept (there is no repacking); the report shows
-their dead bytes. The module docs of `ant_store::postgres::gc` give the
-safety argument. A run can be interrupted at any time (Ctrl-C, crash,
-`--max-batches N`); the next run resumes it. `--abort` drops a pending run
+transactions, and finally deletes S3 packs without live objects (a pack
+`ant admin repack` moved objects out of is kept for `--quiesce` after the
+move). Packs that are only partly dead are kept; the report shows their
+dead bytes, which the next repack drops. The module docs of
+`ant_store::postgres::gc` give the safety argument. A run can be interrupted
+at any time (Ctrl-C, crash, `--max-batches N`); the next run resumes it.
+`--abort` drops a pending run
 instead (its condemned data becomes visible again). Operations that touch
 condemned data during a run fail with not found or `aborted` (retryable),
 never with lost data.
@@ -237,6 +239,64 @@ Schedule it daily or weekly. A run reads every reachable tree once, so on a
 kernel-sized store the mark takes a while and reads from S3; run it off-peak.
 Postgres gets the space back through autovacuum (or `VACUUM` after a large
 first run).
+
+### Repacking
+
+Writers compress each write on its own (an import batch, a land), so
+versions of one file written at different times share nothing.
+`ant admin repack <store flags>` (Postgres + S3 stores) is antimony's
+`git gc`: it walks the whole history and rewrites *cold* objects, including
+small objects stored in Postgres, as delta frames: the versions of each
+path, newest first, as git deltas against each other, compressed together.
+Objects reachable from the newest `--keep-recent` (default `100`)
+first-parent commits of every ref are hot: they stay in Postgres or are
+rewritten as plain frames, so checking out a recent revision decodes no
+deltas. Rows written within `--min-age` (default `1d`) are left alone.
+
+```sh
+ant admin repack --dry-run --pg-url ... --pg-schema ant --s3-...  # estimate only
+ant admin repack --pg-url ... --pg-schema ant --s3-...            # repack
+# done
+# commits 82500                     walked
+# reachable 403443                  objects reached (hot ones excluded)
+# hot 5788
+# selected 266839 2167 0 136604     packed objects: cold, hot, not reached; from Postgres
+# old-bytes 687865498 84828053      what they took: S3 (their share of records), Postgres
+# new-bytes 88216313                the new packs
+# saved 684477238
+# packs 2 1803                      packs and records written
+# deltas 307844 16                  objects stored as deltas, deepest chain
+# moved 405610 136604               objects moved (of them from Postgres)
+# skipped 0                         gone, condemned or locked meanwhile: left where they were
+```
+
+It is safe while servers serve, land and import and while `ant admin gc`
+runs (one repack per schema at a time); reads find every object before,
+during and after the move. Old packs are freed by the next `ant admin gc`
+(once their quiesce period after the move is over); Postgres reuses the
+space of moved rows (autovacuum), or returns it with `VACUUM FULL objects,
+object_index` (which locks the tables: off-peak, or use `pg_repack`).
+A run can be interrupted (Ctrl-C, `--max-packs N`): what it switched stays
+switched, an unswitched pack is garbage for the collector, and the next run
+continues with what is left. Later runs only repack what is new since (and
+hot objects that have gone cold); `--all` rewrites everything again, which
+merges the deltas of incremental runs and drops dead bytes in repacked
+packs: run it now and then (monthly), incremental runs after imports or
+weekly. Before the first repack, every server must run a release with schema
+version 7 or later (they read delta frames).
+
+Measured on git/git (82k commits, 20 cores, local SeaweedFS): 55 s, 127
+CPU-seconds, 1.1 GiB peak RSS; stored bytes 901 MiB → 361 MiB (238 MiB after
+`VACUUM FULL`; S3 656 → 84 MiB), against 298 MiB for `git gc` and 94 MiB
+for `git gc --aggressive` (51 s, 420 CPU-seconds) of the same history.
+Reads (fresh server, cold client): checkout of the tip 0.34 → 0.28 s, of a
+2015 revision 0.24 → 0.33 s, first blame 258 → 239 ms, blobless clone
+6.4 → 5.5 s, full clone 19.4 → 13.2 s. Flags:
+`--window` (default 10) and `--depth` (16) as in git; `--record-bytes`
+(2 MiB: the most a read of one object decompresses); `--level` (zstd, 19;
+9 halves the time for ~5% more bytes); `--jobs` (CPU count, at most 8).
+Memory: about 100 bytes per object for the walk, plus per job a read batch
+(16 MiB), a delta window (at most 24 MiB) and a record.
 
 
 ### Client cache
@@ -708,6 +768,8 @@ Families (all names verified in `crates/ant-server/src/metrics.rs`):
 | `ant_ref_watchers` | | open `WatchRef` streams (CI watchers) |
 | `ant_ref_watch_events_total`, `ant_ref_watch_coalesced_events_total` | | ref events sent; of those, coalesced ones (catch-ups, gap fills, slow watchers) |
 | `ant_pg_pool_size`, `_idle`, `_in_use`, `_max` | | query pool (the lock pool is not included) |
+| `ant_s3_retries_total`, `ant_s3_gave_up_total` | `reason` = `throttled`/`server_error`/`network`/`body`/`timeout` | S3 attempts retried; operations that failed after the retry budget |
+| `ant_s3_requests_in_flight`, `ant_s3_requests_queued`, `ant_s3_max_concurrency` | | S3 request slots (`--s3-max-concurrency`) in use, waited for, configured |
 | `ant_build_info` | `version`, `git` | always 1 |
 
 `ant cache-serve` has its own `ant_cacheserve_*` families (see Cache tier).
@@ -905,7 +967,7 @@ ever points at lost objects, and a land that was acknowledged is durable.
 | situation | symptom | impact | action |
 |---|---|---|---|
 | **Postgres restart or failover** | burst of `ant_store_errors_total`, `ant_land_outcomes_total{outcome="aborted"}`, RPC `aborted`/`internal`; growing `ant_pg_pool_*` churn; `ant_land_queue_depth` rises then drains | In-flight lands: if the lock session died, the publish fails, the batch is aborted, and agents get `aborted` (not "landed"); because retries are idempotent, they re-run `ant land`. Reads fail until the new primary is reachable. Unpublished objects stay as unreachable rows. No acknowledged land is lost, no ref points at missing data. Replicas reconnect on their own (sqlx pool); if the failover changes the hostname, restart the replicas with the new URL. | Nothing to repair. Make sure the harness retries `aborted`. After a failover, check that the new primary has the same data (a **promoted asynchronous replica can lose acknowledged commits**; that is a Postgres replication property: use synchronous replication if you cannot afford it). |
-| **S3 outage or throttling** | `ant_store_errors_total{store="objects"}` (ops `get_many`/`put_many`), `internal` RPC codes, `/o/<id>` 5xx for large objects | Objects up to 4 KiB live in Postgres and keep working, so many small-file operations survive. Anything touching a large object fails: reads of those files, submits and lands that contain them. Metadata queries (`log`, `diff` names) still work. A CDN in front of `/o` keeps serving what it cached. | Restore S3. Agents retry. Nothing to repair: lands that included large objects were aborted before publishing. Verify credentials and bucket policy if errors persist after S3 is healthy. |
+| **S3 outage or throttling** | `ant_s3_retries_total{reason="throttled"}` / `{reason="body"}` rising (absorbed: requests slower, not failing); then `ant_s3_gave_up_total`, `ant_store_errors_total{store="objects"}` (ops `get_many`/`put_many`), `internal` RPC codes, `/o/<id>` 5xx for large objects | Throttling and brief outages are retried for `--s3-retry-budget` (60 s) per operation; only longer ones fail requests. Objects up to 4 KiB live in Postgres and keep working, so many small-file operations survive. Anything touching a large object fails: reads of those files, submits and lands that contain them. Metadata queries (`log`, `diff` names) still work. A CDN in front of `/o` keeps serving what it cached. | Restore S3. Agents retry. Nothing to repair: lands that included large objects were aborted before publishing. Verify credentials and bucket policy if errors persist after S3 is healthy. Under sustained throttling lower `--s3-max-concurrency` (summed over replicas and admin jobs) or raise the store's limits (`docs/operations.md`, S3 timeouts, retries and throttling). |
 | **Replica crash mid-batch** | one replica's `up == 0`, connection errors at clients, `ant_land_queue_depth` for that instance disappears | The crashed replica's lock session is closed by Postgres, which releases the advisory lock; other replicas continue. Requests it was processing get a connection error and were never acknowledged. Objects it wrote are unreachable garbage unless its publish committed (in which case a retry returns the same tip). | Restart or replace the replica; the load balancer drains it. Agents retry (idempotent). No data repair needed. |
 | **Postgres disk full** | `ant_store_errors_total` on all stores, Postgres logs `No space left on device`, lands `aborted` | All writes fail; reads of existing data mostly continue. Refs stay consistent (statements are atomic). | Free or grow the volume (consider dropping old `soak_*` or scratch schemas, then `VACUUM`); Postgres recovers by itself. Plan capacity from section 2; alert on volume use at 80 percent. |
 | **S3 full or quota exceeded** | as S3 outage, only for `put_many` | Large-object writes fail; reads fine. | Raise the quota. |
@@ -953,7 +1015,7 @@ safe first step.
 for the procedure (schema versioning and rolling restarts). In short, because
 replicas are stateless, a rolling restart behind the load balancer is the
 normal shape; clients reconnect and retry idempotent lands. From 0.1.x to
-0.2 (schema version 6) a rolling upgrade needs `--pack-frames false` on the
+0.2 (schema version 7) a rolling upgrade needs `--pack-frames false` on the
 new servers until the last 0.1.x server is gone, and no 0.1.x server can be
 restarted once the first 0.2 server has started (see "Pack frames" there).
 

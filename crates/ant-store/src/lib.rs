@@ -478,6 +478,17 @@ pub trait MetaStore: Send + Sync + 'static {
     /// Sequence numbers start at 1 and strictly increase (gaps allowed).
     async fn tail(&self, after: u64, limit: usize) -> Result<Vec<(u64, ObjectId)>>;
 
+    /// Index-aligned log sequence numbers of recorded commits (`None`:
+    /// unrecorded, or not known to this store). Commits are recorded only
+    /// after their parents (the parents a node's generation is computed
+    /// from), so the log order is a topological order: a commit recorded
+    /// after `d` is not an ancestor of `d` (`graph::merge_base` relies on
+    /// it). The default knows none; persistent stores should override this
+    /// with a single round trip.
+    async fn log_seqs(&self, ids: &[ObjectId]) -> Result<Vec<Option<u64>>> {
+        Ok(vec![None; ids.len()])
+    }
+
     /// Generic derived-data space. `kind` names the derivation (e.g.
     /// `"path-history/v1"`). Values are immutable once written: a second put
     /// of the same key overwrites only if the value is identical (no-op) and

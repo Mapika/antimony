@@ -3,6 +3,8 @@
 //! Subcommands:
 //!   import   <git-dir> ...   git -> antimony import throughput + per-phase store timings
 //!   fleet    --agents N ...  concurrent agent simulation with correctness invariants
+//!   git-fleet --repo-url U   the plain-git counterpart of `fleet` (clones pushing to one branch)
+//!   synth    --files N ...   build the synthetic kernel-shaped tree into a store (`--export DIR`)
 //!   checkout --server URL    cold/warm sparse workspace materialization
 //!   soak     --replicas N ... multi-replica long run: leaks, drift, errors
 //!
@@ -13,6 +15,7 @@
 mod cdn;
 mod checkout;
 mod fleet;
+mod git_fleet;
 mod import;
 mod json;
 mod replicas;
@@ -38,6 +41,10 @@ enum Cmd {
     Import(import::Args),
     /// Simulate N concurrent agents landing changes on one ref.
     Fleet(fleet::Args),
+    /// Plain-git counterpart of `fleet`: N clones pushing to one branch.
+    GitFleet(git_fleet::Args),
+    /// Build the synthetic kernel-shaped tree into a store (and export it).
+    Synth(synth::Args),
     /// Time sparse workspace materialization cold and warm.
     Checkout(checkout::Args),
     /// Drive N server replicas with many agents for a long time; report per window.
@@ -83,6 +90,8 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
     match cli.cmd {
         Cmd::Import(args) => import::run(args).await.map(|()| 0),
         Cmd::Fleet(args) => fleet::run(args).await,
+        Cmd::GitFleet(args) => git_fleet::run(args).await,
+        Cmd::Synth(args) => synth::run(args).await.map(|()| 0),
         Cmd::Checkout(args) => checkout::run(args).await.map(|()| 0),
         Cmd::Soak(args) => soak::run(args).await,
         Cmd::Serve(args) => ant_server::serve::run(args).await.map(|()| 0),

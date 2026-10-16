@@ -34,7 +34,8 @@
 //! - An object stored twice (concurrent writers) occupies space in two packs;
 //!   the index keeps the first. Packs are never rewritten here.
 
-mod frame;
+pub(crate) mod cluster;
+pub(crate) mod frame;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -49,6 +50,7 @@ use crate::postgres::{IndexEntry, PgStore};
 use crate::s3::S3ObjectStore;
 use crate::{BLOCKING_THRESHOLD, ObjectStore, Result, StoreError};
 
+pub use cluster::ClusterOptions;
 pub use frame::FRAME_RAW;
 
 /// Target size of one pack, after compression.
@@ -113,9 +115,49 @@ fn coalesce(mut entries: Vec<IndexEntry>) -> Vec<Run> {
     runs
 }
 
+/// A decoded multi-object record: a frame or a delta frame.
+enum Decoded {
+    Frame(frame::Frame),
+    Delta(frame::DeltaFrame),
+}
+
+impl Decoded {
+    /// Decode a frame or delta frame record (`None`: a single-object record).
+    fn decode(record: &[u8]) -> Option<Result<Self>> {
+        if frame::is_frame(record) {
+            Some(frame::decode_frame(record).map(Self::Frame))
+        } else if frame::is_delta_frame(record) {
+            Some(frame::decode_delta_frame(record).map(Self::Delta))
+        } else {
+            None
+        }
+    }
+
+    fn weight(&self) -> usize {
+        match self {
+            Self::Frame(f) => f.weight(),
+            Self::Delta(f) => f.weight(),
+        }
+    }
+
+    fn member_len(&self, id: &ObjectId) -> usize {
+        match self {
+            Self::Frame(f) => f.member_len(id),
+            Self::Delta(f) => f.member_len(id),
+        }
+    }
+
+    fn get(&self, id: &ObjectId) -> Option<Result<EncodedObject>> {
+        match self {
+            Self::Frame(f) => f.get(id),
+            Self::Delta(f) => f.get(id),
+        }
+    }
+}
+
 /// Recently decoded frames by `(pack, offset)`, bounded by bytes.
 struct FrameCache {
-    frames: lru::LruCache<([u8; 16], u64), Arc<frame::Frame>>,
+    frames: lru::LruCache<([u8; 16], u64), Arc<Decoded>>,
     bytes: usize,
     limit: usize,
 }
@@ -125,11 +167,11 @@ impl FrameCache {
         Self { frames: lru::LruCache::unbounded(), bytes: 0, limit }
     }
 
-    fn get(&mut self, key: &([u8; 16], u64)) -> Option<Arc<frame::Frame>> {
+    fn get(&mut self, key: &([u8; 16], u64)) -> Option<Arc<Decoded>> {
         self.frames.get(key).cloned()
     }
 
-    fn insert(&mut self, key: ([u8; 16], u64), f: Arc<frame::Frame>) {
+    fn insert(&mut self, key: ([u8; 16], u64), f: Arc<Decoded>) {
         if f.weight() > self.limit {
             return;
         }
@@ -148,7 +190,7 @@ impl FrameCache {
 
 /// The object `e.id` out of a decoded frame; the index naming a frame that
 /// lacks it is corruption.
-fn member(f: &frame::Frame, e: &IndexEntry) -> Result<EncodedObject> {
+fn member(f: &Decoded, e: &IndexEntry) -> Result<EncodedObject> {
     f.get(&e.id).unwrap_or_else(|| {
         Err(frame::corrupt(format!(
             "object {} is not in the frame at {} of pack {}",
@@ -231,8 +273,8 @@ impl PackedS3Store {
                 let first = &group[0];
                 let at = (first.off - run.start) as usize;
                 let record = &body[at..at + first.len as usize];
-                if frame::is_frame(record) {
-                    let f = Arc::new(frame::decode_frame(record)?);
+                if let Some(f) = Decoded::decode(record) {
+                    let f = Arc::new(f?);
                     for e in group {
                         out.push((e.id, member(&f, e)?));
                     }
@@ -299,7 +341,7 @@ impl ObjectStore for PackedS3Store {
             .filter_map(|id| index.get(id).copied())
             .collect();
         // Members of frames decoded recently need no S3 read.
-        let mut cached: Vec<(IndexEntry, Arc<frame::Frame>)> = Vec::new();
+        let mut cached: Vec<(IndexEntry, Arc<Decoded>)> = Vec::new();
         let mut fetch: Vec<IndexEntry> = Vec::with_capacity(found.len());
         {
             let mut cache = self.frames.lock();
@@ -729,7 +771,9 @@ mod tests {
         let objects = history(8);
         let ids: Vec<ObjectId> = objects.iter().map(EncodedObject::id).collect();
         let refs: Vec<&EncodedObject> = objects.iter().collect();
-        let f = Arc::new(frame::decode_frame(&frame::encode(&refs, &ids).unwrap()).unwrap());
+        let f = Arc::new(Decoded::Frame(
+            frame::decode_frame(&frame::encode(&refs, &ids).unwrap()).unwrap(),
+        ));
         let w = f.weight();
         let mut cache = FrameCache::new(3 * w);
         for off in 0..10u64 {

@@ -17,7 +17,7 @@ services:
   # so any access key/secret is accepted.
   s3:
     image: chrislusf/seaweedfs:3.97
-    command: ["server", "-s3", "-s3.port=8333", "-dir=/data", "-ip.bind=0.0.0.0"]
+    command: ["server", "-s3", "-s3.port=8333", "-dir=/data", "-ip.bind=0.0.0.0", "-volume.concurrentDownloadLimitMB=512", "-volume.concurrentUploadLimitMB=256", "-filer.concurrentUploadLimitMB=256"]
     ports: ["9009:8333"]
 
   # `docker compose --profile server up -d`: the antimony server itself,

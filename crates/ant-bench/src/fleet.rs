@@ -85,6 +85,8 @@ struct AgentOut {
     /// land latencies split by whether the server rebased.
     land_ff: Vec<u64>,
     land_rebased: Vec<u64>,
+    /// whole change, `get_ref` to a successful land (comparable to a git commit+push).
+    change: Vec<u64>,
     landed: u64,
     rebased: u64,
     conflicts: u64,
@@ -111,6 +113,7 @@ impl AgentOut {
         self.land.extend(o.land);
         self.land_ff.extend(o.land_ff);
         self.land_rebased.extend(o.land_rebased);
+        self.change.extend(o.change);
         self.landed += o.landed;
         self.rebased += o.rebased;
         self.conflicts += o.conflicts;
@@ -178,6 +181,7 @@ async fn agent(i: usize, url: String, a: AgentCfg, deadline: Instant) -> Result<
     while Instant::now() < deadline {
         seq += 1;
         let t = Instant::now();
+        let change_start = t;
         let tip = match client.get_ref(pb::GetRefRequest { name: a.ref_name.clone() }).await {
             Ok(r) => r.into_inner().target,
             Err(e) => {
@@ -240,6 +244,7 @@ async fn agent(i: usize, url: String, a: AgentCfg, deadline: Instant) -> Result<
             Ok(r) => match r.into_inner().outcome {
                 Some(pb::land_response::Outcome::Landed(l)) => {
                     out.land.push(lat);
+                    out.change.push(micros(change_start));
                     out.landed += 1;
                     if l.rebased {
                         out.rebased += 1;
@@ -423,6 +428,7 @@ pub async fn run(args: Args) -> Result<i32> {
     let land = Lat::from_micros(tot.land);
     let land_ff = Lat::from_micros(tot.land_ff);
     let land_rb = Lat::from_micros(tot.land_rebased);
+    let change = Lat::from_micros(std::mem::take(&mut tot.change));
     let get_ref = Lat::from_micros(tot.get_ref);
     let read = Lat::from_micros(tot.read);
     let lands_per_s = tot.landed as f64 / wall;
@@ -450,6 +456,7 @@ pub async fn run(args: Args) -> Result<i32> {
     println!("{}", land.line("land"));
     println!("{}", land_ff.line("land(ff)"));
     println!("{}", land_rb.line("land(reb)"));
+    println!("{}", change.line("change"));
     if let Some(r) = peak_rss_bytes() {
         println!("peak RSS        {:.1} MiB (client + embedded server)", mib(r));
     }
@@ -486,6 +493,7 @@ pub async fn run(args: Args) -> Result<i32> {
         .with("latency_land", land.json())
         .with("latency_land_ff", land_ff.json())
         .with("latency_land_rebased", land_rb.json())
+        .with("latency_change", change.json())
         .with("peak_rss_bytes", peak_rss_bytes())
         .with("cpu_user_s", cpu1.0 - cpu0.0)
         .with("cpu_sys_s", cpu1.1 - cpu0.1)

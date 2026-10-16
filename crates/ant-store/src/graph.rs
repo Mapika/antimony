@@ -536,9 +536,11 @@ pub async fn is_first_parent_ancestor(
 
 /// A best common ancestor of `x` and `y`: the one with the highest
 /// generation (no other common ancestor descends from it), ties broken by
-/// the larger id. `None` for unrelated histories. When one is more than
-/// [`FIRST_WINDOW`] generations older and on the other's first-parent
-/// chain (skip index, O(log n) reads), it is the answer. Otherwise paints
+/// the larger id. `None` for unrelated histories. When the two are more
+/// than [`FIRST_WINDOW`] generations apart, first tries
+/// [`merge_base_by_first_parents`] (a few store calls however far apart
+/// they are: an ancestor on the other's first-parent chain, or a branch
+/// off it). Otherwise, or when that cannot decide, paints
 /// both sides' ancestry walking in generation order, reading the walk's
 /// ancestry a doubling window of generations per store call
 /// ([`Queue::pop_above`], the first down to just below the older side): the
@@ -555,13 +557,13 @@ pub async fn merge_base(b: &Backend, x: ObjectId, y: ObjectId) -> Result<Option<
     }
     let gx = nodes.get(&x)?.generation;
     let gy = nodes.get(&y)?.generation;
-    // An ancestor of the other is the answer (no other common ancestor
-    // has its generation); a first-parent one is found without a walk.
+    // Far apart: the walk would visit everything between them; the first
+    // parents (skip index) usually settle it without one.
     let (old, new) = if gx < gy { (x, y) } else { (y, x) };
     if gx.abs_diff(gy) > FIRST_WINDOW
-        && skip::on_first_parent_chain(b, nodes.get(&old)?, new).await? == Some(true)
+        && let Some(base) = merge_base_by_first_parents(b, new, old).await?
     {
-        return Ok(Some(old));
+        return Ok(Some(base));
     }
     let mut paint: HashMap<ObjectId, u8> = HashMap::from([(x, X), (y, Y)]);
     // The walk pops everything from the newer side down to the older one's
@@ -586,6 +588,75 @@ pub async fn merge_base(b: &Backend, x: ObjectId, y: ObjectId) -> Result<Option<
         }
     }
     Ok(None)
+}
+
+/// Most commits [`merge_base_by_first_parents`] reads above the first-parent
+/// meeting point on either side.
+const MAX_BRANCH_READ: usize = 1024;
+
+/// [`merge_base`] decided from the first-parent chains, or `None` when they
+/// cannot decide it (the caller walks):
+/// - `m` = the newest commit on both first-parent chains (skip index,
+///   [`skip::first_parent_meet`], O(log n) reads) is a common ancestor, so
+///   the answer ranks at or above it (generation, then id). If `m` is `x`
+///   or `y`, it is the answer (an ancestor of the other).
+/// - The "branch" side (fewer first parents above `m`) has its ancestry at
+///   generations `>= gen(m)` read ([`crate::MetaStore::ancestors_above`], at
+///   most [`MAX_BRANCH_READ`] commits). Every common ancestor ranking above
+///   `m` is in it. When none of those is the other side itself, each must
+///   be shown not to be an ancestor of the other side: it is not when it
+///   was recorded after it (the log is a topological order,
+///   [`crate::MetaStore::log_seqs`]); then `m` is the answer.
+/// - Otherwise the other side's ancestry in that range is read too; when
+///   both reads are complete, the common ancestors there are exactly their
+///   intersection.
+///
+/// Store calls: the skip-index reads, one `ancestors_above`, one
+/// `log_seqs` (a branch off a long first-parent chain: a few store calls
+/// however far back it was based, where the walk reads everything newer).
+async fn merge_base_by_first_parents(
+    b: &Backend,
+    x: ObjectId,
+    y: ObjectId,
+) -> Result<Option<ObjectId>> {
+    let Some(Some(meet)) = skip::first_parent_meet(b, x, y).await? else { return Ok(None) };
+    let (m, gm) = (meet.id, meet.generation);
+    if m == x || m == y {
+        return Ok(Some(m));
+    }
+    let floor = gm.saturating_sub(1);
+    let rank = |n: &CommitNode| (n.generation, n.id);
+    let (branch_tip, other) = if meet.from_x <= meet.from_y { (x, y) } else { (y, x) };
+    let branch = b.meta.ancestors_above(&[branch_tip], floor, MAX_BRANCH_READ).await?;
+    if branch.len() >= MAX_BRANCH_READ {
+        return Ok(None);
+    }
+    // Commits of the branch that would beat `m` if they were common.
+    let above: Vec<&CommitNode> = branch.iter().filter(|n| rank(n) > (gm, m)).collect();
+    if above.iter().any(|n| n.id == other) {
+        // `other` is an ancestor of the branch side: the answer.
+        return Ok(Some(other));
+    }
+    let mut ids: Vec<ObjectId> = above.iter().map(|n| n.id).collect();
+    ids.push(other);
+    let seqs = b.meta.log_seqs(&ids).await?;
+    if let Some(Some(other_seq)) = seqs.last().copied()
+        && seqs[..above.len()].iter().all(|s| s.is_some_and(|s| s > other_seq))
+    {
+        return Ok(Some(m));
+    }
+    let others = b.meta.ancestors_above(&[other], floor, MAX_BRANCH_READ).await?;
+    if others.len() >= MAX_BRANCH_READ {
+        return Ok(None);
+    }
+    let in_other: HashSet<ObjectId> = others.iter().map(|n| n.id).collect();
+    Ok(branch
+        .iter()
+        .filter(|n| in_other.contains(&n.id))
+        .map(rank)
+        .max()
+        .filter(|r| *r >= (gm, m))
+        .map(|(_, id)| id))
 }
 
 /// `id`'s `n`-th first-parent ancestor (`id~n`; `None` when its chain is
@@ -895,6 +966,7 @@ mod tests {
         get_commits: std::sync::atomic::AtomicUsize,
         chains: std::sync::atomic::AtomicUsize,
         ancestry: std::sync::atomic::AtomicUsize,
+        seqs: std::sync::atomic::AtomicUsize,
         derived: std::sync::atomic::AtomicUsize,
         /// Commits returned by graph reads.
         nodes: std::sync::atomic::AtomicUsize,
@@ -903,7 +975,10 @@ mod tests {
     impl CountingMeta {
         fn calls(&self) -> usize {
             use std::sync::atomic::Ordering::Relaxed;
-            self.get_commits.load(Relaxed) + self.chains.load(Relaxed) + self.ancestry.load(Relaxed)
+            self.get_commits.load(Relaxed)
+                + self.chains.load(Relaxed)
+                + self.ancestry.load(Relaxed)
+                + self.seqs.load(Relaxed)
         }
         fn derived_calls(&self) -> usize {
             self.derived.load(std::sync::atomic::Ordering::Relaxed)
@@ -916,6 +991,7 @@ mod tests {
             self.get_commits.store(0, Relaxed);
             self.chains.store(0, Relaxed);
             self.ancestry.store(0, Relaxed);
+            self.seqs.store(0, Relaxed);
             self.derived.store(0, Relaxed);
             self.nodes.store(0, Relaxed);
         }
@@ -961,6 +1037,10 @@ mod tests {
         }
         async fn tail(&self, after: u64, limit: usize) -> Result<Vec<(u64, ObjectId)>> {
             self.inner.tail(after, limit).await
+        }
+        async fn log_seqs(&self, ids: &[ObjectId]) -> Result<Vec<Option<u64>>> {
+            self.seqs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.log_seqs(ids).await
         }
         async fn get_derived(&self, kind: &str, key: &[u8]) -> Result<Option<bytes::Bytes>> {
             self.derived.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1097,6 +1177,89 @@ mod tests {
         d.meta.reset();
         assert!(!is_ancestor(&b, tip, main[5]).await.unwrap());
         assert_eq!(d.meta.calls(), 1);
+    }
+
+    /// Branches off a long first-parent chain, based far back: the merge
+    /// base comes from the first parents (skip index) and the branch's own
+    /// commits, in a few store calls however far back the branch starts,
+    /// when the branch was recorded after the other side; otherwise from
+    /// both sides' reads when they are short, else from the walk.
+    #[tokio::test]
+    async fn merge_base_of_branches_far_back() {
+        let mut d = Dag::new();
+        let main_a = d.chain(None, 1500).await;
+        // Recorded before the rest of main.
+        let early = d.chain(Some(main_a[1000]), 3).await;
+        let main_b = d.chain(Some(main_a[1499]), 300).await;
+        let mid = main_b[299];
+        let main_c = d.chain(Some(mid), 8000).await;
+        let tip = main_c[7999];
+        // Recorded after main's tip: new work on an old base.
+        let late = d.chain(Some(main_a[1000]), 3).await;
+        // Merges main later on: the base is that merged commit, above the
+        // first-parent meeting point.
+        let topic = d.chain(Some(main_a[500]), 2).await;
+        let synced = d.add(&[topic[1], main_a[1400]]).await;
+        let synced_tip = d.chain(Some(synced), 2).await[1];
+        // Synced recently, then long: the base is the synced commit, which
+        // the branch's ancestry above the meeting point holds.
+        let recent = d.chain(Some(main_a[1000]), 2).await;
+        let resynced = d.add(&[recent[1], main_a[1400]]).await;
+        let long_tip = d.chain(Some(resynced), 300).await[299];
+        // Synced with a commit far above its base: its ancestry above the
+        // meeting point is too long to read.
+        let wide = d.chain(Some(main_a[100]), 2).await;
+        let wide_tip = d.add(&[wide[1], main_a[1450]]).await;
+        // Off a commit that is not on main's first-parent chain (merged
+        // into a commit off main).
+        let side = d.chain(Some(main_a[200]), 2).await;
+        let merge = d.add(&[main_a[1499], side[1]]).await;
+        let off_side = d.chain(Some(side[0]), 2).await[1];
+        let b = d.b.clone();
+
+        let cold = |x, y| merge_base(&b, x, y);
+        assert_eq!(cold(late[2], tip).await.unwrap(), Some(main_a[1000]));
+
+        // Index filled in: the late branch costs its arguments, one
+        // ancestry read of the branch and one sequence-number read, both
+        // ways round.
+        for (x, y) in [(late[2], tip), (tip, late[2])] {
+            let (mb, calls, derived, nodes) =
+                measured(&d, "merge_base(late branch off main~9300, main)", merge_base(&b, x, y))
+                    .await;
+            assert_eq!(mb, Some(main_a[1000]));
+            assert!(calls <= 3, "{calls}");
+            assert!(nodes <= 8, "{nodes}");
+            assert!(derived <= 64, "{derived}");
+        }
+        // Recorded before main's tip, but both sides short above the
+        // meeting point: their ancestries intersect.
+        let (mb, calls, _, nodes) =
+            measured(&d, "merge_base(early branch, main_b)", merge_base(&b, early[2], mid)).await;
+        assert_eq!(mb, Some(main_a[1000]));
+        assert!(calls <= 5, "{calls}"); // with the branch's index fill
+        assert!(nodes < 1000, "{nodes}");
+        // The rest is walked; same answers.
+        assert_eq!(merge_base(&b, early[2], tip).await.unwrap(), Some(main_a[1000]));
+        assert_eq!(merge_base(&b, tip, early[2]).await.unwrap(), Some(main_a[1000]));
+        assert_eq!(merge_base(&b, synced_tip, tip).await.unwrap(), Some(main_a[1400]));
+        assert_eq!(merge_base(&b, tip, synced_tip).await.unwrap(), Some(main_a[1400]));
+        assert_eq!(merge_base(&b, synced_tip, mid).await.unwrap(), Some(main_a[1400]));
+        assert_eq!(merge_base(&b, long_tip, main_a[1400]).await.unwrap(), Some(main_a[1400]));
+        assert_eq!(merge_base(&b, main_a[1400], long_tip).await.unwrap(), Some(main_a[1400]));
+        assert_eq!(merge_base(&b, long_tip, tip).await.unwrap(), Some(main_a[1400]));
+        assert_eq!(merge_base(&b, wide_tip, tip).await.unwrap(), Some(main_a[1450]));
+        assert_eq!(merge_base(&b, tip, wide_tip).await.unwrap(), Some(main_a[1450]));
+        assert_eq!(merge_base(&b, off_side, tip).await.unwrap(), Some(main_a[200]));
+        assert_eq!(merge_base(&b, tip, side[0]).await.unwrap(), Some(main_a[200]));
+        assert_eq!(merge_base(&b, off_side, merge).await.unwrap(), Some(side[0]));
+        // The branch side is the other's ancestor.
+        assert_eq!(merge_base(&b, side[1], merge).await.unwrap(), Some(side[1]));
+        assert_eq!(merge_base(&b, merge, side[0]).await.unwrap(), Some(side[0]));
+        // Unrelated histories.
+        let other = d.chain(None, 400).await;
+        assert_eq!(merge_base(&b, other[399], tip).await.unwrap(), None);
+        assert_eq!(merge_base(&b, tip, other[0]).await.unwrap(), None);
     }
 
     /// Merge commits (imported history): second parents are walked too.

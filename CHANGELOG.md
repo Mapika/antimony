@@ -8,7 +8,11 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
-Planned as 0.2.0 (storage format change, schema version 6).
+## [0.2.0] - 2026-10-16
+
+Storage format change (schema version 7): read docs/operations.md, "Upgrading", before upgrading from 0.1.x. Final scorecard: [docs/scorecard/2026-10-16-v0.2.0.md](docs/scorecard/2026-10-16-v0.2.0.md) (27/27); upgrade test from v0.1.0 on git/git: 90/90.
+
+Known issue: the cold checkout of the synthetic 96k-file tree measured 4.7 s (target 5 s; 2.5 s in the 0.1.0 scorecard); to be investigated for 0.2.1.
 
 ### Added
 
@@ -31,6 +35,27 @@ Planned as 0.2.0 (storage format change, schema version 6).
   of the export, client skew both ways, `ant admin gc` and the refused
   downgrade; run before every release (`docs/release.md`). Run from 0.1.0
   with git/git as extra corpus: every check passes.
+- `ant admin repack` (`ant_store::postgres::repack`): git-gc-style repacking
+  of Postgres + S3 stores. Walks the history from every ref (newest first,
+  noting each object's path) and rewrites cold objects, small Postgres
+  -resident ones included, as *delta frames* (new S3 pack record kind,
+  magic `ADF1`): versions of a path, newest first, stored as git delta
+  instructions against the best of the previous `--window` objects (10),
+  chains at most `--depth` deep (16), the record (`--record-bytes`, 2 MiB of
+  stream) compressed whole at zstd `--level` 19. Delta bases always live in
+  the same record, so records still decode on their own and collecting a
+  base never breaks the objects built on it. Objects reachable from the
+  newest `--keep-recent` (100) first-parent commits of every ref stay one
+  decode away (Postgres rows, or plain frames). Index rows switch to the new
+  packs in short transactions that keep write times and skip condemned or
+  locked rows; old packs are freed by `ant admin gc`, which keeps a pack for
+  its quiesce period after a repack moved rows out of it. Safe beside
+  serving, landing, imports and collections; resumable (`--max-packs`, or
+  any interruption); `--dry-run` reports the savings; `--min-age` (1d),
+  `--all` (rewrite earlier repacks too), `--no-small`, `--jobs`. Output
+  contract in `ant-cli/src/main.rs`. Every record is decoded and hashed
+  before it is uploaded. `ant_core::delta` (git delta instructions) moved
+  there from `ant-gitserve`.
 
 ### Changed
 
@@ -50,6 +75,14 @@ Planned as 0.2.0 (storage format change, schema version 6).
   share of the frame's bytes for `ant admin gc` byte counts) and rewrites
   nothing. It ships in a minor release (0.2.0), as `docs/compatibility.md`
   requires for a migration older servers cannot run alongside.
+- **Schema version 7 (migration `repack`).** Adds the `packs` table:
+  `ant admin repack` records the packs it wrote (`repacked_at`, `hot`) and
+  the packs it moved index rows out of (`moved_at`), which `ant admin gc`
+  keeps for its quiesce period after the move. Additive (a new table, no
+  rewrite). Packs may now also hold delta frames (`ADF1`), written only by
+  `ant admin repack`: run it only once every server reads them (this
+  release or later); servers supporting only version 6 refuse the migrated
+  schema.
 
 ### Performance
 
@@ -66,6 +99,35 @@ Planned as 0.2.0 (storage format change, schema version 6).
   unchanged (~90 ms); repeated blame 2.3 -> 3.3 ms. A typed derived-data
   layer, `ant_store::derive` (`Derivation`: versioned kind, key, codec,
   recursive rule, eager/deferred policy; batched get/put), carries it.
+- Path history (`ant log <ref> --path`) is served from the ref's history
+  index right after an import: `ant import` and `ant-bench import` build it
+  (git/git, 24k first-parent commits: 1.3 s), and a path query or blame on
+  a ref the index cannot serve (no index yet, e.g. a ref set straight in
+  the store; lag past 4096 commits; a non-fast-forward move) schedules its
+  catch-up, so only the first queries scan. Before, an imported ref was
+  never indexed until something landed on it, and every path log scanned
+  the whole first-parent history. A path scan's chain/changeset reads now
+  double from 256 up to 4096 commits (git/git: 95 round-trip pairs -> 10),
+  and a Postgres server analyzes the `history` table after writing 50k
+  index rows (a freshly built index otherwise looks empty to the planner
+  until autovacuum runs, and path queries filter every row of the ref:
+  14 ms instead of 1 ms on git/git). git/git on Postgres + S3, 6 paths,
+  warm server, CLI wall time: whole history 210 ms -> 6.7 ms (git
+  `log --first-parent` with commit-graph Bloom filters: 101 ms), newest 20
+  23.4 ms -> 5.3 ms (git 11.7 ms).
+- `merge-base` of a branch far off a long first-parent chain is decided
+  from the first parents instead of a walk over everything newer than the
+  branch point: the skip index finds where the two first-parent chains
+  meet (both descend in lockstep, O(log n) entry reads); the branch side's
+  ancestry above that commit is read (at most 1024 commits), and its
+  commits are shown not to be ancestors of the other side because they
+  were recorded after it (`MetaStore::log_seqs`: the commit log is a
+  topological order), or both sides' short ancestries are intersected.
+  Anything else walks as before; answers are unchanged (oracle property
+  tests on random diverged histories, in memory and on Postgres). git/git,
+  a commit on `main~12198` against `main`: 193 ms -> 9.3 ms (git 54 ms); a
+  3-commit branch off `main~2000` on a 342k-commit merge-heavy synthetic
+  history reads 4 store calls / 70 commits.
 - `ant import` cuts object batches at 64 MiB instead of 16 MiB (still at
   most 1024 objects), so more versions of a path share a batch and a frame.
 - Stored size: a git/git import (82k commits; git pack of what `master`
@@ -76,6 +138,27 @@ Planned as 0.2.0 (storage format change, schema version 6).
   cold checkout unchanged (0.33 -> 0.31 s). Reads decode at most one 2 MiB
   frame per record (no delta chains), with a 64 MiB decoded-frame cache and
   a 64 MiB bound on frames being decoded per server.
+
+### Fixed
+
+- S3 throttling no longer fails `ant admin gc`, clones and reads. Transient
+  S3 failures (429, 503 `SlowDown`, 5xx, connection resets, timeouts, bodies
+  cut off mid-stream, as SeaweedFS does above its in-flight download limit)
+  were retried 5 times within about one second, so a short burst of
+  throttling failed a whole `ant admin gc` mark (`gave up after 5
+  attempt(s) in 1.05s: reading body: streaming error`). They are now retried
+  with exponential backoff and full jitter (pauses up to 5 s, `Retry-After`
+  honoured) for a time budget, `--s3-retry-budget` (`ANT_S3_RETRY_BUDGET`,
+  default 60 s, counted from the first failure); `--s3-max-attempts` now
+  defaults to 0 (no attempt limit). Client errors and corrupt data still fail
+  at once. A process keeps at most `--s3-max-concurrency`
+  (`ANT_S3_MAX_CONCURRENCY`, default 32) S3 requests in flight, so bursts
+  (GC mark, repack, clone planning, checkout bundles) queue instead of
+  overrunning the store. New metrics `ant_s3_retries_total{reason}`,
+  `ant_s3_gave_up_total`, `ant_s3_requests_in_flight`,
+  `ant_s3_requests_queued`, `ant_s3_max_concurrency`. Busy dev SeaweedFS
+  (two servers, 16 concurrent git/git clones and two `gc --dry-run`): 429s
+  749 -> 157, retried requests 564 -> 84, no failures, same throughput.
 
 ## [0.1.0] - 2026-10-16
 
@@ -339,5 +422,6 @@ Also in this release:
   around restricted paths, and principals sharing a cache directory share
   what it holds.
 
-[Unreleased]: https://github.com/Mapika/antimony/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Mapika/antimony/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Mapika/antimony/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Mapika/antimony/releases/tag/v0.1.0

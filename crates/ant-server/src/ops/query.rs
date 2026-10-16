@@ -166,13 +166,18 @@ pub async fn log_as(
     let mut out = Vec::new();
     let mut next = Some(tip);
     // Chunked walk: one chain read, one changeset read (with a path) and one
-    // commit read per chunk instead of round trips per commit.
+    // commit read per chunk instead of round trips per commit. With a path
+    // the chunks double (a path's history usually spans far more commits
+    // than it returns), so a whole-history scan takes a few dozen round
+    // trips, not one per LOG_SCAN_CHUNK commits.
+    let mut chunk = LOG_SCAN_CHUNK;
     while let Some(from) = next {
         if out.len() >= limit {
             break;
         }
-        let want = if path.is_some() { LOG_SCAN_CHUNK } else { limit - out.len() };
-        let chain = b.meta.first_parent_chain(from, None, want.min(LOG_SCAN_CHUNK)).await?;
+        let want = if path.is_some() { chunk } else { (limit - out.len()).min(LOG_SCAN_CHUNK) };
+        chunk = (chunk * 2).min(MAX_LOG_SCAN_CHUNK);
+        let chain = b.meta.first_parent_chain(from, None, want).await?;
         let Some(last) = chain.last() else {
             return Err(OpError::not_found_commit(from));
         };
@@ -205,8 +210,11 @@ pub async fn log_as(
     Ok(out)
 }
 
-/// First-parent commits read per round trip by the log scan.
+/// First-parent commits read per round trip by the log scan (the first
+/// read of a path scan, which doubles up to [`MAX_LOG_SCAN_CHUNK`]).
 const LOG_SCAN_CHUNK: usize = 256;
+/// Largest read of a path scan.
+const MAX_LOG_SCAN_CHUNK: usize = 4096;
 
 /// Serve `log --path` from the history index when `tip` is on an indexed
 /// ref's first-parent chain (for a ref name, also when the index trails it

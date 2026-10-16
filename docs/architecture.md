@@ -61,14 +61,34 @@ implementations:
 
 `TieredObjectStore` sends objects ≤ 4 KiB (encoded) to Postgres and larger ones
 to S3, so the many tiny trees and files avoid S3's per-request latency. Batch
-writes are key-ordered so concurrent writers never deadlock. There are no
-packfiles: objects are written once and never rewritten. Within one write,
-large objects that look alike (versions of one file or directory, found by a
-MinHash of entry names or lines) are compressed together as one zstd frame
-of at most 2 MiB inside an S3 pack, which plays the role of git's deltas
-without base chains: every frame decodes from its own bytes, so a read is
-one ranged GET plus at most one 2 MiB decompression, and collecting some
-members of a frame never breaks the others.
+writes are key-ordered so concurrent writers never deadlock. Writers never
+rewrite objects. Within one write, large objects that look alike (versions
+of one file or directory, found by a MinHash of entry names or lines) are
+compressed together as one zstd frame of at most 2 MiB inside an S3 pack,
+which plays the role of git's deltas without base chains: every frame
+decodes from its own bytes, so a read is one ranged GET plus at most one
+2 MiB decompression, and collecting some members of a frame never breaks
+the others.
+
+**Repacking** (`ant admin repack`, `ant_store::postgres::repack`) is the
+offline counterpart, like `git gc`: it walks the whole history (newest
+first, noting each object's path), and rewrites cold objects, Postgres
+-resident ones included, as *delta frames*: versions of one path, ordered
+newest first, each stored as git delta instructions against the best of
+the previous few (window 10, chains at most 16 deep), the record (at most
+2 MiB of stream) compressed whole with zstd 19. Delta bases always live in
+the same record, so a delta frame too decodes from its own bytes and a
+read stays one ranged GET plus one bounded decompression; readers keep
+rebuilt bases while the frame is cached. Objects reachable from the newest
+100 first-parent commits of every ref stay one decode away (plain frames,
+or Postgres rows). Index rows switch to the new packs in short
+transactions that keep each row's write time and skip condemned or locked
+rows; old packs are kept for the collector's quiesce period after the move
+and then deleted by it. git/git (82k commits): 901 MiB stored → 361 MiB (238 MiB
+after `VACUUM FULL`: Postgres 153, S3 84), against a 298 MiB `git gc` pack and 94 MiB
+`git gc --aggressive`; tip checkouts, blame and clones from the export are as
+fast or faster, a cold checkout of a 2015 revision takes 0.33 s instead of
+0.24 s.
 
 **Garbage collection** (`ant admin gc`, `ant_store::postgres::gc`) deletes
 data unreachable from refs, the history index, landed-as and import
