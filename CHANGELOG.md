@@ -8,87 +8,7 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
-### Added
-
-- Cache tier (crate `ant-cache`): `ant cache-serve --cache <dir> --upstream
-  <http-url>` serves the immutable `GET /o/<id>` and `GET /t/<tree>` surface
-  from a local disk cache (client cache format, same budget, eviction and
-  `ant cache stats/gc`), filling misses from the origin or another
-  cache-serve with hash verification and in-flight dedup. `--auth forward`
-  (default) never answers on its own authority: every request is authorized
-  by the upstream with the caller's own credentials (conditional `GET` ->
-  `304`), so it cannot serve what the origin would refuse; `--auth open` is
-  for upstreams without a policy and is refused at startup against one.
-  `ant_cacheserve_*` Prometheus metrics (hit/revalidated/miss/joined/...
-  per route, upstream requests and bytes, disk gauges).
-- Processes sharing a client cache directory fetch each missing object or
-  tree bundle once (`flock` claim files under `<cache>/claims`, crash-safe,
-  additive: the cache format version stays 1); `ANT_CACHE_DEDUP=0` disables
-  it. 8 concurrent cold checkouts: 599k objects received -> 75k (the
-  distinct ones), 18.6k HTTP requests -> 2.4k.
-- `ant cache seed <rev>[:<path>] [--sparse <pattern>]...` pre-fetches a tree
-  into the cache through tree bundles, without writing files;
-  `ant cache stats --tiers` adds per-tier counters (local, waited-for-peer,
-  joined, bundled, fetched) recorded in `<cache>/gc/tiers`.
-
-- Overload protection (`ant-server` limits): per-class concurrency gates with
-  a bounded queue that shed load (gRPC `UNAVAILABLE` / HTTP 503) are on by
-  default, sized from `--pg-max-connections`. Per-caller token-bucket rate
-  limits (`RESOURCE_EXHAUSTED` / 429) are opt-in and unlimited by default:
-  `--rate-{read,write,admin}` or `[principal.limits]` in the policy (additive
-  field). Rejections carry `retry-after-ms` (gRPC metadata) and `Retry-After`;
-  `ant`/`antd` retry such hinted rejections with jittered, bounded backoff.
-  Metrics `ant_ratelimit_*`; `--no-limits` disables everything. The gRPC
-  client buffers each request body once so it can be replayed, a memory cost
-  proportional to the request size for large `PutObjects`/`CreateChangeset`.
-- History queries for CI, bisect, revert and "did it merge" tooling, without
-  a checkout or a client-side log walk: RPCs `MergeBase`, `IsAncestor`
-  (optionally first-parent only), `LogRange` (`from..to`, first parents,
-  path filter through the history index, paged) and `LandedAs` (follows the
-  server-side rebase mapping); `Diff` takes `path_prefixes` (only those
-  subtrees are diffed), `merge_base` (`from...to`) and `patch` (unified
-  hunks per text file computed on the server, binary files flagged, with
-  per-file and per-response size limits). Access control filters them like
-  `Log` and `Diff`. CLI: `ant merge-base`, `ant log <a>..<b> [-- <path>]`,
-  `ant diff --patch [-U N] [--merge-base] <a> <b> [-- <path>...]`,
-  `ant landed-as <commit> [--ref <name>]`.
-- Land event stream for post-merge CI: server-streaming RPC `WatchRef`
-  (`RefEvent`: old/new tip, every landed commit oldest first, kind
-  `land`/`update`/`force`, `coalesced`), with an optional catch-up from a
-  commit, gapless across replicas (Postgres `LISTEN/NOTIFY` on ref moves,
-  gaps filled from the ref) and bounded per-watcher buffering (slow watchers
-  get coalesced events). Needs `read`, `update` or `land` on the ref; ref
-  rules accept a new `read` list. CLI: `ant ref watch <ref> [--from <rev>]`.
-  Metrics `ant_ref_watchers`, `ant_ref_watch_events_total`,
-  `ant_ref_watch_coalesced_events_total`. Postgres replicas with watchers
-  hold one extra `LISTEN` connection.
-
-### Changed
-
-- `ant ref set` checks fast-forwards with one `IsAncestor` call instead of
-  paging through `Log` (still the fallback against older servers).
-
-### Performance
-
-- Ancestry walks (`graph::merge_base`, `graph::is_ancestor`) read whole
-  windows of ancestry per store call (`MetaStore::ancestors_above`, one
-  recursive query on Postgres) and use a first-parent skip index (derived
-  kind `graph/skip/v1`, filled lazily and by the importer, collected by GC);
-  `rev~N` resolves in O(log N) lookups. On rust-lang/rust (343k commits),
-  `merge-base main main~2000` went from 170 s to 10 ms, and `ref set`
-  fast-forward checks across 40k merges take about 12 ms.
-- Postgres store connections run with `jit = off`. The planner cannot size
-  the recursive ancestry walk and estimates it far above the JIT thresholds,
-  so servers built with LLVM (such as the official Docker image) compiled
-  every walk first: about 80 ms per call instead of 0.5 ms.
-
-- First (uncached) `blame` of a long-lived file is 10-25x faster, with
-  byte-identical output: changes between versions are diffed on the changed
-  region only (bytewise prefix/suffix, integer line ids, bit-parallel LCS
-  with the previous tie-break), version diffs run in parallel on blocking
-  threads, and blob reads are prefetched a few batches ahead of the walk.
-
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-10-16
 
 First release. Working end to end against real Postgres and S3, covered by
 unit, integration and property tests; see "Known limitations" before
@@ -199,6 +119,63 @@ deploying.
   and `scripts/scorecard.sh`, which runs the headline benchmarks against the
   v1 targets.
 
+### Queries, events, cache tier and overload protection
+
+- Cache tier (crate `ant-cache`): `ant cache-serve --cache <dir> --upstream
+  <http-url>` serves the immutable `GET /o/<id>` and `GET /t/<tree>` surface
+  from a local disk cache (client cache format, same budget, eviction and
+  `ant cache stats/gc`), filling misses from the origin or another
+  cache-serve with hash verification and in-flight dedup. `--auth forward`
+  (default) never answers on its own authority: every request is authorized
+  by the upstream with the caller's own credentials (conditional `GET` ->
+  `304`), so it cannot serve what the origin would refuse; `--auth open` is
+  for upstreams without a policy and is refused at startup against one.
+  `ant_cacheserve_*` Prometheus metrics (hit/revalidated/miss/joined/...
+  per route, upstream requests and bytes, disk gauges).
+- Processes sharing a client cache directory fetch each missing object or
+  tree bundle once (`flock` claim files under `<cache>/claims`, crash-safe,
+  additive: the cache format version stays 1); `ANT_CACHE_DEDUP=0` disables
+  it. 8 concurrent cold checkouts: 599k objects received -> 75k (the
+  distinct ones), 18.6k HTTP requests -> 2.4k.
+- `ant cache seed <rev>[:<path>] [--sparse <pattern>]...` pre-fetches a tree
+  into the cache through tree bundles, without writing files;
+  `ant cache stats --tiers` adds per-tier counters (local, waited-for-peer,
+  joined, bundled, fetched) recorded in `<cache>/gc/tiers`.
+- Overload protection (`ant-server` limits): per-class concurrency gates with
+  a bounded queue that shed load (gRPC `UNAVAILABLE` / HTTP 503) are on by
+  default, sized from `--pg-max-connections`. Per-caller token-bucket rate
+  limits (`RESOURCE_EXHAUSTED` / 429) are opt-in and unlimited by default:
+  `--rate-{read,write,admin}` or `[principal.limits]` in the policy (additive
+  field). Rejections carry `retry-after-ms` (gRPC metadata) and `Retry-After`;
+  `ant`/`antd` retry such hinted rejections with jittered, bounded backoff.
+  Metrics `ant_ratelimit_*`; `--no-limits` disables everything. The gRPC
+  client buffers each request body once so it can be replayed, a memory cost
+  proportional to the request size for large `PutObjects`/`CreateChangeset`.
+- History queries for CI, bisect, revert and "did it merge" tooling, without
+  a checkout or a client-side log walk: RPCs `MergeBase`, `IsAncestor`
+  (optionally first-parent only), `LogRange` (`from..to`, first parents,
+  path filter through the history index, paged) and `LandedAs` (follows the
+  server-side rebase mapping); `Diff` takes `path_prefixes` (only those
+  subtrees are diffed), `merge_base` (`from...to`) and `patch` (unified
+  hunks per text file computed on the server, binary files flagged, with
+  per-file and per-response size limits). Access control filters them like
+  `Log` and `Diff`. CLI: `ant merge-base`, `ant log <a>..<b> [-- <path>]`,
+  `ant diff --patch [-U N] [--merge-base] <a> <b> [-- <path>...]`,
+  `ant landed-as <commit> [--ref <name>]`.
+- Land event stream for post-merge CI: server-streaming RPC `WatchRef`
+  (`RefEvent`: old/new tip, every landed commit oldest first, kind
+  `land`/`update`/`force`, `coalesced`), with an optional catch-up from a
+  commit, gapless across replicas (Postgres `LISTEN/NOTIFY` on ref moves,
+  gaps filled from the ref) and bounded per-watcher buffering (slow watchers
+  get coalesced events). Needs `read`, `update` or `land` on the ref; ref
+  rules accept a new `read` list. CLI: `ant ref watch <ref> [--from <rev>]`.
+  Metrics `ant_ref_watchers`, `ant_ref_watch_events_total`,
+  `ant_ref_watch_coalesced_events_total`. Postgres replicas with watchers
+  hold one extra `LISTEN` connection.
+
+- `ant ref set` checks fast-forwards with one `IsAncestor` call instead of
+  paging through `Log` (still the fallback against older servers).
+
 ### Performance
 
 From [docs/scorecard/](docs/scorecard/) (WSL2 on one development machine, one
@@ -222,6 +199,25 @@ guarantees) and the ROADMAP status:
 The final pre-release scorecard
 ([docs/scorecard/2026-10-14-final.md](docs/scorecard/2026-10-14-final.md))
 passes all 27 rows.
+
+Also in this release:
+
+- Ancestry walks (`graph::merge_base`, `graph::is_ancestor`) read whole
+  windows of ancestry per store call (`MetaStore::ancestors_above`, one
+  recursive query on Postgres) and use a first-parent skip index (derived
+  kind `graph/skip/v1`, filled lazily and by the importer, collected by GC);
+  `rev~N` resolves in O(log N) lookups. On rust-lang/rust (343k commits),
+  `merge-base main main~2000` went from 170 s to 10 ms, and `ref set`
+  fast-forward checks across 40k merges take about 12 ms.
+- Postgres store connections run with `jit = off`. The planner cannot size
+  the recursive ancestry walk and estimates it far above the JIT thresholds,
+  so servers built with LLVM (such as the official Docker image) compiled
+  every walk first: about 80 ms per call instead of 0.5 ms.
+- First (uncached) `blame` of a long-lived file is 10-25x faster, with
+  byte-identical output: changes between versions are diffed on the changed
+  region only (bytewise prefix/suffix, integer line ids, bit-parallel LCS
+  with the previous tie-break), version diffs run in parallel on blocking
+  threads, and blob reads are prefetched a few batches ahead of the walk.
 
 ### Known limitations
 

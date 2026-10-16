@@ -40,7 +40,7 @@ Client/server skew: a client works against a server of the same minor
 version and, for as long as the rules above hold, one minor version older or
 newer. Upgrade servers first, then clients.
 
-Additions since 0.1.0 (all additive; an older server answers a new RPC with
+Late additions in 0.1.0 (all additive; an older server answers a new RPC with
 `unimplemented` and ignores new request fields):
 
 | addition | what |
