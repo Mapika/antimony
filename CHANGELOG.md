@@ -8,6 +8,10 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-16
+
+Patch release: no storage or protocol changes; servers and clients of 0.2.0 interoperate. Agents need this client to reach a server behind an `https://` proxy.
+
 ### Added
 
 - Clients accept `https://` gRPC server URLs (`ANT_SERVER=https://ant.example.com`),
@@ -464,6 +468,7 @@ Also in this release:
   around restricted paths, and principals sharing a cache directory share
   what it holds.
 
-[Unreleased]: https://github.com/Mapika/antimony/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Mapika/antimony/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Mapika/antimony/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Mapika/antimony/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Mapika/antimony/releases/tag/v0.1.0
