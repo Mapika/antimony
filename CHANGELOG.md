@@ -8,7 +8,11 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
-Planned as 0.2.0 (storage format change, schema version 7).
+## [0.2.0] - 2026-10-16
+
+Storage format change (schema version 7): read docs/operations.md, "Upgrading", before upgrading from 0.1.x. Final scorecard: [docs/scorecard/2026-10-16-v0.2.0.md](docs/scorecard/2026-10-16-v0.2.0.md) (27/27); upgrade test from v0.1.0 on git/git: 90/90.
+
+Known issue: the cold checkout of the synthetic 96k-file tree measured 4.7 s (target 5 s; 2.5 s in the 0.1.0 scorecard); to be investigated for 0.2.1.
 
 ### Added
 
@@ -418,5 +422,6 @@ Also in this release:
   around restricted paths, and principals sharing a cache directory share
   what it holds.
 
-[Unreleased]: https://github.com/Mapika/antimony/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Mapika/antimony/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Mapika/antimony/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Mapika/antimony/releases/tag/v0.1.0
