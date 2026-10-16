@@ -62,7 +62,8 @@ Large objects of one write (an import batch, a land) that look alike
 most 2 MiB uncompressed; a read decodes the whole frame, and servers keep
 the last 64 MiB of decoded frames. `--pack-frames false`
 (`ANT_PACK_FRAMES`) writes every object alone, the format servers before
-schema version 6 read (see Upgrading).
+schema version 6 read (see Upgrading). `ant admin repack` rewrites the
+history as delta frames afterwards (`docs/operator-guide.md`, Repacking).
 
 ## Metrics and logs
 
@@ -213,6 +214,7 @@ ant admin schema --migrate --pg-url ... --pg-schema ant  # apply now
 | 4 | `storage_tuning` | out-of-line storage and insert-only autovacuum settings |
 | 5 | `gc` | write times (`written_at`, BRIN-indexed) on objects, packed-object index rows, commits and changesets; garbage-collection state (`gc_condemned`, `gc_live`, `gc_state`) |
 | 6 | `pack_frames` | `object_index.share` (a nullable column, no table rewrite); marks that S3 packs may hold multi-object frames, which servers supporting only version 5 cannot read |
+| 7 | `repack` | the `packs` table (`ant admin repack` state: packs it wrote, packs it moved rows out of; a new table, no rewrite); marks that S3 packs may hold delta frames, which servers supporting only version 6 cannot read |
 
 To control when migrations run, start servers with `--no-migrate`
 (`ANT_NO_MIGRATE=1`) and run `ant admin schema --migrate` yourself; a
@@ -250,8 +252,9 @@ keep serving:
 2. Run every 0.2 `ant serve` *and* `ant import` with `--pack-frames false`
    (`ANT_PACK_FRAMES=false`): they read frames but write every object
    alone, in the old format.
-3. Start the first 0.2 server. It migrates the schema to version 6 at once,
-   whatever the flag (`ant admin schema` prints `version 6`). The 0.1.x
+3. Start the first 0.2 server. It migrates the schema to version 7 at once
+   (migrations 6 and 7), whatever the flag (`ant admin schema` prints
+   `version 7`). The 0.1.x
    servers already running keep serving reads and writes, including
    objects the 0.2 servers wrote, but none of them can be started again: a
    0.1.x `ant serve`, `ant import` or `ant admin` now exits 1 with `hint:
@@ -264,11 +267,12 @@ keep serving:
 
 After step 3 the only way back to 0.1.x is the backup: nothing a 0.1.x
 server cannot read is written before step 5, but the 0.1.x binary refuses
-the version 6 schema. A 0.1.x server still running after step 5 fails the
+the migrated schema. A 0.1.x server still running after step 5 fails the
 reads of framed objects (the client gets `error:` and exit 1; the server
 logs `backend error: ... Unknown frame descriptor` or `corrupt pack
-record`); it never returns wrong bytes. Objects written while frames were
-off are not recompressed later. Clients need no particular order: 0.1.x and
+record`); it never returns wrong bytes. `ant admin repack` (delta frames,
+`docs/operator-guide.md`, Repacking) recompresses objects written while
+frames were off; run it only once no 0.1.x process is left. Clients need no particular order: 0.1.x and
 0.2 `ant` (and `ant cache-serve`) work against servers of either version,
 and keep using caches and workspaces the other one wrote.
 `scripts/upgrade-test.sh` checks all of this against a real Postgres and

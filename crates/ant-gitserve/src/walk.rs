@@ -31,16 +31,13 @@ use std::{
     mem,
 };
 
-use ant_core::{EncodedObject, ObjectId, ObjectKind};
+use ant_core::{EncodedObject, ObjectId, ObjectKind, delta};
 use ant_store::Backend;
 use anyhow::{Result, anyhow, bail, ensure};
 use bytes::BytesMut;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
-use crate::{
-    delta,
-    select::{BATCH, Read, Selection, entries},
-};
+use crate::select::{BATCH, Read, Selection, entries};
 
 /// Objects in pack order, each with its path fingerprint.
 pub type Batch = Vec<(u64, EncodedObject)>;

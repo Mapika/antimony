@@ -6,7 +6,6 @@
 //! window of other versions of the same path (see `pack.rs`, `README.md`).
 //! Commits served must be recorded in the MetaStore (generation numbers bound
 //! the `have` walk).
-mod delta;
 mod pack;
 mod protocol;
 mod select;

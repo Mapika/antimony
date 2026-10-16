@@ -5,12 +5,14 @@ use std::fmt::Write as _;
 use ant_server::acl::{self, Acl};
 use ant_server::ops::query;
 use ant_store::StoreError;
+use ant_store::packed::ClusterOptions;
 use ant_store::postgres::gc::GcOptions;
+use ant_store::postgres::repack::RepackOptions;
 use ant_store::postgres::{MIGRATIONS, PgStore};
 use ant_store::s3::S3ObjectStore;
 use anyhow::{Context, Result, anyhow};
 
-use crate::args::{GcArgs, ReindexArgs, SchemaArgs};
+use crate::args::{GcArgs, ReindexArgs, RepackArgs, SchemaArgs};
 use crate::ctx::Outcome;
 
 /// `ant admin reindex-acl <rev> --policy <file> [--full] [--history] <store flags>`.
@@ -121,5 +123,60 @@ pub async fn gc(a: GcArgs) -> Result<Outcome> {
     if r.missing > 0 {
         eprintln!("gc: warning: {} reachable objects are missing from the store", r.missing);
     }
+    Ok(Outcome::ok(out))
+}
+
+/// `ant admin repack [--dry-run] [--min-age <dur>] [--keep-recent <n>] [--all]
+/// [--no-small] [--window <n>] [--depth <n>] [--record-bytes <n>] [--level <n>]
+/// [--jobs <n>] [--max-packs <n>] <store flags>`. Progress goes to stderr
+/// (`repack: ...`); stdout is the report (see the output contract in
+/// `main.rs`).
+pub async fn repack(a: RepackArgs) -> Result<Outcome> {
+    let (backend, probes) = a.store.backend_with_probes().await?;
+    let pg = probes.pg.ok_or_else(|| anyhow!("admin repack needs a Postgres store (--pg-url)"))?;
+    let cfg = a
+        .store
+        .s3_config()?
+        .ok_or_else(|| anyhow!("admin repack needs an S3 store (--s3-endpoint ...)"))?;
+    let s3 = S3ObjectStore::connect(&cfg).await.context("configuring S3")?;
+    let mut opts = RepackOptions::new(s3);
+    opts.dry_run = a.dry_run;
+    opts.min_age = a.min_age;
+    opts.keep_recent = a.keep_recent;
+    opts.all = a.all;
+    opts.small = !a.no_small;
+    opts.cluster = ClusterOptions {
+        window: a.window,
+        depth: a.depth,
+        cluster_raw: a.record_bytes,
+        level: a.level,
+    };
+    if let Some(j) = a.jobs {
+        opts.jobs = j.max(1);
+    }
+    opts.stop_after_packs = a.max_packs;
+    let r = pg.repack(backend.objects.as_ref(), &opts, &|line| eprintln!("repack: {line}")).await?;
+    let state = match (r.dry_run, r.finished) {
+        (true, _) => "dry-run",
+        (false, true) => "done",
+        (false, false) => "stopped",
+    };
+    let mut out = String::new();
+    writeln!(out, "{state}")?;
+    writeln!(out, "commits {}", r.commits)?;
+    writeln!(out, "reachable {}", r.reachable)?;
+    writeln!(out, "hot {}", r.hot)?;
+    writeln!(
+        out,
+        "selected {} {} {} {}",
+        r.selected_cold, r.selected_hot, r.selected_other, r.selected_small
+    )?;
+    writeln!(out, "old-bytes {} {}", r.old_s3_bytes, r.old_pg_bytes)?;
+    writeln!(out, "new-bytes {}", r.new_bytes)?;
+    writeln!(out, "saved {}", r.saved_bytes())?;
+    writeln!(out, "packs {} {}", r.packs, r.records)?;
+    writeln!(out, "deltas {} {}", r.deltas, r.max_depth)?;
+    writeln!(out, "moved {} {}", r.moved, r.moved_small)?;
+    writeln!(out, "skipped {}", r.skipped)?;
     Ok(Outcome::ok(out))
 }

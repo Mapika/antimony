@@ -6,6 +6,7 @@
 //! [`ObjectId`] plus *encoded* object bytes (header included).
 
 pub mod commit;
+pub mod delta;
 mod error;
 mod id;
 pub mod merge;

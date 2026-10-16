@@ -251,8 +251,9 @@ every flag; `ant completions <shell>` prints a completion script.
   property tests (codecs, changesets, landing single and multi-replica,
   garbage collection).
 - **0.2.0 is in progress on `main`**: a storage format change (look-alike
-  objects compressed together in S3 packs, schema version 6), incremental
-  blame, and a cache tier that batches permission checks
+  objects compressed together in S3 packs, offline whole-history repacking
+  with `ant admin repack`; schema version 7), incremental blame, and a
+  cache tier that batches permission checks
   (`POST /o/check`). See [Unreleased](CHANGELOG.md#unreleased).
 - **Known limitations**: one Postgres primary (no multi-region); FUSE
   workspaces are Linux only; the git export is read-only; no code review;

@@ -209,11 +209,13 @@ A run marks reachable data (in a working table in Postgres, so memory use is
 flat), condemns the rest (servers then report it as missing), waits
 `--quiesce` (default `30m`; it must exceed the servers' 10 minute cache
 lifetime plus your longest request), marks again, then deletes in small
-transactions, and finally deletes S3 packs without live objects. Packs that
-are only partly dead are kept (there is no repacking); the report shows
-their dead bytes. The module docs of `ant_store::postgres::gc` give the
-safety argument. A run can be interrupted at any time (Ctrl-C, crash,
-`--max-batches N`); the next run resumes it. `--abort` drops a pending run
+transactions, and finally deletes S3 packs without live objects (a pack
+`ant admin repack` moved objects out of is kept for `--quiesce` after the
+move). Packs that are only partly dead are kept; the report shows their
+dead bytes, which the next repack drops. The module docs of
+`ant_store::postgres::gc` give the safety argument. A run can be interrupted
+at any time (Ctrl-C, crash, `--max-batches N`); the next run resumes it.
+`--abort` drops a pending run
 instead (its condemned data becomes visible again). Operations that touch
 condemned data during a run fail with not found or `aborted` (retryable),
 never with lost data.
@@ -237,6 +239,64 @@ Schedule it daily or weekly. A run reads every reachable tree once, so on a
 kernel-sized store the mark takes a while and reads from S3; run it off-peak.
 Postgres gets the space back through autovacuum (or `VACUUM` after a large
 first run).
+
+### Repacking
+
+Writers compress each write on its own (an import batch, a land), so
+versions of one file written at different times share nothing.
+`ant admin repack <store flags>` (Postgres + S3 stores) is antimony's
+`git gc`: it walks the whole history and rewrites *cold* objects, including
+small objects stored in Postgres, as delta frames: the versions of each
+path, newest first, as git deltas against each other, compressed together.
+Objects reachable from the newest `--keep-recent` (default `100`)
+first-parent commits of every ref are hot: they stay in Postgres or are
+rewritten as plain frames, so checking out a recent revision decodes no
+deltas. Rows written within `--min-age` (default `1d`) are left alone.
+
+```sh
+ant admin repack --dry-run --pg-url ... --pg-schema ant --s3-...  # estimate only
+ant admin repack --pg-url ... --pg-schema ant --s3-...            # repack
+# done
+# commits 82500                     walked
+# reachable 403443                  objects reached (hot ones excluded)
+# hot 5788
+# selected 266839 2167 0 136604     packed objects: cold, hot, not reached; from Postgres
+# old-bytes 687865498 84828053      what they took: S3 (their share of records), Postgres
+# new-bytes 88216313                the new packs
+# saved 684477238
+# packs 2 1803                      packs and records written
+# deltas 307844 16                  objects stored as deltas, deepest chain
+# moved 405610 136604               objects moved (of them from Postgres)
+# skipped 0                         gone, condemned or locked meanwhile: left where they were
+```
+
+It is safe while servers serve, land and import and while `ant admin gc`
+runs (one repack per schema at a time); reads find every object before,
+during and after the move. Old packs are freed by the next `ant admin gc`
+(once their quiesce period after the move is over); Postgres reuses the
+space of moved rows (autovacuum), or returns it with `VACUUM FULL objects,
+object_index` (which locks the tables: off-peak, or use `pg_repack`).
+A run can be interrupted (Ctrl-C, `--max-packs N`): what it switched stays
+switched, an unswitched pack is garbage for the collector, and the next run
+continues with what is left. Later runs only repack what is new since (and
+hot objects that have gone cold); `--all` rewrites everything again, which
+merges the deltas of incremental runs and drops dead bytes in repacked
+packs: run it now and then (monthly), incremental runs after imports or
+weekly. Before the first repack, every server must run a release with schema
+version 7 or later (they read delta frames).
+
+Measured on git/git (82k commits, 20 cores, local SeaweedFS): 55 s, 127
+CPU-seconds, 1.1 GiB peak RSS; stored bytes 901 MiB → 361 MiB (238 MiB after
+`VACUUM FULL`; S3 656 → 84 MiB), against 298 MiB for `git gc` and 94 MiB
+for `git gc --aggressive` (51 s, 420 CPU-seconds) of the same history.
+Reads (fresh server, cold client): checkout of the tip 0.34 → 0.28 s, of a
+2015 revision 0.24 → 0.33 s, first blame 258 → 239 ms, blobless clone
+6.4 → 5.5 s, full clone 19.4 → 13.2 s. Flags:
+`--window` (default 10) and `--depth` (16) as in git; `--record-bytes`
+(2 MiB: the most a read of one object decompresses); `--level` (zstd, 19;
+9 halves the time for ~5% more bytes); `--jobs` (CPU count, at most 8).
+Memory: about 100 bytes per object for the walk, plus per job a read batch
+(16 MiB), a delta window (at most 24 MiB) and a record.
 
 
 ### Client cache
@@ -953,7 +1013,7 @@ safe first step.
 for the procedure (schema versioning and rolling restarts). In short, because
 replicas are stateless, a rolling restart behind the load balancer is the
 normal shape; clients reconnect and retry idempotent lands. From 0.1.x to
-0.2 (schema version 6) a rolling upgrade needs `--pack-frames false` on the
+0.2 (schema version 7) a rolling upgrade needs `--pack-frames false` on the
 new servers until the last 0.1.x server is gone, and no 0.1.x server can be
 restarted once the first 0.2 server has started (see "Pack frames" there).
 

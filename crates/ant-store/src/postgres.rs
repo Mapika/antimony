@@ -59,6 +59,7 @@ use crate::feed::{MoveCause, RefMove};
 pub mod gc;
 mod migrate;
 mod notify;
+pub mod repack;
 pub use migrate::{MIGRATIONS, Migration, SCHEMA_VERSION, SchemaStatus};
 pub use notify::listener_application_name;
 

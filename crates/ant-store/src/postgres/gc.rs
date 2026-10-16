@@ -58,9 +58,11 @@
 //!    commits. Zone tags and uploader records (`acl/...`) are kept: a writer
 //!    tags an object before storing it, so deleting tags could leave a
 //!    re-stored restricted object untagged; they are a few bytes per object.
-//! 6. **Packs.** S3 packs none of whose objects are still indexed, and that
-//!    are older than the grace period, are deleted. Packs with only some
-//!    dead objects are kept (no repacking); their dead bytes are reported.
+//! 6. **Packs.** S3 packs none of whose objects are still indexed, that are
+//!    older than the grace period, and that `ant admin repack` has not moved
+//!    index rows out of within the quiesce period, are deleted. Packs with
+//!    only some dead objects are kept; their dead bytes are reported
+//!    (`ant admin repack` rewrites the live objects elsewhere).
 //!
 //! Interrupting a run at any point is safe; the next run resumes it from
 //! the phase recorded in `gc_state` (the mark working set is rebuilt if a
@@ -130,10 +132,21 @@
 //!   the upload that wrote it, within one operation. A pack with no index
 //!   rows that is older than the grace period can therefore gain none.
 //!   Records inside a pack never depend on each other: a multi-object frame
-//!   (`crate::packed`) decodes from its own bytes, with no delta base or
-//!   dictionary elsewhere, so deleting the index rows of some of its members
+//!   or delta frame (`crate::packed`) decodes from its own bytes, with every
+//!   delta base inside the same record and no dictionary elsewhere, so
+//!   deleting the index rows of some of its members (delta bases included)
 //!   leaves the others readable, and the pack stays while any row points
-//!   into it.
+//!   into it. A delta base can therefore never be collected out from under
+//!   the objects built on it: its bytes go only with the whole pack.
+//! - *Repacking* (`super::repack`) moves index rows (and Postgres-resident
+//!   objects) to new packs. It keeps each row's write time, never moves a
+//!   condemned id or a row that a writer or this collector holds locked
+//!   (`FOR UPDATE SKIP LOCKED`), and moves a Postgres object only by
+//!   deleting its `objects` row in the same transaction: an id the sweep
+//!   deletes is never re-created elsewhere, and nothing moved looks younger
+//!   than it is. A pack it moved rows out of is kept for the quiesce period
+//!   after the move (`packs.moved_at`), so a reader that looked up the old
+//!   location just before still finds it.
 //!
 //! What the argument assumes: clients refer to stored objects only through
 //! validated server operations (changesets, lands, ref moves under a policy)
@@ -1242,8 +1255,9 @@ impl Run<'_> {
     }
 
     /// Delete packs without index rows that are older than the pack minimum
-    /// age (dry run: count them, judging index rows by the mark), and add up
-    /// the dead bytes of the packs that stay.
+    /// age and that no repack moved rows out of within the quiesce period
+    /// (dry run: count them, judging index rows by the mark), and add up the
+    /// dead bytes of the packs that stay.
     async fn packs(&mut self) -> Result<()> {
         let Some(s3) = self.opts.s3.clone() else { return Ok(()) };
         let min_age = self.opts.pack_min_age.unwrap_or(self.opts.grace);
@@ -1254,12 +1268,18 @@ impl Run<'_> {
         } else {
             "true"
         };
+        // One statement (one snapshot) for rows and repack moves: a repack
+        // moving a pack's last rows records the move in the same transaction.
         let stmt = format!(
-            "SELECT pack, \
+            "WITH live AS (SELECT pack, \
                     coalesce(sum(coalesce(share, len)) FILTER (WHERE {live_rows}), 0)::bigint \
                       AS live_bytes, \
                     count(*) FILTER (WHERE {live_rows}) AS live \
-             FROM object_index x WHERE pack = ANY($1) GROUP BY pack"
+                 FROM object_index x WHERE pack = ANY($1) GROUP BY pack) \
+             SELECT pack, live_bytes, live, false AS moved FROM live \
+             UNION ALL \
+             SELECT pack, 0::bigint, 0::bigint, true FROM packs p \
+             WHERE pack = ANY($1) AND moved_at > now() - make_interval(secs => $3)"
         );
         let mut token = None;
         loop {
@@ -1268,12 +1288,18 @@ impl Run<'_> {
             let rows = sqlx::query(sqlx::AssertSqlSafe(stmt.clone()))
                 .bind(&ids)
                 .bind(self.cutoff)
+                .bind(secs(self.opts.quiesce))
                 .fetch_all(&mut *self.conn)
                 .await
                 .map_err(be)?;
             let mut live: HashMap<Vec<u8>, (u64, i64)> = HashMap::new();
+            let mut moved: HashSet<Vec<u8>> = HashSet::new();
             for r in &rows {
                 let pack: Vec<u8> = r.try_get("pack").map_err(be)?;
+                if r.try_get::<bool, _>("moved").map_err(be)? {
+                    moved.insert(pack);
+                    continue;
+                }
                 let bytes: i64 = r.try_get("live_bytes").map_err(be)?;
                 let n: i64 = r.try_get("live").map_err(be)?;
                 live.insert(pack, (bytes as u64, n));
@@ -1281,7 +1307,10 @@ impl Run<'_> {
             let mut dead = Vec::new();
             for p in &page {
                 let (bytes, n) = live.get(p.id.as_slice()).copied().unwrap_or((0, 0));
-                if n == 0 && p.modified < pack_cutoff {
+                // A pack a repack moved rows out of recently may still be read
+                // by whoever looked the old location up just before.
+                let recently_moved = moved.contains(p.id.as_slice());
+                if n == 0 && p.modified < pack_cutoff && !recently_moved {
                     dead.push(p.id);
                     self.report.packs += 1;
                     self.report.pack_bytes += p.size;
@@ -1293,6 +1322,12 @@ impl Run<'_> {
             }
             if !self.opts.dry_run && !dead.is_empty() {
                 s3.delete_packs(&dead).await?;
+                let dead: Vec<&[u8]> = dead.iter().map(|p| p.as_slice()).collect();
+                sqlx::query("DELETE FROM packs WHERE pack = ANY($1)")
+                    .bind(&dead)
+                    .execute(&mut *self.conn)
+                    .await
+                    .map_err(be)?;
             }
             match next {
                 Some(t) => token = Some(t),

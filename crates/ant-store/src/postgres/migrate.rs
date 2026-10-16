@@ -30,7 +30,7 @@ use super::{be, quote_ident};
 use crate::{Result, StoreError};
 
 /// The schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// One schema migration.
 pub struct Migration {
@@ -83,6 +83,13 @@ pub static MIGRATIONS: [Migration; SCHEMA_VERSION as usize] = [
         description: "S3 packs may hold multi-object frames (unreadable by versions before \
                       0.2.0); objects in a frame record their share of its bytes",
         ddl: pack_frames,
+    },
+    Migration {
+        version: 7,
+        name: "repack",
+        description: "state of `ant admin repack` (packs); S3 packs may hold delta frames \
+                      (unreadable by versions supporting only schema 6)",
+        ddl: repack,
     },
 ];
 
@@ -270,6 +277,27 @@ fn gc(qs: &str, _ql: &str) -> Vec<String> {
 /// a nullable column does not rewrite the table.
 fn pack_frames(qs: &str, _ql: &str) -> Vec<String> {
     vec![format!("ALTER TABLE {qs}.object_index ADD COLUMN IF NOT EXISTS share integer")]
+}
+
+/// Repacking (`super::repack`). Packs written from this version on may hold
+/// delta frames (`crate::packed`), which binaries supporting only version 6
+/// cannot decode: they refuse the schema instead of failing reads. `packs`
+/// holds what `ant admin repack` records about packs: `repacked_at` for the
+/// packs it writes (their objects are not repacked again unless asked to),
+/// `hot` for those of them that hold recent objects as plain frames
+/// (repacked again once those objects are no longer recent), `moved_at` for
+/// the packs it last moved index rows out of (garbage collection keeps a
+/// pack for its quiesce period after that, for readers that looked up the
+/// old location). Packs without a row are ordinary write packs. A new
+/// table: nothing is rewritten.
+fn repack(qs: &str, _ql: &str) -> Vec<String> {
+    vec![format!(
+        "CREATE TABLE IF NOT EXISTS {qs}.packs (\
+            pack bytea PRIMARY KEY, \
+            repacked_at timestamptz, \
+            hot boolean NOT NULL DEFAULT false, \
+            moved_at timestamptz)"
+    )]
 }
 
 /// Version state of one schema ([`super::PgStore::schema_status`]).
@@ -506,6 +534,57 @@ mod tests {
         ))
         .await;
         assert_eq!(names, i64::from(SCHEMA_VERSION));
+    }
+
+    /// A schema at version 6 (as main wrote it before migration 7 existed,
+    /// with data in it) migrates to 7 with exactly that migration: the
+    /// repack state table appears, nothing else changes, and a store
+    /// without migrating refuses it until then.
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_version_6_schema_upgrades_to_7() {
+        let schema = format!("t_mig_{}", rand::random::<u64>());
+        let _guard = SchemaGuard::new(&url(), &schema);
+        let qs = quote_ident(&schema);
+        let ql = qs.replace('\'', "''");
+        let mut stmts = vec![
+            format!("CREATE SCHEMA {qs}"),
+            format!(
+                "CREATE TABLE {qs}.schema_version (version integer PRIMARY KEY, \
+                 name text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now(), \
+                 applied_by text NOT NULL)"
+            ),
+        ];
+        for m in MIGRATIONS.iter().filter(|m| m.version <= 6) {
+            stmts.extend((m.ddl)(&qs, &ql));
+            stmts.push(format!(
+                "INSERT INTO {qs}.schema_version (version, name, applied_by) \
+                 VALUES ({}, '{}', 'ant 0.2.0-pre')",
+                m.version, m.name
+            ));
+        }
+        stmts.push(format!(
+            "INSERT INTO {qs}.refs VALUES ('main', '\\x{}'::bytea)",
+            ObjectId([5; 32]).to_hex()
+        ));
+        for stmt in &stmts {
+            sql(stmt).await;
+        }
+        let st = PgStore::schema_status(&url(), &schema).await.unwrap();
+        assert_eq!(st.version, 6);
+        assert_eq!(st.pending.iter().map(|m| m.name).collect::<Vec<_>>(), vec!["repack"]);
+        let err = PgStore::connect_with(&url(), &schema, &no_migrate()).await.err().unwrap();
+        assert!(matches!(err, StoreError::MigrationRequired { found: 6, .. }), "{err}");
+        let packs = format!(
+            "SELECT count(*) FROM information_schema.tables \
+             WHERE table_schema = '{schema}' AND table_name = 'packs'"
+        );
+        assert_eq!(scalar(&packs).await, 0);
+        assert_eq!(PgStore::migrate(&url(), &schema).await.unwrap(), vec![7]);
+        assert_eq!(scalar(&packs).await, 1);
+        let s = PgStore::connect_with(&url(), &schema, &no_migrate()).await.unwrap();
+        assert_eq!(s.get_ref("main").await.unwrap(), Some(ObjectId([5; 32])));
+        assert!(PgStore::migrate(&url(), &schema).await.unwrap().is_empty());
     }
 
     /// A schema recorded by a newer version is never read, written or
