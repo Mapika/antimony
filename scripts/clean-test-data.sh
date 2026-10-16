@@ -78,12 +78,14 @@ if [ "$drop_bucket" = 1 ]; then
     exit 0
 fi
 # Objects are deleted by the tests' guards; what stays is empty directories
-# (and the data of killed runs) under `<label>-t<secs>`.
+# (and the data of killed runs) under `<label>-t<secs>-<random>` (older:
+# `<label>-t<secs>`).
 prefixes="$(printf 'fs.ls /buckets/%s/\n' "$bucket" | shell \
-    | tr -d '>' | tr ' ' '\n' | grep -E -- '-t[0-9]{10}$' || true)"
+    | tr -d '>' | tr ' ' '\n' | grep -E -- '-t[0-9]{10}(-[0-9]+)?$' || true)"
 n=0
 for p in $prefixes; do
     t="${p##*-t}"
+    t="${t%%-*}"
     [ "$t" -le "$cutoff" ] || continue
     n=$((n + 1))
     if [ "$dry" = 1 ]; then echo "would remove s3 prefix $p"; else

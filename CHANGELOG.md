@@ -26,6 +26,28 @@ release of the 0.x series may change.
   the run; `scripts/scorecard-local.sh` runs the headline benchmarks in local
   mode. Tests that ran in memory take `ANT_TEST_BACKEND=local`.
 
+## [0.2.2] - 2026-10-16
+
+Patch release: no storage or protocol changes.
+
+### Fixed
+
+- `ant admin repack` could hang (until the S3 operation timeout, then
+  fail): while it waited for pack uploads it stopped polling the segments
+  it was reading, and a paused read keeps the S3 request slots it holds
+  (`--s3-max-concurrency`), which the uploads it waited for needed. It now
+  keeps every running read going and applies backpressure by not starting
+  new segments while uploads are behind.
+- Tests: S3 test prefixes get a random suffix
+  (`<label>-t<secs>-<random>`); two tests starting in the same second
+  shared a prefix and one's cleanup deleted the other's data.
+
+## [0.2.1] - 2026-10-16
+
+Patch release: no storage or protocol changes; servers and clients of 0.2.0 interoperate. Agents need this client to reach a server behind an `https://` proxy.
+
+### Added
+
 - Clients accept `https://` gRPC server URLs (`ANT_SERVER=https://ant.example.com`),
   verifying the TLS proxy in front of `ant serve` against the system roots
   (`SSL_CERT_FILE` for a private CA). Before, an `https://` URL was spoken as
@@ -38,11 +60,39 @@ release of the 0.x series may change.
 - Tests no longer leave Postgres schemas or S3 data behind; killed runs are
   swept (`scripts/clean-test-data.sh`).
 
+### Performance
+
+- Cold checkouts are no longer slowed down by cross-process fetch claims
+  when nothing else uses the cache. Since the cache tier (0.1.0) every
+  missing object and bundled tree was claimed with its own lock file (create,
+  `flock`, stat, unlink: about 217k file operations for the synthetic
+  96k-file tree, on the fetch path), which made that cold checkout about 2 s
+  slower on ext4. Each `ReadThrough` over a disk cache now registers itself
+  under `<cache>/live/` (a file it holds an exclusive `flock` on while it
+  lives) and claims objects only while another live handle, or a claim file
+  of an older binary, is present: checked once per fetch batch. Dedup between
+  concurrent processes is unchanged (8 cold clients, 48k files: 75k objects
+  and 2.35k requests reach the server either way, 599k / 18.6k without
+  dedup); a process that arrives while a batch is already being fetched
+  without claims may fetch some of that batch's objects again, once.
+  Synthetic 96k-file cold checkout, same machine and hour, ext4: median
+  5.4-6.5 s -> 3.2-3.3 s (tmpfs: 2.3 -> 1.6 s); warm and status unchanged.
+  Dead processes' registrations are never counted (nobody holds their lock)
+  and are removed by the cache's sweep.
+
+### Fixed
+
+- `ant-bench checkout` flushed dirty pages between phases with a global
+  `sync()`, which waits on every mounted filesystem and hung forever on a
+  machine with an unresponsive FUSE mount; it now uses `syncfs` on the
+  cache's filesystem. `--no-dedup` now applies to the normal phases too, and
+  each phase reports its kernel CPU time (`cpu_sys_s`).
+
 ## [0.2.0] - 2026-10-16
 
 Storage format change (schema version 7): read docs/operations.md, "Upgrading", before upgrading from 0.1.x. Final scorecard: [docs/scorecard/2026-10-16-v0.2.0.md](docs/scorecard/2026-10-16-v0.2.0.md) (27/27); upgrade test from v0.1.0 on git/git: 90/90.
 
-Known issue: the cold checkout of the synthetic 96k-file tree measured 4.7 s (target 5 s; 2.5 s in the 0.1.0 scorecard); to be investigated for 0.2.1.
+Known issue: the cold checkout of the synthetic 96k-file tree measured 4.7 s (target 5 s; 2.5 s in the 0.1.0 scorecard); to be investigated for 0.2.1 (cause: per-object cross-process claim files, see Unreleased).
 
 ### Added
 
@@ -452,6 +502,8 @@ Also in this release:
   around restricted paths, and principals sharing a cache directory share
   what it holds.
 
-[Unreleased]: https://github.com/Mapika/antimony/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Mapika/antimony/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/Mapika/antimony/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/Mapika/antimony/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Mapika/antimony/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Mapika/antimony/releases/tag/v0.1.0

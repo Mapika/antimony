@@ -104,10 +104,20 @@ fn schema_stamp(name: &str) -> Option<u64> {
     (all_digits(rand) && secs.len() == 10 && all_digits(secs)).then(|| secs.parse().ok())?
 }
 
-/// Creation time encoded in an S3 test prefix `<label>-t<secs>`.
+/// Creation time encoded in an S3 test prefix `<label>-t<secs>-<random>`
+/// (or the older `<label>-t<secs>`).
 fn prefix_stamp(prefix: &str) -> Option<u64> {
-    let (_, secs) = prefix.trim_end_matches('/').rsplit_once("-t")?;
-    (secs.len() == 10 && all_digits(secs)).then(|| secs.parse().ok())?
+    let prefix = prefix.trim_end_matches('/');
+    let stamp = |p: &str| {
+        let (_, secs) = p.rsplit_once("-t")?;
+        (secs.len() == 10 && all_digits(secs)).then(|| secs.parse().ok())?
+    };
+    match prefix.rsplit_once('-') {
+        Some((rest, rand)) if all_digits(rand) && !rest.ends_with("-t") => {
+            stamp(rest).or_else(|| stamp(prefix))
+        }
+        _ => stamp(prefix),
+    }
 }
 
 /// Drop every test schema (`t_<label>_<secs>_<random>`, see
@@ -175,7 +185,7 @@ pub async fn delete_s3_prefix(cfg: &crate::s3::S3Config) -> usize {
     }
 }
 
-/// Delete the S3 test prefixes (`<label>-t<secs>/`, see
+/// Delete the S3 test prefixes (`<label>-t<secs>-<random>/`, see
 /// [`crate::s3::S3Config::for_tests`]) of the shared test bucket that are
 /// older than `max_age`; returns the swept prefixes.
 pub async fn sweep_s3_prefixes(max_age: Duration) -> Vec<String> {
@@ -316,6 +326,8 @@ mod sweep_tests {
         assert_eq!(schema_stamp("ant_1760000000_5"), None);
         assert_eq!(schema_stamp("t_rp_1760000000_x"), None);
         assert_eq!(prefix_stamp("rp9-t1760000000/"), Some(1760000000));
+        assert_eq!(prefix_stamp("rp9-t1760000000-42/"), Some(1760000000));
+        assert_eq!(prefix_stamp("rp9-t1760000000-42"), Some(1760000000));
         assert_eq!(prefix_stamp("e2e/abc"), None);
         assert_eq!(prefix_stamp("repo-t12"), None);
     }

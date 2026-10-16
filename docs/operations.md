@@ -383,7 +383,7 @@ as user processes on the ports the tests expect (no Docker needed).
 `docker compose up -d` is the equivalent with containers, and is what CI uses.
 
 Tests create scratch Postgres schemas (`t_<label>_<unix secs>_<random>`) and
-S3 prefixes (`<label>-t<unix secs>` in the shared `ant-test` bucket) and remove
+S3 prefixes (`<label>-t<unix secs>-<random>` in the shared `ant-test` bucket) and remove
 them when they finish, also on panic. A killed test run leaves them behind;
 every test process sweeps those older than 6 hours when it starts
 (`ANT_TEST_SWEEP_HOURS`), and `scripts/clean-test-data.sh` does the same on

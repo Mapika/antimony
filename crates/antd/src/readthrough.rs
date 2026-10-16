@@ -24,7 +24,10 @@
 //!   the shared cache (`crate::claim`). Ids another process has claimed are
 //!   fetched by that process: this one fetches and stores its own claims
 //!   first, then waits (up to [`WAIT_FOR_PEER`]) for the others' and reads
-//!   them from the cache, fetching itself whatever is still missing.
+//!   them from the cache, fetching itself whatever is still missing. Claims
+//!   are only taken while another process is using the cache
+//!   ([`Claims::peers_active`], checked once per batch): alone, a process
+//!   fetches without per-object claim files.
 //! - Tier counters (`crate::tiers`) record how each object was served and are
 //!   added to the cache directory's totals when the `ReadThrough` is dropped.
 
@@ -100,6 +103,7 @@ impl ReadThrough {
     /// cache; off: every process fetches its own misses, as before).
     pub fn with_cross_process_dedup(mut self, on: bool) -> Self {
         self.claims = match (&self.disk, on) {
+            (Some(_), true) if self.claims.is_some() => self.claims.take(),
             (Some(disk), true) => Some(Claims::new(disk.root())),
             _ => None,
         };
@@ -117,6 +121,12 @@ impl ReadThrough {
             self.get_many(&misses).await?;
         }
         Ok(misses.len())
+    }
+
+    /// Cross-process claims taken so far (0 without dedup, and while no
+    /// other process uses the cache).
+    pub fn claims_taken(&self) -> u64 {
+        self.claims.as_ref().map_or(0, Claims::taken)
     }
 
     /// This handle's tier counters so far (`crate::tiers::NAMES` order).
@@ -364,6 +374,9 @@ async fn claim_ids(
     };
     let work = ids.clone();
     let done = tokio::task::spawn_blocking(move || {
+        if !claims.peers_active() {
+            return (work.into_iter().map(|id| (id, None)).collect(), Vec::new());
+        }
         let mut owned = Vec::new();
         let mut peers = Vec::new();
         for id in work {
@@ -682,6 +695,40 @@ mod tests {
         assert_eq!(up.ids(), objs.len(), "each object fetched once");
         assert!(waited > 0, "some handle waited for a peer");
         assert!(!dir.path().join("claims").read_dir().unwrap().any(|e| e.is_ok()), "claims gone");
+    }
+
+    /// A process alone on its cache takes no claims (no per-object claim
+    /// files: they made a 96k-file cold checkout ~2 s slower); once a second
+    /// handle is alive, both claim again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_process_alone_takes_no_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = Arc::new(CountingStore::default());
+        let objs = blobs(300);
+        up.inner().put_many(&objs).await.unwrap();
+        let ids: Vec<ObjectId> = objs.iter().map(|o| o.id()).collect();
+        let open = || {
+            let disk = Arc::new(DiskObjectStore::open(dir.path(), u64::MAX).unwrap());
+            ReadThrough::over_disk(disk, up.clone())
+                .with_cross_process_dedup(true)
+                .verified_upstream()
+        };
+        let rt = open();
+        for chunk in ids[..200].chunks(50) {
+            let got = rt.get_many(chunk).await.unwrap();
+            assert!(got.iter().all(Option::is_some));
+        }
+        assert_eq!(rt.claims_taken(), 0, "alone: no claims");
+        assert!(!dir.path().join("claims").exists(), "no claim files were created");
+        assert_eq!(up.ids(), 200);
+
+        let peer = open();
+        rt.get_many(&ids[200..250]).await.unwrap();
+        assert_eq!(rt.claims_taken(), 50, "with a live peer every miss is claimed");
+        drop(peer);
+        rt.get_many(&ids[250..]).await.unwrap();
+        assert_eq!(rt.claims_taken(), 50, "alone again");
+        assert_eq!(up.ids(), 300);
     }
 
     /// Without the claims every process fetches for itself.
