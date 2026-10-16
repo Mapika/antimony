@@ -67,7 +67,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind};
-use futures::{StreamExt, stream};
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use sqlx::Row;
 
 use super::{PgStore, be, object_id_col};
@@ -95,6 +95,9 @@ const WALK_BATCH: usize = 1000;
 const WALK_COMMITS: usize = 1024;
 /// Reads in flight while walking trees.
 const WALK_READS: usize = 8;
+/// Uploads in flight beyond which no new segment is started (each holds a
+/// pack in memory).
+const UPLOADS_AHEAD: usize = 1;
 /// Rows per page of the index and object scans.
 const SCAN_PAGE: i64 = 20_000;
 
@@ -662,78 +665,98 @@ impl Run<'_> {
     }
 
     /// Read, compress and write the segments; switch rows pack by pack.
+    ///
+    /// Segments being read are polled all the time, also while uploads are
+    /// awaited: a read that is not polled keeps whatever it holds, such as
+    /// S3 request slots (`S3Timeouts::max_concurrency`, shared with the
+    /// uploads), and uploads waiting for them would never finish. So
+    /// backpressure stops *starting* segments (at most `jobs` at once, none
+    /// while more than [`UPLOADS_AHEAD`] uploads are in flight); it never
+    /// pauses one that runs.
     async fn pack(&mut self, segments: Vec<Segment>) -> Result<()> {
         let total = segments.len();
         let started = Instant::now();
         let sources = Arc::new(std::mem::take(&mut self.sources));
         let (objects, opts) = (self.objects, self.opts);
-        let mut work = stream::iter(segments)
-            .map(|s| pack_segment(objects, opts.cluster, s))
-            .buffer_unordered(opts.jobs.max(1));
+        let jobs = opts.jobs.max(1);
+        let mut pending = segments.into_iter();
+        let mut running = FuturesUnordered::new();
+        let mut uploads: FuturesUnordered<tokio::task::JoinHandle<Result<Switched>>> =
+            FuturesUnordered::new();
         // Delta frames and hot objects' plain frames go to separate packs.
         let mut bufs = [PackBuf::default(), PackBuf { hot: true, ..PackBuf::default() }];
         let mut done = 0usize;
         let mut stopped = false;
-        let mut uploads = Vec::new();
-        let mut failed = None;
-        while let Some(out) = work.next().await {
-            let out = match out {
-                Ok(out) => out,
-                Err(e) => {
-                    // Let the uploads in flight finish (switching their
-                    // rows) before giving up: nothing outlives the run.
-                    failed = Some(e);
-                    break;
+        let mut failed: Option<StoreError> = None;
+        loop {
+            if !stopped && failed.is_none() {
+                while running.len() < jobs && uploads.len() <= UPLOADS_AHEAD {
+                    let Some(s) = pending.next() else { break };
+                    running.push(pack_segment(objects, opts.cluster, s));
                 }
-            };
-            done += 1;
-            self.report.skipped += out.missing;
-            let buf = &mut bufs[usize::from(out.hot)];
-            for record in out.records {
-                self.report.records += 1;
-                self.report.deltas += record.deltas as u64;
-                self.report.max_depth = self.report.max_depth.max(record.max_depth);
-                buf.add(record)?;
-                if buf.body.len() >= self.opts.pack_bytes.max(1) {
+            }
+            tokio::select! {
+                Some(out) = running.next(), if !running.is_empty() => {
+                    let out = match out {
+                        Ok(out) => out,
+                        Err(e) => {
+                            // Let the uploads in flight finish (switching
+                            // their rows) before giving up: nothing outlives
+                            // the run.
+                            failed = failed.or(Some(e));
+                            running.clear();
+                            continue;
+                        }
+                    };
+                    done += 1;
+                    self.report.skipped += out.missing;
+                    let buf = &mut bufs[usize::from(out.hot)];
+                    for record in out.records {
+                        self.report.records += 1;
+                        self.report.deltas += record.deltas as u64;
+                        self.report.max_depth = self.report.max_depth.max(record.max_depth);
+                        buf.add(record)?;
+                        if buf.body.len() >= self.opts.pack_bytes.max(1) {
+                            uploads.push(self.flush(buf, sources.clone()));
+                        }
+                    }
+                    if done.is_multiple_of(16) || done == total {
+                        self.say(&format!(
+                            "packed {done}/{total} segments: {} packs, {:.1} MiB, {} deltas \
+                             ({:.0}s)",
+                            self.report.packs,
+                            mib(self.report.new_bytes),
+                            self.report.deltas,
+                            started.elapsed().as_secs_f64()
+                        ));
+                    }
+                    if self.opts.stop_after_packs.is_some_and(|n| self.report.packs as usize >= n)
+                    {
+                        stopped = true;
+                        running.clear();
+                    }
+                }
+                Some(up) = uploads.next(), if !uploads.is_empty() => {
+                    match up.map_err(StoreError::backend).and_then(|r| r) {
+                        Ok(s) => self.tally(s)?,
+                        Err(e) => {
+                            failed = failed.or(Some(e));
+                            running.clear();
+                        }
+                    }
+                }
+                else => break,
+            }
+        }
+        if !stopped && failed.is_none() {
+            for buf in &mut bufs {
+                if !buf.body.is_empty() {
                     uploads.push(self.flush(buf, sources.clone()));
                 }
             }
-            // Bound the uploads in flight: wait for all but the newest.
-            if uploads.len() > 1 {
-                let last = uploads.pop();
-                for u in uploads.drain(..) {
-                    match u.await.map_err(StoreError::backend).and_then(|r| r) {
-                        Ok(s) => self.tally(s)?,
-                        Err(e) => failed = failed.or(Some(e)),
-                    }
-                }
-                uploads.extend(last);
-                if failed.is_some() {
-                    break;
-                }
-            }
-            if done.is_multiple_of(16) || done == total {
-                self.say(&format!(
-                    "packed {done}/{total} segments: {} packs, {:.1} MiB, {} deltas ({:.0}s)",
-                    self.report.packs,
-                    mib(self.report.new_bytes),
-                    self.report.deltas,
-                    started.elapsed().as_secs_f64()
-                ));
-            }
-            if self.opts.stop_after_packs.is_some_and(|n| self.report.packs as usize >= n) {
-                stopped = true;
-                break;
-            }
         }
-        drop(work);
-        for buf in &mut bufs {
-            if !stopped && failed.is_none() && !buf.body.is_empty() {
-                uploads.push(self.flush(buf, sources.clone()));
-            }
-        }
-        for u in uploads {
-            match u.await.map_err(StoreError::backend).and_then(|r| r) {
+        while let Some(up) = uploads.next().await {
+            match up.map_err(StoreError::backend).and_then(|r| r) {
                 Ok(s) => self.tally(s)?,
                 Err(e) => failed = failed.or(Some(e)),
             }
@@ -1214,6 +1237,55 @@ mod tests {
         let got = reader().get_many(&ids).await.unwrap();
         assert!(got.iter().zip(&objs).all(|(g, o)| g.as_ref() == Some(o)));
         assert_eq!(reader().get(&ids[29]).await.unwrap().as_ref(), Some(&objs[29]));
+    }
+
+    /// Reads and uploads share the S3 store's request slots: a repack must
+    /// keep polling the segments it reads while it waits for uploads, or a
+    /// paused read holding the slots starves the uploads it waits for
+    /// (a hang until the S3 operation timeout). One slot, several segments
+    /// read at once, a pack per record: every wait for uploads finds other
+    /// segments mid-read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs postgres and s3: docker compose up -d"]
+    async fn uploads_never_wait_on_slots_held_by_paused_reads() {
+        let pg = PgStore::connect_scratch(
+            &crate::testing::pg_url(),
+            &crate::testing::scratch_schema("rp"),
+        )
+        .await
+        .unwrap();
+        let mut cfg = S3Config::for_tests(&format!("rp{}", rand::random::<u64>()));
+        cfg.timeouts.max_concurrency = 1;
+        let s3 = S3ObjectStore::connect_scratch(&cfg).await.unwrap();
+        s3.ensure_bucket().await.unwrap();
+        let packed = PackedS3Store::new(pg.clone(), s3.clone());
+        let objects: Arc<dyn ObjectStore> =
+            Arc::new(TieredObjectStore::new(Arc::new(pg.clone()), Arc::new(packed), 64));
+        // Unreachable objects (no refs): segments of `SEGMENT_OBJECTS / 2`,
+        // spread over many packs (many ranged reads per segment).
+        let n = SEGMENT_OBJECTS * 2;
+        let all: Vec<EncodedObject> = (0..n)
+            .map(|i| {
+                let body: Vec<u8> = (0..200).map(|_| rand::random::<u8>()).collect();
+                EncodedObject::new(ObjectKind::Blob, &[format!("{i}\n").as_bytes(), &body].concat())
+            })
+            .collect();
+        for chunk in all.chunks(16) {
+            objects.put_many(chunk).await.unwrap();
+        }
+        let cluster = ClusterOptions { cluster_raw: 4096, ..opts(&s3).cluster };
+        let o = RepackOptions { jobs: 4, pack_bytes: 1, cluster, ..opts(&s3) };
+        for round in 0..3 {
+            let run = pg.repack(objects.as_ref(), &o, &|_| {});
+            let r = tokio::time::timeout(Duration::from_secs(60), run)
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: repack hangs: {:?}", crate::s3::stats()))
+                .unwrap();
+            assert!(r.finished && r.moved == n as u64 && r.packs > 100, "{r:?}");
+        }
+        let ids: Vec<ObjectId> = all.iter().map(EncodedObject::id).collect();
+        let got = objects.get_many(&ids).await.unwrap();
+        assert!(got.iter().zip(&all).all(|(g, o)| g.as_ref() == Some(o)));
     }
 
     #[test]
