@@ -228,7 +228,8 @@ ant local stop                             # stopped <pid>
 
 Import a git repository into it with `ant import <git-dir> --local` while
 the server is stopped; see [docs/operations.md](docs/operations.md#local-mode-one-machine-no-postgres-or-s3)
-for durability, sizing, garbage collection and moving to Postgres + S3.
+for durability, sizing, garbage collection and moving to Postgres + S3
+(`ant admin copy-local`).
 
 Exit codes: `0` ok, `1` error (`error: ...` plus an optional `hint: ...` on
 stderr), `2` land or update conflict. More in [docs/usage.md](docs/usage.md):
@@ -258,7 +259,7 @@ importing large histories, Docker, several replicas.
 | Clone with plain git | `git clone [--filter=blob:none \| --depth N] http://<server>:7421/repo.git` |
 | Run a server | `ant serve [--memory \| --local [<dir>] \| --pg-url ... --s3-endpoint ...] [--policy policy.toml]` |
 | Local server in the background | `ant local start\|stop\|status [--dir <dir>]` |
-| Administer | `ant admin schema`, `ant admin gc`, `ant admin reindex-acl` (`--local` too) |
+| Administer | `ant admin schema`, `ant admin gc`, `ant admin reindex-acl` (`--local` too), `ant admin copy-local` |
 
 Output is one record per line; the full contract is in the module docs of
 [`crates/ant-cli/src/main.rs`](crates/ant-cli/src/main.rs). Clients find the

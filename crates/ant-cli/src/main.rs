@@ -210,6 +210,15 @@
 //!       `packs-compacted <count> <bytes-before> <bytes-after>` and, except
 //!       for dry runs, `vacuumed yes|no`. `--quiesce` and `--max-batches`
 //!       are ignored; `--abort`: exit 1.
+//!   ant admin copy-local [--from <dir>] <store flags>
+//!       Copies a local data directory (offline: not in use by a server,
+//!       else exit 1; `<dir>` defaults like `--local`) into the stores of
+//!       the store flags (e.g. Postgres + S3): every object, commit record
+//!       and changeset, derived data (landed-as and import mappings, blame
+//!       caches), then each ref the destination does not have. Idempotent.
+//!       stdout: `objects <n>`, `commits <n>`, `derived <n>`, `refs <n>`,
+//!       then `skipped <ref> <id>` per ref the destination already had (left
+//!       unchanged). Progress on stderr (`copy: ...`).
 //!   ant admin repack [--dry-run] [--min-age 1d] [--keep-recent 100] [--all] [--no-small]
 //!       [--window 10] [--depth 16] [--record-bytes 2097152] [--level 19] [--jobs N]
 //!       [--max-packs N] <store flags>

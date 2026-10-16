@@ -150,8 +150,8 @@ binary's supported version is printed by `ant admin schema` as `supported <n>`.
   `id -> (pack, offset, length)`). A new record format needs a new magic, a
   new pack header version and a schema bump.
 - Table names are an implementation detail, as for Postgres. Moving a local
-  repository to Postgres + S3 goes through git (see `docs/operations.md`,
-  Local mode), not through the files.
+  repository to Postgres + S3 goes through `ant admin copy-local` (see
+  `docs/operations.md`, Local mode), not through the files.
 
 ## 3. On-disk client formats
 

@@ -137,19 +137,25 @@ ant serve --local /data/ant            # the same in the foreground, any directo
 - **Backups.** Stop the server (or use SQLite's `.backup` on `meta.db`) and
   copy the directory; pack files are append-only and never rewritten except
   by `ant admin gc --local`.
-- **Moving to Postgres + S3** goes through git, which carries every ref and
-  object with unchanged ids (SHA-256):
+- **Moving to Postgres + S3** (or to another directory): stop the server
+  and copy the directory into the new stores, then serve those:
 
   ```sh
-  git clone --mirror http://127.0.0.1:7421/repo.git /tmp/ant-export.git   # every ref, as refs/heads/<name>
-  ant import /tmp/ant-export.git --git-ref refs/heads/main --ref main \
-      --pg-url postgres://... --s3-endpoint ...                           # once per ref to keep
+  ant local stop
+  ant admin copy-local --from ~/.local/share/antimony/local \
+      --pg-url postgres://... --pg-schema ant --s3-endpoint ... --s3-bucket ...
+  # objects <n> / commits <n> / derived <n> / refs <n>
+  ant serve --pg-url postgres://... --pg-schema ant --s3-endpoint ...
   ```
 
-  Commit ids stay the same, so workspaces can be recreated at the same
-  revisions; landed-as mappings, blame caches and the path-history index are
-  rebuilt or not carried over (changesets that were never landed are lost:
-  land or re-submit them first).
+  Every object, commit record, changeset and derived row (landed-as and
+  import mappings, blame caches) is copied, then the refs the destination
+  does not have yet (others are listed as `skipped <ref> <id>` and left
+  alone). Ids do not change, so workspaces keep working against the new
+  server once `ANT_SERVER` points at it; the path-history index is rebuilt
+  on first use. The copy is idempotent: an interrupted one is run again.
+  (A mirror clone of the git export is not a way back in: the export is
+  SHA-256 and `ant import` reads SHA-1 repositories only.)
 
 ## Metrics and logs
 

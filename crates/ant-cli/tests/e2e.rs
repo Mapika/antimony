@@ -854,3 +854,92 @@ fn cli_local_start_status_stop() {
     ctx.run(None, &["local", "status", "--dir", &data_s]).expect_code(1);
     assert!(data.join("server.log").exists());
 }
+
+/// `ant admin copy-local`: an imported local repository copied into another
+/// store (a second local directory; with the dev services also Postgres),
+/// then served from there.
+fn copy_local_into(dest: &[&str]) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    build_repo(&repo);
+    let src = tmp.path().join("src").display().to_string();
+    let ctx = Ctx {
+        ant: PathBuf::from(env!("CARGO_BIN_EXE_ant")),
+        env: vec![("ANT_CACHE".into(), tmp.path().join("cache").display().to_string())],
+    };
+    let git_dir = repo.join(".git").display().to_string();
+    let r =
+        ctx.run(None, &["import", &git_dir, "--git-ref", "refs/heads/main", "--local", &src]).ok();
+    let tip = r.stdout().trim_end().strip_prefix("main ").expect("main <id>").to_string();
+    let mut args = vec!["admin", "copy-local", "--from", &src];
+    args.extend_from_slice(dest);
+    let r = ctx.run(None, &args).ok();
+    let out = r.stdout();
+    if !out.contains("commits 3\n") || !out.contains("refs 1\n") || !out.starts_with("objects ") {
+        r.fail("copy report");
+    }
+    let r = ctx.run(None, &args).ok();
+    if !r.stdout().ends_with(&format!("refs 0\nskipped main {tip}\n")) {
+        r.fail("second copy skips the existing ref");
+    }
+    // Serve the copy and read through it.
+    let (grpc, http) = free_ports();
+    let _server = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ant"))
+            .arg("serve")
+            .args(dest)
+            .arg("--grpc-listen")
+            .arg(format!("127.0.0.1:{grpc}"))
+            .arg("--http-listen")
+            .arg(format!("127.0.0.1:{http}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawning ant serve"),
+    );
+    let client = Ctx {
+        ant: ctx.ant.clone(),
+        env: vec![
+            ("ANT_CACHE".into(), tmp.path().join("cache2").display().to_string()),
+            ("ANT_SERVER".into(), format!("http://127.0.0.1:{grpc}")),
+        ],
+    };
+    common::wait_until(|| client.run(None, &["ref", "get", "main"]).code() == Some(0));
+    let r = client.run(None, &["cat", "main:src/lib.rs"]).ok();
+    check_eq(&r, "content", r.stdout(), LIB_V2.to_string());
+    let r = client.run(None, &["log", "main"]).ok();
+    check_eq(&r, "history", r.stdout().lines().count(), 3);
+}
+
+#[test]
+fn cli_copy_local_into_local() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dest = tmp.path().join("dest").display().to_string();
+    copy_local_into(&["--local", &dest]);
+}
+
+#[test]
+#[ignore = "needs docker compose up -d"]
+fn cli_copy_local_into_postgres() {
+    let schema = ant_store::testing::scratch_schema("e2e_copy");
+    let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
+    let s3_cfg = ant_store::s3::S3Config::for_tests("e2e-copy");
+    let _s3 = ant_store::testing::S3PrefixGuard(s3_cfg.clone());
+    copy_local_into(&[
+        "--pg-url",
+        PG_URL,
+        "--pg-schema",
+        &schema,
+        "--s3-endpoint",
+        S3_ENDPOINT,
+        "--s3-bucket",
+        &s3_cfg.bucket,
+        "--s3-prefix",
+        &s3_cfg.prefix,
+        "--s3-access-key",
+        "test",
+        "--s3-secret-key",
+        "test",
+    ]);
+}

@@ -21,6 +21,9 @@ release of the 0.x series may change.
   (`docs/compatibility.md`); flags `--local-readers`,
   `--local-frame-cache-mib`, `--local-sync full|normal`, and for every
   server `--worker-threads` and `--cache-mib`. `/readyz` reports `"local"`.
+- `ant admin copy-local --from <dir> <store flags>` copies a local data
+  directory into other stores (Postgres + S3): objects, commits,
+  changesets, derived data, then the refs the destination lacks.
 - `ant serve` exits cleanly (status 0) on SIGTERM and SIGINT.
 - `ant-bench fleet --server-pid <pid>` reports the server's RSS and CPU over
   the run; `scripts/scorecard-local.sh` runs the headline benchmarks in local

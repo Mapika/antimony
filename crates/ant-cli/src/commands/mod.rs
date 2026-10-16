@@ -81,6 +81,7 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
         Command::Admin { cmd: AdminCmd::ReindexAcl(a) } => admin::reindex_acl(a).await,
         Command::Admin { cmd: AdminCmd::Schema(a) } => admin::schema(a).await,
         Command::Admin { cmd: AdminCmd::Gc(a) } => admin::gc(a).await,
+        Command::Admin { cmd: AdminCmd::CopyLocal(a) } => admin::copy_local(a).await,
         Command::Admin { cmd: AdminCmd::Repack(a) } => admin::repack(a).await,
         Command::Cache { cmd: CacheCmd::Stats { tiers } } => cache::stats(&ctx, tiers).await,
         Command::Cache { cmd: CacheCmd::Seed { target, sparse } } => {

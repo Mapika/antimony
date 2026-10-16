@@ -68,6 +68,7 @@
 //! Pack bytes are always fsynced before their index rows are written
 //! ([`packs`]): pack files are outside the WAL's ordering.
 
+pub mod copy;
 pub(crate) mod db;
 pub mod gc;
 

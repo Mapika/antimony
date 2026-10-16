@@ -12,7 +12,7 @@ use ant_store::postgres::{MIGRATIONS, PgStore};
 use ant_store::s3::S3ObjectStore;
 use anyhow::{Context, Result, anyhow};
 
-use crate::args::{GcArgs, ReindexArgs, RepackArgs, SchemaArgs};
+use crate::args::{CopyLocalArgs, GcArgs, ReindexArgs, RepackArgs, SchemaArgs};
 use crate::ctx::Outcome;
 
 /// `ant admin reindex-acl <rev> --policy <file> [--full] [--history] <store flags>`.
@@ -166,6 +166,36 @@ async fn local_gc(a: &GcArgs, store: ant_store::local::LocalStore) -> Result<Out
     }
     if r.missing > 0 {
         eprintln!("gc: warning: {} reachable objects are missing from the store", r.missing);
+    }
+    Ok(Outcome::ok(out))
+}
+
+/// `ant admin copy-local [--from <dir>] <store flags>`: stdout `objects <n>`,
+/// `commits <n>`, `derived <n>`, `refs <n>`, then `skipped <ref> <id>` per
+/// ref the destination already had. Progress on stderr (`copy: ...`).
+pub async fn copy_local(a: CopyLocalArgs) -> Result<Outcome> {
+    use ant_store::local::{LocalOptions, LocalStore, copy::copy_to};
+    let from = match a.from {
+        Some(d) => d,
+        None => ant_store::local::default_dir()
+            .ok_or_else(|| anyhow!("no --from given and $HOME is not set"))?,
+    };
+    if a.store.local_dir()?.as_deref() == Some(from.as_path()) {
+        return Err(anyhow!("--from and the destination are the same directory"));
+    }
+    let dst = a.store.backend().await?;
+    let options = LocalOptions { migrate: false, ..LocalOptions::default() };
+    let src = tokio::task::spawn_blocking(move || LocalStore::open(&from, &options))
+        .await
+        .context("opening the local data directory")??;
+    let r = copy_to(&src, &dst, &|line| eprintln!("copy: {line}")).await?;
+    let mut out = String::new();
+    writeln!(out, "objects {}", r.objects)?;
+    writeln!(out, "commits {}", r.commits)?;
+    writeln!(out, "derived {}", r.derived)?;
+    writeln!(out, "refs {}", r.refs)?;
+    for (name, id) in &r.refs_skipped {
+        writeln!(out, "skipped {name} {id}")?;
     }
     Ok(Outcome::ok(out))
 }
