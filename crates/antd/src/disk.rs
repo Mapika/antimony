@@ -14,6 +14,11 @@
 //!   ([`crate::par::par_map`]); zstd contexts are thread-local and reused. Objects are
 //!   compressed with the content size in the frame header so reads allocate
 //!   once (older entries without it still decode).
+//! - Packs: batches of at least [`PACK_MIN`] objects (a checkout's tree
+//!   bundles, batched fetches) are stored as one pack file plus an index
+//!   under `{root}/packs/` instead of one file per object ([`crate::pack`]
+//!   has the layout). Reads look in the packs first (an in-memory index),
+//!   then `objects/`. Objects already cached are not stored again.
 //! - Format version: `{root}/format` holds [`CACHE_FORMAT`]. `open` writes
 //!   it when missing (a cache from before the marker is version 1) and
 //!   refuses a cache whose version is newer (`ant_core::NewerFormat`).
@@ -57,6 +62,7 @@
 //! counters are flushed and the budget enforced periodically even when idle.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fs::{File, TryLockError};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -70,6 +76,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::par::par_map;
+
+/// Batches of at least this many objects are stored as a pack.
+pub const PACK_MIN: usize = 64;
 
 /// Prefix of in-progress writes inside a shard directory.
 const TMP_PREFIX: &str = ".tmp.";
@@ -164,6 +173,7 @@ pub struct CacheStats {
 /// State shared with the handle's blocking tasks.
 struct Shared {
     root: PathBuf,
+    packs: crate::pack::Packs,
     max_bytes: u64,
     /// Newly written bytes not yet added to the shared counter.
     pending: AtomicU64,
@@ -189,7 +199,13 @@ impl DiskObjectStore {
         crate::claim::sweep(&root);
         let flush_at = (max_bytes / 64).clamp(1, MAX_FLUSH_BYTES);
         Ok(Self {
-            shared: Arc::new(Shared { root, max_bytes, pending: AtomicU64::new(0), flush_at }),
+            shared: Arc::new(Shared {
+                packs: crate::pack::Packs::new(&root),
+                root,
+                max_bytes,
+                pending: AtomicU64::new(0),
+                flush_at,
+            }),
             touch_interval: DEFAULT_TOUCH_INTERVAL,
         })
     }
@@ -225,7 +241,56 @@ impl DiskObjectStore {
         if objects.is_empty() {
             return Ok(());
         }
+        if objects.len() >= PACK_MIN {
+            return self.write_pack(objects).await;
+        }
         self.write_batch(objects, |w, (id, o)| write_one(w, id, o)).await
+    }
+
+    /// Store a large batch as a pack (see the module docs): the objects not
+    /// cached yet go into one new pack (or loose files, if few remain);
+    /// cached ones only count as used.
+    async fn write_pack(&self, objects: Vec<(ObjectId, EncodedObject)>) -> Result<()> {
+        let shared = self.shared.clone();
+        let touch = self.touch_interval;
+        blocking(move || {
+            let packs = &shared.packs;
+            let ids: Vec<ObjectId> = objects.iter().map(|(id, _)| *id).collect();
+            let packed = packs.present(&ids);
+            let present: Vec<bool> =
+                par_map(&ids.iter().zip(&packed).collect::<Vec<_>>(), 64, |(id, p)| {
+                    **p || object_path(&shared.root, id).exists()
+                });
+            let packed: HashSet<ObjectId> =
+                ids.iter().zip(&packed).filter(|(_, p)| **p).map(|(id, _)| *id).collect();
+            let (old, fresh): (Vec<_>, Vec<_>) =
+                objects.into_iter().zip(present).partition(|(_, p)| *p);
+            let old: Vec<ObjectId> = old.into_iter().map(|((id, _), _)| id).collect();
+            if !old.is_empty() {
+                packs.touch(&old, touch);
+                let w = Writer { root: &shared.root, touch };
+                let loose: Vec<&ObjectId> = old.iter().filter(|id| !packed.contains(id)).collect();
+                par_map(&loose, 64, |id| {
+                    let dest = object_path(w.root, id);
+                    if let (Ok(meta), Ok(f)) = (std::fs::metadata(&dest), File::open(&dest)) {
+                        self::touch(&f, meta.modified().ok(), w.touch);
+                    }
+                });
+            }
+            let fresh: Vec<(ObjectId, EncodedObject)> = fresh.into_iter().map(|(o, _)| o).collect();
+            let written = if fresh.len() >= PACK_MIN {
+                packs.write(&fresh)?
+            } else {
+                let w = Writer { root: &shared.root, touch };
+                par_map(&fresh, 16, |(id, o)| write_one(&w, id, o))
+                    .into_iter()
+                    .sum::<std::io::Result<u64>>()?
+            };
+            shared.account(written);
+            Ok(())
+        })
+        .await
+        .map_err(StoreError::backend)
     }
 
     /// Write `items` with `write` on the blocking pool, several at a time,
@@ -260,7 +325,7 @@ impl DiskObjectStore {
         blocking(move || {
             let files = scan(&root)?;
             Ok(CacheStats {
-                objects: files.len() as u64,
+                objects: files.iter().map(|f| f.objects).sum(),
                 bytes: files.iter().map(|f| f.size).sum(),
                 budget,
             })
@@ -457,7 +522,7 @@ impl Shared {
             Goal::Bytes(t) => (t, t),
         };
         let mut report = EvictReport::default();
-        let mut remaining = files.len() as u64;
+        let mut remaining: u64 = files.iter().map(|f| f.objects).sum();
         if total > trigger {
             files.sort_by_key(|f| f.modified);
             for f in &files {
@@ -471,13 +536,21 @@ impl Shared {
                 {
                     continue;
                 }
+                // A pack's index goes first: nobody loads a pack without it.
+                if let Some(idx) = &f.index {
+                    match std::fs::remove_file(idx) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == ErrorKind::NotFound => {}
+                        Err(e) => return Err(e),
+                    }
+                }
                 match std::fs::remove_file(&f.path) {
-                    Ok(()) => report.removed += 1,
+                    Ok(()) => report.removed += f.objects,
                     Err(e) if e.kind() == ErrorKind::NotFound => {}
                     Err(e) => return Err(e),
                 }
                 total -= f.size;
-                remaining -= 1;
+                remaining -= f.objects;
                 report.freed += f.size;
             }
         }
@@ -520,6 +593,10 @@ struct Cached {
     path: PathBuf,
     size: u64,
     modified: SystemTime,
+    /// Objects it holds (1 for a loose object).
+    objects: u64,
+    /// A pack's index, removed before the pack.
+    index: Option<PathBuf>,
 }
 
 /// Every cached object.
@@ -551,13 +628,30 @@ fn scan_with(
                 on_tmp(f.path(), modified); // in-progress write
                 continue;
             }
-            out.push(Cached { path: f.path(), size: meta.len(), modified });
+            out.push(Cached {
+                path: f.path(),
+                size: meta.len(),
+                modified,
+                objects: 1,
+                index: None,
+            });
         }
     }
+    let (packs, abandoned) = crate::pack::scan(root)?;
+    for (path, modified) in abandoned {
+        on_tmp(path, modified);
+    }
+    out.extend(packs.into_iter().map(|p| Cached {
+        path: p.pack,
+        size: p.size,
+        modified: p.modified,
+        objects: p.objects,
+        index: Some(p.idx),
+    }));
     Ok(out)
 }
 
-fn decompress(compressed: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn decompress(compressed: &[u8]) -> Option<Vec<u8>> {
     match zstd::zstd_safe::get_frame_content_size(compressed) {
         Ok(Some(n)) if n <= MAX_PREALLOC => DECOMPRESSOR.with(|cell| {
             let mut slot = cell.borrow_mut();
@@ -585,7 +679,7 @@ fn compress(raw: &[u8]) -> std::io::Result<Vec<u8>> {
 
 /// Mark the object as used now, unless it already was within `interval`.
 /// Failures (read-only cache, file evicted meanwhile) are ignored.
-fn touch(file: &File, modified: Option<SystemTime>, interval: Duration) {
+pub(crate) fn touch(file: &File, modified: Option<SystemTime>, interval: Duration) {
     let now = SystemTime::now();
     let fresh = modified.is_some_and(|m| now.duration_since(m).is_ok_and(|age| age < interval));
     if !fresh {
@@ -660,27 +754,68 @@ impl ObjectStore for DiskObjectStore {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let root = self.shared.root.clone();
+        let shared = self.shared.clone();
         let touch = self.touch_interval;
         let ids = ids.to_vec();
-        blocking(move || Ok(par_map(&ids, 32, |id| read_one(&object_path(&root, id), touch))))
-            .await
-            .map_err(StoreError::backend)
+        blocking(move || {
+            let packs = &shared.packs;
+            let mut out = packs.read(&ids, touch);
+            let missing: Vec<usize> = (0..ids.len()).filter(|&i| out[i].is_none()).collect();
+            if missing.is_empty() {
+                return Ok(out);
+            }
+            let loose =
+                par_map(&missing, 32, |&i| read_one(&object_path(&shared.root, &ids[i]), touch));
+            for (&i, o) in missing.iter().zip(loose) {
+                out[i] = o;
+            }
+            // Still missing: a pack written since the index was loaded?
+            let still: Vec<usize> = missing.into_iter().filter(|&i| out[i].is_none()).collect();
+            if !still.is_empty() && packs.refresh(false) {
+                let again: Vec<ObjectId> = still.iter().map(|&i| ids[i]).collect();
+                for (&i, o) in still.iter().zip(packs.read(&again, touch)) {
+                    out[i] = o;
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(StoreError::backend)
     }
 
     async fn put_many(&self, objects: &[EncodedObject]) -> Result<()> {
         if objects.is_empty() {
             return Ok(());
         }
+        if objects.len() >= PACK_MIN {
+            let objects = objects.to_vec();
+            let pairs = blocking(move || Ok(par_map(&objects, 16, |o| (o.id(), o.clone()))))
+                .await
+                .map_err(StoreError::backend)?;
+            return self.write_pack(pairs).await;
+        }
         self.write_batch(objects.to_vec(), |w, o| write_one(w, &o.id(), o)).await
     }
 
     async fn has_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {
-        let root = self.shared.root.clone();
+        let shared = self.shared.clone();
         let ids = ids.to_vec();
-        blocking(move || Ok(par_map(&ids, 256, |id| object_path(&root, id).exists())))
-            .await
-            .map_err(StoreError::backend)
+        blocking(move || {
+            let packs = &shared.packs;
+            let packed = packs.present(&ids);
+            let check =
+                |(id, p): &(&ObjectId, &bool)| **p || object_path(&shared.root, id).exists();
+            let mut out = par_map(&ids.iter().zip(&packed).collect::<Vec<_>>(), 256, check);
+            if out.iter().any(|p| !p) && packs.refresh(false) {
+                let again = packs.present(&ids);
+                for (p, a) in out.iter_mut().zip(again) {
+                    *p = *p || a;
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(StoreError::backend)
     }
 }
 
@@ -818,6 +953,138 @@ mod tests {
         assert!(s.disk_usage().await.unwrap() <= (total / 2) * 9 / 10 + 1);
         assert!(s.get(&objs[0].id()).await.unwrap().is_some(), "recently used survived");
         assert!(s.get(&objs[1].id()).await.unwrap().is_none(), "oldest evicted");
+    }
+
+    fn many(n: usize, tag: &str) -> Vec<EncodedObject> {
+        (0..n)
+            .map(|i| EncodedObject::new(ObjectKind::Blob, format!("{tag} {i}").as_bytes()))
+            .collect()
+    }
+
+    fn pack_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.join(crate::pack::DIR))
+            .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// A large batch becomes one pack and an index (no loose files); every
+    /// object reads back, from this handle and from new ones.
+    #[tokio::test]
+    async fn large_batches_are_packed() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = DiskObjectStore::open(dir.path(), u64::MAX).unwrap();
+        let objs = many(PACK_MIN + 10, "packed");
+        let pairs: Vec<_> = objs.iter().map(|o| (o.id(), o.clone())).collect();
+        s.put_many_trusted(pairs.clone()).await.unwrap();
+        let files = pack_files(dir.path());
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(files[0].ends_with(".idx") && files[1].ends_with(".pack"));
+        assert!(!object_path(dir.path(), &objs[0].id()).exists(), "not loose");
+        let ids: Vec<_> = objs.iter().map(|o| o.id()).collect();
+        let check = |got: Vec<Option<EncodedObject>>| {
+            assert!(got.iter().zip(&objs).all(|(g, o)| g.as_ref() == Some(o)));
+        };
+        check(s.get_many(&ids).await.unwrap());
+        assert!(s.has_many(&ids).await.unwrap().iter().all(|p| *p));
+        let t = DiskObjectStore::open(dir.path(), u64::MAX).unwrap();
+        check(t.get_many(&ids).await.unwrap());
+        let st = t.stats().await.unwrap();
+        assert_eq!(st.objects, objs.len() as u64);
+        // Storing them again writes nothing new.
+        s.put_many_trusted(pairs).await.unwrap();
+        s.put_many(&objs).await.unwrap();
+        assert_eq!(pack_files(dir.path()).len(), 2);
+    }
+
+    /// A handle that loaded the packs before another one wrote a new pack
+    /// still finds its objects (the directory is listed again on a miss).
+    #[tokio::test]
+    async fn packs_written_by_another_handle_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let reader = DiskObjectStore::open(dir.path(), u64::MAX).unwrap();
+        let first = many(PACK_MIN, "first");
+        reader.put_many(&first).await.unwrap();
+        assert!(reader.get(&first[0].id()).await.unwrap().is_some());
+        let writer = DiskObjectStore::open(dir.path(), u64::MAX).unwrap();
+        let second = many(PACK_MIN * 2, "second");
+        writer.put_many(&second).await.unwrap();
+        let ids: Vec<_> = second.iter().map(|o| o.id()).collect();
+        assert!(reader.has_many(&ids).await.unwrap().iter().all(|p| *p));
+        let got = reader.get_many(&ids).await.unwrap();
+        assert!(got.iter().zip(&second).all(|(g, o)| g.as_ref() == Some(o)));
+    }
+
+    /// Packs count toward the budget and are evicted whole, least recently
+    /// used first, index before pack; a reader that loses its pack sees
+    /// misses, not errors.
+    #[tokio::test]
+    async fn packs_are_evicted_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = DiskObjectStore::open(dir.path(), u64::MAX)
+            .unwrap()
+            .with_touch_interval(Duration::ZERO);
+        let a: Vec<_> = (0..PACK_MIN as u64).map(|i| blob(i, 1000)).collect();
+        let b: Vec<_> = (0..PACK_MIN as u64).map(|i| blob(10_000 + i, 1000)).collect();
+        s.put_many(&a).await.unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        s.put_many(&b).await.unwrap();
+        let st = s.stats().await.unwrap();
+        assert_eq!(st.objects, 2 * PACK_MIN as u64);
+        // Reading `a` makes it the more recently used pack.
+        std::thread::sleep(Duration::from_millis(20));
+        s.get_many(&a.iter().map(|o| o.id()).collect::<Vec<_>>()).await.unwrap();
+        let r = s.evict_to(st.bytes / 2 + 1).await.unwrap();
+        assert_eq!(r.removed, PACK_MIN as u64);
+        assert_eq!(r.objects, PACK_MIN as u64);
+        assert_eq!(pack_files(dir.path()).len(), 2);
+        assert!(s.get(&a[0].id()).await.unwrap().is_some(), "recently read pack kept");
+        assert!(s.get(&b[0].id()).await.unwrap().is_none(), "evicted pack is a miss");
+        let r = s.evict_to(0).await.unwrap();
+        assert_eq!((r.objects, r.bytes), (0, 0));
+        assert!(s.get(&a[0].id()).await.unwrap().is_none());
+        assert!(pack_files(dir.path()).is_empty());
+        // Stored again after eviction (this handle still remembers the old
+        // pack's index): written anew and readable.
+        assert!(!s.has_many(&[b[0].id()]).await.unwrap()[0]);
+        s.put_many(&b).await.unwrap();
+        assert_eq!(s.get(&b[0].id()).await.unwrap().as_ref(), Some(&b[0]));
+        assert_eq!(pack_files(dir.path()).len(), 2);
+    }
+
+    /// Interrupted pack writes are never read and are cleared after an hour;
+    /// a corrupt index is ignored (its objects are misses).
+    #[tokio::test]
+    async fn torn_and_corrupt_packs_are_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = DiskObjectStore::open(dir.path(), u64::MAX).unwrap();
+        let objs = many(PACK_MIN, "torn");
+        s.put_many(&objs).await.unwrap();
+        let packs = dir.path().join(crate::pack::DIR);
+        let idx = pack_files(dir.path()).into_iter().find(|n| n.ends_with(".idx")).unwrap();
+        // Corrupt index: a fresh handle loads nothing from it.
+        std::fs::write(packs.join(&idx), b"ANTPIDX1junk").unwrap();
+        let t = DiskObjectStore::open(dir.path(), u64::MAX).unwrap();
+        assert!(t.get(&objs[0].id()).await.unwrap().is_none());
+        // A pack without an index (crash before the index was renamed) and
+        // a temp file: invisible, then removed once old.
+        std::fs::remove_file(packs.join(&idx)).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(7200);
+        for name in pack_files(dir.path()) {
+            File::options().write(true).open(packs.join(name)).unwrap().set_modified(old).unwrap();
+        }
+        std::fs::write(packs.join(".tmp.x.pack"), b"partial").unwrap();
+        File::options()
+            .write(true)
+            .open(packs.join(".tmp.x.pack"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let u = DiskObjectStore::open(dir.path(), u64::MAX).unwrap();
+        assert!(u.get(&objs[0].id()).await.unwrap().is_none());
+        u.evict_to(u64::MAX).await.unwrap();
+        assert!(pack_files(dir.path()).is_empty(), "{:?}", pack_files(dir.path()));
     }
 
     #[tokio::test]

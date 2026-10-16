@@ -1738,6 +1738,13 @@ async fn tree_bundles_when_the_root_zone_is_restricted() {
     let r = get_bundle(&s, &shared.id(), Some("t-insider")).await;
     assert_eq!(r.cache, "public, max-age=31536000, immutable");
     assert_eq!(r.ids, [shared.id(), hidden.id()]);
+    // The insider's public bundle is now in the server's bundle cache; the
+    // outsider is still not served it (nor anything it cannot read).
+    let again = get_bundle(&s, &shared.id(), Some("t-insider")).await;
+    assert_eq!(again.body, r.body, "served from the bundle cache unchanged");
+    let r = get_bundle(&s, &shared.id(), Some("t-outsider")).await;
+    assert_eq!(r.cache, "private, no-store");
+    assert_eq!(r.ids, [shared.id()]);
 
     let trees = [root.id(), docs.id(), src.id(), shared.id()];
     check_bundle_invariants(&s, &policy, &trees, &["t-outsider", "t-insider"]).await;

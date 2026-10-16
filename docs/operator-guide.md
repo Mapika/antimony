@@ -184,7 +184,7 @@ memory otherwise lingers in per-thread arenas and a full git clone's peak RSS
 is far above its live heap. On glibc you can also set `ANT_MALLOC_TRIM_SECS=<n>` to call
 `malloc_trim` every n seconds (off by default) if RSS stays high after bursts.
 `GET /debug/stats` on the HTTP port prints cache entries and budgets, land
-queue counts and running history catch-ups as one JSON line. Without a policy
+queue counts, running history catch-ups and the tree-bundle cache (`bundle_cache`: entries, bytes, budget, hits and misses) as one JSON line. Without a policy
 it is open; with `--policy` it needs an admin token (`Authorization: Bearer
 <token>`, or Basic with the token as password): `401` without a valid token,
 `403` for a non-admin principal. It is not available on the `--metrics-listen`

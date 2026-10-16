@@ -282,6 +282,16 @@ immediately.
   (under one core); idle 16 MiB RSS and no CPU; under 50 agents 170–300
   MiB; git/git import about 6,000 commits/s; checkouts and queries as fast
   as on Postgres + S3.
+- **Tree bundles:** the server keeps recently served `GET /t/` bundles in
+  memory (`--bundle-cache-mib` / `ANT_BUNDLE_CACHE_MIB`, default 1024, 64
+  in local mode, 0 = off; least recently used first, entries expire like
+  the other server caches). Building a bundle reads every object of a
+  directory subtree from the store; with the cache a fleet checking out the
+  same commit pays that once. A 96k-file, 1.4 GiB checkout is about 525 MiB
+  of bundles. Bundles that hid something from the caller are not cached;
+  under a policy a cached bundle is served only to callers who may read all
+  of it. A cache tier (`ant cache-serve`) in front shares bundles across
+  servers as well.
 - **Clients:** the shared disk cache defaults to 20 GiB
   (`--cache-bytes` / `ANT_CACHE_BYTES`). Sparse workspaces keep checkouts
   proportional to what an agent actually touches.

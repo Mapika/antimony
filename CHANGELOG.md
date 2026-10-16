@@ -8,7 +8,48 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+### Changed
+
+- **Network checkout**: a 96k-file, 1.4 GiB checkout over Hetzner's private
+  network now takes 2.9 s cold and 1.8 s warm, down from 14.4 s and 3.5 s.
+  The client uses 13 CPU-s instead of 43. Adding 30 ms of RTT costs about
+  0.1 s (`docs/scorecard/2026-10-16-hetzner-ccx43-ccx33-checkout.md`).
+  - `Workspace::materialize` overlaps the tree walk, the fetches and the
+    file writes. Subtrees are requested as soon as their parent is decoded,
+    with no wait between levels. Files come straight from the downloaded
+    tree bundles, without reading the cache back.
+  - HTTP requests are bounded per client (64), across all of its
+    concurrent calls.
+- **Client disk cache**: batches of 64 or more objects (tree bundles,
+  batched fetches) are stored as one pack plus an index under
+  `<cache>/packs/`, instead of one compressed file per object.
+  - Pack records are uncompressed: they use more disk and less CPU.
+  - Eviction removes whole packs, least recently used first. `ant cache
+    stats/gc` count the objects inside them.
+  - The change is additive and the cache format stays 1. Older binaries
+    ignore `packs/` and fetch what they miss
+    (`docs/compatibility.md`).
+
 ### Added
+
+- `ant serve --bundle-cache-mib` (`ANT_BUNDLE_CACHE_MIB`): an in-memory
+  cache of served tree bundles.
+  - Default 1024, 64 in local mode, 0 turns it off.
+  - Entries expire like the other server caches.
+  - Under a policy, a cached bundle is served only to callers who may read
+    all of it.
+  - A fleet checking out one commit has each bundle built once: 6.2 s for
+    the first cold checkout above, 2.9 s for the later ones.
+  - `/debug/stats` reports it (`bundle_cache`).
+- Bundle builds that run at the same time share their store reads, so the
+  reads land close together in S3 packs. A cold server is about 20% faster.
+- `ant-bench netem` adds round-trip time and an optional bandwidth cap to a
+  TCP relay; `ant-bench checkout --rtt-ms/--mbit` uses it. Together they
+  emulate a WAN locally, without root.
+- `scripts/checkout-bench.sh` measures the network checkout. It runs per
+  build and per added RTT, optionally against a baseline build. Use it
+  locally or via `scripts/remote-bench.sh --what checkout --extra-bins
+  NAME=DIR`.
 
 - **Local mode**: `ant serve --local [<dir>]` keeps refs, metadata and small
   objects in SQLite (WAL, one writer thread with group commit) and large

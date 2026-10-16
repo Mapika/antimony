@@ -17,6 +17,7 @@ pub mod claim;
 pub mod disk;
 pub mod files;
 pub mod ignore;
+mod pack;
 mod par;
 pub mod readthrough;
 pub mod remote;

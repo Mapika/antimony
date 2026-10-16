@@ -1,6 +1,5 @@
 //! Writing tree entries to disk: materializing, resetting and updating.
 
-use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -17,7 +16,6 @@ use futures::StreamExt;
 use super::index::{Entry, stat_of};
 use super::sparse::Matcher;
 use crate::files::file_perm;
-use crate::par::par_map;
 use crate::walk::BATCH;
 
 /// Batches fetched and written concurrently.
@@ -39,51 +37,6 @@ pub(super) fn prepare_empty_dir(dir: &Path) -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     }
     fs::create_dir_all(dir)?;
-    Ok(())
-}
-
-/// Directories that must exist for `leaves`: every parent plus its ancestors,
-/// as repo-relative paths grouped by depth (parents before children), each
-/// level sorted so siblings are adjacent.
-pub(super) fn leaf_dirs(leaves: &[(RepoPath, EntryMode, ObjectId)]) -> Vec<Vec<String>> {
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut levels: Vec<Vec<String>> = Vec::new();
-    for (path, _, _) in leaves {
-        let mut cur = path.as_str().rsplit_once('/').map(|(parent, _)| parent);
-        while let Some(d) = cur {
-            if !seen.insert(d) {
-                break; // it and all its ancestors are already listed
-            }
-            let depth = d.matches('/').count();
-            if levels.len() <= depth {
-                levels.resize_with(depth + 1, Vec::new);
-            }
-            levels[depth].push(d.to_string());
-            cur = d.rsplit_once('/').map(|(parent, _)| parent);
-        }
-    }
-    for level in &mut levels {
-        level.sort_unstable();
-    }
-    levels
-}
-
-/// Blocking: create `levels` of directories under `dir`, one level at a time,
-/// each level in parallel (siblings stay on one thread, so their shared
-/// parent directory is not contended).
-pub(super) fn create_dirs(dir: &Path, levels: &[Vec<String>]) -> anyhow::Result<()> {
-    for level in levels {
-        let results = par_map(level, 64, |d| {
-            let full = dir.join(d);
-            match fs::create_dir(&full) {
-                Err(e) if e.kind() != ErrorKind::AlreadyExists => {
-                    Err(e).with_context(|| format!("creating {}", full.display()))
-                }
-                _ => Ok(()),
-            }
-        });
-        results.into_iter().collect::<anyhow::Result<()>>()?;
-    }
     Ok(())
 }
 
@@ -180,20 +133,32 @@ pub(super) fn write_file(
     Ok(f.metadata()?)
 }
 
+/// Where [`write_items`] writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Dest {
+    /// A new workspace: nothing exists at the destinations.
+    Fresh,
+    /// An existing workspace: whatever is at a destination is replaced.
+    Existing,
+}
+
 /// Blocking: write items under `dir`. Returns the index entry per item;
-/// gitlinks produce `None` (empty directory, not indexed). `fresh`: nothing
-/// can exist at the destinations (new workspace), so skip clearing them.
+/// gitlinks produce `None` (empty directory, not indexed). Missing parent
+/// directories are created (items arrive grouped by directory). In a
+/// [`Dest::Fresh`] workspace nothing can exist at the destinations, so they
+/// are not cleared first.
 pub(super) fn write_items(
     dir: &Path,
     items: Vec<WriteItem>,
-    fresh: bool,
+    dest: Dest,
 ) -> anyhow::Result<Written> {
+    let fresh = dest == Dest::Fresh;
     let mut out = Vec::with_capacity(items.len());
     let mut last_dir: Option<PathBuf> = None;
     for it in items {
         let key = it.path.as_str().to_string();
         let full = dir.join(&key);
-        if let (false, Some(parent)) = (fresh, full.parent()) {
+        if let Some(parent) = full.parent() {
             ensure_dir(parent, &mut last_dir)?;
         }
         if !fresh {
@@ -233,34 +198,10 @@ pub(super) async fn write_leaves(
     objects: &dyn ObjectStore,
     dir: &Path,
     leaves: &[(RepoPath, EntryMode, ObjectId)],
-    fresh: bool,
+    dest: Dest,
 ) -> anyhow::Result<Written> {
     let batches: Vec<anyhow::Result<Written>> = futures::stream::iter(leaves.chunks(BATCH))
-        .map(|chunk| async move {
-            let ids: Vec<ObjectId> = chunk
-                .iter()
-                .filter(|(_, mode, _)| *mode != EntryMode::Gitlink)
-                .map(|(_, _, id)| *id)
-                .collect();
-            let fetched: Vec<Option<EncodedObject>> =
-                if ids.is_empty() { Vec::new() } else { objects.get_many(&ids).await? };
-            let mut fetched = fetched.into_iter();
-            let mut items = Vec::with_capacity(chunk.len());
-            for (path, mode, id) in chunk {
-                let body = if *mode == EntryMode::Gitlink {
-                    Bytes::new()
-                } else {
-                    let obj = fetched
-                        .next()
-                        .flatten()
-                        .ok_or_else(|| anyhow!("missing blob {id} for {path}"))?;
-                    blob_body(&obj, id)?
-                };
-                items.push(WriteItem { path: path.clone(), mode: *mode, id: *id, body });
-            }
-            let d = dir.to_path_buf();
-            tokio::task::spawn_blocking(move || write_items(&d, items, fresh)).await?
-        })
+        .map(|chunk| fetch_and_write(objects, dir, chunk, dest))
         .buffer_unordered(WRITE_CONCURRENCY)
         .collect()
         .await;
@@ -269,6 +210,37 @@ pub(super) async fn write_leaves(
         out.extend(b?);
     }
     Ok(out)
+}
+
+/// Fetch the blobs of `chunk` with one `get_many` and write them (gitlinks
+/// need no fetch).
+pub(super) async fn fetch_and_write(
+    objects: &dyn ObjectStore,
+    dir: &Path,
+    chunk: &[(RepoPath, EntryMode, ObjectId)],
+    dest: Dest,
+) -> anyhow::Result<Written> {
+    let ids: Vec<ObjectId> = chunk
+        .iter()
+        .filter(|(_, mode, _)| *mode != EntryMode::Gitlink)
+        .map(|(_, _, id)| *id)
+        .collect();
+    let fetched: Vec<Option<EncodedObject>> =
+        if ids.is_empty() { Vec::new() } else { objects.get_many(&ids).await? };
+    let mut fetched = fetched.into_iter();
+    let mut items = Vec::with_capacity(chunk.len());
+    for (path, mode, id) in chunk {
+        let body = if *mode == EntryMode::Gitlink {
+            Bytes::new()
+        } else {
+            let obj =
+                fetched.next().flatten().ok_or_else(|| anyhow!("missing blob {id} for {path}"))?;
+            blob_body(&obj, id)?
+        };
+        items.push(WriteItem { path: path.clone(), mode: *mode, id: *id, body });
+    }
+    let d = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || write_items(&d, items, dest)).await?
 }
 
 pub(super) type Expanded = (Vec<(RepoPath, ObjectId)>, Vec<(RepoPath, EntryMode, ObjectId)>);

@@ -16,6 +16,9 @@
 //!   bundles, storing every bundled object (already verified by `remote`)
 //!   locally, so the walk's later reads of their blobs and subtrees are
 //!   local hits. Trees that no bundle delivered go through `get_many`.
+//!   [`ReadThrough::get_trees_bundled_with_contents`] also hands the bundled
+//!   objects to the caller (a checkout writes them out without reading them
+//!   back).
 //! - In-flight dedup: concurrent `get_many` calls that miss on the same id
 //!   trigger only one upstream fetch for it (a map of shared futures).
 //! - Cross-process dedup (`over_disk`, on by default;
@@ -156,15 +159,26 @@ impl ReadThrough {
         &self,
         trees: &[ObjectId],
     ) -> Result<Vec<Option<EncodedObject>>> {
+        Ok(self.get_trees_bundled_with_contents(trees).await?.0)
+    }
+
+    /// [`Self::get_trees_bundled`], also returning the other objects the
+    /// bundles this call fetched delivered (blobs and subtrees, verified and
+    /// already stored locally), so a walk can use them without reading them
+    /// back from the cache.
+    pub async fn get_trees_bundled_with_contents(
+        &self,
+        trees: &[ObjectId],
+    ) -> Result<(Vec<Option<EncodedObject>>, Vec<(ObjectId, EncodedObject)>)> {
         let Some(remote) = self.bundles.as_ref().filter(|r| r.tree_bundles_enabled()) else {
-            return self.get_many(trees).await;
+            return Ok((self.get_many(trees).await?, Vec::new()));
         };
         let mut out = self.local.get_many(trees).await?;
         self.stats.add(&self.stats.local_hits, out.iter().flatten().count());
         let mut misses: Vec<ObjectId> =
             trees.iter().zip(&out).filter(|(_, o)| o.is_none()).map(|(id, _)| *id).collect();
         if misses.is_empty() {
-            return Ok(out);
+            return Ok((out, Vec::new()));
         }
         misses.sort_unstable();
         misses.dedup();
@@ -228,7 +242,9 @@ impl ReadThrough {
                 }
             }
         }
-        drop(fetched);
+        let requested: HashSet<&ObjectId> = trees.iter().collect();
+        let extra: Vec<(ObjectId, EncodedObject)> =
+            fetched.into_iter().filter(|(id, _)| !requested.contains(id)).collect();
         if !rest.is_empty() {
             let got: HashMap<ObjectId, EncodedObject> = rest
                 .iter()
@@ -242,7 +258,7 @@ impl ReadThrough {
                 }
             }
         }
-        Ok(out)
+        Ok((out, extra))
     }
 
     /// Declare that `upstream` already hash-verifies every object it returns
@@ -523,6 +539,13 @@ impl Drop for ReadThrough {
 impl DirFetch for ReadThrough {
     async fn get_dirs(&self, trees: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
         self.get_trees_bundled(trees).await
+    }
+
+    async fn get_dirs_with_contents(
+        &self,
+        trees: &[ObjectId],
+    ) -> Result<(Vec<Option<EncodedObject>>, Vec<(ObjectId, EncodedObject)>)> {
+        self.get_trees_bundled_with_contents(trees).await
     }
 }
 

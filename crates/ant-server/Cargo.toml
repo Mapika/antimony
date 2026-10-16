@@ -23,6 +23,7 @@ futures.workspace = true
 http.workspace = true
 http-body.workspace = true
 libc.workspace = true
+lru.workspace = true
 pin-project-lite.workspace = true
 prometheus-client.workspace = true
 thiserror.workspace = true

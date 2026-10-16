@@ -269,6 +269,7 @@ dependencies = [
  "http 1.5.0",
  "http-body 1.1.0",
  "libc",
+ "lru 0.16.4",
  "pin-project-lite",
  "prometheus-client",
  "prometheus-parse",

@@ -88,6 +88,11 @@ pub struct ServeArgs {
     #[arg(long, env = "ANT_CACHE_MIB")]
     pub cache_mib: Option<usize>,
 
+    /// Budget of the in-memory cache of served tree bundles (`GET /t/`),
+    /// MiB; 0 turns it off (default 1024; 64 in local mode).
+    #[arg(long, env = "ANT_BUNDLE_CACHE_MIB")]
+    pub bundle_cache_mib: Option<usize>,
+
     #[command(flatten)]
     pub limits: LimitArgs,
 
@@ -102,6 +107,8 @@ pub const LOCAL_WORKER_THREADS: usize = 4;
 pub const LOCAL_BLOCKING_THREADS: usize = 64;
 /// Server cache budget in local mode, MiB.
 pub const LOCAL_CACHE_MIB: usize = 48;
+/// Bundle cache budget in local mode, MiB (`--bundle-cache-mib`).
+pub const LOCAL_BUNDLE_CACHE_MIB: usize = 64;
 
 impl ServeArgs {
     /// Async worker threads: `--worker-threads`, else in local mode
@@ -201,6 +208,11 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let cache_mib = args.cache_mib.or(args.store.is_local().then_some(LOCAL_CACHE_MIB));
     if let Some(mib) = cache_mib {
         crate::ops::set_cache_budget(mib.saturating_mul(1 << 20));
+    }
+    let bundle_mib =
+        args.bundle_cache_mib.or(args.store.is_local().then_some(LOCAL_BUNDLE_CACHE_MIB));
+    if let Some(mib) = bundle_mib {
+        crate::bundle::set_cache_bytes(mib.saturating_mul(1 << 20));
     }
     let started = std::time::Instant::now();
     let (backend, probes) = args.store.backend_with_probes().await?;

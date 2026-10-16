@@ -16,11 +16,20 @@
 //! left out; a subdirectory with any hidden object (its tree or any blob it
 //! lists) is left out together with everything below it, so the client asks
 //! for that directory with its own request.
+//!
+//! [`BundleCache`] keeps recently served encoded bundles in memory, so a
+//! fleet checking out the same commit has its bundles built (read from the
+//! store and compressed) once, not once per checkout. [`Coalescer`] merges
+//! the store reads of bundles built at the same time.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use ant_core::{EncodedObject, ObjectId, ObjectKind, Tree};
 use ant_store::{ObjectStore, StoreError};
+use bytes::Bytes;
 
 /// Size limits of one bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +260,269 @@ pub fn select(units: &[Unit], hidden: &HashSet<ObjectId>) -> Vec<(ObjectId, Enco
     out
 }
 
+/// Ids per merged read at most.
+const COALESCE_MAX_IDS: usize = 16 * 1024;
+/// How long a read waits for others to join it while reads are in flight.
+const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(2);
+
+type Shared = std::result::Result<Arc<Vec<Option<EncodedObject>>>, Arc<String>>;
+
+/// One merged read being collected.
+struct Batch {
+    ids: Vec<ObjectId>,
+    tx: tokio::sync::watch::Sender<Option<Shared>>,
+}
+
+/// An [`ObjectStore`] reader that merges concurrent `get_many` calls into
+/// one call of the store below (group-commit style): a call that finds other
+/// reads in flight waits [`COALESCE_WINDOW`] for more ids to join it. Many
+/// bundles are built at once during a checkout, each reading a few hundred
+/// objects; merged, the reads of a pack-backed store land close together in
+/// its packs and share ranged reads, instead of one request per object.
+pub struct Coalescer {
+    inner: Arc<dyn ObjectStore>,
+    open: std::sync::Mutex<Option<Arc<std::sync::Mutex<Batch>>>>,
+    in_flight: AtomicUsize,
+}
+
+impl Coalescer {
+    pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self { inner, open: std::sync::Mutex::new(None), in_flight: AtomicUsize::new(0) }
+    }
+
+    /// `get_many` of the store below, merged with concurrent calls.
+    pub async fn get_many(
+        &self,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<EncodedObject>>, StoreError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Join the open batch if there is room.
+        let joined = {
+            let open = crate::lock(&self.open);
+            match open.as_ref() {
+                Some(b) => {
+                    let mut batch = crate::lock(b);
+                    (batch.ids.len() + ids.len() <= COALESCE_MAX_IDS).then(|| {
+                        let start = batch.ids.len();
+                        batch.ids.extend_from_slice(ids);
+                        (start, batch.tx.subscribe())
+                    })
+                }
+                None => None,
+            }
+        };
+        if let Some((start, mut rx)) = joined {
+            let res = rx
+                .wait_for(Option::is_some)
+                .await
+                .map_err(|e| StoreError::backend(std::io::Error::other(e.to_string())))?
+                .clone();
+            return match res {
+                Some(Ok(all)) => Ok(all[start..start + ids.len()].to_vec()),
+                Some(Err(e)) => Err(StoreError::backend(std::io::Error::other(e.to_string()))),
+                None => Err(StoreError::backend(std::io::Error::other("merged read lost"))),
+            };
+        }
+        // Lead a new batch.
+        let (tx, _) = tokio::sync::watch::channel(None);
+        let batch = Arc::new(std::sync::Mutex::new(Batch { ids: ids.to_vec(), tx }));
+        *crate::lock(&self.open) = Some(batch.clone());
+        if self.in_flight.load(Ordering::Relaxed) > 0 {
+            tokio::time::sleep(COALESCE_WINDOW).await;
+        }
+        {
+            let mut open = crate::lock(&self.open);
+            if open.as_ref().is_some_and(|b| Arc::ptr_eq(b, &batch)) {
+                *open = None;
+            }
+        }
+        // No one can join any more: joining happens through `open` only.
+        let all = std::mem::take(&mut crate::lock(&batch).ids);
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        let got = self.inner.get_many(&all).await;
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let shared: Shared = match &got {
+            Ok(v) if v.len() == all.len() => Ok(Arc::new(v.clone())),
+            Ok(_) => Err(Arc::new("store returned a wrong number of objects".to_owned())),
+            Err(e) => Err(Arc::new(e.to_string())),
+        };
+        let mine = shared.as_ref().ok().map(|v| v[..ids.len()].to_vec());
+        crate::lock(&batch).tx.send_replace(Some(shared));
+        match (got, mine) {
+            (Ok(_), Some(mine)) => Ok(mine),
+            (Err(e), _) => Err(e),
+            (Ok(_), None) => Err(StoreError::backend(std::io::Error::other(
+                "store returned a wrong number of objects",
+            ))),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for Coalescer {
+    async fn get_many(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>, StoreError> {
+        Coalescer::get_many(self, ids).await
+    }
+    async fn put_many(&self, objects: &[EncodedObject]) -> Result<(), StoreError> {
+        self.inner.put_many(objects).await
+    }
+    async fn has_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, StoreError> {
+        self.inner.has_many(ids).await
+    }
+}
+
+/// Default [`BundleCache`] budget (`ant serve --bundle-cache-mib`).
+pub const DEFAULT_CACHE_BYTES: usize = 1 << 30;
+
+static CACHE_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_CACHE_BYTES);
+static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Budget of the bundle caches created from now on (0 turns them off).
+pub fn set_cache_bytes(bytes: usize) {
+    CACHE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// Bundle cache lookups so far, process-wide: (hits, misses).
+pub fn cache_lookups() -> (u64, u64) {
+    (CACHE_HITS.load(Ordering::Relaxed), CACHE_MISSES.load(Ordering::Relaxed))
+}
+
+/// One cached response body.
+#[derive(Debug)]
+pub struct CachedBundle {
+    /// The encoded (compressed) bundle, exactly as served.
+    pub body: Bytes,
+    /// Every object whose visibility decided the response (the units'
+    /// objects and every blob they list), sorted: a caller under an access
+    /// policy is served this body only if it may read all of them.
+    pub ids: Vec<ObjectId>,
+    at: Instant,
+}
+
+impl CachedBundle {
+    fn weight(&self) -> usize {
+        256 + self.body.len() + self.ids.len() * 32
+    }
+}
+
+/// Encoded bundles that held every object their units selected (nothing was
+/// hidden, served `public`), by tree; least recently used evicted first,
+/// within a byte budget. A bundle is a function of its tree id, but entries
+/// still expire after [`crate::ops::cache_max_age`] like the server's other
+/// caches, so garbage collection's quiesce wait covers them too: no
+/// condemned object is served from here after it.
+pub struct BundleCache {
+    budget: usize,
+    inner: std::sync::Mutex<Lru>,
+}
+
+struct Lru {
+    map: lru::LruCache<ObjectId, Arc<CachedBundle>>,
+    bytes: usize,
+}
+
+impl std::fmt::Debug for BundleCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = crate::lock(&self.inner);
+        f.debug_struct("BundleCache")
+            .field("budget", &self.budget)
+            .field("entries", &inner.map.len())
+            .field("bytes", &inner.bytes)
+            .finish()
+    }
+}
+
+impl Default for BundleCache {
+    /// A cache with the budget set by [`set_cache_bytes`].
+    fn default() -> Self {
+        Self::new(CACHE_BYTES.load(Ordering::Relaxed))
+    }
+}
+
+impl BundleCache {
+    pub fn new(budget: usize) -> Self {
+        Self {
+            budget,
+            inner: std::sync::Mutex::new(Lru { map: lru::LruCache::unbounded(), bytes: 0 }),
+        }
+    }
+
+    /// The cached bundle of `tree`, unless absent or expired.
+    pub fn get(&self, tree: &ObjectId) -> Option<Arc<CachedBundle>> {
+        if self.budget == 0 {
+            return None;
+        }
+        let mut inner = crate::lock(&self.inner);
+        let hit = match inner.map.get(tree) {
+            Some(c) if c.at.elapsed() < crate::ops::cache_max_age() => Some(c.clone()),
+            Some(_) => {
+                if let Some(old) = inner.map.pop(tree) {
+                    inner.bytes -= old.weight();
+                }
+                None
+            }
+            None => None,
+        };
+        drop(inner);
+        let counter = if hit.is_some() { &CACHE_HITS } else { &CACHE_MISSES };
+        counter.fetch_add(1, Ordering::Relaxed);
+        hit
+    }
+
+    /// Remember `body` as the bundle of `tree` (`ids`: see
+    /// [`CachedBundle::ids`]). Bodies over a quarter of the budget are not
+    /// kept.
+    pub fn insert(&self, tree: ObjectId, body: Bytes, mut ids: Vec<ObjectId>) {
+        if self.budget == 0 {
+            return;
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let entry = Arc::new(CachedBundle { body, ids, at: Instant::now() });
+        let weight = entry.weight();
+        if weight > self.budget / 4 {
+            return;
+        }
+        let mut inner = crate::lock(&self.inner);
+        if let Some(old) = inner.map.put(tree, entry) {
+            inner.bytes -= old.weight();
+        }
+        inner.bytes += weight;
+        while inner.bytes > self.budget {
+            match inner.map.pop_lru() {
+                Some((_, old)) => inner.bytes -= old.weight(),
+                None => break,
+            }
+        }
+    }
+
+    /// The byte budget (0: off).
+    pub fn budget(&self) -> usize {
+        self.budget
+    }
+
+    /// Entries and bytes held.
+    pub fn usage(&self) -> (usize, usize) {
+        let inner = crate::lock(&self.inner);
+        (inner.map.len(), inner.bytes)
+    }
+}
+
+/// The objects whose visibility decides the response for `units` (see
+/// [`CachedBundle::ids`]), sorted and deduplicated.
+pub fn visibility_ids(units: &[Unit]) -> Vec<ObjectId> {
+    let mut ids: Vec<ObjectId> = units
+        .iter()
+        .flat_map(|u| u.ids().copied().chain(u.refs.iter().copied()).collect::<Vec<_>>())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +656,80 @@ mod tests {
         assert!(!got.contains(&ids["deep"]) && !got.contains(&ids["c"]));
         assert!(got.contains(&ids["sub"]) && got.contains(&ids["b"]));
         assert_eq!(ids_of(&[])[0], root);
+    }
+
+    #[test]
+    fn cache_keeps_recent_bundles_within_budget() {
+        let body = |n: usize| Bytes::from(vec![7u8; n]);
+        let t = |i: u8| ObjectId([i; 32]);
+        let cache = BundleCache::new(4 * 1024);
+        cache.insert(t(1), body(700), vec![t(9), t(9), t(8)]);
+        let hit = cache.get(&t(1)).unwrap();
+        assert_eq!(hit.body.len(), 700);
+        assert_eq!(hit.ids, vec![t(8), t(9)], "sorted and deduplicated");
+        cache.insert(t(2), body(700), vec![]);
+        cache.insert(t(3), body(700), vec![]);
+        cache.get(&t(1)); // most recently used now
+        cache.insert(t(4), body(700), vec![]);
+        cache.insert(t(5), body(700), vec![]);
+        assert!(cache.usage().1 <= 4 * 1024);
+        assert!(cache.get(&t(1)).is_some(), "recently used survives");
+        assert!(cache.get(&t(2)).is_none(), "least recently used went first");
+        // Too large for the budget: not kept. A zero budget keeps nothing.
+        cache.insert(t(6), body(2000), vec![]);
+        assert!(cache.get(&t(6)).is_none());
+        let off = BundleCache::new(0);
+        off.insert(t(1), body(10), vec![]);
+        assert!(off.get(&t(1)).is_none());
+    }
+
+    /// Concurrent reads through a [`Coalescer`] get exactly their own
+    /// objects (in order, misses as `None`), and overlapping calls share
+    /// store calls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coalesced_reads_return_each_callers_objects() {
+        struct Counting(MemoryObjectStore, AtomicUsize);
+        #[async_trait::async_trait]
+        impl ObjectStore for Counting {
+            async fn get_many(
+                &self,
+                ids: &[ObjectId],
+            ) -> Result<Vec<Option<EncodedObject>>, StoreError> {
+                self.1.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                self.0.get_many(ids).await
+            }
+            async fn put_many(&self, objects: &[EncodedObject]) -> Result<(), StoreError> {
+                self.0.put_many(objects).await
+            }
+            async fn has_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>, StoreError> {
+                self.0.has_many(ids).await
+            }
+        }
+        let store = Arc::new(Counting(MemoryObjectStore::default(), AtomicUsize::new(0)));
+        let objs: Vec<EncodedObject> = (0..400).map(|i| blob(&format!("o{i}"))).collect();
+        store.put_many(&objs).await.unwrap();
+        let c = Arc::new(Coalescer::new(store.clone()));
+        let tasks: Vec<_> = (0..40)
+            .map(|k| {
+                let (c, objs) = (c.clone(), objs.clone());
+                tokio::spawn(async move {
+                    let mut ids: Vec<ObjectId> =
+                        objs[k * 10..k * 10 + 10].iter().map(|o| o.id()).collect();
+                    ids.push(ObjectId([k as u8; 32]));
+                    let got = c.get_many(&ids).await.unwrap();
+                    assert_eq!(got.len(), 11);
+                    for (g, o) in got.iter().zip(&objs[k * 10..k * 10 + 10]) {
+                        assert_eq!(g.as_ref(), Some(o));
+                    }
+                    assert!(got[10].is_none());
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let calls = store.1.load(Ordering::Relaxed);
+        assert!(calls < 40, "reads were merged: {calls} store calls for 40 reads");
     }
 }
