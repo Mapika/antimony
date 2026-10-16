@@ -155,6 +155,10 @@ impl RefLockRelease for CountingLock {
         self.inner.can_publish()
     }
 
+    async fn contended(&mut self) -> ant_store::Result<bool> {
+        self.inner.contended().await
+    }
+
     async fn publish(
         &mut self,
         expected: Option<ObjectId>,

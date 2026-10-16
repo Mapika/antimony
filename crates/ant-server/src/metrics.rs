@@ -257,7 +257,7 @@ pub struct Metrics {
     probes: Mutex<crate::health::Probes>,
     /// Cache lookup totals already folded into the counters (starts at the
     /// process-wide values when this `Metrics` is created).
-    cache_synced: Mutex<[(u64, u64); 4]>,
+    cache_synced: Mutex<[(u64, u64); 5]>,
 }
 
 impl Metrics {

@@ -244,14 +244,15 @@ impl BatchState {
         Ok(LandOutcome::Landed { new_tip: onto, rebased: true })
     }
 
-    /// The blobs `ids`, from this batch's blobs or one `get_many`.
+    /// The blobs `ids`, from this batch's blobs, the blob cache or one
+    /// `get_many`.
     async fn blobs(
         &self,
         b: &Backend,
         ids: BTreeSet<ObjectId>,
     ) -> OpResult<BTreeMap<ObjectId, EncodedObject>> {
         let mut blobs = BTreeMap::new();
-        let fetch: Vec<_> = ids
+        let unbuilt: Vec<_> = ids
             .into_iter()
             .filter(|id| match self.blobs.get(id) {
                 Some(blob) => {
@@ -261,8 +262,20 @@ impl BatchState {
                 None => true,
             })
             .collect();
+        let cached = cache::objects(&b.objects).blobs.get_many(&unbuilt);
+        let mut fetch = Vec::new();
+        for (id, blob) in unbuilt.into_iter().zip(cached) {
+            match blob {
+                Some(blob) => {
+                    blobs.insert(id, blob);
+                }
+                None => fetch.push(id),
+            }
+        }
         if !fetch.is_empty() {
-            for (id, object) in fetch.iter().copied().zip(b.objects.get_many(&fetch).await?) {
+            let fetched = b.objects.get_many(&fetch).await?;
+            cache::remember_blobs(b, fetched.iter().flatten());
+            for (id, object) in fetch.iter().copied().zip(fetched) {
                 let object = object.ok_or(StoreError::NotFound(id))?;
                 if object.kind() != ObjectKind::Blob {
                     return Err(StoreError::WrongKind {
@@ -404,11 +417,42 @@ impl BatchState {
         Ok(Ok(id))
     }
 
+    /// Start from what `predecessor` read and built (nodes, trees, blobs):
+    /// a batch replayed on an unpublished predecessor's tentative tip needs
+    /// its new commits and trees before they are written (and cached).
+    pub(super) fn seed(&mut self, predecessor: &BatchState) {
+        for (id, node) in &predecessor.nodes {
+            self.nodes.entry(*id).or_insert_with(|| node.clone());
+        }
+        for (id, tree) in &predecessor.trees {
+            self.trees.entry(*id).or_insert_with(|| tree.clone());
+        }
+        for (id, blob) in &predecessor.blobs {
+            self.blobs.entry(*id).or_insert_with(|| blob.clone());
+        }
+    }
+
     /// Write queued objects and record queued commits (parents first), then
     /// publish both to the store-scoped caches.
     pub(super) async fn flush(&mut self, b: &Backend) -> OpResult<()> {
-        let writes = std::mem::take(&mut self.writes);
-        if writes.commits.is_empty() && writes.objects.is_empty() {
+        self.take_writes().write(b).await
+    }
+
+    /// The queued objects and commit records, to write with [`Writes::write`].
+    pub(super) fn take_writes(&mut self) -> Writes {
+        std::mem::take(&mut self.writes)
+    }
+}
+
+impl Writes {
+    pub(super) fn is_empty(&self) -> bool {
+        self.commits.is_empty() && self.objects.is_empty()
+    }
+
+    /// See [`BatchState::flush`].
+    pub(super) async fn write(self, b: &Backend) -> OpResult<()> {
+        let writes = self;
+        if writes.is_empty() {
             return Ok(());
         }
         // Tags must be recorded before the objects are stored, one call per

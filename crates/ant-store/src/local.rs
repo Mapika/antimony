@@ -674,6 +674,10 @@ impl RefLockRelease for LocalRefLock {
         true
     }
 
+    async fn contended(&mut self) -> Result<bool> {
+        Ok(self.guard.as_ref().is_some_and(crate::memory::waiting))
+    }
+
     /// Move the ref and insert the derived rows in one durable transaction.
     /// Every write acknowledged before (deferred ones included) precedes it
     /// in the WAL, so its fsync makes them durable too.

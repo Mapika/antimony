@@ -23,25 +23,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use ant_core::{Commit, Object, ObjectId, ObjectKind, Tree};
+use ant_core::{Commit, EncodedObject, Object, ObjectId, ObjectKind, Tree};
 use ant_store::graph::TreeSource;
 use ant_store::{Backend, CommitNode, MetaStore, ObjectStore, PathChange, StoreError};
 
 use super::{OpError, OpResult};
 
 /// Cache names, indexed by [`Cache`] slot.
-pub(crate) const CACHE_NAMES: [&str; 4] = ["trees", "commits", "nodes", "changesets"];
+pub(crate) const CACHE_NAMES: [&str; 5] = ["trees", "commits", "nodes", "changesets", "blobs"];
 const TREES: usize = 0;
 const COMMITS: usize = 1;
 const NODES: usize = 2;
 const CHANGESETS: usize = 3;
+const BLOBS: usize = 4;
 
 /// Process-wide lookup counters per cache slot (all store instances). Plain
 /// relaxed atomics: the metrics endpoint reads them on scrape.
-static HITS: [AtomicU64; 4] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-static MISSES: [AtomicU64; 4] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HITS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static MISSES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Default lifetime of a cache entry.
 pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(600);
@@ -68,7 +67,7 @@ fn count(slot: usize, hits: usize, misses: usize) {
 }
 
 /// Cumulative `(hits, misses)` per cache, in [`CACHE_NAMES`] order.
-pub(crate) fn lookup_counters() -> [(u64, u64); 4] {
+pub(crate) fn lookup_counters() -> [(u64, u64); 5] {
     std::array::from_fn(|i| (HITS[i].load(Ordering::Relaxed), MISSES[i].load(Ordering::Relaxed)))
 }
 
@@ -198,6 +197,10 @@ pub(crate) fn tree_weight(tree: &Tree) -> usize {
 pub(crate) struct ObjectCaches {
     pub trees: Cache<ObjectId, Arc<Tree>>,
     pub commits: Cache<ObjectId, Arc<Commit>>,
+    /// Small blobs ([`BLOB_CACHE_MAX`]) that `create_changeset` wrote or a
+    /// land's text merge read: a land merging a file that agents keep
+    /// editing reads them without a store round trip.
+    pub blobs: Cache<ObjectId, EncodedObject>,
 }
 
 /// Caches scoped to one `MetaStore`: recorded commits only.
@@ -206,13 +209,17 @@ pub(crate) struct MetaCaches {
     pub changesets: Cache<ObjectId, Arc<Vec<PathChange>>>,
 }
 
-const TREE_BUDGET: usize = 64 << 20;
+const TREE_BUDGET: usize = 56 << 20;
 const COMMIT_BUDGET: usize = 8 << 20;
 const NODE_BUDGET: usize = 16 << 20;
 const CHANGESET_BUDGET: usize = 16 << 20;
+const BLOB_BUDGET: usize = 8 << 20;
 /// Sum of the default budgets of one store's caches.
 pub const DEFAULT_BUDGET_BYTES: usize =
-    TREE_BUDGET + COMMIT_BUDGET + NODE_BUDGET + CHANGESET_BUDGET;
+    TREE_BUDGET + COMMIT_BUDGET + NODE_BUDGET + CHANGESET_BUDGET + BLOB_BUDGET;
+
+/// Largest blob kept in the blob cache.
+pub(crate) const BLOB_CACHE_MAX: usize = 64 << 10;
 
 /// Total budget of the caches of one store, bytes (process-wide; read when
 /// a store's caches are created). Each cache gets its default share.
@@ -235,6 +242,22 @@ pub(crate) const NODE_WEIGHT: usize = 160;
 
 pub(crate) fn changeset_weight(changes: &[PathChange]) -> usize {
     32 + changes.iter().map(|c| 160 + c.path.as_str().len()).sum::<usize>()
+}
+
+/// Remember the small blobs among `objects` (stored or read from `b`).
+pub(crate) fn remember_blobs<'a>(
+    b: &Backend,
+    written: impl IntoIterator<Item = &'a EncodedObject>,
+) {
+    let small = written
+        .into_iter()
+        .filter(|o| o.kind() == ObjectKind::Blob && o.as_bytes().len() <= BLOB_CACHE_MAX);
+    let mut small = small.peekable();
+    if small.peek().is_some() {
+        objects(&b.objects)
+            .blobs
+            .insert_many(small.map(|o| (o.id(), o.clone(), 96 + o.as_bytes().len())));
+    }
 }
 
 pub(crate) fn commit_weight(commit: &Commit) -> usize {
@@ -275,6 +298,7 @@ pub(crate) fn objects(store: &Arc<dyn ObjectStore>) -> Arc<ObjectCaches> {
     scoped(&OBJECTS, store, || ObjectCaches {
         trees: Cache::new(share(TREE_BUDGET), TREES),
         commits: Cache::new(share(COMMIT_BUDGET), COMMITS),
+        blobs: Cache::new(share(BLOB_BUDGET), BLOBS),
     })
 }
 
@@ -300,15 +324,16 @@ fn add<K: Hash + Eq + Clone, V: Clone>(acc: &mut (usize, usize, usize), cache: &
 }
 
 /// Process-wide cache sizes for diagnostics: per-cache totals over the live
-/// stores (`trees`, `commits`, `nodes`, `changesets`, in that order), plus the
+/// stores (`trees`, `commits`, `nodes`, `changesets`, `blobs`, in that order), plus the
 /// number of live object-store and meta-store registrations.
 pub fn cache_stats() -> (Vec<CacheStat>, usize, usize) {
     let objects = live(&OBJECTS);
     let metas = live(&META);
-    let mut totals = [(0, 0, 0); 4];
+    let mut totals = [(0, 0, 0); 5];
     for c in &objects {
         add(&mut totals[TREES], &c.trees);
         add(&mut totals[COMMITS], &c.commits);
+        add(&mut totals[BLOBS], &c.blobs);
     }
     for c in &metas {
         add(&mut totals[NODES], &c.nodes);
@@ -530,11 +555,23 @@ mod tests {
         meta(&a).nodes.insert(id, node, NODE_WEIGHT);
         let (stats, _, metas) = cache_stats();
         let names: Vec<&str> = stats.iter().map(|s| s.name).collect();
-        assert_eq!(names, ["trees", "commits", "nodes", "changesets"]);
+        assert_eq!(names, ["trees", "commits", "nodes", "changesets", "blobs"]);
         let nodes = stats.iter().find(|s| s.name == "nodes").expect("nodes entry");
         assert!(nodes.entries >= 1);
         assert!(nodes.budget_bytes >= NODE_BUDGET);
         assert!(metas >= 1);
+    }
+
+    #[test]
+    fn only_small_blobs_are_remembered() {
+        let b = Backend::in_memory();
+        let small = EncodedObject::new(ObjectKind::Blob, b"line\n");
+        let large = EncodedObject::new(ObjectKind::Blob, &vec![b'x'; BLOB_CACHE_MAX + 1]);
+        let tree = Object::Tree(Tree::empty()).encode();
+        remember_blobs(&b, [&small, &large, &tree]);
+        let cached = objects(&b.objects).blobs.get_many(&[small.id(), large.id(), tree.id()]);
+        assert_eq!(cached.iter().map(Option::is_some).collect::<Vec<_>>(), [true, false, false]);
+        assert_eq!(cached[0].as_ref().map(EncodedObject::id), Some(small.id()));
     }
 
     #[test]

@@ -5,8 +5,12 @@
 #
 #   scripts/dev-services.sh install   # download binaries (once)
 #   scripts/dev-services.sh start|stop|status
+#   scripts/dev-services.sh pg-restart  # restart Postgres only (picks up $ANT_PG_OPTS)
 #   scripts/dev-services.sh wipe      # stop and delete all service data
 #
+# ANT_PG_OPTS: extra postgres options for start/pg-restart, e.g.
+# "-c commit_delay=50 -c shared_preload_libraries=pg_stat_statements"
+# (scripts/landing-bench.sh uses it to compare Postgres settings).
 # Everything lives in $ANT_SERVICES_DIR (default ~/.local/share/antimony-services).
 set -eu
 
@@ -32,6 +36,17 @@ install() {
     rm -rf "$tmp"
 }
 
+pg_start() {
+    # shellcheck disable=SC2086 # ANT_PG_OPTS is a list of options
+    setsid nohup "$PGBIN/postgres" -D "$PGDATA" -p 54329 -k /tmp \
+        -c listen_addresses=127.0.0.1 -c max_connections=500 -c shared_buffers=512MB \
+        ${ANT_PG_OPTS:-} > "$BASE/postgres.log" 2>&1 < /dev/null &
+    i=0; until pg_up; do i=$((i + 1)); [ $i -gt 60 ] && { echo "postgres did not start"; exit 1; }; sleep 0.5; done
+    PGPASSWORD=ant "$PGBIN/psql" -h 127.0.0.1 -p 54329 -U ant -d postgres -tAc \
+        "select 1 from pg_database where datname='ant'" | grep -q 1 \
+        || PGPASSWORD=ant "$PGBIN/createdb" -h 127.0.0.1 -p 54329 -U ant ant
+}
+
 start() {
     [ -x "$PGBIN/postgres" ] && [ -x "$BASE/bin/weed" ] || install
     if [ ! -d "$PGDATA" ]; then
@@ -39,15 +54,7 @@ start() {
         "$PGBIN/initdb" -D "$PGDATA" -U ant --pwfile="$BASE/.pw" -A scram-sha-256 >/dev/null
         rm -f "$BASE/.pw"
     fi
-    if ! pg_up; then
-        setsid nohup "$PGBIN/postgres" -D "$PGDATA" -p 54329 -k /tmp \
-            -c listen_addresses=127.0.0.1 -c max_connections=500 -c shared_buffers=512MB \
-            > "$BASE/postgres.log" 2>&1 < /dev/null &
-        i=0; until pg_up; do i=$((i + 1)); [ $i -gt 60 ] && { echo "postgres did not start"; exit 1; }; sleep 0.5; done
-        PGPASSWORD=ant "$PGBIN/psql" -h 127.0.0.1 -p 54329 -U ant -d postgres -tAc \
-            "select 1 from pg_database where datname='ant'" | grep -q 1 \
-            || PGPASSWORD=ant "$PGBIN/createdb" -h 127.0.0.1 -p 54329 -U ant ant
-    fi
+    pg_up || pg_start
     if ! s3_up; then
         mkdir -p "$S3DATA"
         setsid nohup "$BASE/bin/weed" server -s3 -s3.port=9009 -dir="$S3DATA" \
@@ -83,6 +90,10 @@ case "${1:-status}" in
     start) start ;;
     stop) stop ;;
     status) status ;;
+    pg-restart)
+        pg_up && "$PGBIN/pg_ctl" -D "$PGDATA" stop -m fast >/dev/null
+        pg_start
+        status ;;
     wipe) wipe ;;
-    *) echo "usage: $0 install|start|stop|status|wipe" >&2; exit 2 ;;
+    *) echo "usage: $0 install|start|stop|status|pg-restart|wipe" >&2; exit 2 ;;
 esac

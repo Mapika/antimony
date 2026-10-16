@@ -85,6 +85,16 @@ impl RefLockRelease for MemoryRefLock {
     async fn release(self: Box<Self>) -> Result<()> {
         Ok(())
     }
+
+    async fn contended(&mut self) -> Result<bool> {
+        Ok(self.guard.as_ref().is_some_and(waiting))
+    }
+}
+
+/// Whether a task waits for the mutex `guard` holds: every waiter holds a
+/// clone of it, besides the lock table and the guard itself.
+pub(crate) fn waiting(guard: &tokio::sync::OwnedMutexGuard<()>) -> bool {
+    Arc::strong_count(tokio::sync::OwnedMutexGuard::mutex(guard)) > 2
 }
 
 #[async_trait]
