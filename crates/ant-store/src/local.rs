@@ -57,6 +57,7 @@
 //! after the rows it covers.
 
 pub(crate) mod db;
+pub mod gc;
 
 pub mod migrate;
 pub mod packs;

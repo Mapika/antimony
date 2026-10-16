@@ -218,49 +218,69 @@ fn strs(v: &[&str]) -> Vec<String> {
 #[test]
 #[ignore = "needs docker compose up -d"]
 fn cli_end_to_end() {
-    run_end_to_end(false);
+    run_end_to_end(false, Stores::Postgres);
+}
+
+/// The same flow in local mode (`--local <dir>`: SQLite + pack files; no
+/// services needed): import, then serve the directory.
+#[test]
+fn cli_end_to_end_local() {
+    run_end_to_end(false, Stores::Local);
 }
 
 #[test]
 #[ignore = "needs docker compose up -d and FUSE"]
 fn cli_lazy_end_to_end() {
-    run_end_to_end(true);
+    run_end_to_end(true, Stores::Postgres);
 }
 
-fn run_end_to_end(lazy: bool) {
-    let schema = ant_store::testing::scratch_schema("e2e");
-    // Declared first, so they drop last (after the server) and also on panic.
-    let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
-    // The shared test bucket under a per-run prefix.
-    let s3_cfg = ant_store::s3::S3Config::for_tests("e2e");
-    let prefix = s3_cfg.prefix.clone();
-    let _s3 = ant_store::testing::S3PrefixGuard(s3_cfg.clone());
+/// Where an end-to-end run keeps its data.
+enum Stores {
+    /// Postgres + S3 (the dev services).
+    Postgres,
+    /// A local data directory.
+    Local,
+}
 
+fn run_end_to_end(lazy: bool, stores: Stores) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
+    // Declared before the server, so they drop last (after it) and also on panic.
+    let mut _schema = None;
+    let mut _s3 = None;
+    let store_flags: Vec<String> = match stores {
+        Stores::Postgres => {
+            let schema = ant_store::testing::scratch_schema("e2e");
+            _schema = Some(ant_store::postgres::SchemaGuard::new(PG_URL, &schema));
+            // The shared test bucket under a per-run prefix.
+            let s3_cfg = ant_store::s3::S3Config::for_tests("e2e");
+            let prefix = s3_cfg.prefix.clone();
+            _s3 = Some(ant_store::testing::S3PrefixGuard(s3_cfg.clone()));
+            [
+                "--pg-url",
+                PG_URL,
+                "--pg-schema",
+                &schema,
+                "--s3-endpoint",
+                S3_ENDPOINT,
+                "--s3-bucket",
+                &s3_cfg.bucket,
+                "--s3-prefix",
+                &prefix,
+                "--s3-access-key",
+                "test",
+                "--s3-secret-key",
+                "test",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+        }
+        Stores::Local => vec!["--local".into(), root.join("data").display().to_string()],
+    };
 
     let repo = root.join("repo");
     build_repo(&repo);
-
-    let store_flags: Vec<String> = [
-        "--pg-url",
-        PG_URL,
-        "--pg-schema",
-        &schema,
-        "--s3-endpoint",
-        S3_ENDPOINT,
-        "--s3-bucket",
-        &s3_cfg.bucket,
-        "--s3-prefix",
-        &prefix,
-        "--s3-access-key",
-        "test",
-        "--s3-secret-key",
-        "test",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
 
     let (grpc_port, http_port) = free_ports();
     let cache = root.join("cache");
@@ -716,5 +736,69 @@ fn cli_gc() {
     let r = run(&["admin", "gc", "--grace", "1h"]).expect_code(1);
     if !r.stderr().contains("grace period must be at least 24 hours") {
         r.fail("short grace refused");
+    }
+}
+
+/// `ant admin gc` / `ant admin schema` on a local data directory, which one
+/// process uses at a time.
+#[test]
+fn cli_gc_and_schema_local() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data = tmp.path().join("data");
+    let data_s = data.display().to_string();
+    let ctx = Ctx {
+        ant: PathBuf::from(env!("CARGO_BIN_EXE_ant")),
+        env: vec![("ANT_CACHE".into(), tmp.path().join("cache").display().to_string())],
+    };
+    let run = |args: &[&str]| {
+        let mut all: Vec<&str> = args.to_vec();
+        all.extend(["--local", &data_s]);
+        ctx.run(None, &all)
+    };
+    let r = run(&["admin", "schema"]).ok();
+    check_eq(
+        &r,
+        "new directory",
+        r.stdout(),
+        "version 0\nsupported 1\npending 1 baseline\n".into(),
+    );
+    let r = run(&["admin", "schema", "--migrate"]).ok();
+    check_eq(&r, "migrated", r.stdout(), "migrated 1 baseline\nversion 1\nsupported 1\n".into());
+    let counts = "live 0\ncondemned 0\nobjects 0 0\nlarge-objects 0 0\ncommits 0\nchangesets 0 0\n";
+    let r = run(&["admin", "gc", "--dry-run"]).ok();
+    let out = r.stdout();
+    if !out.starts_with("dry-run\ncutoff ") || !out.contains(counts) {
+        r.fail("dry run report");
+    }
+    let r = run(&["admin", "gc"]).ok();
+    let out = r.stdout();
+    let tail = format!("{counts}legacy-changes 0\nderived 0\nkept 0\npacks 0 0\n");
+    if !out.starts_with("done\ncutoff ") || !out.contains(&tail) || !out.ends_with("vacuumed no\n")
+    {
+        r.fail("run report");
+    }
+    run(&["admin", "gc", "--abort"]).expect_code(1);
+    let r = run(&["admin", "gc", "--grace", "1h"]).expect_code(1);
+    if !r.stderr().contains("grace period must be at least 24 hours") {
+        r.fail("short grace refused");
+    }
+    // While a server uses the directory, offline tools are refused.
+    let (grpc, http) = free_ports();
+    let _server = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ant"))
+            .args(["serve", "--local", &data_s, "--grpc-listen"])
+            .arg(format!("127.0.0.1:{grpc}"))
+            .arg("--http-listen")
+            .arg(format!("127.0.0.1:{http}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawning ant serve"),
+    );
+    common::wait_until(|| std::net::TcpStream::connect(("127.0.0.1", grpc)).is_ok());
+    let r = run(&["admin", "gc"]).expect_code(1);
+    if !r.stderr().contains("is in use by another process") {
+        r.fail("directory in use");
     }
 }

@@ -60,6 +60,8 @@ type JobFn = Box<dyn FnOnce(Option<&Connection>, &mut Effects) -> (bool, Complet
 
 struct Job {
     durable: bool,
+    /// Runs alone, outside any transaction (`VACUUM`, maintenance).
+    raw: bool,
     run: JobFn,
 }
 
@@ -166,6 +168,25 @@ impl Db {
         R: Send + 'static,
         F: FnOnce(&Connection, &mut Effects) -> Result<R> + Send + 'static,
     {
+        self.submit(durable, false, f).await
+    }
+
+    /// Run `f` on the write connection alone, outside any transaction, after
+    /// the writes queued before it (maintenance such as `VACUUM`; `f` opens
+    /// its own transactions if it needs them).
+    pub(crate) async fn write_raw<R, F>(&self, f: F) -> Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection) -> Result<R> + Send + 'static,
+    {
+        self.submit(true, true, move |c, _| f(c)).await
+    }
+
+    async fn submit<R, F>(&self, durable: bool, raw: bool, f: F) -> Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection, &mut Effects) -> Result<R> + Send + 'static,
+    {
         let (tx, rx) = oneshot::channel::<Result<R>>();
         let run: JobFn = Box::new(move |conn, fx| {
             let r = match conn {
@@ -182,7 +203,7 @@ impl Db {
             (ok, done)
         });
         let sent = match &self.writer.lock().tx {
-            Some(tx) => tx.send(Job { durable, run }).is_ok(),
+            Some(tx) => tx.send(Job { durable, raw, run }).is_ok(),
             None => false,
         };
         if !sent {
@@ -226,10 +247,31 @@ impl Db {
 
 fn writer_loop(conn: Connection, rx: mpsc::Receiver<Job>, feed: RefFeed) {
     let mut synchronous_full = true;
-    while let Ok(first) = rx.recv() {
+    // A raw job met while collecting a group waits for the next round.
+    let mut held: Option<Job> = None;
+    loop {
+        let first = match held.take() {
+            Some(j) => j,
+            None => match rx.recv() {
+                Ok(j) => j,
+                Err(_) => break,
+            },
+        };
+        if first.raw {
+            if !synchronous_full && conn.execute_batch("PRAGMA synchronous = FULL").is_ok() {
+                synchronous_full = true;
+            }
+            let (_, done) = (first.run)(Some(&conn), &mut Effects::default());
+            done(Ok(()));
+            continue;
+        }
         let mut jobs = vec![first];
         while jobs.len() < MAX_GROUP {
             match rx.try_recv() {
+                Ok(j) if j.raw => {
+                    held = Some(j);
+                    break;
+                }
                 Ok(j) => jobs.push(j),
                 Err(_) => break,
             }

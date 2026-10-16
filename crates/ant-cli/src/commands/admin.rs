@@ -40,7 +40,10 @@ pub async fn reindex_acl(a: ReindexArgs) -> Result<Outcome> {
 /// <name>` per migration applied (with `--migrate`), then `version <n>`,
 /// `supported <n>` and `pending <version> <name>` per migration still to run.
 pub async fn schema(a: SchemaArgs) -> Result<Outcome> {
-    let url = a.store.pg_url().ok_or_else(|| anyhow!("admin schema needs --pg-url"))?;
+    if let Some(dir) = a.store.local_dir()? {
+        return local_schema(&a, &dir).await;
+    }
+    let url = a.store.pg_url().ok_or_else(|| anyhow!("admin schema needs --pg-url or --local"))?;
     let schema = a.store.pg_schema();
     let mut out = String::new();
     if a.migrate {
@@ -66,12 +69,119 @@ pub async fn schema(a: SchemaArgs) -> Result<Outcome> {
     Ok(Outcome::ok(out))
 }
 
+/// `ant admin schema --local [<dir>]`: the local store's SQLite schema.
+async fn local_schema(a: &SchemaArgs, dir: &std::path::Path) -> Result<Outcome> {
+    use ant_store::local::{LocalStore, MIGRATIONS as LOCAL_MIGRATIONS};
+    let mut out = String::new();
+    if a.migrate {
+        let before = LocalStore::schema_status(dir)?.version;
+        let options = ant_store::local::LocalOptions { migrate: true, ..a.store.local_options() };
+        let d = dir.to_owned();
+        tokio::task::spawn_blocking(move || LocalStore::open(&d, &options))
+            .await
+            .context("opening the local data directory")??;
+        for m in LOCAL_MIGRATIONS.iter().filter(|m| m.version > before) {
+            writeln!(out, "migrated {} {}", m.version, m.name)?;
+        }
+    }
+    let status = LocalStore::schema_status(dir)?;
+    if status.version > status.supported {
+        return Err(StoreError::NewerFormat(ant_core::NewerFormat {
+            what: "local store schema version".into(),
+            found: u64::from(status.version),
+            supported: u64::from(status.supported),
+        })
+        .into());
+    }
+    writeln!(out, "version {}", status.version)?;
+    writeln!(out, "supported {}", status.supported)?;
+    for m in LOCAL_MIGRATIONS.iter().filter(|m| m.version > status.version) {
+        writeln!(out, "pending {} {}", m.version, m.name)?;
+    }
+    Ok(Outcome::ok(out))
+}
+
+/// `YYYY-MM-DD HH:MM:SS+00` of Unix seconds (UTC).
+fn utc_text(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}+00",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// `ant admin gc --local`: an offline run (the directory's lock keeps a
+/// server out while it runs).
+async fn local_gc(a: &GcArgs, store: ant_store::local::LocalStore) -> Result<Outcome> {
+    use ant_store::local::gc::{GcOptions as LocalGcOptions, collect};
+    if a.abort {
+        return Err(anyhow!("--abort: local collection runs have nothing to abort"));
+    }
+    let opts = LocalGcOptions { grace: a.grace, dry_run: a.dry_run, ..LocalGcOptions::default() };
+    let r = collect(&store, &opts, &|line| eprintln!("gc: {line}")).await?;
+    let mut out = String::new();
+    writeln!(out, "{}", if r.dry_run { "dry-run" } else { "done" })?;
+    writeln!(out, "cutoff {}", utc_text(r.cutoff))?;
+    writeln!(out, "live {}", r.live)?;
+    writeln!(out, "condemned {}", r.objects + r.large_objects + r.commits)?;
+    writeln!(out, "objects {} {}", r.objects, r.object_bytes)?;
+    writeln!(out, "large-objects {} {}", r.large_objects, r.large_object_bytes)?;
+    writeln!(out, "commits {}", r.commits)?;
+    writeln!(out, "changesets {} {}", r.changesets, r.changeset_bytes)?;
+    if !r.dry_run {
+        writeln!(out, "legacy-changes 0")?;
+        writeln!(out, "derived {}", r.derived)?;
+        writeln!(out, "kept 0")?;
+    }
+    writeln!(out, "packs {} {}", r.packs, r.pack_bytes)?;
+    let ratio = if r.packs_kept_bytes == 0 {
+        0.0
+    } else {
+        r.packs_dead_bytes as f64 / r.packs_kept_bytes as f64
+    };
+    writeln!(
+        out,
+        "packs-kept {} {} {} {:.1}%",
+        r.packs_kept,
+        r.packs_kept_bytes,
+        r.packs_dead_bytes,
+        100.0 * ratio
+    )?;
+    writeln!(out, "packs-compacted {} {} {}", r.packs_compacted, r.compacted_from, r.compacted_to)?;
+    if !r.dry_run {
+        writeln!(out, "vacuumed {}", if r.vacuumed { "yes" } else { "no" })?;
+    }
+    if r.missing > 0 {
+        eprintln!("gc: warning: {} reachable objects are missing from the store", r.missing);
+    }
+    Ok(Outcome::ok(out))
+}
+
 /// `ant admin gc [--dry-run] [--grace <dur>] [--quiesce <dur>] [--max-batches <n>]
 /// [--abort] <store flags>`. Progress goes to stderr (`gc: ...`); stdout is
 /// the report (see the output contract in `main.rs`).
 pub async fn gc(a: GcArgs) -> Result<Outcome> {
     let (backend, probes) = a.store.backend_with_probes().await?;
-    let pg = probes.pg.ok_or_else(|| anyhow!("admin gc needs a Postgres store (--pg-url)"))?;
+    if let Some(local) = probes.local {
+        drop(backend);
+        return local_gc(&a, local).await;
+    }
+    let pg = probes
+        .pg
+        .ok_or_else(|| anyhow!("admin gc needs a Postgres store (--pg-url) or --local"))?;
     if a.abort {
         let pending = pg.gc_abort().await?;
         let out = if pending { "aborted\n" } else { "nothing to abort\n" };
@@ -133,6 +243,11 @@ pub async fn gc(a: GcArgs) -> Result<Outcome> {
 /// `main.rs`).
 pub async fn repack(a: RepackArgs) -> Result<Outcome> {
     let (backend, probes) = a.store.backend_with_probes().await?;
+    if probes.local.is_some() {
+        return Err(anyhow!(
+            "admin repack needs Postgres + S3; local stores are compacted by `ant admin gc --local`"
+        ));
+    }
     let pg = probes.pg.ok_or_else(|| anyhow!("admin repack needs a Postgres store (--pg-url)"))?;
     let cfg = a
         .store
@@ -179,4 +294,14 @@ pub async fn repack(a: RepackArgs) -> Result<Outcome> {
     writeln!(out, "moved {} {}", r.moved, r.moved_small)?;
     writeln!(out, "skipped {}", r.skipped)?;
     Ok(Outcome::ok(out))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn utc_text_formats_unix_seconds() {
+        assert_eq!(super::utc_text(0), "1970-01-01 00:00:00+00");
+        assert_eq!(super::utc_text(951_782_400), "2000-02-29 00:00:00+00");
+        assert_eq!(super::utc_text(1_792_108_799), "2026-10-15 23:59:59+00");
+    }
 }

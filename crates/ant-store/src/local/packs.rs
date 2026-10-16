@@ -226,11 +226,6 @@ impl LocalPacks {
         Ok(out)
     }
 
-    /// The pack being appended to, if any.
-    pub(crate) fn active_id(&self) -> Option<[u8; 16]> {
-        self.inner.active.lock().0.as_ref().map(|a| a.id)
-    }
-
     /// Close the active pack (durably): the next write starts a new one.
     pub(crate) fn seal(&self) -> Result<()> {
         let mut guard = self.inner.active.lock();
