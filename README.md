@@ -213,6 +213,23 @@ curl -s http://127.0.0.1:7421/metrics | grep '^ant_land_outcomes'
 kill $SERVER_PID; cd / && rm -rf /tmp/ant-demo
 ```
 
+### Local mode (no Postgres/S3)
+
+A durable server for one machine, for example a workstation running a few
+dozen agents: everything lives in one directory (SQLite plus pack files,
+default `~/.local/share/antimony/local`), with small default caches and at
+most four worker threads.
+
+```sh
+ant local start                            # started <pid> http://127.0.0.1:7420 http://127.0.0.1:7421
+ant ref init main && ant ws new /tmp/ant-local-demo   # then as in steps 2-7 above
+ant local stop                             # stopped <pid>
+```
+
+Import a git repository into it with `ant import <git-dir> --local` while
+the server is stopped; see [docs/operations.md](docs/operations.md#local-mode-one-machine-no-postgres-or-s3)
+for durability, sizing, garbage collection and moving to Postgres + S3.
+
 Exit codes: `0` ok, `1` error (`error: ...` plus an optional `hint: ...` on
 stderr), `2` land or update conflict. More in [docs/usage.md](docs/usage.md):
 conflicts and `ws update`, lazy workspaces, access control in two minutes,
@@ -239,8 +256,9 @@ importing large histories, Docker, several replicas.
 | Cache tier | `ant cache-serve --cache <dir> --upstream <origin-http-url>` |
 | Import from git | `ant import <git-dir> [--git-ref refs/heads/main] [--ref main] <store flags>` |
 | Clone with plain git | `git clone [--filter=blob:none \| --depth N] http://<server>:7421/repo.git` |
-| Run a server | `ant serve [--memory \| --pg-url ... --s3-endpoint ...] [--policy policy.toml]` |
-| Administer | `ant admin schema`, `ant admin gc`, `ant admin reindex-acl` |
+| Run a server | `ant serve [--memory \| --local [<dir>] \| --pg-url ... --s3-endpoint ...] [--policy policy.toml]` |
+| Local server in the background | `ant local start\|stop\|status [--dir <dir>]` |
+| Administer | `ant admin schema`, `ant admin gc`, `ant admin reindex-acl` (`--local` too) |
 
 Output is one record per line; the full contract is in the module docs of
 [`crates/ant-cli/src/main.rs`](crates/ant-cli/src/main.rs). Clients find the

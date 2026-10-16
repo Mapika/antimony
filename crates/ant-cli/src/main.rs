@@ -20,9 +20,10 @@
 //! A failure with an obvious remedy adds a `hint: <text>` line after it.
 //!
 //!   ant import <git-dir> [--git-ref refs/heads/main] [--ref main] <store flags>
-//!       Store flags are exactly ant-server's (`--memory` | `--pg-url` +
-//!       `--pg-schema` + optional `--s3-*`, same env vars). Imports straight
-//!       into the stores (no server needed).
+//!       Store flags are exactly ant-server's (`--memory` | `--local [<dir>]`
+//!       | `--pg-url` + `--pg-schema` + optional `--s3-*`, same env vars).
+//!       Imports straight into the stores (no server needed; a local data
+//!       directory must not be in use by a server).
 //!       stdout: `<ref> <tip-id>`
 //!   ant ls <rev>[:<path>]
 //!       Tree: one line per entry `<mode> <kind> <id>\t<name>` where mode is
@@ -182,7 +183,8 @@
 //!       imports / policy path-rule changes). stdout:
 //!       `<commit-id> <trees walked> <trees skipped> <tags written>`.
 //!   ant admin schema [--migrate] <store flags>
-//!       Postgres schema version. With `--migrate`, first applies pending
+//!       Postgres schema version (with `--local [<dir>]`: the local store's
+//!       SQLite schema, same lines). With `--migrate`, first applies pending
 //!       migrations: `migrated <version> <name>` per migration. Then
 //!       `version <n>` (0: none recorded, i.e. a new or pre-versioning
 //!       schema), `supported <n>` (this binary's version) and
@@ -200,6 +202,13 @@
 //!       `packs-kept <count> <bytes> <dead-bytes> <dead-percent>%`. Dry runs
 //!       report what a run would delete. `--abort`: `aborted` or
 //!       `nothing to abort`. A grace period under 1d: exit 1.
+//!       With `--local [<dir>]` (offline: the directory must not be in use,
+//!       else exit 1): first line `dry-run` or `done`, the same lines as
+//!       above (`condemned` = ids deleted; `legacy-changes` and `kept` are
+//!       0) plus `packs <count> <bytes>`, `packs-kept ...` as with S3,
+//!       `packs-compacted <count> <bytes-before> <bytes-after>` and, except
+//!       for dry runs, `vacuumed yes|no`. `--quiesce` and `--max-batches`
+//!       are ignored; `--abort`: exit 1.
 //!   ant admin repack [--dry-run] [--min-age 1d] [--keep-recent 100] [--all] [--no-small]
 //!       [--window 10] [--depth 16] [--record-bytes 2097152] [--level 19] [--jobs N]
 //!       [--max-packs N] <store flags>
@@ -213,6 +222,24 @@
 //!       `moved <n> <from-postgres>`, `skipped <n>`. Dry runs report what a
 //!       run would write. Another repack of the schema running, or no S3
 //!       store: exit 1.
+//!
+//!   ant local start [--dir <dir>] [--grpc-listen 127.0.0.1:7420]
+//!       [--http-listen 127.0.0.1:7421] [-- <ant serve flags>...]
+//!       Starts `ant serve --local <dir>` in the background (log appended to
+//!       `<dir>/server.log`, `<dir>/server.pid` written) and waits until it
+//!       listens. stdout: `started <pid> <grpc-url> <http-url>`, or
+//!       `running <pid> <grpc-url> <http-url>` when it already runs. The
+//!       directory in use by another process, or a server that exits or
+//!       does not listen within 20 s: exit 1. `<dir>` defaults to
+//!       `$ANT_LOCAL_DIR`, else `~/.local/share/antimony/local`.
+//!   ant local status [--dir <dir>]
+//!       `running <pid> <grpc-url> <http-url>` (exit 0), `busy` (exit 0: in
+//!       use by a process `ant local start` did not start) or `stopped`
+//!       (exit 1).
+//!   ant local stop [--dir <dir>]
+//!       SIGTERM to the server, then waits (20 s at most, else exit 1)
+//!       until it released the directory. stdout: `stopped <pid>`, or
+//!       `stopped` when none ran. `busy`: exit 1.
 //!
 //! Store flags (`ant import`, `ant serve`, `ant admin`) include
 //! `--no-migrate` (ANT_NO_MIGRATE): by default the Postgres schema is

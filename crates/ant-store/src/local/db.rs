@@ -72,11 +72,14 @@ pub struct DbOptions {
     pub readers: usize,
     /// SQLite page cache per connection, in KiB.
     pub cache_kib: u32,
+    /// Never fsync at commit (`synchronous = NORMAL` for every group): see
+    /// `LocalOptions::sync`.
+    pub no_fsync: bool,
 }
 
 impl Default for DbOptions {
     fn default() -> Self {
-        Self { readers: 4, cache_kib: 8 * 1024 }
+        Self { readers: 4, cache_kib: 8 * 1024, no_fsync: false }
     }
 }
 
@@ -144,13 +147,19 @@ impl Db {
         }
         // FULL until a group says otherwise; the WAL file is truncated back
         // after checkpoints that let it grow beyond 64 MiB.
-        conn.execute_batch("PRAGMA synchronous = FULL; PRAGMA journal_size_limit = 67108864;")
-            .map_err(sql_err)?;
+        let sync = if options.no_fsync { "NORMAL" } else { "FULL" };
+        conn.execute_batch(&format!(
+            "PRAGMA synchronous = {sync}; PRAGMA journal_size_limit = 67108864;"
+        ))
+        .map_err(sql_err)?;
         init(&conn)?;
         let (tx, rx) = mpsc::channel::<Job>();
         let thread = std::thread::Builder::new()
             .name("ant-sqlite-writer".into())
-            .spawn(move || writer_loop(conn, rx, feed))
+            .spawn({
+                let no_fsync = options.no_fsync;
+                move || writer_loop(conn, rx, feed, no_fsync)
+            })
             .map_err(be)?;
         Ok(Self {
             path: path.to_owned(),
@@ -245,8 +254,8 @@ impl Db {
     }
 }
 
-fn writer_loop(conn: Connection, rx: mpsc::Receiver<Job>, feed: RefFeed) {
-    let mut synchronous_full = true;
+fn writer_loop(conn: Connection, rx: mpsc::Receiver<Job>, feed: RefFeed, no_fsync: bool) {
+    let mut synchronous_full = !no_fsync;
     // A raw job met while collecting a group waits for the next round.
     let mut held: Option<Job> = None;
     loop {
@@ -258,7 +267,10 @@ fn writer_loop(conn: Connection, rx: mpsc::Receiver<Job>, feed: RefFeed) {
             },
         };
         if first.raw {
-            if !synchronous_full && conn.execute_batch("PRAGMA synchronous = FULL").is_ok() {
+            if !no_fsync
+                && !synchronous_full
+                && conn.execute_batch("PRAGMA synchronous = FULL").is_ok()
+            {
                 synchronous_full = true;
             }
             let (_, done) = (first.run)(Some(&conn), &mut Effects::default());
@@ -276,7 +288,7 @@ fn writer_loop(conn: Connection, rx: mpsc::Receiver<Job>, feed: RefFeed) {
                 Err(_) => break,
             }
         }
-        let durable = jobs.iter().any(|j| j.durable);
+        let durable = !no_fsync && jobs.iter().any(|j| j.durable);
         if durable != synchronous_full {
             let pragma = if durable { "FULL" } else { "NORMAL" };
             if conn.execute_batch(&format!("PRAGMA synchronous = {pragma}")).is_ok() {

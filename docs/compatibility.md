@@ -132,6 +132,27 @@ binary's supported version is printed by `ant admin schema` as `supported <n>`.
   surfaces that are documented (`schema_version`, `gc_*` working tables for
   the GC) change only through migrations that are announced in the changelog.
 
+### Local data directory (`ant serve --local`)
+
+| part | marker | now |
+|---|---|---|
+| directory layout | `<dir>/FORMAT` (`1\n`) | 1 |
+| SQLite schema (`meta.db`) | `schema_version` table (`ant admin schema --local`) | 1 |
+| pack files (`packs/<32 hex>.pack`) | 8-byte header `ANTPACK1` | 1 |
+
+- The same rules as the Postgres schema apply: migrations are forward-only,
+  recorded in `schema_version` and applied on open (or refused with
+  `--no-migrate`); a binary refuses a newer `FORMAT` or schema version
+  without touching the directory (`hint: upgrade ant`).
+- Pack records are the S3 pack records above (single-object records and
+  `AFR1` frames; local mode does not write `ADF1`), each self-contained;
+  a pack file has no index of its own (the SQLite `object_index` holds
+  `id -> (pack, offset, length)`). A new record format needs a new magic, a
+  new pack header version and a schema bump.
+- Table names are an implementation detail, as for Postgres. Moving a local
+  repository to Postgres + S3 goes through git (see `docs/operations.md`,
+  Local mode), not through the files.
+
 ## 3. On-disk client formats
 
 | format | marker | now |

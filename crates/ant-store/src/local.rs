@@ -122,6 +122,22 @@ pub struct LocalOptions {
     pub pack_frames: bool,
     /// Create or migrate the schema when opening (off: fail unless current).
     pub migrate: bool,
+    /// Commit durability (see [`LocalSync`]).
+    pub sync: LocalSync,
+}
+
+/// How local-store commits reach the disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LocalSync {
+    /// Every acknowledged write that is not deferred, and every land
+    /// publish, is fsynced before it returns (`synchronous = FULL`; pack
+    /// bytes are always fsynced). The default.
+    #[default]
+    Full,
+    /// No fsync at commit (`synchronous = NORMAL`): a crash of the process
+    /// loses nothing, but an OS crash or power loss can lose the last
+    /// acknowledged writes, lands included. The database stays consistent.
+    Normal,
 }
 
 impl Default for LocalOptions {
@@ -133,6 +149,7 @@ impl Default for LocalOptions {
             frame_cache_bytes: 16 * 1024 * 1024,
             pack_frames: true,
             migrate: true,
+            sync: LocalSync::Full,
         }
     }
 }
@@ -298,7 +315,11 @@ impl LocalStore {
         let migrate = options.migrate;
         let db = Db::open(
             &dir.join(DB_FILE),
-            DbOptions { readers: options.readers, cache_kib: options.cache_kib },
+            DbOptions {
+                readers: options.readers,
+                cache_kib: options.cache_kib,
+                no_fsync: options.sync == LocalSync::Normal,
+            },
             feed.clone(),
             |conn| migrate::migrate(conn, migrate, &label).map(|_| ()),
         )?;

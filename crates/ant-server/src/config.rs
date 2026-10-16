@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ant_store::local::{LocalOptions, LocalStore};
+use ant_store::local::{LocalOptions, LocalStore, LocalSync};
 use ant_store::packed::PackedS3Store;
 use ant_store::postgres::{PgOptions, PgStore};
 use ant_store::s3::{S3Config, S3ObjectStore, S3Timeouts};
@@ -64,6 +64,13 @@ pub struct StoreArgs {
     /// Local mode: decoded pack frames kept in memory, MiB.
     #[arg(long, env = "ANT_LOCAL_FRAME_CACHE_MIB", default_value_t = 16)]
     local_frame_cache_mib: usize,
+
+    /// Local mode: `full` fsyncs every acknowledged write and land (the
+    /// default); `normal` never fsyncs at commit: nothing is lost when the
+    /// process crashes, but an OS crash or power loss can lose the last
+    /// acknowledged lands.
+    #[arg(long, env = "ANT_LOCAL_SYNC", default_value = "full", value_parser = ["full", "normal"])]
+    local_sync: String,
 
     /// Postgres URL for refs, metadata and small objects.
     #[arg(long, env = "ANT_PG_URL")]
@@ -193,6 +200,7 @@ impl StoreArgs {
             frame_cache_bytes: self.local_frame_cache_mib.saturating_mul(1 << 20),
             pack_frames: self.pack_frames,
             migrate: !self.no_migrate,
+            sync: if self.local_sync == "normal" { LocalSync::Normal } else { LocalSync::Full },
             ..LocalOptions::default()
         }
     }
