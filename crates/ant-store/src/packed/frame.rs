@@ -3,10 +3,10 @@
 //! A pack is a concatenation of records. Two kinds exist, told apart by
 //! their first bytes:
 //!
-//! - **Single object** (every pack written before 0.1.5, and objects that
+//! - **Single object** (every pack written before 0.2.0, and objects that
 //!   share a record with nothing): one zstd frame holding the encoded
 //!   object. Starts with the zstd magic `28 b5 2f fd`.
-//! - **Frame** (0.1.5): several objects compressed as one zstd stream. The
+//! - **Frame** (0.2.0): several objects compressed as one zstd stream. The
 //!   writer puts similar objects next to each other (versions of one file or
 //!   directory, see [`similarity_key`]), so zstd stores each of them as a
 //!   handful of back-references to its neighbour: the effect of git's deltas

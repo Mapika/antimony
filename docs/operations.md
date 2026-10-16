@@ -241,12 +241,38 @@ large objects into shared, compressed multi-object frames inside S3 packs
 (`ant_store::packed`); servers that support only version 5 cannot decode
 them (a read fails with `backend error: ... corrupt pack record` or a zstd
 error) and refuse to start against the migrated schema. Old packs stay
-readable. For a rolling upgrade, start the new servers with
-`--pack-frames false` (`ANT_PACK_FRAMES=false`): they read frames but keep
-writing every object alone, in the old format. Once no server of the
-previous release is left, restart them without it. Imports (`ant import`)
-take the same flag. Objects written while frames were off are not
-recompressed later.
+readable. Upgrading from 0.1.x (schema version 5) to 0.2 is therefore
+either a stop-and-start (stop every 0.1.x server and import job, back up,
+start the 0.2 servers) or this rolling upgrade, during which the servers
+keep serving:
+
+1. Back up Postgres.
+2. Run every 0.2 `ant serve` *and* `ant import` with `--pack-frames false`
+   (`ANT_PACK_FRAMES=false`): they read frames but write every object
+   alone, in the old format.
+3. Start the first 0.2 server. It migrates the schema to version 6 at once,
+   whatever the flag (`ant admin schema` prints `version 6`). The 0.1.x
+   servers already running keep serving reads and writes, including
+   objects the 0.2 servers wrote, but none of them can be started again: a
+   0.1.x `ant serve`, `ant import` or `ant admin` now exits 1 with `hint:
+   upgrade ant` and changes nothing. Keep supervisors and autoscalers from
+   restarting or adding 0.1.x replicas from here on.
+4. Replace the remaining 0.1.x servers with 0.2 servers (flag still
+   `false`).
+5. Once no 0.1.x process is left, restart the 0.2 servers without the flag
+   and drop it from import jobs. Frames are written from then on.
+
+After step 3 the only way back to 0.1.x is the backup: nothing a 0.1.x
+server cannot read is written before step 5, but the 0.1.x binary refuses
+the version 6 schema. A 0.1.x server still running after step 5 fails the
+reads of framed objects (the client gets `error:` and exit 1; the server
+logs `backend error: ... Unknown frame descriptor` or `corrupt pack
+record`); it never returns wrong bytes. Objects written while frames were
+off are not recompressed later. Clients need no particular order: 0.1.x and
+0.2 `ant` (and `ant cache-serve`) work against servers of either version,
+and keep using caches and workspaces the other one wrote.
+`scripts/upgrade-test.sh` checks all of this against a real Postgres and
+S3.
 
 **Clients.** The disk cache (`<cache>/format`), sparse workspaces
 (`format=` in `.ant/workspace`) and lazy workspace state directories

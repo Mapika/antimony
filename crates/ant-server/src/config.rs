@@ -123,7 +123,7 @@ pub struct StoreArgs {
 
     /// Compress similar large objects together in multi-object frames of S3
     /// packs (`false`: store each object alone, the format servers before
-    /// 0.1.5 read; for the window of a rolling upgrade).
+    /// 0.2.0 read; for the window of a rolling upgrade).
     #[arg(long, env = "ANT_PACK_FRAMES", default_value_t = true, action = clap::ArgAction::Set)]
     pack_frames: bool,
 }

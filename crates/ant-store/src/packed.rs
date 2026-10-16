@@ -188,7 +188,7 @@ impl PackedS3Store {
     }
 
     /// Write frames of at most `bytes` uncompressed bytes; 0 stores every
-    /// object alone, in the record format of versions before 0.1.5.
+    /// object alone, in the record format of versions before 0.2.0.
     pub fn with_frame_bytes(mut self, bytes: usize) -> Self {
         self.frame_raw = bytes.min(frame::MAX_FRAME_RAW);
         self

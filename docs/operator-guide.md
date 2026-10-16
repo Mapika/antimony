@@ -952,7 +952,10 @@ safe first step.
 **Upgrades.** See the "Upgrading" section of [operations.md](operations.md)
 for the procedure (schema versioning and rolling restarts). In short, because
 replicas are stateless, a rolling restart behind the load balancer is the
-normal shape; clients reconnect and retry idempotent lands.
+normal shape; clients reconnect and retry idempotent lands. From 0.1.x to
+0.2 (schema version 6) a rolling upgrade needs `--pack-frames false` on the
+new servers until the last 0.1.x server is gone, and no 0.1.x server can be
+restarted once the first 0.2 server has started (see "Pack frames" there).
 
 **Disk discipline for big imports and scale runs** (from the contributor
 guide): check free space on the filesystem and, on WSL, on the Windows drive
