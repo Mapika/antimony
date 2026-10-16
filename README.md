@@ -277,6 +277,9 @@ recreates is in [docs/scion-gap.md](docs/scion-gap.md).
   imports, policies, sizing, upgrading, local services, benchmarks.
 - [Operator guide](docs/operator-guide.md): topology, sizing, cache tier,
   fleet workflow, rate limits, metrics and alerts, failure runbook, backups.
+- [Production deployment kit](deploy/README.md): a single-host compose setup
+  (Caddy TLS, Postgres 17, SeaweedFS), nightly backups with a tested restore
+  procedure, a plain-git mirror, alerts and a step-by-step guide for a fresh VM.
 - [Compatibility](docs/compatibility.md): what each 0.x release keeps stable
   (API, Postgres schema, on-disk formats, CLI output) and how deprecations
   work.

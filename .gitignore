@@ -1,2 +1,4 @@
 target/
 .claude/
+deploy/.env
+deploy/policy.toml

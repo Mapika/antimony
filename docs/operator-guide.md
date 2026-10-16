@@ -1026,6 +1026,10 @@ exists in the services directory.
 
 ## 8. Checklist for a new fleet deployment
 
+A ready-made single-host implementation of this checklist (compose with TLS,
+tuned Postgres, SeaweedFS, backups with a restore procedure, git mirror, alert
+rules) is in [deploy/](../deploy/README.md).
+
 1. Postgres >= 15 with `max_connections` computed from section 2; fsync
    latency measured; backups on.
 2. S3 bucket and credentials; lifecycle rules **off** for the bucket.

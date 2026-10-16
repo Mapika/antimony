@@ -32,7 +32,10 @@ logs a warning; never expose an open-mode server.
 
 Run it behind TLS. Bearer tokens are secrets, and the server itself does not
 terminate TLS. Put a reverse proxy (or a gRPC-aware load balancer) in front
-of both ports.
+of both ports. Clients (`ant`, `antd`) take an `https://` `ANT_SERVER` and
+verify the proxy's certificate against the system's trusted roots (set
+`SSL_CERT_FILE` for a private CA). A ready-made Caddy setup is in
+[deploy/](../deploy/README.md).
 
 
 ### S3 timeouts, retries and throttling

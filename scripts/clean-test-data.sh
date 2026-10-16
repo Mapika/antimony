@@ -41,7 +41,9 @@ url="${ANT_TEST_PG_URL:-postgres://ant:ant@localhost:54329/ant}"
 bucket="${ANT_TEST_S3_BUCKET:-ant-test}"
 weed="$base/bin/weed"
 psql_bin="$(command -v psql || true)"
-[ -n "$psql_bin" ] || psql_bin="$(ls "$base"/postgresql-*/bin/psql 2>/dev/null | head -n1 || true)"
+if [ -z "$psql_bin" ]; then
+    for c in "$base"/postgresql-*/bin/psql; do [ -x "$c" ] && psql_bin="$c"; done
+fi
 [ -n "$psql_bin" ] || { echo "psql not found" >&2; exit 1; }
 
 now="$(date +%s)"
