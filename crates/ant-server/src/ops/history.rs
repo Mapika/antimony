@@ -2271,6 +2271,13 @@ mod tests {
         let t = Instant::now();
         let slow = query::log(&b, "main", Some(&p), 0).await.unwrap();
         let scan = t.elapsed();
+        // The unindexed query scheduled a background catch-up: let it
+        // finish and drop what it indexed, so the timed catch-up below
+        // indexes the whole history from scratch.
+        while running_catch_ups() > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        b.meta.clear_history("main").await.unwrap();
 
         let t = Instant::now();
         let n = catch_up(&b, "main").await.unwrap();

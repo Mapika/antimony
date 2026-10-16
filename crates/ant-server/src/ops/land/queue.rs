@@ -14,9 +14,12 @@
 //! *write* (its new objects and commit records, on a task of its own) and
 //! *publish* (one CAS, after its own writes and its predecessor's publish).
 //! The stages of consecutive batches overlap: while a batch's writes finish
-//! the worker prepares another one, and while a batch publishes it prepares
-//! (and starts writing) one more, up to [`MAX_AHEAD`] prepared batches
-//! behind the one publishing. A speculative batch is seeded with what its
+//! and it publishes, the worker prepares (and starts writing) the next one,
+//! up to [`MAX_AHEAD`] prepared batches behind the one publishing. A
+//! publish starts as soon as its own batch's writes are done: it never
+//! waits for the replay running beside it (with slow, fsync-bound commits
+//! that wait would add a replay to every publish, and each request waits
+//! for several). A speculative batch is seeded with what its
 //! predecessor read and built (nodes, trees, blobs: not yet written or
 //! cached) and sees the landed-as mappings of every unpublished batch
 //! before it (`carry`). It is published only after all of them succeeded
@@ -174,7 +177,8 @@ impl Worker {
                     batch
                 }
             };
-            // While the current batch's writes finish, replay another one.
+            // The batch prepared (and started writing) while this one's
+            // writes finish and it publishes.
             let mut ahead = None;
             if pipeline.len() < MAX_AHEAD
                 && extend_turn(lock, &mut started).await
@@ -185,18 +189,72 @@ impl Worker {
             }
             let writes = current.writes.take();
             let carry = unpublished_mappings(&current, &pipeline);
-            let newest = pipeline.back().unwrap_or(&current);
-            let (written, prepared) = futures::join!(
-                async {
-                    match writes {
-                        Some(writes) => writes.await.map_err(|error| {
-                            OpError::Aborted(format!("land writes failed: {error}"))
-                        })?,
-                        None => Ok(()),
+            // Read-only batches linearize at their start (already published).
+            // Otherwise even conflict replies wait for the publish: their
+            // tentative tips must exist in the published history.
+            let tip = current.tip.filter(|_| current.moves());
+            let mappings = if tip.is_some() { current.mappings() } else { Vec::new() };
+            let start = current.start;
+            // With nothing to prepare yet, requests that arrive meanwhile
+            // form the next batch, prepared while this one publishes.
+            let mut next = None;
+            let room = ahead.is_none() && pipeline.len() < MAX_AHEAD;
+            let (written, published, prepared) = {
+                let newest = pipeline.back().unwrap_or(&current);
+                let speculation = speculate(b, ref_name, deferred, ahead.as_mut(), newest, &carry);
+                futures::pin_mut!(speculation);
+                let mut prepared = None;
+                // This batch's writes finish while the next one is
+                // prepared...
+                let written = {
+                    let written = async {
+                        match writes {
+                            Some(writes) => writes.await.map_err(|error| {
+                                OpError::Aborted(format!("land writes failed: {error}"))
+                            })?,
+                            None => Ok(()),
+                        }
+                    };
+                    futures::pin_mut!(written);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            result = &mut written => break result,
+                            result = &mut speculation, if prepared.is_none() => {
+                                prepared = Some(result);
+                            }
+                        }
                     }
-                },
-                speculate(b, ref_name, deferred, ahead.as_mut(), newest, &carry)
-            );
+                };
+                // ...and it publishes as soon as they did, still alongside
+                // that preparation: a publish never waits for a replay.
+                let rest = async {
+                    match prepared {
+                        Some(prepared) => prepared,
+                        None => speculation.await,
+                    }
+                };
+                match (&written, tip) {
+                    (Ok(()), Some(tip)) => {
+                        if room
+                            && extend_turn(lock, &mut started).await
+                            && let Some(requests) = self.drain()
+                        {
+                            batches += 1;
+                            next = Some(Batch::new(requests));
+                        }
+                        let (published, prepared, speculated) = futures::join!(
+                            publish(b, ref_name, lock, deferred, start, tip, mappings),
+                            rest,
+                            speculate(b, ref_name, deferred, next.as_mut(), newest, &carry)
+                        );
+                        (written, Some(published), prepared.or(speculated))
+                    }
+                    _ => (written, None, rest.await),
+                }
+            };
+            // At most one of them was drained.
+            let mut ahead = ahead.or(next);
             if let Some(Err(error)) = prepared
                 && let Some(batch) = ahead.take()
             {
@@ -212,35 +270,15 @@ impl Worker {
                 known = None;
                 continue;
             }
-            pipeline.extend(ahead);
-            // Read-only batches linearize at their start (already published).
-            // Otherwise even conflict replies wait for the publish: their
-            // tentative tips must exist in the published history.
-            let Some(tip) = current.tip.filter(|_| current.moves()) else {
+            let Some(published) = published else {
+                pipeline.extend(ahead);
                 known = Some(current.start);
                 current.succeed();
                 continue;
             };
-            // While it publishes, replay (and write) one more.
-            let mut next = None;
-            if pipeline.len() < MAX_AHEAD
-                && extend_turn(lock, &mut started).await
-                && let Some(requests) = self.drain()
-            {
-                batches += 1;
-                next = Some(Batch::new(requests));
-            }
-            let carry = unpublished_mappings(&current, &pipeline);
-            let newest = pipeline.back().unwrap_or(&current);
-            let mappings = current.mappings();
-            let start = current.start;
-            let (published, speculated) = futures::join!(
-                publish(b, ref_name, lock, deferred, start, tip, mappings),
-                speculate(b, ref_name, deferred, next.as_mut(), newest, &carry)
-            );
             match published {
                 Ok((CasOutcome::Updated, durable)) => {
-                    known = Some(Some(tip));
+                    known = Some(tip);
                     match durable {
                         // Answered once the publish is durable; the next
                         // batch publishes meanwhile (`RefLock::publish_pipelined`).
@@ -254,18 +292,15 @@ impl Worker {
                         }
                         None => current.succeed(),
                     }
-                    match (next, speculated) {
-                        (Some(next), Some(Err(error))) => next.fail(error),
-                        (next, _) => pipeline.extend(next),
-                    }
+                    pipeline.extend(ahead);
                 }
                 Ok((CasOutcome::Mismatch { actual }, _)) => {
                     if let Some(m) = current.requests.iter().find_map(|r| r.metrics.as_deref()) {
                         m.record_land_cas_retry();
                     }
                     // Newest first, so the queue keeps arrival order.
-                    if let Some(next) = next {
-                        self.requeue(next.abandon().await);
+                    if let Some(batch) = ahead {
+                        self.requeue(batch.abandon().await);
                     }
                     self.requeue_all(&mut pipeline).await;
                     match current.retry(b, ref_name, actual).await {
@@ -280,8 +315,8 @@ impl Worker {
                     }
                 }
                 Err(error) => {
-                    if let Some(next) = next {
-                        self.requeue(next.abandon().await);
+                    if let Some(batch) = ahead {
+                        self.requeue(batch.abandon().await);
                     }
                     self.requeue_all(&mut pipeline).await;
                     current.fail(error);
