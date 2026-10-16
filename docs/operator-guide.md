@@ -451,7 +451,9 @@ read the result from the cache (30 s at most, then they fetch it
 themselves; a crashed holder releases its claim with the process).
 Claims are only taken while another process uses the cache (each one
 registers under `<cache>/live/` while it runs), so a process alone on its
-cache pays nothing for them. `ANT_CACHE_DEDUP=0` turns it off. 8 concurrent cold checkouts of a 48k-file
+cache pays only one small file per fetch batch (under `<cache>/batches/`,
+listing the batch's ids), which a process starting meanwhile waits for
+instead of fetching the same objects again. `ANT_CACHE_DEDUP=0` turns it off. 8 concurrent cold checkouts of a 48k-file
 tree through one cache (tmpfs): 18,633 HTTP requests and 599k objects
 received without it, 2,354 requests and 75k objects (the distinct ones) with
 it; wall time 4.8 s to 2.0 s. `ant cache stats --tiers` prints where this

@@ -28,27 +28,45 @@
 //!   exists (an older binary, which claims without registering, is
 //!   fetching). A process alone on its cache therefore pays no per-object
 //!   file work (a claim is a create, a lock, a stat and an unlink, which on
-//!   a journaling filesystem cost a 96k-file cold checkout about 2 s). A peer
-//!   that appears while a batch is already being fetched unclaimed may fetch
-//!   some of the same objects once more (a duplicate fetch, as without
-//!   dedup); every later batch of both sees the other. A handle that cannot
-//!   register (read-only cache) always claims, as before. Registrations
-//!   whose holder died are unlocked, so they never count, and [`sweep`]
-//!   removes them.
+//!   a journaling filesystem cost a 96k-file cold checkout about 2 s). A
+//!   handle that cannot register (read-only cache) always claims, as before.
+//!   Registrations whose holder died are unlocked, so they never count, and
+//!   [`sweep`] removes them.
+//! - Instead, a batch fetched without per-object claims is *announced*
+//!   ([`Claims::announce`]): one file under `{root}/batches/` holding the
+//!   batch's ids (32 raw bytes each), written and then exclusively locked
+//!   for as long as the fetch runs, unlinked (then unlocked) after it. The
+//!   announcement is made *before* the peer check, and a handle registers
+//!   before its first check, so of two handles starting at the same moment
+//!   at least one sees the other: either the announcer sees the newcomer
+//!   (and claims per object instead), or the newcomer, whose check finds the
+//!   announcer alive, finds the announcement. A handle that sees peers drops
+//!   its own announcement and looks for other handles' in-flight batches
+//!   ([`Claims::in_flight`]); ids in one are waited for
+//!   ([`Claims::wait_batches`], same bound and fallback as a claim) instead
+//!   of being claimed, then re-read from the cache, and whatever is still
+//!   missing goes through the per-object claims. Unlocked announcements are
+//!   ignored (still being written, or abandoned by a crash) and swept like
+//!   registrations.
 //! - The directories are additive: older binaries ignore them, so the cache
 //!   format version stays 1.
 
+use std::collections::HashSet;
 use std::fs::{File, TryLockError};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use ant_core::ObjectId;
+
 const DIR: &str = "claims";
 /// Registrations of live handles (see the module docs).
 const LIVE_DIR: &str = "live";
+/// Announcements of batches fetched without per-object claims.
+const BATCH_DIR: &str = "batches";
 /// An unlocked registration older than this belongs to a dead process (the
 /// margin covers the moment between creating the file and locking it).
 const LIVE_STALE: Duration = Duration::from_secs(60);
@@ -62,10 +80,13 @@ const STALE: Duration = Duration::from_secs(3600);
 pub struct Claims {
     dir: PathBuf,
     live: PathBuf,
+    batches: PathBuf,
     /// This handle's registration (`None`: registering failed).
     me: Option<Arc<Registration>>,
     /// Claims taken through this handle and its clones.
     taken: Arc<AtomicU64>,
+    /// Batches announced through this handle and its clones.
+    announced: Arc<AtomicU64>,
 }
 
 /// A handle's entry in `{root}/live/`: exclusively locked while it lives,
@@ -84,23 +105,33 @@ impl Drop for Registration {
     }
 }
 
+/// A name no other file in the cache's directories has (process, sequence,
+/// clock).
+fn unique_name() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos =
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    format!("{}-{}-{nanos}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Create the new file `dir/name` (and `dir` if needed).
+fn create_new(dir: &Path, name: &str) -> std::io::Result<(File, PathBuf)> {
+    let path = dir.join(name);
+    let open = || File::options().write(true).create_new(true).open(&path);
+    let file = match open() {
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir)?;
+            open()?
+        }
+        r => r?,
+    };
+    Ok((file, path))
+}
+
 impl Registration {
     fn create(live: &Path) -> std::io::Result<Self> {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let name =
-            format!("{}-{}-{nanos}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
-        let path = live.join(&name);
-        let open = || File::options().write(true).create_new(true).open(&path);
-        let file = match open() {
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                std::fs::create_dir_all(live)?;
-                open()?
-            }
-            r => r?,
-        };
+        let name = unique_name();
+        let (file, path) = create_new(live, &name)?;
         if let Err(e) = file.lock() {
             let _ = std::fs::remove_file(&path);
             return Err(e);
@@ -125,13 +156,122 @@ impl Drop for Claim {
     }
 }
 
+/// An announced batch (see the module docs): its file is exclusively locked
+/// until this is dropped, and unlinked (then unlocked) on drop.
+#[derive(Debug)]
+pub struct Batch {
+    file: File,
+    path: PathBuf,
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = self.file.unlock();
+    }
+}
+
+/// Ids found in other handles' in-flight batches ([`Claims::in_flight`]),
+/// with those batches' files to wait on.
+#[derive(Debug, Default)]
+pub struct Overlap {
+    pub ids: Vec<ObjectId>,
+    files: Vec<File>,
+}
+
 impl Claims {
     /// Claims in the cache at `root`, registering this handle as live there
     /// until the last clone is dropped (blocking: a few syscalls).
     pub fn new(root: &Path) -> Self {
         let live = root.join(LIVE_DIR);
         let me = Registration::create(&live).ok().map(Arc::new);
-        Self { dir: root.join(DIR), live, me, taken: Arc::default() }
+        Self {
+            dir: root.join(DIR),
+            batches: root.join(BATCH_DIR),
+            live,
+            me,
+            taken: Arc::default(),
+            announced: Arc::default(),
+        }
+    }
+
+    /// Announce that this handle fetches `ids` now (blocking: create,
+    /// write, lock). Made before [`Claims::peers_active`]; held until the
+    /// fetched objects are stored.
+    pub fn announce(&self, ids: &[ObjectId]) -> std::io::Result<Batch> {
+        let (mut file, path) = create_new(&self.batches, &unique_name())?;
+        let mut body = Vec::with_capacity(ids.len() * ObjectId::LEN);
+        for id in ids {
+            body.extend_from_slice(&id.0);
+        }
+        // Written before it is locked: a locked announcement is complete.
+        if let Err(e) = file.write_all(&body).and_then(|()| file.lock()) {
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
+        self.announced.fetch_add(1, Ordering::Relaxed);
+        Ok(Batch { file, path })
+    }
+
+    /// Which of `ids` are in a batch another holder is fetching right now
+    /// (blocking: a directory listing plus, per announcement, a lock probe
+    /// and a read).
+    pub fn in_flight(&self, ids: &[ObjectId]) -> Overlap {
+        let mut out = Overlap::default();
+        let Ok(entries) = std::fs::read_dir(&self.batches) else { return out };
+        let mut wanted: HashSet<ObjectId> = ids.iter().copied().collect();
+        for e in entries.flatten() {
+            if wanted.is_empty() {
+                break;
+            }
+            let Ok(mut f) = File::open(e.path()) else { continue };
+            // Unlocked: being written, finished, or abandoned.
+            if !matches!(f.try_lock_shared(), Err(TryLockError::WouldBlock)) {
+                continue;
+            }
+            let mut body = Vec::new();
+            if f.read_to_end(&mut body).is_err() {
+                continue;
+            }
+            let before = out.ids.len();
+            for chunk in body.chunks_exact(ObjectId::LEN) {
+                let mut id = [0; ObjectId::LEN];
+                id.copy_from_slice(chunk);
+                if wanted.remove(&ObjectId(id)) {
+                    out.ids.push(ObjectId(id));
+                }
+            }
+            if out.ids.len() > before {
+                out.files.push(f);
+            }
+        }
+        out
+    }
+
+    /// Block until the batches of `overlap` are done (`true`) or `timeout`
+    /// passes (`false`).
+    pub fn wait_batches(&self, overlap: Overlap, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        for f in overlap.files {
+            loop {
+                match f.try_lock_shared() {
+                    Ok(()) => break,
+                    Err(TryLockError::WouldBlock) => {}
+                    Err(TryLockError::Error(_)) => return false,
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(POLL);
+            }
+        }
+        true
+    }
+
+    /// How many batches were announced through this handle (and its
+    /// clones).
+    pub fn announced(&self) -> u64 {
+        self.announced.load(Ordering::Relaxed)
     }
 
     /// Whether another process may be fetching into this cache: another
@@ -224,7 +364,7 @@ fn file_ino(file: &File) -> u64 {
     file.metadata().map_or(0, |m| m.ino())
 }
 
-/// Remove claim files and registrations abandoned by crashed processes
+/// Remove claim files, registrations and announcements abandoned by crashed processes
 /// (best effort).
 pub fn sweep(root: &Path) {
     let older = |e: &std::fs::DirEntry, age: Duration| {
@@ -237,7 +377,8 @@ pub fn sweep(root: &Path) {
             }
         }
     }
-    if let Ok(entries) = std::fs::read_dir(root.join(LIVE_DIR)) {
+    for dir in [LIVE_DIR, BATCH_DIR] {
+        let Ok(entries) = std::fs::read_dir(root.join(dir)) else { continue };
         for e in entries.flatten() {
             // A live holder keeps its lock; a dead one's file is unlocked.
             let unlocked = File::open(e.path()).is_ok_and(|f| f.try_lock_shared().is_ok());
@@ -291,6 +432,45 @@ mod tests {
         drop((a, a2));
         let left = std::fs::read_dir(dir.path().join(LIVE_DIR)).unwrap().flatten().count();
         assert_eq!(left, 1, "only the dead registration is left");
+    }
+
+    #[test]
+    fn announced_batches_are_found_and_awaited() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (Claims::new(dir.path()), Claims::new(dir.path()));
+        let id = |n: u8| ObjectId([n; ObjectId::LEN]);
+        let batch = a.announce(&[id(1), id(2), id(3)]).unwrap();
+        assert_eq!(a.announced(), 1);
+        let mut found = b.in_flight(&[id(3), id(4), id(1)]);
+        found.ids.sort();
+        assert_eq!(found.ids, vec![id(1), id(3)]);
+        assert!(b.in_flight(&[id(4)]).ids.is_empty());
+        assert!(!b.wait_batches(b.in_flight(&[id(2)]), Duration::from_millis(30)));
+        let waiter = {
+            let (b, overlap) = (b.clone(), b.in_flight(&[id(2)]));
+            std::thread::spawn(move || b.wait_batches(overlap, Duration::from_secs(5)))
+        };
+        std::thread::sleep(Duration::from_millis(30));
+        drop(batch);
+        assert!(waiter.join().unwrap());
+        assert!(b.in_flight(&[id(1)]).ids.is_empty(), "done: no longer in flight");
+        let left = std::fs::read_dir(dir.path().join(BATCH_DIR)).unwrap().flatten().count();
+        assert_eq!(left, 0, "removed with the batch");
+        // An unlocked announcement (being written, or its process crashed)
+        // is not in flight, and is swept once old.
+        let dead = dir.path().join(BATCH_DIR).join("1-0-0");
+        std::fs::write(&dead, id(5).0).unwrap();
+        assert!(b.in_flight(&[id(5)]).ids.is_empty());
+        File::options()
+            .write(true)
+            .open(&dead)
+            .unwrap()
+            .set_modified(SystemTime::now() - 2 * LIVE_STALE)
+            .unwrap();
+        let held = a.announce(&[id(6)]).unwrap();
+        sweep(dir.path());
+        assert!(!dead.exists());
+        assert!(held.path.exists(), "in flight: kept");
     }
 
     #[test]

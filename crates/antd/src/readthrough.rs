@@ -27,19 +27,22 @@
 //!   them from the cache, fetching itself whatever is still missing. Claims
 //!   are only taken while another process is using the cache
 //!   ([`Claims::peers_active`], checked once per batch): alone, a process
-//!   fetches without per-object claim files.
+//!   fetches without per-object claim files, under one announcement of the
+//!   whole batch ([`Claims::announce`]), which a process that starts
+//!   meanwhile waits for instead of fetching the same ids again.
 //! - Tier counters (`crate::tiers`) record how each object was served and are
 //!   added to the cache directory's totals when the `ReadThrough` is dropped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use ant_core::{EncodedObject, ObjectId};
 use ant_store::{ObjectStore, Result, StoreError};
 use async_trait::async_trait;
 use futures::future::{BoxFuture, FutureExt, Shared};
 
-use crate::claim::{Claim, Claims};
+use crate::claim::{Batch, Claim, Claims, Overlap};
 use crate::disk::DiskObjectStore;
 use crate::par::par_map;
 use crate::remote::RemoteObjectStore;
@@ -129,6 +132,11 @@ impl ReadThrough {
         self.claims.as_ref().map_or(0, Claims::taken)
     }
 
+    /// Batches announced so far (one per batch fetched without claims).
+    pub fn batches_announced(&self) -> u64 {
+        self.claims.as_ref().map_or(0, Claims::announced)
+    }
+
     /// This handle's tier counters so far (`crate::tiers::NAMES` order).
     pub fn tier_counts(&self) -> [u64; 7] {
         self.stats.snapshot()
@@ -160,42 +168,57 @@ impl ReadThrough {
         }
         misses.sort_unstable();
         misses.dedup();
-        // Trees another process is already fetching as bundles are waited
-        // for after our own bundles are stored (never while holding claims).
-        let (owned, peers) = self.claim(&misses, "b-").await;
-        // A peer may have finished between our local miss and our claim.
-        let owned = drop_present(self.local.as_ref(), owned).await?;
-        let (ids, guards): (Vec<ObjectId>, Vec<Option<Claim>>) = owned.into_iter().unzip();
-        let mut fetched: HashMap<ObjectId, EncodedObject> = HashMap::new();
-        if !ids.is_empty() {
-            self.stats.add(&self.stats.bundle_requests, ids.len());
+        let (local, disk, stats) = (&self.local, &self.disk, &self.stats);
+        let fetch_bundles = |ids: Vec<ObjectId>| async move {
+            stats.add(&stats.bundle_requests, ids.len());
+            let mut fetched: HashMap<ObjectId, EncodedObject> = HashMap::new();
             for bundle in remote.get_tree_bundles(&ids).await.into_iter().flatten() {
                 fetched.extend(bundle);
             }
-        }
-        if !fetched.is_empty() {
-            self.stats.add(&self.stats.bundled_objects, fetched.len());
-            let found: Vec<(ObjectId, EncodedObject)> =
-                fetched.iter().map(|(id, o)| (*id, o.clone())).collect();
-            match &self.disk {
-                Some(disk) => disk.put_many_trusted(found).await?,
-                None => {
-                    let objs: Vec<EncodedObject> = found.into_iter().map(|(_, o)| o).collect();
-                    self.local.put_many(&objs).await?
+            stats.add(&stats.bundled_objects, fetched.len());
+            // The bundles' own trees are stored last: a process that finds
+            // one of them in the cache walks on below it without waiting,
+            // so everything its bundle delivered must be there already.
+            let wanted: HashSet<ObjectId> = ids.into_iter().collect();
+            let (tops, below): (Vec<_>, Vec<_>) =
+                fetched.into_iter().partition(|(id, _)| wanted.contains(id));
+            for part in [&below, &tops] {
+                if part.is_empty() {
+                    continue;
+                }
+                match disk {
+                    Some(disk) => disk.put_many_trusted(part.clone()).await?,
+                    None => {
+                        let objs: Vec<EncodedObject> =
+                            part.iter().map(|(_, o)| o.clone()).collect();
+                        local.put_many(&objs).await?
+                    }
                 }
             }
-        }
-        drop(guards);
-        if !peers.is_empty() {
-            self.wait_for_peers(&peers, "b-").await;
-            let got = self.local.get_many(&peers).await?;
-            self.stats.add(&self.stats.waited_hits, got.iter().flatten().count());
-            for (id, o) in peers.iter().zip(got) {
-                if let Some(o) = o {
-                    fetched.insert(*id, o);
+            let mut found = below;
+            found.extend(tops);
+            Ok(found)
+        };
+        // Trees another process is already fetching as bundles are waited
+        // for after our own bundles are stored (never while holding claims).
+        let fetched: HashMap<ObjectId, EncodedObject> = match &self.claims {
+            Some(claims) => {
+                let done =
+                    coordinate(claims, local.as_ref(), misses.clone(), "b-", fetch_bundles).await?;
+                let mut fetched: HashMap<ObjectId, EncodedObject> = done.got.into_iter().collect();
+                // What peers fetched (or landed meanwhile) is in the cache now.
+                let lacking: Vec<ObjectId> =
+                    misses.iter().filter(|id| !fetched.contains_key(id)).copied().collect();
+                if !lacking.is_empty() {
+                    let got = local.get_many(&lacking).await?;
+                    stats.add(&stats.waited_hits, got.iter().flatten().count());
+                    fetched
+                        .extend(lacking.into_iter().zip(got).filter_map(|(id, o)| Some((id, o?))));
                 }
+                fetched
             }
-        }
+            None => fetch_bundles(misses).await?.into_iter().collect(),
+        };
         let mut rest = Vec::new();
         for (slot, id) in out.iter_mut().zip(trees) {
             if slot.is_none() {
@@ -205,6 +228,7 @@ impl ReadThrough {
                 }
             }
         }
+        drop(fetched);
         if !rest.is_empty() {
             let got: HashMap<ObjectId, EncodedObject> = rest
                 .iter()
@@ -227,25 +251,6 @@ impl ReadThrough {
     pub fn verified_upstream(mut self) -> Self {
         self.trusted_upstream = true;
         self
-    }
-
-    /// Claim each of `ids` (key prefix `prefix`); returns the ones this
-    /// process now owns (with their guard, `None` if claiming failed: fetch
-    /// anyway) and the ones a peer holds. Without claims everything is owned.
-    async fn claim(
-        &self,
-        ids: &[ObjectId],
-        prefix: &'static str,
-    ) -> (Vec<(ObjectId, Option<Claim>)>, Vec<ObjectId>) {
-        claim_ids(self.claims.clone(), ids.to_vec(), prefix).await
-    }
-
-    /// Wait (bounded by [`WAIT_FOR_PEER`] overall) until the peers holding
-    /// `ids` are done.
-    async fn wait_for_peers(&self, ids: &[ObjectId], prefix: &'static str) {
-        if let Some(claims) = self.claims.clone() {
-            wait_ids(claims, ids.to_vec(), prefix).await;
-        }
     }
 
     /// Fetch `ids` from upstream, verify, and fill the local store. Re-checks
@@ -275,46 +280,37 @@ impl ReadThrough {
         if missing.is_empty() {
             return Ok(out);
         }
-        if let Some(claims) = claims {
-            let (owned, others) = claim_ids(Some(claims.clone()), missing, "").await;
-            // A peer may have finished between our local miss and our claim.
-            let claimed = owned.len();
-            let owned = drop_present(local.as_ref(), owned).await?;
-            let landed_meanwhile = owned.len() != claimed;
-            let (mine, guards): (Vec<ObjectId>, Vec<Option<Claim>>) = owned.into_iter().unzip();
-            if !mine.is_empty() {
-                let found = Self::fetch_store(&local, &disk, trusted, &upstream, &stats, mine);
-                out.extend(found.await?);
-            }
-            drop(guards);
-            missing = Vec::new();
-            if !others.is_empty() {
-                wait_ids(claims, others.clone(), "").await;
-                let got = local.get_many(&others).await?;
-                for (id, o) in others.into_iter().zip(got) {
-                    match o {
-                        Some(o) => {
-                            stats.add(&stats.waited_hits, 1);
-                            out.insert(id, o);
-                        }
-                        None => missing.push(id),
-                    }
+        let fetch_own = |mine| Self::fetch_store(&local, &disk, trusted, &upstream, &stats, mine);
+        let Some(claims) = claims else {
+            out.extend(fetch_own(missing).await?);
+            return Ok(out);
+        };
+        let done = coordinate(&claims, local.as_ref(), missing.clone(), "", fetch_own).await?;
+        out.extend(done.got);
+        // The rest was fetched by peers (or landed meanwhile): read it from
+        // the cache, and fetch what is still missing (a peer gave up or
+        // failed) ourselves. Ids we asked upstream for and did not get are
+        // not asked for again.
+        let lacking: Vec<ObjectId> = missing
+            .into_iter()
+            .filter(|id| !out.contains_key(id) && !done.asked.contains(id))
+            .collect();
+        if lacking.is_empty() {
+            return Ok(out);
+        }
+        let mut still = Vec::new();
+        let got = local.get_many(&lacking).await?;
+        for (id, o) in lacking.into_iter().zip(got) {
+            match o {
+                Some(o) => {
+                    stats.add(&stats.waited_hits, 1);
+                    out.insert(id, o);
                 }
-            }
-            if landed_meanwhile {
-                let lacking: Vec<ObjectId> =
-                    ids.iter().filter(|id| !out.contains_key(id)).copied().collect();
-                for (id, o) in lacking.iter().zip(local.get_many(&lacking).await?) {
-                    if let Some(o) = o {
-                        out.insert(*id, o);
-                    }
-                }
+                None => still.push(id),
             }
         }
-        if !missing.is_empty() {
-            out.extend(
-                Self::fetch_store(&local, &disk, trusted, &upstream, &stats, missing).await?,
-            );
+        if !still.is_empty() {
+            out.extend(Self::fetch_store(&local, &disk, trusted, &upstream, &stats, still).await?);
         }
         Ok(out)
     }
@@ -361,59 +357,154 @@ impl ReadThrough {
     }
 }
 
-/// Claim `ids` under `{prefix}{hex}` keys (see [`crate::claim`]): the ids to
-/// fetch (with their guards) and the ids a peer is fetching. Without claims,
-/// or when claiming fails, an id is ours to fetch.
-async fn claim_ids(
-    claims: Option<Claims>,
-    ids: Vec<ObjectId>,
-    prefix: &'static str,
-) -> (Vec<(ObjectId, Option<Claim>)>, Vec<ObjectId>) {
-    let Some(claims) = claims else {
-        return (ids.into_iter().map(|id| (id, None)).collect(), Vec::new());
-    };
+/// How one fetch of missing ids is split up (see [`plan`]).
+#[derive(Default)]
+struct Plan {
+    /// Ids to fetch, with their claim (`None`: fetched without one).
+    owned: Vec<(ObjectId, Option<Claim>)>,
+    /// Ids another process has claimed.
+    peers: Vec<ObjectId>,
+    /// Ids in another handle's in-flight batch.
+    deferred: Overlap,
+    /// This handle's announcement of `owned` (fetching alone).
+    batch: Option<Batch>,
+}
+
+impl Plan {
+    fn unclaimed(ids: Vec<ObjectId>) -> Self {
+        Self { owned: ids.into_iter().map(|id| (id, None)).collect(), ..Self::default() }
+    }
+}
+
+/// Decide who fetches `ids` (see [`crate::claim`]). First round
+/// (`announce`): announce the batch, then check for peers; alone, fetch it
+/// all under that one announcement. With peers (and in later rounds), ids in
+/// another handle's in-flight batch are deferred to it, the others claimed
+/// one by one under `{prefix}{hex}` keys. Claiming that fails makes an id
+/// ours to fetch.
+async fn plan(claims: &Claims, ids: Vec<ObjectId>, prefix: &'static str, announce: bool) -> Plan {
+    let claims = claims.clone();
     let work = ids.clone();
     let done = tokio::task::spawn_blocking(move || {
-        if !claims.peers_active() {
-            return (work.into_iter().map(|id| (id, None)).collect(), Vec::new());
+        let mut ids = work;
+        let mut deferred = Overlap::default();
+        if announce {
+            match claims.announce(&ids) {
+                Ok(batch) => {
+                    if !claims.peers_active() {
+                        return Plan { batch: Some(batch), ..Plan::unclaimed(ids) };
+                    }
+                    drop(batch);
+                    deferred = claims.in_flight(&ids);
+                    if !deferred.ids.is_empty() {
+                        let skip: HashSet<ObjectId> = deferred.ids.iter().copied().collect();
+                        ids.retain(|id| !skip.contains(id));
+                    }
+                }
+                // Cannot announce (e.g. a read-only cache): claim per
+                // object whenever someone else may be fetching.
+                Err(_) if !claims.peers_active() => return Plan::unclaimed(ids),
+                Err(_) => {}
+            }
         }
         let mut owned = Vec::new();
         let mut peers = Vec::new();
-        for id in work {
+        for id in ids {
             match claims.try_claim(&format!("{prefix}{}", id.to_hex())) {
                 Ok(Some(c)) => owned.push((id, Some(c))),
                 Ok(None) => peers.push(id),
                 Err(_) => owned.push((id, None)),
             }
         }
-        (owned, peers)
+        Plan { owned, peers, deferred, batch: None }
     })
     .await;
     // A panic in the blocking pool is not worth failing a read: fetch all.
-    done.unwrap_or_else(|_| (ids.into_iter().map(|id| (id, None)).collect(), Vec::new()))
+    done.unwrap_or_else(|_| Plan::unclaimed(ids))
 }
 
-/// Drop the claims on ids that are in the local store after all (the
-/// previous holder finished between our miss and our claim).
-async fn drop_present(
+/// What [`coordinate`] fetched itself.
+struct Coordinated {
+    /// Objects this handle fetched (and stored).
+    got: Vec<(ObjectId, EncodedObject)>,
+    /// Every id this handle asked upstream for.
+    asked: HashSet<ObjectId>,
+}
+
+/// Fetch `ids` (missing locally) with `fetch_own`, coordinated with the
+/// other processes on the cache: [`plan`], fetch and store what is ours
+/// (holding its claims or announcement, never waiting meanwhile), release,
+/// then wait (bounded by [`WAIT_FOR_PEER`] overall) for the batches and
+/// claims of others; ids whose batch ended without them go through a claim
+/// round of their own. The caller reads what others fetched from the cache.
+async fn coordinate<F, Fut>(
+    claims: &Claims,
+    local: &dyn ObjectStore,
+    ids: Vec<ObjectId>,
+    prefix: &'static str,
+    mut fetch_own: F,
+) -> Result<Coordinated>
+where
+    F: FnMut(Vec<ObjectId>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<(ObjectId, EncodedObject)>>>,
+{
+    let deadline = Instant::now() + WAIT_FOR_PEER;
+    let mut done = Coordinated { got: Vec::new(), asked: HashSet::new() };
+    let Plan { owned, mut peers, deferred, batch } = plan(claims, ids, prefix, true).await;
+    fetch_owned(local, owned, &mut fetch_own, &mut done).await?;
+    drop(batch);
+    if !deferred.ids.is_empty() {
+        let ids = deferred.ids.clone();
+        let c = claims.clone();
+        let left = deadline.saturating_duration_since(Instant::now());
+        let _ = tokio::task::spawn_blocking(move || c.wait_batches(deferred, left)).await;
+        let present = local.has_many(&ids).await?;
+        let still: Vec<ObjectId> =
+            ids.into_iter().zip(present).filter(|(_, p)| !*p).map(|(id, _)| id).collect();
+        if !still.is_empty() {
+            let again = plan(claims, still, prefix, false).await;
+            fetch_owned(local, again.owned, &mut fetch_own, &mut done).await?;
+            peers.extend(again.peers);
+        }
+    }
+    if !peers.is_empty() {
+        wait_ids(claims.clone(), peers, prefix, deadline).await;
+    }
+    Ok(done)
+}
+
+/// Fetch the owned ids not in the local store after all (a previous holder
+/// finished between our miss and our claim), then release their claims.
+async fn fetch_owned<F, Fut>(
     local: &dyn ObjectStore,
     owned: Vec<(ObjectId, Option<Claim>)>,
-) -> Result<Vec<(ObjectId, Option<Claim>)>> {
+    fetch_own: &mut F,
+    done: &mut Coordinated,
+) -> Result<()>
+where
+    F: FnMut(Vec<ObjectId>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<(ObjectId, EncodedObject)>>>,
+{
     if owned.is_empty() {
-        return Ok(owned);
+        return Ok(());
     }
     let ids: Vec<ObjectId> = owned.iter().map(|(id, _)| *id).collect();
     let present = local.has_many(&ids).await?;
-    Ok(owned.into_iter().zip(present).filter(|(_, p)| !*p).map(|(o, _)| o).collect())
+    let (mine, guards): (Vec<ObjectId>, Vec<Option<Claim>>) =
+        owned.into_iter().zip(present).filter(|(_, p)| !*p).map(|(o, _)| o).unzip();
+    if !mine.is_empty() {
+        done.asked.extend(mine.iter().copied());
+        done.got.extend(fetch_own(mine).await?);
+    }
+    drop(guards);
+    Ok(())
 }
 
-/// Wait until every peer holding one of `ids` is done, for at most
-/// [`WAIT_FOR_PEER`] in total.
-async fn wait_ids(claims: Claims, ids: Vec<ObjectId>, prefix: &'static str) {
+/// Wait until every peer holding one of `ids` is done, or `deadline`.
+async fn wait_ids(claims: Claims, ids: Vec<ObjectId>, prefix: &'static str, deadline: Instant) {
     let _ = tokio::task::spawn_blocking(move || {
-        let deadline = std::time::Instant::now() + WAIT_FOR_PEER;
         for id in ids {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let left = deadline.saturating_duration_since(Instant::now());
             claims.wait_released(&format!("{prefix}{}", id.to_hex()), left);
         }
     })
@@ -720,6 +811,7 @@ mod tests {
         }
         assert_eq!(rt.claims_taken(), 0, "alone: no claims");
         assert!(!dir.path().join("claims").exists(), "no claim files were created");
+        assert_eq!(rt.batches_announced(), 4, "one announcement per batch, not per object");
         assert_eq!(up.ids(), 200);
 
         let peer = open();
@@ -728,7 +820,122 @@ mod tests {
         drop(peer);
         rt.get_many(&ids[250..]).await.unwrap();
         assert_eq!(rt.claims_taken(), 50, "alone again");
+        assert_eq!(rt.batches_announced(), 6);
         assert_eq!(up.ids(), 300);
+        let left = dir.path().join("batches").read_dir().unwrap().flatten().count();
+        assert_eq!(left, 0, "announcements are removed after their batch");
+    }
+
+    /// Upstream that answers only once the gate is opened.
+    struct Gated {
+        up: Arc<CountingStore>,
+        open: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait]
+    impl ObjectStore for Gated {
+        async fn get_many(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
+            let _ = self.open.clone().wait_for(|o| *o).await;
+            self.up.get_many(ids).await
+        }
+        async fn put_many(&self, objects: &[EncodedObject]) -> Result<()> {
+            self.up.put_many(objects).await
+        }
+        async fn has_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {
+            self.up.has_many(ids).await
+        }
+    }
+
+    /// A process that starts while another one fetches a batch alone (no
+    /// per-object claims) waits for that batch instead of fetching the
+    /// overlapping ids again; ids outside it it fetches itself, once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_peer_arriving_mid_batch_waits_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = Arc::new(CountingStore::default());
+        let objs = blobs(90);
+        up.inner().put_many(&objs).await.unwrap();
+        let ids: Vec<ObjectId> = objs.iter().map(|o| o.id()).collect();
+        let (gate, open) = tokio::sync::watch::channel(false);
+        let gated: Arc<dyn ObjectStore> = Arc::new(Gated { up: up.clone(), open });
+        let rt = |dir: &std::path::Path| {
+            let disk = Arc::new(DiskObjectStore::open(dir, u64::MAX).unwrap());
+            Arc::new(ReadThrough::over_disk(disk, gated.clone()).verified_upstream())
+        };
+        let first = rt(dir.path());
+        let a = {
+            let (first, ids) = (first.clone(), ids[..60].to_vec());
+            tokio::spawn(async move { first.get_many(&ids).await.unwrap() })
+        };
+        // The first one is fetching (held at the gate) under its announcement.
+        let batches = dir.path().join("batches");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !batches.read_dir().is_ok_and(|mut d| d.next().is_some()) {
+            assert!(std::time::Instant::now() < deadline, "no announcement");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(first.claims_taken(), 0, "it was alone when it started");
+        let second = rt(dir.path());
+        let b = {
+            let (second, ids) = (second.clone(), ids[30..].to_vec());
+            tokio::spawn(async move { second.get_many(&ids).await.unwrap() })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.send(true).unwrap();
+        let (got_a, got_b) = (a.await.unwrap(), b.await.unwrap());
+        assert!(got_a.iter().zip(&objs[..60]).all(|(g, o)| g.as_ref() == Some(o)));
+        assert!(got_b.iter().zip(&objs[30..]).all(|(g, o)| g.as_ref() == Some(o)));
+        assert_eq!(up.ids(), 90, "every object fetched once: {:?}", up.reads());
+        let c = second.tier_counts();
+        assert_eq!(c[6], 30, "the second fetched only its own ids: {c:?}");
+    }
+
+    /// Handles that start at the same moment see each other: every object
+    /// is fetched once, whether they were registered before either fetched
+    /// (even rounds) or each registers and fetches at once (odd rounds, a
+    /// few ms apart: the first may start alone and the others join its
+    /// batch).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_starters_fetch_once() {
+        for round in 0..40 {
+            let dir = tempfile::tempdir().unwrap();
+            let up = Arc::new(CountingStore::default().with_delay(Duration::from_millis(20)));
+            let objs = blobs(50 + round);
+            up.inner().put_many(&objs).await.unwrap();
+            let ids: Vec<ObjectId> = objs.iter().map(|o| o.id()).collect();
+            let open = {
+                let (root, up) = (dir.path().to_path_buf(), up.clone());
+                move || {
+                    let disk = Arc::new(DiskObjectStore::open(&root, u64::MAX).unwrap());
+                    ReadThrough::over_disk(disk, up.clone()).verified_upstream()
+                }
+            };
+            let early: Vec<_> = (0..3).map(|_| (round % 2 == 0).then(&open)).collect();
+            let start = Arc::new(tokio::sync::Barrier::new(early.len()));
+            let tasks: Vec<_> = early
+                .into_iter()
+                .enumerate()
+                .map(|(i, rt)| {
+                    let (ids, start, open) = (ids.clone(), start.clone(), open.clone());
+                    // Late starters arrive 0-12 ms apart: often while an
+                    // earlier one fetches (20 ms) under its announcement.
+                    let stagger = Duration::from_millis((i * (round % 7)) as u64);
+                    tokio::spawn(async move {
+                        start.wait().await;
+                        if rt.is_none() {
+                            tokio::time::sleep(stagger).await;
+                        }
+                        let rt = rt.unwrap_or_else(open);
+                        rt.get_many(&ids).await.unwrap()
+                    })
+                })
+                .collect();
+            for t in tasks {
+                let got = t.await.unwrap();
+                assert!(got.iter().zip(&objs).all(|(g, o)| g.as_ref() == Some(o)));
+            }
+            assert_eq!(up.ids(), objs.len(), "round {round}: {:?}", up.reads());
+        }
     }
 
     /// Without the claims every process fetches for itself.
