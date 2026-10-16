@@ -1290,7 +1290,30 @@ async fn reindex_flow(b: &Backend) {
 
 #[tokio::test]
 async fn reindex_tags_imported_history() {
-    reindex_flow(&Backend::in_memory()).await;
+    reindex_flow(&ant_store::testing::test_backend("acl")).await;
+}
+
+/// The ops-level flows and the RPC layer on a local store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acl_local() {
+    let b = ant_store::testing::local_backend("acl");
+    reindex_flow(&b).await;
+    let s = Server::start_on(b, acl()).await;
+    let mut r = s.client(Some(READER));
+    let mut w = s.client(Some(WRITER));
+    let up = put_blob(&mut w, "local secret\n").await.unwrap();
+    let c = changeset(
+        &mut w,
+        None,
+        vec![blob_file("secrets/local", up), write_file("src/local", "pub\n")],
+    )
+    .await
+    .unwrap();
+    landed_tip(&mut w, "ws/local", c).await;
+    assert_eq!(found(&mut r, &[up, blob_id("pub\n")]).await, [false, true]);
+    assert_eq!(found(&mut w, &[up, blob_id("pub\n")]).await, [true, true]);
+    let e = changeset(&mut r, Some(c), vec![blob_file("src/steal", up)]).await.unwrap_err();
+    assert_eq!(e.code(), Code::NotFound);
 }
 
 /// The ops-level flows against Postgres (batched derived lookups).

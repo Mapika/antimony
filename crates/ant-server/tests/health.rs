@@ -71,6 +71,17 @@ async fn get(url: &str, auth: Option<&str>) -> (u16, String) {
 }
 
 #[tokio::test]
+async fn local_mode_reports_its_store() {
+    let local = ant_store::local::LocalStore::open_scratch("health").unwrap();
+    let probes = Probes { local: Some(local), ..Probes::default() };
+    let (url, _) = serve(Acl::open(), probes, true).await;
+    assert_eq!(
+        get(&format!("{url}/readyz"), None).await,
+        (200, r#"{"status":"ok","local":"ok"}"#.into())
+    );
+}
+
+#[tokio::test]
 async fn in_memory_is_ready_and_counted_under_its_own_route() {
     let (url, metrics) = serve(Acl::open(), Probes::default(), true).await;
     assert_eq!(get(&format!("{url}/healthz"), None).await, (200, "ok".into()));
@@ -82,7 +93,7 @@ async fn in_memory_is_ready_and_counted_under_its_own_route() {
 #[tokio::test]
 async fn unreachable_postgres_is_not_ready_but_stays_live() {
     let pg = PgStore::connect_lazy_unchecked("postgres://ant:ant@127.0.0.1:1/ant", "ant").unwrap();
-    let probes = Probes { pg: Some(Arc::new(pg)), s3: None };
+    let probes = Probes { pg: Some(Arc::new(pg)), ..Probes::default() };
     let (url, metrics) = serve(Acl::open(), probes, true).await;
 
     let (status, body) = get(&format!("{url}/readyz"), None).await;
@@ -108,7 +119,7 @@ async fn unreachable_s3_is_not_ready() {
         timeouts: Default::default(),
     };
     let s3 = S3ObjectStore::connect(&cfg).await.unwrap();
-    let (url, _) = serve(Acl::open(), Probes { pg: None, s3: Some(s3) }, true).await;
+    let (url, _) = serve(Acl::open(), Probes { s3: Some(s3), ..Probes::default() }, true).await;
     let (status, body) = get(&format!("{url}/readyz"), None).await;
     assert_eq!(status, 503);
     assert!(body.starts_with(r#"{"status":"unavailable","s3":""#), "{body}");
@@ -122,7 +133,7 @@ async fn ready_with_postgres_and_s3() {
     let pg = PgStore::connect_scratch(&common::pg::pg_url(), &schema).await.unwrap();
     let s3 = S3ObjectStore::connect_scratch(&S3Config::for_tests("health")).await.unwrap();
     s3.ensure_bucket().await.unwrap();
-    let probes = Probes { pg: Some(Arc::new(pg)), s3: Some(s3) };
+    let probes = Probes { pg: Some(Arc::new(pg)), s3: Some(s3), ..Probes::default() };
 
     // Readiness needs no credentials, even under a policy.
     let (http, _) = serve(policy(), probes, true).await;

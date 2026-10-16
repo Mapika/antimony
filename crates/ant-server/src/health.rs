@@ -1,14 +1,16 @@
 //! Readiness probing for `GET /readyz` (`crate::http`).
 //!
 //! [`Probes`] holds the dependencies a server was started with: the Postgres
-//! store (a trivial query on the query pool) and the S3 store (`HEAD` on the
-//! bucket). In-memory servers have none and are always ready. Each probe is
+//! store (a trivial query on the query pool), the S3 store (`HEAD` on the
+//! bucket) or the local store (a trivial SQLite read). In-memory servers
+//! have none and are always ready. Each probe is
 //! bounded by [`PROBE_TIMEOUT`], runs concurrently with the other, and keeps
 //! no connection beyond the probe itself.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use ant_store::local::LocalStore;
 use ant_store::postgres::PgStore;
 use ant_store::s3::S3ObjectStore;
 
@@ -20,6 +22,7 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct Probes {
     pub pg: Option<Arc<PgStore>>,
     pub s3: Option<S3ObjectStore>,
+    pub local: Option<LocalStore>,
 }
 
 /// Result of one dependency probe.
@@ -45,11 +48,12 @@ impl Status {
 pub struct Readiness {
     pub postgres: Option<Status>,
     pub s3: Option<Status>,
+    pub local: Option<Status>,
 }
 
 impl Readiness {
     pub fn is_ready(&self) -> bool {
-        [self.postgres, self.s3].into_iter().flatten().all(|s| s == Status::Ok)
+        [self.postgres, self.s3, self.local].into_iter().flatten().all(|s| s == Status::Ok)
     }
 
     /// `{"status":"ok","postgres":"ok","s3":"ok"}`; unconfigured
@@ -57,7 +61,8 @@ impl Readiness {
     pub fn json(&self) -> String {
         let overall = if self.is_ready() { "ok" } else { "unavailable" };
         let mut out = format!(r#"{{"status":"{overall}""#);
-        for (name, status) in [("postgres", self.postgres), ("s3", self.s3)] {
+        for (name, status) in [("postgres", self.postgres), ("s3", self.s3), ("local", self.local)]
+        {
             if let Some(s) = status {
                 out.push_str(&format!(r#","{name}":"{}""#, s.as_str()));
             }
@@ -99,8 +104,14 @@ impl Probes {
                 None => None,
             }
         };
-        let (postgres, s3) = tokio::join!(pg, s3);
-        Readiness { postgres, s3 }
+        let local = async {
+            match &self.local {
+                Some(l) => Some(bounded("local", l.ping()).await),
+                None => None,
+            }
+        };
+        let (postgres, s3, local) = tokio::join!(pg, s3, local);
+        Readiness { postgres, s3, local }
     }
 }
 
@@ -110,11 +121,14 @@ mod tests {
 
     #[test]
     fn json_names_failing_dependencies() {
-        let ok = Readiness { postgres: None, s3: None };
+        let ok = Readiness { postgres: None, s3: None, local: None };
         assert!(ok.is_ready());
         assert_eq!(ok.json(), r#"{"status":"ok"}"#);
-        let bad = Readiness { postgres: Some(Status::Down), s3: Some(Status::Ok) };
+        let bad = Readiness { postgres: Some(Status::Down), s3: Some(Status::Ok), local: None };
         assert!(!bad.is_ready());
         assert_eq!(bad.json(), r#"{"status":"unavailable","postgres":"down","s3":"ok"}"#);
+        let local = Readiness { postgres: None, s3: None, local: Some(Status::Ok) };
+        assert!(local.is_ready());
+        assert_eq!(local.json(), r#"{"status":"ok","local":"ok"}"#);
     }
 }

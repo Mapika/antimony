@@ -18,6 +18,7 @@ use ant_server::ops::OpError;
 use ant_server::ops::changeset::{ChangesetRequest, FileOp, WriteContent, create_changeset};
 use ant_server::ops::land::{LandOutcome, land};
 use ant_store::graph::is_ancestor;
+use ant_store::testing::test_backend;
 use ant_store::{Backend, ObjectStoreExt};
 use bytes::Bytes;
 use common::*;
@@ -207,7 +208,7 @@ async fn check_pair(
     mx: Vec<Mutation>,
     my: Vec<Mutation>,
 ) -> Result<(), TestCaseError> {
-    let b = Backend::in_memory();
+    let b = test_backend("props");
     let c0 = init_ref(&b, "main", &base).await;
     let xm = apply_mutations(&base, &mx);
     let ym = apply_mutations(&base, &my);
@@ -352,7 +353,7 @@ proptest! {
     fn disjoint_changes_always_land((base, mx, my) in disjoint_pools()) {
         let rt = runtime();
         let rt_res = rt.block_on(async {
-            let b = Backend::in_memory();
+            let b = test_backend("props");
             let c0 = init_ref(&b, "main", &base).await;
             let xm = apply_mutations(&base, &mx);
             let ym = apply_mutations(&base, &my);
@@ -420,7 +421,7 @@ proptest! {
         let base: Model = [("f".to_string(), (EntryMode::File, base_text.into_bytes()))].into();
         let rt = runtime();
         rt.block_on(async {
-            let b = Backend::in_memory();
+            let b = test_backend("props");
             let c0 = init_ref(&b, "main", &base).await;
             let xm: Model = [("f".to_string(), (EntryMode::File, xt.into_bytes()))].into();
             let ym: Model = [("f".to_string(), (EntryMode::File, yt.into_bytes()))].into();
@@ -451,7 +452,7 @@ proptest! {
     ) {
         let rt = runtime();
         rt.block_on(async {
-            let b = Backend::in_memory();
+            let b = test_backend("props");
             let c0 = init_ref(&b, "main", &base).await;
             let t1 = apply_mutations(&base, &m1);
             let t2 = apply_mutations(&t1, &m2);
@@ -479,7 +480,7 @@ proptest! {
     ) {
         let rt = runtime();
         rt.block_on(async {
-            let b = Backend::in_memory();
+            let b = test_backend("props");
             let c0 = init_ref(&b, "main", &base).await;
             let xm = apply_mutations(&base, &mx);
             let ym = apply_mutations(&base, &my);
@@ -509,7 +510,7 @@ proptest! {
     ) {
         let rt = runtime();
         rt.block_on(async {
-            let b = Backend::in_memory();
+            let b = test_backend("props");
             let c0 = init_ref(&b, "main", &base).await;
             let xm = apply_mutations(&base, &mx);
             let ym = apply_mutations(&base, &my);
@@ -537,7 +538,7 @@ proptest! {
     ) {
         let rt = runtime();
         rt.block_on(async {
-            let b = Backend::in_memory();
+            let b = test_backend("props");
             let c0 = init_ref(&b, "main", &base).await;
             let xm = apply_mutations(&base, &mx);
             let ym = apply_mutations(&base, &my);
@@ -557,7 +558,7 @@ proptest! {
 
 #[tokio::test]
 async fn regression_reland_file_to_dir_conflicts() {
-    let b = Backend::in_memory();
+    let b = test_backend("props");
     let base: Model = [("a".to_string(), (EntryMode::File, vec![]))].into();
     let c0 = init_ref(&b, "main", &base).await;
     let ym: Model = [("a/a".to_string(), (EntryMode::File, vec![]))].into();
@@ -572,7 +573,7 @@ async fn regression_reland_file_to_dir_conflicts() {
 
 #[tokio::test]
 async fn regression_reland_original_moves_ref() {
-    let b = Backend::in_memory();
+    let b = test_backend("props");
     let base: Model = [("a".to_string(), (EntryMode::File, b"1\n".to_vec()))].into();
     let c0 = init_ref(&b, "main", &base).await;
     let xm: Model = [("a".to_string(), (EntryMode::File, b"2\n".to_vec()))].into();
@@ -593,7 +594,7 @@ async fn regression_reland_original_moves_ref() {
 /// only the top commit, silently dropping the lower commit's changes.
 #[tokio::test]
 async fn regression_stack_landing_drops_parent_changes() {
-    let b = Backend::in_memory();
+    let b = test_backend("props");
     let base: Model = [("a".to_string(), (EntryMode::File, b"1\n".to_vec()))].into();
     let c0 = init_ref(&b, "main", &base).await;
     let file = |c: &str| (EntryMode::File, c.as_bytes().to_vec());
@@ -833,7 +834,25 @@ proptest! {
     #[test]
     fn concurrent_lands_in_memory(plans in prop::collection::vec(task_plan(), 2..=32)) {
         let rt = runtime();
-        rt.block_on(concurrency_case(Backend::in_memory(), "main".into(), plans))?;
+        rt.block_on(concurrency_case(test_backend("props"), "main".into(), plans))?;
+    }
+}
+
+/// The concurrency property on a local store (SQLite + pack files): one
+/// store, a fresh ref per case.
+#[test]
+fn concurrent_lands_local() {
+    let rt = runtime();
+    let backend = ant_store::testing::local_backend("props");
+    let counter = std::sync::atomic::AtomicUsize::new(0);
+    let mut runner = proptest::test_runner::TestRunner::new(config(16));
+    let result = runner.run(&prop::collection::vec(task_plan(), 2..=32), |plans| {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        rt.block_on(concurrency_case(backend.clone(), format!("main-{n}"), plans))
+    });
+    drop(backend);
+    if let Err(e) = result {
+        panic!("{e}");
     }
 }
 
@@ -862,7 +881,7 @@ fn concurrent_lands_postgres() {
 async fn ancestor_check_sanity() {
     // Guards the helper stack used above: a rebased commit descends from the
     // tip it was rebased onto and not from its own pre-rebase original.
-    let b = Backend::in_memory();
+    let b = test_backend("props");
     let base: Model = [("a".to_string(), (EntryMode::File, b"1\n".to_vec()))].into();
     let c0 = init_ref(&b, "main", &base).await;
     let bm: Model = [
