@@ -8,7 +8,7 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
-Planned as 0.2.0 (storage format change, schema version 6).
+Planned as 0.2.0 (storage format change, schema version 7).
 
 ### Added
 
@@ -31,6 +31,27 @@ Planned as 0.2.0 (storage format change, schema version 6).
   of the export, client skew both ways, `ant admin gc` and the refused
   downgrade; run before every release (`docs/release.md`). Run from 0.1.0
   with git/git as extra corpus: every check passes.
+- `ant admin repack` (`ant_store::postgres::repack`): git-gc-style repacking
+  of Postgres + S3 stores. Walks the history from every ref (newest first,
+  noting each object's path) and rewrites cold objects, small Postgres
+  -resident ones included, as *delta frames* (new S3 pack record kind,
+  magic `ADF1`): versions of a path, newest first, stored as git delta
+  instructions against the best of the previous `--window` objects (10),
+  chains at most `--depth` deep (16), the record (`--record-bytes`, 2 MiB of
+  stream) compressed whole at zstd `--level` 19. Delta bases always live in
+  the same record, so records still decode on their own and collecting a
+  base never breaks the objects built on it. Objects reachable from the
+  newest `--keep-recent` (100) first-parent commits of every ref stay one
+  decode away (Postgres rows, or plain frames). Index rows switch to the new
+  packs in short transactions that keep write times and skip condemned or
+  locked rows; old packs are freed by `ant admin gc`, which keeps a pack for
+  its quiesce period after a repack moved rows out of it. Safe beside
+  serving, landing, imports and collections; resumable (`--max-packs`, or
+  any interruption); `--dry-run` reports the savings; `--min-age` (1d),
+  `--all` (rewrite earlier repacks too), `--no-small`, `--jobs`. Output
+  contract in `ant-cli/src/main.rs`. Every record is decoded and hashed
+  before it is uploaded. `ant_core::delta` (git delta instructions) moved
+  there from `ant-gitserve`.
 
 ### Changed
 
@@ -50,6 +71,14 @@ Planned as 0.2.0 (storage format change, schema version 6).
   share of the frame's bytes for `ant admin gc` byte counts) and rewrites
   nothing. It ships in a minor release (0.2.0), as `docs/compatibility.md`
   requires for a migration older servers cannot run alongside.
+- **Schema version 7 (migration `repack`).** Adds the `packs` table:
+  `ant admin repack` records the packs it wrote (`repacked_at`, `hot`) and
+  the packs it moved index rows out of (`moved_at`), which `ant admin gc`
+  keeps for its quiesce period after the move. Additive (a new table, no
+  rewrite). Packs may now also hold delta frames (`ADF1`), written only by
+  `ant admin repack`: run it only once every server reads them (this
+  release or later); servers supporting only version 6 refuse the migrated
+  schema.
 
 ### Performance
 

@@ -440,9 +440,11 @@ inplace() {
     sql "UPDATE $SCHEMA.derived SET value = '\\xdeadbeef'::bytea WHERE kind = 'blame/v1'"
     "$NEW" admin schema --no-migrate "${STORE[@]}" > "$OUT/schema-pending.txt" || true
     if grep -q '^pending 6 pack_frames' "$OUT/schema-pending.txt"; then pass "new binary lists pending migration 6"; else fail "pending migrations: $(cat "$OUT/schema-pending.txt")"; fi
+    local want
+    want=$(awk '/^supported /{print $2}' "$OUT/schema-pending.txt")
     start_server NEW1 "$NEW"
     s=$(sql "SELECT max(version) FROM $SCHEMA.schema_version")
-    if [ "$s" = 6 ]; then pass "schema_version is 6 after the new server started"; else fail "schema_version $s"; fi
+    if [ -n "$want" ] && [ "$s" = "$want" ]; then pass "schema_version is $want (the new binary's) after the new server started"; else fail "schema_version $s, want $want"; fi
     snap "$OUT/b-old" "$OLD" "$NEW1_GRPC" "$NEW1_HTTP" "$C/cache-old"
     same "old client: every output identical after the upgrade" "$OUT/a-old" "$OUT/b-old"
     snap "$OUT/b-new" "$NEW" "$NEW1_GRPC" "$NEW1_HTTP" "$C/cache-new2"
@@ -570,7 +572,9 @@ rolling() {
     log "step 1: one new server with --pack-frames false (migrates)"
     start_server NEWA "$NEW" --pack-frames false
     s=$(sql "SELECT max(version) FROM $SCHEMA.schema_version")
-    [ "$s" = 6 ] && pass "rolling: schema migrated to 6 while old servers run" || fail "rolling: schema_version $s"
+    local want
+    want=$("$NEW" admin schema --no-migrate "${STORE[@]}" | awk '/^supported /{print $2}')
+    if [ -n "$want" ] && [ "$s" = "$want" ]; then pass "rolling: schema migrated to $want while old servers run"; else fail "rolling: schema_version $s, want $want"; fi
     local na=(ant "$NEW" "$NEWA_GRPC" "$NEWA_HTTP" "$C/cache-na")
     check "rolling: old server B still serves (readyz)" curl -fsS "$OLDB_HTTP/readyz"
     "${na[@]}" ws new "$C/ws-new" > /dev/null

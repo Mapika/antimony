@@ -1,7 +1,9 @@
-//! Git delta instructions. A block index sized to the base (at most 2^20
-//! slots) bounds both memory and collision work, including on repetitive or
-//! adversarial input. An index is built once per base and reused for every
-//! target tried against it (see the delta window in `pack.rs`).
+//! Git delta instructions (the payload format of git's `OFS_DELTA` pack
+//! entries): used by the git export (`ant-gitserve`) and by delta frames of
+//! repacked S3 packs (`ant-store` `packed`). A block index sized to the base
+//! (at most 2^20 slots) bounds both memory and collision work, including on
+//! repetitive or adversarial input. An index is built once per base and
+//! reused for every target tried against it (a delta window).
 const BLOCK: usize = 16;
 const MIN_SLOTS: usize = 1 << 8;
 const MAX_SLOTS: usize = 1 << 20;
@@ -170,6 +172,13 @@ fn varint(input: &mut &[u8]) -> Option<usize> {
         }
     }
     None
+}
+
+/// The base and target lengths `delta` declares in its header, or `None` if
+/// the header is malformed. Lets a reader check a delta (and bound the memory
+/// it would allocate) before applying it.
+pub fn lengths(mut delta: &[u8]) -> Option<(usize, usize)> {
+    Some((varint(&mut delta)?, varint(&mut delta)?))
 }
 
 /// Rebuild the target of `delta` against `base` into `out` (cleared first).

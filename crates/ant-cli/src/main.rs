@@ -200,6 +200,19 @@
 //!       `packs-kept <count> <bytes> <dead-bytes> <dead-percent>%`. Dry runs
 //!       report what a run would delete. `--abort`: `aborted` or
 //!       `nothing to abort`. A grace period under 1d: exit 1.
+//!   ant admin repack [--dry-run] [--min-age 1d] [--keep-recent 100] [--all] [--no-small]
+//!       [--window 10] [--depth 16] [--record-bytes 2097152] [--level 19] [--jobs N]
+//!       [--max-packs N] <store flags>
+//!       Rewrite cold objects as delta frames (Postgres + S3 stores; see
+//!       `ant_store::postgres::repack`). Progress on stderr (`repack: ...`).
+//!       stdout: first line `dry-run`, `done` or `stopped` (resumable: run
+//!       again); then `commits <n>`, `reachable <n>`, `hot <n>`,
+//!       `selected <cold> <hot> <other> <from-postgres>`,
+//!       `old-bytes <s3> <postgres>`, `new-bytes <n>`, `saved <bytes>` (may
+//!       be negative), `packs <packs> <records>`, `deltas <n> <max-depth>`,
+//!       `moved <n> <from-postgres>`, `skipped <n>`. Dry runs report what a
+//!       run would write. Another repack of the schema running, or no S3
+//!       store: exit 1.
 //!
 //! Store flags (`ant import`, `ant serve`, `ant admin`) include
 //! `--no-migrate` (ANT_NO_MIGRATE): by default the Postgres schema is
@@ -293,9 +306,16 @@ fn static_hint(e: &anyhow::Error) -> Option<&'static str> {
 
 fn main() -> ExitCode {
     let cli = args::parse();
-    if let args::Command::Serve(serve) = &cli.command {
+    match &cli.command {
         // Before the runtime exists: threads keep the arena they start with.
-        ant_server::serve::configure_malloc(serve.malloc_arenas);
+        args::Command::Serve(serve) => {
+            ant_server::serve::configure_malloc(serve.malloc_arenas);
+        }
+        // Many blocking compression threads: the same cap as a server.
+        args::Command::Admin { cmd: args::AdminCmd::Repack(_) } => {
+            ant_server::serve::configure_malloc(None);
+        }
+        _ => {}
     }
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,

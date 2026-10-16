@@ -105,18 +105,28 @@ binary's supported version is printed by `ant admin schema` as `supported <n>`.
 - Pre-versioning data (version 0) is adopted in place and stays readable for
   all of 0.x.
 - **S3 pack records** are part of stored data. A pack holds single-object
-  records (a zstd frame; every pack written before schema version 6) and,
-  from version 6 on, multi-object frames (magic `AFR1`, see
-  `ant_store::packed`). Every later binary reads both. Binaries supporting
-  only version 5 cannot read frames: version 6 is the one migration so far
-  after which running servers of the previous release must not keep
-  serving once new servers write. A rolling upgrade is still possible by
-  starting the new servers with `--pack-frames false` until the old ones
-  are gone; old servers already running keep working, but none can be
-  started again once the first new server has migrated the schema
-  (`docs/operations.md`, Upgrading). `scripts/upgrade-test.sh` checks the
-  upgrade from the previous release before each release. Changing a record format again
-  requires a new magic and a schema version bump.
+  records (a zstd frame; every pack written before schema version 6),
+  from version 6 on multi-object frames (magic `AFR1`), and from version 7
+  on delta frames (magic `ADF1`, written only by `ant admin repack`); all
+  are specified in the module docs of `ant_store::packed::frame`, and every
+  later binary reads all three. A delta frame's bases are always earlier
+  members of the same record, so every record decodes from its own bytes;
+  a reader refuses chains longer than 1,000 and members larger than 64 MiB.
+  Binaries supporting only version 5 cannot read frames: version 6 is the
+  first migration after which running servers of the previous release must
+  not keep serving once new servers write. A rolling upgrade is still
+  possible by starting the new servers with `--pack-frames false` until the
+  old ones are gone; old servers already running keep working, but none
+  can be started again once the first new server has migrated the schema
+  (`docs/operations.md`, Upgrading). Delta frames are written only by an
+  operator's `ant admin repack`: run it once no server older than version 7
+  is left. `scripts/upgrade-test.sh` checks the upgrade from the previous
+  release before each release. Changing a record format again requires a
+  new magic and a schema version bump.
+- Migration 7 (`repack`) creates the `packs` table (`repacked_at`, `hot`,
+  `moved_at`): `ant admin repack` records the packs it wrote and the packs
+  it moved index rows out of; `ant admin gc` keeps the latter for its
+  quiesce period after the move.
 - Table and column names are an implementation detail: use the API, the
   CLI, or `ant admin` rather than reading tables directly. Operational
   surfaces that are documented (`schema_version`, `gc_*` working tables for

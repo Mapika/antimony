@@ -32,7 +32,9 @@ use tokio::sync::{
     oneshot,
 };
 
-use crate::{delta, protocol::packet, select::Selection, walk};
+use ant_core::delta;
+
+use crate::{protocol::packet, select::Selection, walk};
 
 pub type Chunk = Result<Bytes, io::Error>;
 const SIDEBAND: usize = 65515;
