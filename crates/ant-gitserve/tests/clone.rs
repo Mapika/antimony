@@ -291,3 +291,76 @@ async fn delta_chains_path_type_changes_and_incremental_fetch() {
     let packed_count = packed_objects(&pack_dir).await.len();
     assert_eq!(packed_count, new.len(), "incremental pack repeated known objects");
 }
+
+/// The bytes of the one pack of a bare clone.
+fn single_pack(dir: &Path) -> Vec<u8> {
+    let packs: Vec<_> = std::fs::read_dir(dir.join("objects/pack"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "pack"))
+        .collect();
+    assert_eq!(packs.len(), 1, "{packs:?}");
+    std::fs::read(&packs[0]).unwrap()
+}
+
+/// Clones reuse the pack of the first clone (the cached base pack): clones
+/// arriving while it is built wait for it and receive the same bytes; after
+/// new commits a clone receives the base entries followed by exactly the new
+/// objects; after a ref moves back, a clone is built from scratch again.
+/// Every clone has exactly the objects of a clone from a fresh server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clones_reuse_the_cached_base_pack() {
+    let f = Fixture::new().await;
+    let tip = support::revisions(&f.b, Some(f.ids[2]), 0..20).await;
+    f.b.refs.cas_ref("main", Some(f.ids[2]), Some(tip)).await.unwrap();
+    for (n, filter) in [&[][..], &["--filter=blob:none"][..]].into_iter().enumerate() {
+        let clone = |name: String| {
+            let f = &f;
+            async move {
+                let mut options = vec!["--bare"];
+                options.extend_from_slice(filter);
+                f.clone_into(&name, &options).await
+            }
+        };
+        // A fresh server for every comparison clone: nothing cached.
+        let fresh = |name: String| {
+            let b = f.b.clone();
+            let temp = f.temp.path().to_path_buf();
+            async move {
+                let (url, task) = serve(b).await;
+                let mut args = vec!["clone", "--bare"];
+                args.extend_from_slice(filter);
+                args.extend([url.as_str(), name.as_str()]);
+                git(&temp, &args).await;
+                task.abort();
+                objects(&temp.join(&name)).await
+            }
+        };
+        let concurrent =
+            futures::future::join_all((0..4).map(|i| clone(format!("first-{n}-{i}")))).await;
+        let first = single_pack(&concurrent[0]);
+        for dir in &concurrent {
+            assert!(single_pack(dir) == first, "concurrent clones received different packs");
+            git(dir, &["fsck", "--full", "--strict"]).await;
+        }
+        assert_eq!(objects(&concurrent[0]).await, fresh(format!("fresh-{n}-a")).await);
+
+        let next = support::revisions(&f.b, Some(tip), 20 + n * 5..25 + n * 5).await;
+        f.b.refs.cas_ref("main", Some(tip), Some(next)).await.unwrap();
+        let after = clone(format!("after-{n}")).await;
+        let pack = single_pack(&after);
+        assert!(pack[12..first.len() - 32] == first[12..first.len() - 32], "base not reused");
+        assert!(pack.len() > first.len());
+        git(&after, &["fsck", "--full", "--strict"]).await;
+        let expected = fresh(format!("fresh-{n}-b")).await;
+        assert_eq!(objects(&after).await, expected);
+        assert_eq!(packed_objects(&after.join("objects/pack")).await.len(), expected.len());
+
+        // Back to `tip`: the base (built for `tip`... or `next`) is refused
+        // or reused, and the clone is exact either way.
+        f.b.refs.cas_ref("main", Some(next), Some(tip)).await.unwrap();
+        let back = clone(format!("back-{n}")).await;
+        git(&back, &["fsck", "--full", "--strict"]).await;
+        assert_eq!(objects(&back).await, fresh(format!("fresh-{n}-c")).await);
+    }
+}

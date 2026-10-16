@@ -29,6 +29,38 @@ release of the 0.x series may change.
   the run; `scripts/scorecard-local.sh` runs the headline benchmarks in local
   mode. Tests that ran in memory take `ANT_TEST_BACKEND=local`.
 
+### Changed
+
+- **Faster `git clone` from the git export.** A complete clone (no
+  `have`s, not shallow) keeps its pack entries as the cached *base pack* of
+  its filter (`blob:none` or none) in an unlinked temporary file; later
+  clones send the base verbatim followed by exactly the objects their wants
+  add beyond it (the pack holds the same objects as without the cache).
+  Clones arriving while a base is built wait for it. A new base is built
+  once clones reach more than 1/8 of its commits (plus 1,024) beyond it, or
+  when a tip of the base is no longer reachable. Bases live in the server
+  process only (no store or format change; at most one per filter). The
+  export still admits only principals that can read everything, so a base
+  never carries objects its requester could not get uncached (new ACL test).
+  git/git (Postgres + S3, local, `--single-branch`): blobless clone 6.0-7.8 s
+  -> 2.1 s (native `git daemon` 1.6 s), full clone 19-22 s -> 7.1 s (native
+  6.3 s); a clone 2,000 first-parent commits past the base: 3.0 s / 10 s.
+  Hetzner ccx43 + ccx33 (docs/scorecard/2026-10-16-hetzner-gitserve-clone.md):
+  blobless 29.5 -> 4.2 s (native 2.9 s), full 77.5 -> 11.4 s (native 8.9 s).
+- Smaller and cheaper export packs: trees try 40 delta bases instead of 10
+  (git/git blobless `.git` 92.4 -> 81.4 MB, native 61.1 MB; full 160 -> 149
+  MB, native 112 MB; most of the rest is SHA-256 ids); entries are zlib-
+  compressed through a small scratch buffer with the zlib-rs backend
+  (flate2's `compress_vec` zero-filled the multi-MB segment buffer on every
+  object: half the export's compression CPU); blobs are read 16 requests of
+  64 at a time (was 8 of 16). First (uncached) clone: blobless 6.8 s, full
+  12-17 s.
+- `scripts/vs-git.sh`: clones use `--single-branch` on both sides (the export
+  lists every ref of the store, `synth` and `storm*` included, which made
+  antimony's clones 3-7x larger than the daemon's single-branch repository);
+  `--phases "clone ..."` runs only the named timed phases and prepares only
+  what they need.
+
 ## [0.2.2] - 2026-10-16
 
 Patch release: no storage or protocol changes (the shared disk cache gains

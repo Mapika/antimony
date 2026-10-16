@@ -4,14 +4,20 @@
 //! `filter blob:none`) at `/repo.git`; `receive-pack` is refused. Packs are
 //! streamed with bounded memory and delta-compress trees and blobs against a
 //! window of other versions of the same path (see `pack.rs`, `README.md`).
-//! Commits served must be recorded in the MetaStore (generation numbers bound
-//! the `have` walk).
+//! Complete clones reuse a cached base pack (`cache.rs`). Commits served must
+//! be recorded in the MetaStore (generation numbers bound the `have` walk).
+//!
+//! Every request sees the whole repository: the export has no per-principal
+//! view, and a server with an access policy admits only principals that can
+//! read everything (`ant-server`'s `git_auth`), so packs (cached or not) do
+//! not depend on who asks.
+mod cache;
 mod pack;
 mod protocol;
 mod select;
 mod walk;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use ant_store::Backend;
 use anyhow::Result;
@@ -31,11 +37,19 @@ use select::Fetch;
 
 /// Export a backend at `/repo.git`. Every write endpoint returns HTTP 403.
 pub fn router(backend: Backend) -> Router {
+    let state = Export { backend, cache: Arc::default() };
     Router::new()
         .route("/repo.git/info/refs", get(advertise))
         .route("/repo.git/git-upload-pack", post(upload))
         .route("/repo.git/git-receive-pack", axum::routing::any(|| async { StatusCode::FORBIDDEN }))
-        .with_state(backend)
+        .with_state(state)
+}
+
+/// One export: its backend and its cached base packs (`cache.rs`).
+#[derive(Clone)]
+struct Export {
+    backend: Backend,
+    cache: Arc<cache::PackCache>,
 }
 
 fn response(body: impl Into<Body>, advertisement: bool) -> Response {
@@ -68,7 +82,7 @@ async fn advertise(Query(query): Query<HashMap<String, String>>) -> Response {
     response(body, true)
 }
 
-async fn upload(State(backend): State<Backend>, headers: HeaderMap, body: Bytes) -> Response {
+async fn upload(State(export): State<Export>, headers: HeaderMap, body: Bytes) -> Response {
     let body = match decode_body(&headers, body) {
         Ok(body) => body,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
@@ -78,7 +92,7 @@ async fn upload(State(backend): State<Backend>, headers: HeaderMap, body: Bytes)
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
     match request.command {
-        "ls-refs" => match refs(&backend, &request.args).await {
+        "ls-refs" => match refs(&export.backend, &request.args).await {
             Ok(body) => response(body, false),
             Err(error) => {
                 tracing::warn!(error = format!("{error:#}"), "git ls-refs failed");
@@ -90,7 +104,7 @@ async fn upload(State(backend): State<Backend>, headers: HeaderMap, body: Bytes)
                 Ok(fetch) => fetch,
                 Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
             };
-            match fetch_response(backend, fetch).await {
+            match fetch_response(export, fetch).await {
                 Ok(response) => response,
                 Err(error) => {
                     tracing::warn!(error = format!("{error:#}"), "git fetch failed");
@@ -99,6 +113,19 @@ async fn upload(State(backend): State<Backend>, headers: HeaderMap, body: Bytes)
             }
         }
         _ => StatusCode::BAD_REQUEST.into_response(),
+    }
+}
+
+/// The clone `fetch` planned on top of the cached base of its filter, if
+/// there is one and it fits (`select::select_after`).
+async fn plan_on_base(
+    b: &Backend,
+    fetch: &Fetch,
+    cache: &cache::PackCache,
+) -> Result<Option<select::Selection>> {
+    match cache.get(fetch.no_blobs) {
+        Some(base) => select::select_after(b, fetch, &base, base.rebuild_after()).await,
+        None => Ok(None),
     }
 }
 
@@ -142,7 +169,8 @@ async fn refs(b: &Backend, args: &[&str]) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-async fn fetch_response(b: Backend, fetch: Fetch) -> Result<Response> {
+async fn fetch_response(export: Export, fetch: Fetch) -> Result<Response> {
+    let Export { backend: b, cache } = export;
     let mut prefix = Vec::new();
     if !fetch.done {
         prefix.extend(packet(b"acknowledgments\n"));
@@ -162,7 +190,24 @@ async fn fetch_response(b: Backend, fetch: Fetch) -> Result<Response> {
         return Ok(response(prefix, false));
     }
     let started = std::time::Instant::now();
-    let mut selection = select::select(&b, &fetch).await?;
+    // A clone is planned on top of the cached base pack of its filter when
+    // that fits. Otherwise it waits for a base being built (which may fit),
+    // or is planned from scratch and becomes the new base.
+    let mut on_base = None;
+    let mut build = None;
+    if fetch.is_clone() {
+        on_base = plan_on_base(&b, &fetch, &cache).await?;
+        if on_base.is_none() {
+            let guard = cache.lock_build(fetch.no_blobs).await;
+            on_base = plan_on_base(&b, &fetch, &cache).await?;
+            build = on_base.is_none().then_some(guard);
+        }
+    }
+    let mut selection = match on_base {
+        Some(selection) => selection,
+        None => select::select(&b, &fetch).await?,
+    };
+    let record = build.and_then(|guard| cache::Recorder::new(cache.clone(), &selection, guard));
     let planned = started.elapsed();
     if fetch.depth.is_some() {
         prefix.extend(packet(b"shallow-info\n"));
@@ -178,15 +223,18 @@ async fn fetch_response(b: Backend, fetch: Fetch) -> Result<Response> {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tx.send(Ok(prefix.into())).await?;
     tokio::spawn(async move {
-        match pack::send(b, selection, fetch.ofs_delta, tx.clone()).await {
-            Ok(stats) => tracing::info!(
-                objects = stats.objects,
-                deltas = stats.deltas,
-                bytes = stats.bytes,
-                planning_ms = planned.as_millis() as u64,
-                total_ms = started.elapsed().as_millis() as u64,
-                "git pack sent"
-            ),
+        match pack::send_with(b, selection, fetch.ofs_delta, record, tx.clone()).await {
+            Ok(stats) => {
+                tracing::info!(
+                    objects = stats.objects,
+                    deltas = stats.deltas,
+                    reused = stats.reused,
+                    bytes = stats.bytes,
+                    planning_ms = planned.as_millis() as u64,
+                    total_ms = started.elapsed().as_millis() as u64,
+                    "git pack sent"
+                );
+            }
             Err(error) => {
                 tracing::warn!(error = format!("{error:#}"), "git pack failed");
                 // Sideband 3 (git prints "remote error: ..." and fails), then

@@ -41,8 +41,10 @@ bytes.
 ## Deltas
 
 Clients advertising `ofs-delta` receive tree and blob deltas against an earlier
-entry in the same pack. Each object tries the previous `WINDOW` (10) objects of
-its path, newest first, and keeps the smallest delta, with git's depth-scaled
+entry in the same pack. Each blob tries the previous `WINDOW` (10) blobs of its
+path, each tree the previous `TREE_WINDOW` (40) trees (small, size-sorted and
+the bulk of a blobless clone: git/git's blobless pack 81.7 -> 70.5 MiB for
+about 0.3 s more), newest first, and keeps the smallest delta, with git's depth-scaled
 size limit (a deeper base must beat the current best proportionally) so chains
 fan out instead of running to the cap. Chains are capped at depth 50. A delta
 must be below about half the target size (half less 32 bytes, scaled down for
@@ -51,7 +53,10 @@ file/directory transitions. The encoder builds one block index per base (sized
 to the base, at most 2^20 slots, high bits of a mixed rolling hash), reuses it
 for every target, and extends matches backwards and forwards. No REF_DELTA or
 external base is emitted, even when `thin-pack` is offered. Clients without
-`ofs-delta` receive full objects. Entries are zlib level 6 (git's default).
+`ofs-delta` receive full objects. Entries are zlib level 6 (git's default),
+compressed by zlib-rs into a small scratch buffer (flate2's `compress_vec`
+zero-fills the spare capacity of its output vector on every call, which on a
+segment buffer of megabytes once cost more than the compression).
 
 ## Streaming and memory
 
@@ -83,6 +88,49 @@ share 1 MiB slabs and delta-index tables are reused, which keeps allocator
 churn (and so peak RSS) down. Measured on git/git with a counting allocator,
 the live heap peaks at 300-380 MiB; peak RSS is 2-3x that with glibc's
 default arenas (8 per core), about 1.7x with `MALLOC_ARENA_MAX=16`.
+
+## Cached base packs (`cache.rs`)
+
+A clone (`done`, no `have`s, no shallow boundary, `ofs-delta`) that finds no
+usable base is built as above and its entries (the spill file: everything
+between pack header and trailer) become the *base* of its filter (`blob:none`
+or none), together with the sorted ids of its objects and its *tips* (the
+wanted commits no other wanted commit reaches). The base is installed as soon
+as the walk is complete, before the pack is streamed. Later clones whose wants
+reach every tip are planned like a fetch with the base as `have`s: commits are
+walked from the wants down to the first commits in the base, trees and blobs
+in the base are excluded by id. The pack is
+
+```text
+header(base count + n) | base entries, verbatim | n new entries | trailer
+```
+
+OFS_DELTA distances are relative, so the base entries are valid at any
+position. The client receives exactly the objects its wants reach, as without
+the cache (pinned by `base_pack_reuse_is_exact` and
+`clones_reuse_the_cached_base_pack`). A clone whose wants reach more than
+`commits / 8 + 1024` new commits, or miss a tip (ref deleted or rewound), is
+built from scratch and replaces the base. Clones arriving while a base of
+their filter is built wait for it (one build per filter at a time) and then
+use it if it fits. Bases live in the server process only, as unlinked
+temporary files (about the size of the pack; the git/git bases are 67 and 125
+MiB) plus their ids in memory (32 bytes per object); a restarted server
+rebuilds them on the first clones. Fetches with `have`s, shallow and
+`ofs-delta`-less clones never use or build a base.
+
+git/git on Postgres + SeaweedFS (2026-10-16, loaded 20-core WSL2 machine,
+`git clone --single-branch` over HTTP, native = `git daemon` on the
+`gc --aggressive` + bitmaps repository):
+
+| clone | before | first clone (builds the base) | later clones | native git |
+|---|---:|---:|---:|---:|
+| `--filter=blob:none --no-checkout` | 6.0-7.8 s, .git 92.4 MB | 6.8 s | 2.1 s, .git 81.4 MB | 1.6 s, .git 61.1 MB |
+| full (with checkout) | 19-22 s, .git 160 MB | 12-17 s | 7.1 s, .git 149 MB | 6.3 s, .git 112 MB |
+| base 2,000 first-parent commits behind | | | blobless 3.0 s, full 10 s | |
+
+The remaining 1.33x in bytes is mostly SHA-256: git's own `repack -a -d -f
+--window=250` of the same SHA-256 objects (blobless) is 69.7 MB against 53 MB
+for its SHA-1 pack.
 
 ## Measurements
 

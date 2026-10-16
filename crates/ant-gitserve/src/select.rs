@@ -3,11 +3,14 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, HashSet, VecDeque},
+    sync::Arc,
 };
 
 use ant_core::{EntryMode, ObjectId, ObjectKind};
 use ant_store::{Backend, CommitNode};
 use anyhow::{Result, anyhow, bail, ensure};
+
+use crate::cache::Base;
 
 /// Ids per store call when reading commit metadata and checking `have`s.
 pub const BATCH: usize = 512;
@@ -56,6 +59,29 @@ impl Fetch {
         ensure!(!fetch.wants.is_empty(), "missing wants");
         Ok(fetch)
     }
+
+    /// A complete clone that can use, or become, a cached base pack (see
+    /// `cache.rs`): nothing to subtract, no shallow boundary, deltas taken.
+    pub fn is_clone(&self) -> bool {
+        self.done
+            && self.haves.is_empty()
+            && self.shallow.is_empty()
+            && self.depth.is_none()
+            && self.ofs_delta
+    }
+}
+
+/// Objects the client has: a set, and/or everything in a cached base pack.
+#[derive(Clone, Default)]
+pub struct Excluded {
+    pub set: HashSet<ObjectId>,
+    pub base: Option<Arc<Base>>,
+}
+
+impl Excluded {
+    pub fn contains(&self, id: &ObjectId) -> bool {
+        self.set.contains(id) || self.base.as_ref().is_some_and(|base| base.contains(id))
+    }
 }
 
 /// What a fetch sends, before any tree is read: the export walk
@@ -69,11 +95,16 @@ pub struct Selection {
     pub direct: Vec<ObjectId>,
     /// Root trees of the selected commits (repeats allowed).
     pub roots: Vec<ObjectId>,
-    /// Objects the client has (reachable from its `have`s).
-    pub excluded: HashSet<ObjectId>,
+    /// Objects the client has (reachable from its `have`s), or that the
+    /// cached base pack sent ahead of this selection already holds.
+    pub excluded: Excluded,
     pub no_blobs: bool,
     pub shallow: Vec<ObjectId>,
     pub unshallow: Vec<ObjectId>,
+    /// For a clone (`Fetch::is_clone`): the wanted commits that are not
+    /// ancestors of other wanted commits. The pack is then exactly what
+    /// they reach and can be cached as a base for them.
+    pub tips: Vec<ObjectId>,
 }
 
 /// Lazily paint have ancestry in generation order. To test a candidate at
@@ -228,6 +259,12 @@ pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
     let mut seen = HashSet::new();
     let mut frontier = fetch.wants.clone();
     let mut level = 1;
+    // Clones note their tips: wanted commits no other commit reaches.
+    let clone = fetch.is_clone();
+    let wanted: HashSet<ObjectId> =
+        if clone { fetch.wants.iter().copied().collect() } else { HashSet::new() };
+    let mut tips = Vec::new();
+    let mut parents = HashSet::new();
     while !frontier.is_empty() {
         let mut next = Vec::new();
         for chunk in frontier.chunks(BATCH) {
@@ -251,6 +288,12 @@ pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
                 }
                 commits.push(*id);
                 roots.push((Reverse(node.generation), node.tree));
+                if clone {
+                    if wanted.contains(id) {
+                        tips.push(*id);
+                    }
+                    parents.extend(node.parents.iter().copied());
+                }
                 if fetch.depth.is_some_and(|depth| level >= depth) {
                     if !node.parents.is_empty() {
                         shallow.push(*id);
@@ -269,6 +312,8 @@ pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
         level += 1;
     }
     drop(seen);
+    tips.retain(|id| !parents.contains(id));
+    drop(parents);
     let mut excluded = HashSet::new();
     if !roots.is_empty() || !direct.is_empty() {
         // Exact subtraction includes historical trees, including restored files.
@@ -282,7 +327,77 @@ pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
     // export walk's runs of versions small (see `walk.rs`).
     roots.sort_by_key(|(generation, _)| *generation);
     let roots = roots.into_iter().map(|(_, tree)| tree).collect();
-    Ok(Selection { commits, direct, roots, excluded, no_blobs: fetch.no_blobs, shallow, unshallow })
+    Ok(Selection {
+        commits,
+        direct,
+        roots,
+        excluded: Excluded { set: excluded, base: None },
+        no_blobs: fetch.no_blobs,
+        shallow,
+        unshallow,
+        tips,
+    })
+}
+
+/// Plan a clone on top of a cached `base`: the commits the wants reach
+/// beyond it (the walk stops at commits in the base) and their trees, with
+/// the base's objects excluded. `None` when the base does not fit: a want
+/// is not a commit, the wants do not reach every tip of the base (the pack
+/// would carry objects the client did not ask for), or they reach more than
+/// `limit` commits beyond it (a new base is due).
+pub async fn select_after(
+    b: &Backend,
+    fetch: &Fetch,
+    base: &Arc<Base>,
+    limit: usize,
+) -> Result<Option<Selection>> {
+    let base_tips: HashSet<ObjectId> = base.tips.iter().copied().collect();
+    let mut reached_tips = HashSet::new();
+    let mut commits = Vec::new();
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    let mut frontier = fetch.wants.clone();
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        let mut new = Vec::new();
+        for id in frontier {
+            if !seen.insert(id) {
+                continue;
+            }
+            if base.contains(&id) {
+                // Tips form an antichain: a reachable tip is reached
+                // before any other commit of the base below it.
+                if base_tips.contains(&id) {
+                    reached_tips.insert(id);
+                }
+            } else {
+                new.push(id);
+            }
+        }
+        for chunk in new.chunks(BATCH) {
+            for (id, node) in chunk.iter().zip(b.meta.get_commits(chunk).await?) {
+                let Some(node) = node else { return Ok(None) };
+                commits.push(*id);
+                roots.push((Reverse(node.generation), node.tree));
+                next.extend(node.parents);
+            }
+        }
+        if commits.len() > limit {
+            return Ok(None);
+        }
+        frontier = next;
+    }
+    if reached_tips.len() != base_tips.len() {
+        return Ok(None);
+    }
+    roots.sort_by_key(|(generation, _)| *generation);
+    Ok(Some(Selection {
+        commits,
+        roots: roots.into_iter().map(|(_, tree)| tree).collect(),
+        excluded: Excluded { set: HashSet::new(), base: Some(base.clone()) },
+        no_blobs: fetch.no_blobs,
+        ..Default::default()
+    }))
 }
 
 #[cfg(test)]

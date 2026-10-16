@@ -1165,6 +1165,88 @@ async fn git_clone_requires_full_read() {
     assert_eq!(r.status(), 200);
 }
 
+/// The export's cached base packs (`ant-gitserve` `cache.rs`) serve the same
+/// all-or-nothing view as uncached packs: full readers get the same objects
+/// (and bytes) whether a restricted principal tried before or after them and
+/// whether the pack was built or reused; restricted and anonymous requests
+/// are refused before any pack, cached or not, is planned or sent.
+#[tokio::test]
+async fn git_cached_packs_never_widen_access() {
+    let (s, _) = seeded().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let host = s.http_base.trim_start_matches("http://");
+    let url = |token: &str| format!("http://x:{token}@{host}/repo.git");
+    let objects = |dir: std::path::PathBuf| async move {
+        let out = git(
+            &dir,
+            &["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
+        )
+        .await;
+        assert!(out.status.success());
+        let mut lines: Vec<String> =
+            String::from_utf8(out.stdout).unwrap().lines().map(str::to_owned).collect();
+        lines.sort();
+        lines
+    };
+    let pack = |dir: &Path| {
+        let pack_dir = dir.join("objects/pack");
+        let mut packs: Vec<_> = std::fs::read_dir(&pack_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "pack"))
+            .collect();
+        assert_eq!(packs.len(), 1);
+        std::fs::read(packs.pop().unwrap()).unwrap()
+    };
+    for (n, filter) in [&[][..], &["--filter=blob:none"][..]].into_iter().enumerate() {
+        let clone = |token: &'static str, name: String| {
+            let tmp = tmp.path().to_path_buf();
+            let url = url(token);
+            async move {
+                let mut args = vec!["-c", "fetch.unpackLimit=1", "clone", "--bare"];
+                args.extend_from_slice(filter);
+                args.extend([url.as_str(), name.as_str()]);
+                (git(&tmp, &args).await, tmp.join(&name))
+            }
+        };
+        // Restricted before anything is cached, then a full reader builds the
+        // base, then restricted again (the base exists now), then another full
+        // reader reuses it.
+        let (denied, dir) = clone(READER, format!("r1-{n}")).await;
+        assert!(
+            !denied.status.success() && String::from_utf8_lossy(&denied.stderr).contains("403")
+        );
+        assert!(!dir.exists());
+        let (built, writer) = clone(WRITER, format!("w-{n}")).await;
+        assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+        let (denied, dir) = clone(READER, format!("r2-{n}")).await;
+        assert!(
+            !denied.status.success() && String::from_utf8_lossy(&denied.stderr).contains("403")
+        );
+        assert!(!dir.exists());
+        let r = s
+            .http
+            .post(format!("{}/repo.git/git-upload-pack", s.http_base))
+            .basic_auth("x", Some(READER))
+            .body("0012command=fetch\n00010009done\n0000")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+        assert!(!r.bytes().await.unwrap().windows(4).any(|w| w == b"PACK"));
+        let (reused, admin) = clone(ADMIN, format!("a-{n}")).await;
+        assert!(reused.status.success(), "{}", String::from_utf8_lossy(&reused.stderr));
+        assert!(pack(&admin) == pack(&writer), "cached pack differs from the built one");
+        assert_eq!(objects(admin.clone()).await, objects(writer.clone()).await);
+        for dir in [&writer, &admin] {
+            let fsck = git(dir, &["fsck", "--full", "--strict"]).await;
+            assert!(fsck.status.success(), "{}", String::from_utf8_lossy(&fsck.stderr));
+        }
+        let anon = git(tmp.path(), &["clone", &format!("{}/repo.git", s.http_base), "anon"]).await;
+        assert!(!anon.status.success());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // open mode
 // ---------------------------------------------------------------------------

@@ -37,7 +37,7 @@ use anyhow::{Result, anyhow, bail, ensure};
 use bytes::BytesMut;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
-use crate::select::{BATCH, Read, Selection, entries};
+use crate::select::{BATCH, Excluded, Read, Selection, entries};
 
 /// Objects in pack order, each with its path fingerprint.
 pub type Batch = Vec<(u64, EncodedObject)>;
@@ -49,8 +49,13 @@ const ROOT_PATH: u64 = 1;
 /// One store read takes up to this many trees or commits; a blob, whose size
 /// is not known before reading it, costs `BLOB_COST` of it.
 const READ_COST: usize = 256;
-const BLOB_COST: usize = 16;
+const BLOB_COST: usize = 4;
+/// Store reads in flight while trees and commits are read...
 const READS_IN_FLIGHT: usize = 8;
+/// ...and while blobs are: each takes more requests per byte from packs in
+/// S3 (a full clone of git/git waited about 25% less on reads with 16 reads
+/// of 64 blobs than with 8 of 16).
+const BLOB_READS_IN_FLIGHT: usize = 16;
 /// Bytes of runs (deltas and whole first entries) held for one group.
 const STASH_BYTES: usize = 32 << 20;
 /// Body bytes per batch of merged output.
@@ -255,7 +260,7 @@ struct Fetched {
 fn prepare(
     items: Vec<Item>,
     objects: Vec<Option<EncodedObject>>,
-    excluded: &HashSet<ObjectId>,
+    excluded: &Excluded,
     no_blobs: bool,
 ) -> Result<Fetched> {
     ensure!(objects.len() == items.len(), "incomplete store batch");
@@ -306,9 +311,17 @@ fn prepare(
     Ok(fetched)
 }
 
+/// Reads to keep in flight for the item at the front of `queue`.
+fn reads_in_flight(queue: &VecDeque<Item>) -> usize {
+    match queue.front() {
+        Some(item) if item.kind == Kind::Blob => BLOB_READS_IN_FLIGHT,
+        _ => READS_IN_FLIGHT,
+    }
+}
+
 /// Walk state; moved to the blocking pool for each read.
 struct Walk {
-    excluded: std::sync::Arc<HashSet<ObjectId>>,
+    excluded: std::sync::Arc<Excluded>,
     found: HashSet<ObjectId>,
     no_blobs: bool,
     queue: VecDeque<Item>,
@@ -462,7 +475,7 @@ pub async fn walk(b: Backend, selection: Selection, tx: Sender<Part>) -> Result<
     walk.enqueue(ROOT_PATH, Kind::Tree, roots);
     let mut reads = VecDeque::new();
     loop {
-        while reads.len() < READS_IN_FLIGHT && !walk.queue.is_empty() {
+        while reads.len() < reads_in_flight(&walk.queue) && !walk.queue.is_empty() {
             let mut cost = 0;
             let mut items = Vec::new();
             while let Some(item) = walk.queue.front() {

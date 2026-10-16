@@ -32,7 +32,7 @@ clap_complete = "4"
 diffy = "0.4"
 fuser = { version = "0.18", default-features = false }
 futures = "0.3"
-flate2 = "1"
+flate2 = { version = "1", features = ["zlib-rs"] }
 gix = { version = "0.89", default-features = false, features = ["max-performance-safe", "revision", "sha1"] }
 globset = "0.4"
 http = "1"

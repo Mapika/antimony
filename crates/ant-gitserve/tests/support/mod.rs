@@ -4,8 +4,7 @@
 
 use ant_core::{Commit, EncodedObject, EntryMode, ObjectId, ObjectKind, Signature, TreeEntry};
 use ant_store::{Backend, ObjectStoreExt, graph::write_commit};
-use flate2::{Compression, write::ZlibEncoder};
-use std::io::Write;
+use flate2::{Compress, Compression, FlushCompress, Status};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -146,11 +145,16 @@ pub async fn history(revisions: usize, width: usize) -> (Backend, u64) {
         );
         let encoded = EncodedObject::new(ObjectKind::Commit, &commit.encode());
         // Exactly the encoder's undeltified entries: zlib level 6 (`pack::LEVEL`,
-        // git's default) and the pack object header size.
+        // git's default), all input in one call as the encoder does (zlib-rs
+        // compresses input fed in pieces slightly differently), and the pack
+        // object header size.
         for object in [&tree, &encoded] {
-            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(6));
-            encoder.write_all(object.body()).unwrap();
-            undeltified += encoder.finish().unwrap().len() as u64;
+            let mut compress = Compress::new(Compression::new(6), true);
+            let mut out = Vec::with_capacity(object.body().len() * 2 + 64);
+            let status =
+                compress.compress_vec(object.body(), &mut out, FlushCompress::Finish).unwrap();
+            assert_eq!(status, Status::StreamEnd);
+            undeltified += out.len() as u64;
             let mut size = object.body().len() >> 4;
             undeltified += 1;
             while size != 0 {
