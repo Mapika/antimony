@@ -77,11 +77,68 @@ pub struct ServeArgs {
     #[arg(long, env = "ANT_MALLOC_ARENAS")]
     pub malloc_arenas: Option<usize>,
 
+    /// Async worker threads (default: one per CPU; in local mode at most
+    /// [`LOCAL_WORKER_THREADS`]).
+    #[arg(long, env = "ANT_WORKER_THREADS", value_parser = clap::value_parser!(u32).range(1..=1024))]
+    pub worker_threads: Option<u32>,
+
+    /// Budget of the server's caches of trees, commits and changesets, MiB
+    /// (default 104; 48 in local mode). Each cache may briefly hold twice
+    /// its share.
+    #[arg(long, env = "ANT_CACHE_MIB")]
+    pub cache_mib: Option<usize>,
+
     #[command(flatten)]
     pub limits: LimitArgs,
 
     #[command(flatten)]
     pub store: StoreArgs,
+}
+
+/// Async worker threads of a local-mode server at most (`--worker-threads`).
+pub const LOCAL_WORKER_THREADS: usize = 4;
+/// Blocking-pool threads of a local-mode server at most (SQLite reads and
+/// pack-file I/O; idle ones exit after 10 s).
+pub const LOCAL_BLOCKING_THREADS: usize = 64;
+/// Server cache budget in local mode, MiB.
+pub const LOCAL_CACHE_MIB: usize = 48;
+
+impl ServeArgs {
+    /// Async worker threads: `--worker-threads`, else in local mode
+    /// min([`LOCAL_WORKER_THREADS`], CPUs), else the runtime default.
+    pub fn worker_threads(&self) -> Option<usize> {
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        match self.worker_threads {
+            Some(n) => Some(n as usize),
+            None if self.store.is_local() => Some(LOCAL_WORKER_THREADS.min(cpus)),
+            None => None,
+        }
+    }
+
+    /// Malloc arenas to configure: `--malloc-arenas`, else in local mode
+    /// twice the worker threads (fewer arenas, less retained memory).
+    pub fn effective_malloc_arenas(&self) -> Option<usize> {
+        self.malloc_arenas.or_else(|| {
+            if self.store.is_local() {
+                self.worker_threads().map(|n| (2 * n).clamp(2, 16))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The tokio runtime this server runs on (see [`Self::worker_threads`]).
+    pub fn runtime(&self) -> std::io::Result<tokio::runtime::Runtime> {
+        let mut b = tokio::runtime::Builder::new_multi_thread();
+        b.enable_all();
+        if let Some(n) = self.worker_threads() {
+            b.worker_threads(n.max(1));
+        }
+        if self.store.is_local() {
+            b.max_blocking_threads(LOCAL_BLOCKING_THREADS);
+        }
+        b.build()
+    }
 }
 
 /// Default arena cap: twice the CPU count, within 2..=16.
@@ -141,7 +198,19 @@ pub fn init_logging(format: Option<LogFormat>) {
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     init_logging(args.log_format);
 
+    let cache_mib = args.cache_mib.or(args.store.is_local().then_some(LOCAL_CACHE_MIB));
+    if let Some(mib) = cache_mib {
+        crate::ops::set_cache_budget(mib.saturating_mul(1 << 20));
+    }
+    let started = std::time::Instant::now();
     let (backend, probes) = args.store.backend_with_probes().await?;
+    if let Some(local) = &probes.local {
+        tracing::info!(
+            dir = %local.dir().display(),
+            opened_ms = started.elapsed().as_millis() as u64,
+            "local mode: SQLite metadata and pack files in one directory"
+        );
+    }
     let metrics = Metrics::new();
     metrics.set_probes(probes);
     let backend = metrics.instrument(&backend);
@@ -179,7 +248,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         "ant-server listening"
     );
 
-    let limit_cfg = args.limits.config(args.store.pg_max_connections());
+    let limit_cfg = args.limits.config(args.store.limit_pool());
     if limit_cfg.enabled {
         tracing::info!(
             max_inflight = ?limit_cfg.max_inflight,
@@ -212,8 +281,35 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             None => std::future::pending().await,
         }
     };
-    tokio::try_join!(grpc_fut, http_fut, metrics_fut)?;
-    Ok(())
+    let servers = async { tokio::try_join!(grpc_fut, http_fut, metrics_fut).map(|_| ()) };
+    tokio::select! {
+        r = servers => r,
+        () = shutdown_signal() => {
+            tracing::info!("SIGTERM or SIGINT: shutting down");
+            Ok(())
+        }
+    }
+}
+
+/// Resolves on SIGTERM or SIGINT (never, if the handlers cannot be set).
+async fn shutdown_signal() {
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    let int = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        () = term => {}
+        () = int => {}
+    }
 }
 
 /// Addresses of a server started by [`spawn_local`].

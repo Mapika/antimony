@@ -16,8 +16,8 @@ struct Args {
 fn main() -> ExitCode {
     let args = Args::parse().serve;
     // Before the runtime exists: threads keep the arena they start with.
-    ant_server::serve::configure_malloc(args.malloc_arenas);
-    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    ant_server::serve::configure_malloc(args.effective_malloc_arenas());
+    let rt = match args.runtime() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("error: starting runtime: {e}");

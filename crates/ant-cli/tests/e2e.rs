@@ -802,3 +802,55 @@ fn cli_gc_and_schema_local() {
         r.fail("directory in use");
     }
 }
+
+/// `ant local start|status|stop` on a fresh data directory.
+#[test]
+fn cli_local_start_status_stop() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data = tmp.path().join("data");
+    let data_s = data.display().to_string();
+    let (grpc, http) = free_ports();
+    let ctx = Ctx {
+        ant: PathBuf::from(env!("CARGO_BIN_EXE_ant")),
+        env: vec![
+            ("ANT_CACHE".into(), tmp.path().join("cache").display().to_string()),
+            ("ANT_SERVER".into(), format!("http://127.0.0.1:{grpc}")),
+        ],
+    };
+    /// Stops the server on drop (also on panic).
+    struct Stop<'a>(&'a Ctx, &'a str);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.run(None, &["local", "stop", "--dir", self.1]);
+        }
+    }
+    let r = ctx.run(None, &["local", "status", "--dir", &data_s]).expect_code(1);
+    check_eq(&r, "status before", r.stdout(), "stopped\n".into());
+    let (g, h) = (format!("127.0.0.1:{grpc}"), format!("127.0.0.1:{http}"));
+    let start = ["local", "start", "--dir", &data_s, "--grpc-listen", &g, "--http-listen", &h];
+    let r = ctx.run(None, &start).ok();
+    let _stop = Stop(&ctx, &data_s);
+    let out = r.stdout();
+    let urls = format!("http://{g} http://{h}\n");
+    let Some(pid) = out.strip_prefix("started ").and_then(|o| o.strip_suffix(&format!(" {urls}")))
+    else {
+        r.fail("start output");
+    };
+    let r = ctx.run(None, &["local", "status", "--dir", &data_s]).ok();
+    check_eq(&r, "status", r.stdout(), format!("running {pid} {urls}"));
+    let r = ctx.run(None, &start).ok();
+    check_eq(&r, "second start", r.stdout(), format!("running {pid} {urls}"));
+    // The server answers, and the directory is busy for offline tools.
+    let r = ctx.run(None, &["ref", "list"]).ok();
+    check_eq(&r, "no refs yet", r.stdout(), String::new());
+    let r = ctx.run(None, &["admin", "gc", "--local", &data_s]).expect_code(1);
+    if !r.stderr().contains("in use") {
+        r.fail("busy directory");
+    }
+    let r = ctx.run(None, &["local", "stop", "--dir", &data_s]).ok();
+    check_eq(&r, "stop", r.stdout(), format!("stopped {pid}\n"));
+    let r = ctx.run(None, &["local", "stop", "--dir", &data_s]).ok();
+    check_eq(&r, "stop again", r.stdout(), "stopped\n".into());
+    ctx.run(None, &["local", "status", "--dir", &data_s]).expect_code(1);
+    assert!(data.join("server.log").exists());
+}

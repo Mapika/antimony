@@ -162,6 +162,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "futures",
+ "libc",
  "sqlx",
  "tempfile",
  "tokio",

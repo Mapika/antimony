@@ -9,6 +9,7 @@ mod admin;
 mod cache;
 mod cache_serve;
 mod import;
+mod local;
 mod mount;
 mod query;
 mod refs;
@@ -17,6 +18,7 @@ mod ws;
 pub async fn run(cli: Cli) -> Result<Outcome> {
     let cli = match cli.command {
         Command::Serve(a) => return ant_server::serve::run(*a).await.map(|()| Outcome::empty()),
+        Command::Local { cmd } => return local::run(cmd).await,
         Command::CacheServe(a) => {
             return cache_serve::run(a, cli.cache, cli.cache_bytes)
                 .await
@@ -32,9 +34,10 @@ pub async fn run(cli: Cli) -> Result<Outcome> {
     let ctx = Ctx::from_cli(&cli)?;
     match cli.command {
         // Handled above, before the client context is built.
-        Command::Serve(_) | Command::CacheServe(_) | Command::Completions { .. } => {
-            Ok(Outcome::empty())
-        }
+        Command::Serve(_)
+        | Command::Local { .. }
+        | Command::CacheServe(_)
+        | Command::Completions { .. } => Ok(Outcome::empty()),
         Command::Import(a) => import::run(a).await,
         Command::Ls { target } => query::ls(&ctx, &target).await,
         Command::Cat { target } => query::cat(&ctx, &target).await,

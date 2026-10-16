@@ -35,6 +35,10 @@ pub fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
     Ok(std::time::Duration::from_millis(ms))
 }
 
+/// Concurrency limits of a local-mode server are those of a server with a
+/// pool of this many connections (64 reads, 32 writes, 256 lands in flight).
+pub const LOCAL_LIMIT_POOL: u32 = 16;
+
 /// Backend selection flags (`--memory` | `--local [<dir>]` | `--pg-url` +
 /// optional `--s3-*`).
 #[derive(clap::Args, Debug, Clone)]
@@ -191,6 +195,12 @@ impl StoreArgs {
             migrate: !self.no_migrate,
             ..LocalOptions::default()
         }
+    }
+
+    /// The basis of the default concurrency limits (`crate::limits`): the
+    /// Postgres query-pool size, or [`LOCAL_LIMIT_POOL`] in local mode.
+    pub fn limit_pool(&self) -> u32 {
+        if self.is_local() { LOCAL_LIMIT_POOL } else { self.pg_max_connections }
     }
 
     /// The Postgres query-pool size (also the basis of the default

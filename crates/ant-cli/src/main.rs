@@ -309,7 +309,7 @@ fn main() -> ExitCode {
     match &cli.command {
         // Before the runtime exists: threads keep the arena they start with.
         args::Command::Serve(serve) => {
-            ant_server::serve::configure_malloc(serve.malloc_arenas);
+            ant_server::serve::configure_malloc(serve.effective_malloc_arenas());
         }
         // Many blocking compression threads: the same cap as a server.
         args::Command::Admin { cmd: args::AdminCmd::Repack(_) } => {
@@ -317,7 +317,11 @@ fn main() -> ExitCode {
         }
         _ => {}
     }
-    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let rt = match &cli.command {
+        args::Command::Serve(serve) => serve.runtime(),
+        _ => tokio::runtime::Builder::new_multi_thread().enable_all().build(),
+    };
+    let rt = match rt {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("error: starting runtime: {e}");

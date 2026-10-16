@@ -192,6 +192,12 @@ pub enum Command {
     },
     /// Run the antimony server (gRPC + HTTP object endpoint).
     Serve(Box<ant_server::serve::ServeArgs>),
+    /// A local-mode server (`ant serve --local`) in the background
+    /// (`local start`, `local stop`, `local status`).
+    Local {
+        #[command(subcommand)]
+        cmd: LocalCmd,
+    },
     /// Print a shell completion script.
     Completions {
         /// Target shell.
@@ -655,4 +661,38 @@ mod tests {
         let cli = Cli::try_parse_from(["ant", "ref", "set", "main", "x", "--force"]).unwrap();
         assert!(matches!(cli.command, Command::Ref { cmd: RefCmd::Set { force: true, .. } }));
     }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LocalCmd {
+    /// Start `ant serve --local <dir>` in the background (nothing to do when
+    /// it already runs).
+    Start(LocalStartArgs),
+    /// Stop the background server of a data directory.
+    Stop(LocalDirArgs),
+    /// Whether a server uses the data directory.
+    Status(LocalDirArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct LocalDirArgs {
+    /// Data directory (default: `$ANT_LOCAL_DIR`, else
+    /// `~/.local/share/antimony/local`).
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct LocalStartArgs {
+    #[command(flatten)]
+    pub dir: LocalDirArgs,
+    /// gRPC listen address.
+    #[arg(long, default_value = "127.0.0.1:7420")]
+    pub grpc_listen: std::net::SocketAddr,
+    /// HTTP listen address.
+    #[arg(long, default_value = "127.0.0.1:7421")]
+    pub http_listen: std::net::SocketAddr,
+    /// More `ant serve` flags, after `--` (e.g. `-- --policy policy.toml`).
+    #[arg(last = true)]
+    pub serve_args: Vec<String>,
 }
