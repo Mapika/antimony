@@ -98,6 +98,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         None => None,
     };
 
+    let s3 = match args.store.s3_config()? {
+        Some(cfg) => Some(crate::s3clean::prefix_size(&cfg).await?),
+        None => None,
+    };
+
     let rss = peak_rss_bytes();
     println!();
     println!(
@@ -134,6 +139,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         println!("pg schema size  {:.1} MiB", mib(*total));
         for (name, bytes, rows) in tables {
             println!("    {name:<20} {:>10.1} MiB  ~{rows} rows", mib(*bytes as u64));
+        }
+    }
+    if let Some((count, bytes)) = s3 {
+        println!("s3 stored       {:.1} MiB in {count} objects", mib(bytes));
+        if let Some((total, _)) = &pg {
+            println!("stored total    {:.1} MiB (Postgres + S3)", mib(bytes + *total));
         }
     }
     metrics.print("store-call timing (sum over all callers; writer is sequential)");
@@ -176,6 +187,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .with("peak_rss_bytes", rss)
         .with("writer_store_s", writer_secs)
         .with("pg_schema_bytes", pg.as_ref().map(|p| p.0))
+        .with("s3_objects", s3.map(|s| s.0))
+        .with("s3_bytes", s3.map(|s| s.1))
         .with(
             "pg_tables",
             pg.map(|(_, t)| {

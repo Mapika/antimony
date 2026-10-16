@@ -57,6 +57,13 @@ with one attempt.
 | `--s3-operation-timeout` (retries included) | `ANT_S3_OPERATION_TIMEOUT` | `5m` |
 | `--s3-max-attempts` (1 = no retries) | `ANT_S3_MAX_ATTEMPTS` | `5` |
 
+Large objects of one write (an import batch, a land) that look alike
+(versions of one file or directory) are compressed together in frames of at
+most 2 MiB uncompressed; a read decodes the whole frame, and servers keep
+the last 64 MiB of decoded frames. `--pack-frames false`
+(`ANT_PACK_FRAMES`) writes every object alone, the format servers before
+schema version 6 read (see Upgrading).
+
 ## Metrics and logs
 
 **Metrics.** `GET /metrics` on the HTTP port returns Prometheus (OpenMetrics
@@ -205,6 +212,7 @@ ant admin schema --migrate --pg-url ... --pg-schema ant  # apply now
 | 3 | `changesets` | one compressed changeset row per commit |
 | 4 | `storage_tuning` | out-of-line storage and insert-only autovacuum settings |
 | 5 | `gc` | write times (`written_at`, BRIN-indexed) on objects, packed-object index rows, commits and changesets; garbage-collection state (`gc_condemned`, `gc_live`, `gc_state`) |
+| 6 | `pack_frames` | `object_index.share` (a nullable column, no table rewrite); marks that S3 packs may hold multi-object frames, which servers supporting only version 5 cannot read |
 
 To control when migrations run, start servers with `--no-migrate`
 (`ANT_NO_MIGRATE=1`) and run `ant admin schema --migrate` yourself; a
@@ -227,6 +235,18 @@ anything written before the upgrade until one grace period after it; run
 `ant admin gc` only once every server runs a release with schema version 5
 or later (older servers neither hide condemned data nor refresh write
 times).
+
+**Pack frames (schema version 6).** From version 6 on, servers write similar
+large objects into shared, compressed multi-object frames inside S3 packs
+(`ant_store::packed`); servers that support only version 5 cannot decode
+them (a read fails with `backend error: ... corrupt pack record` or a zstd
+error) and refuse to start against the migrated schema. Old packs stay
+readable. For a rolling upgrade, start the new servers with
+`--pack-frames false` (`ANT_PACK_FRAMES=false`): they read frames but keep
+writing every object alone, in the old format. Once no server of the
+previous release is left, restart them without it. Imports (`ant import`)
+take the same flag. Objects written while frames were off are not
+recompressed later.
 
 **Clients.** The disk cache (`<cache>/format`), sparse workspaces
 (`format=` in `.ant/workspace`) and lazy workspace state directories

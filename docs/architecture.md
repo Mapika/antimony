@@ -45,7 +45,13 @@ implementations:
 `TieredObjectStore` sends objects ≤ 4 KiB (encoded) to Postgres and larger ones
 to S3, so the many tiny trees and files avoid S3's per-request latency. Batch
 writes are key-ordered so concurrent writers never deadlock. There are no
-packfiles: objects are written once and never rewritten.
+packfiles: objects are written once and never rewritten. Within one write,
+large objects that look alike (versions of one file or directory, found by a
+MinHash of entry names or lines) are compressed together as one zstd frame
+of at most 2 MiB inside an S3 pack, which plays the role of git's deltas
+without base chains: every frame decodes from its own bytes, so a read is
+one ranged GET plus at most one 2 MiB decompression, and collecting some
+members of a frame never breaks the others.
 
 **Garbage collection** (`ant admin gc`, `ant_store::postgres::gc`) deletes
 data unreachable from refs, the history index, landed-as and import

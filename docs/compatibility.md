@@ -99,6 +99,16 @@ binary's supported version is printed by `ant admin schema` as `supported <n>`.
   hub's 30 s resync, as coalesced events.
 - Pre-versioning data (version 0) is adopted in place and stays readable for
   all of 0.x.
+- **S3 pack records** are part of stored data. A pack holds single-object
+  records (a zstd frame; every pack written before schema version 6) and,
+  from version 6 on, multi-object frames (magic `AFR1`, see
+  `ant_store::packed`). Every later binary reads both. Binaries supporting
+  only version 5 cannot read frames: version 6 is the one migration so far
+  after which running servers of the previous release must not keep
+  serving once new servers write. A rolling upgrade is still possible by
+  starting the new servers with `--pack-frames false` until the old ones
+  are gone (`docs/operations.md`, Upgrading). Changing a record format again
+  requires a new magic and a schema version bump.
 - Table and column names are an implementation detail: use the API, the
   CLI, or `ant admin` rather than reading tables directly. Operational
   surfaces that are documented (`schema_version`, `gc_*` working tables for

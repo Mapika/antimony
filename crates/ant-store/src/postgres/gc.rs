@@ -129,6 +129,11 @@
 //! - *Packs.* New packs get random ids, so a pack is only ever indexed by
 //!   the upload that wrote it, within one operation. A pack with no index
 //!   rows that is older than the grace period can therefore gain none.
+//!   Records inside a pack never depend on each other: a multi-object frame
+//!   (`crate::packed`) decodes from its own bytes, with no delta base or
+//!   dictionary elsewhere, so deleting the index rows of some of its members
+//!   leaves the others readable, and the pack stays while any row points
+//!   into it.
 //!
 //! What the argument assumes: clients refer to stored objects only through
 //! validated server operations (changesets, lands, ref moves under a policy)
@@ -292,7 +297,8 @@ pub struct GcReport {
     /// Small objects (Postgres) deleted: count, stored (compressed) bytes.
     pub objects: u64,
     pub object_bytes: u64,
-    /// Packed large objects (index rows) deleted: count, packed bytes.
+    /// Packed large objects (index rows) deleted: count, packed bytes (of
+    /// an object sharing a multi-object frame: its share of the frame).
     pub large_objects: u64,
     pub large_object_bytes: u64,
     /// Commit records deleted (with their log rows).
@@ -310,7 +316,8 @@ pub struct GcReport {
     pub packs: u64,
     pub pack_bytes: u64,
     /// Packs kept, their total size and the bytes in them no index row
-    /// points at (dead objects, or copies of objects stored twice).
+    /// points at (dead objects, or copies of objects stored twice; dead
+    /// members of a frame that stays count with their share).
     pub packs_kept: u64,
     pub packs_kept_bytes: u64,
     pub packs_dead_bytes: u64,
@@ -909,7 +916,7 @@ macro_rules! condemn_chunk {
                     AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = o.id) ",
             $lock_o,
             "), \
-             cx AS (SELECT id, len::bigint AS bytes FROM object_index x \
+             cx AS (SELECT id, coalesce(share, len)::bigint AS bytes FROM object_index x \
                   WHERE id >= $1 AND ($2::bytea IS NULL OR id < $2) \
                     AND written_at < to_timestamp($3) \
                     AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = x.id) ",
@@ -1248,7 +1255,9 @@ impl Run<'_> {
             "true"
         };
         let stmt = format!(
-            "SELECT pack, coalesce(sum(len) FILTER (WHERE {live_rows}), 0)::bigint AS live_bytes, \
+            "SELECT pack, \
+                    coalesce(sum(coalesce(share, len)) FILTER (WHERE {live_rows}), 0)::bigint \
+                      AS live_bytes, \
                     count(*) FILTER (WHERE {live_rows}) AS live \
              FROM object_index x WHERE pack = ANY($1) GROUP BY pack"
         );
@@ -1329,7 +1338,7 @@ async fn delete_rows(
         "DELETE FROM object_index WHERE id IN (SELECT id FROM object_index \
              WHERE id = ANY($1) AND written_at < to_timestamp($2) \
              ORDER BY id FOR UPDATE SKIP LOCKED) \
-         RETURNING id, len::bigint AS bytes",
+         RETURNING id, coalesce(share, len)::bigint AS bytes",
     )
     .bind(taken)
     .bind(cutoff)
@@ -1545,7 +1554,13 @@ pub(super) mod tests {
         let index = |ids: &[ObjectId]| -> Vec<IndexEntry> {
             ids.iter()
                 .enumerate()
-                .map(|(i, id)| IndexEntry { id: *id, pack: [7; 16], off: i as u64, len: 1 })
+                .map(|(i, id)| IndexEntry {
+                    id: *id,
+                    pack: [7; 16],
+                    off: i as u64,
+                    len: 1,
+                    share: None,
+                })
                 .collect()
         };
 
@@ -1736,7 +1751,8 @@ pub(super) mod tests {
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_condemned_ids_hide_only_rows_older_than_the_cutoff() {
         let s = scratch().await;
-        let index = |id: ObjectId| vec![IndexEntry { id, pack: [7; 16], off: 0, len: 1 }];
+        let index =
+            |id: ObjectId| vec![IndexEntry { id, pack: [7; 16], off: 0, len: 1, share: None }];
         let (old, new) = (
             EncodedObject::new(ObjectKind::Blob, b"old"),
             EncodedObject::new(ObjectKind::Blob, b"new"),

@@ -296,7 +296,9 @@ dependencies = [
  "bytes",
  "futures",
  "hex",
+ "lru 0.16.4",
  "parking_lot",
+ "proptest",
  "rand 0.9.5",
  "sqlx",
  "thiserror",
@@ -476,7 +478,7 @@ dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
  "http-body 1.1.0",
- "lru",
+ "lru 0.18.5",
  "percent-encoding",
  "regex-lite",
  "sha2 0.11.1",
@@ -3099,6 +3101,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d3a9855747c17eaf4383823f135220716ab49bea5fbea7dd42cc9a92f8aa31"
 dependencies = [
  "logos-codegen",
+]
+
+[[package]]
+name = "lru"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+dependencies = [
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
