@@ -276,6 +276,12 @@ immediately.
   default 8, per process; ref-lock waits are bounded by `--pg-lock-timeout`,
   default 10s). Under sustained bulk import, autovacuum on `objects`
   shows up; give it I/O headroom.
+- **Local mode** (`docs/scorecard/2026-10-16-local-mode.md`, a busy
+  machine): about 500–1,000 lands/s at 16–50 agents (1,786/s in a quiet
+  moment), bounded by the single SQLite writer and fsync rather than CPU
+  (under one core); idle 16 MiB RSS and no CPU; under 50 agents 170–300
+  MiB; git/git import about 6,000 commits/s; checkouts and queries as fast
+  as on Postgres + S3.
 - **Clients:** the shared disk cache defaults to 20 GiB
   (`--cache-bytes` / `ANT_CACHE_BYTES`). Sparse workspaces keep checkouts
   proportional to what an agent actually touches.
