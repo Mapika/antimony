@@ -13,7 +13,11 @@
 //!   indexed ref's watermark (`indexed_ref_for`). Anything else scans
 //!   recorded changesets — on a ref under constant landing that scan walks
 //!   the whole history, so the index paths must cover every race between
-//!   resolving the rev and a concurrent catch-up.
+//!   resolving the rev and a concurrent catch-up. When the index cannot
+//!   serve a ref-named rev (no index yet, e.g. a ref imported straight
+//!   into the store; lag past `MAX_LAG`; a non-fast-forward move), the
+//!   query also schedules a catch-up of that ref, so only the first
+//!   queries scan.
 //! - Exposed as the `Blame` RPC and `ant blame <rev>:<path>` (output per
 //!   line: `<commit-id> <line-no>\t<line>`).
 //!
@@ -350,7 +354,7 @@ struct IndexPlan {
 
 /// The [`IndexPlan`] for `rev` (resolved to `tip`), decided by one read of
 /// the ref's watermark; `None` when the index cannot serve it (see
-/// [`lagging_path_log`]).
+/// [`lagging_path_log`]), and then a catch-up of the ref is scheduled.
 async fn index_plan(
     b: &Backend,
     rev: &str,
@@ -359,6 +363,24 @@ async fn index_plan(
     limit: usize,
 ) -> OpResult<Option<IndexPlan>> {
     let Some(base) = rev_ref(rev) else { return Ok(None) };
+    let plan = index_plan_for(b, base, tip, path, limit).await?;
+    if plan.is_none() {
+        // The ref's index is missing (a ref set outside this server, e.g.
+        // by an import), trails too far or was moved non-fast-forward:
+        // bring it up to date in the background so the next queries use
+        // it instead of scanning the history again.
+        schedule_catch_up(b, base, None);
+    }
+    Ok(plan)
+}
+
+async fn index_plan_for(
+    b: &Backend,
+    base: &str,
+    tip: ObjectId,
+    path: &RepoPath,
+    limit: usize,
+) -> OpResult<Option<IndexPlan>> {
     let Some(wm) = b.meta.history_watermark(base).await? else { return Ok(None) };
     let [Some(tip_node), Some(wm_node)] =
         <[_; 2]>::try_from(cache::get_nodes(b, &[tip, wm]).await?).unwrap_or([None, None])
@@ -409,7 +431,9 @@ async fn index_plan(
 ///   the rest comes from the index.
 ///
 /// `None` when that does not apply (commit-id rev, no index, ref moved
-/// non-fast-forward, lag too long); the caller then scans changesets.
+/// non-fast-forward, lag too long); the caller then scans changesets, and
+/// for a ref a background catch-up ([`schedule_catch_up`]) is started so
+/// that later queries are served from the index.
 pub async fn lagging_path_log(
     b: &Backend,
     rev: &str,
@@ -1397,6 +1421,96 @@ mod tests {
             .unwrap();
         let got = lagging_path_log(&b, "main", tip, &bpath, 0).await.unwrap().unwrap();
         assert!(got.iter().any(|e| e.id == c0), "index rows are used below the watermark");
+    }
+
+    /// Calls of one store operation so far (`ant_store_op_duration_seconds`).
+    fn op_calls(m: &crate::metrics::Metrics, store: &str, op: &str) -> u64 {
+        let key = format!("ant_store_op_duration_seconds_count{{store=\"{store}\",op=\"{op}\"}} ");
+        m.render()
+            .lines()
+            .find_map(|l| l.strip_prefix(&key))
+            .map_or(0, |n| n.trim().parse().unwrap())
+    }
+
+    /// `n` commits on `main` (set directly, as an import does: no index),
+    /// every 10th touching `a/x`; returns the tip.
+    async fn unindexed_history(b: &Backend, n: usize) -> ObjectId {
+        let mut tip = commit(b, None, vec![write("a/x", "init")]).await.unwrap();
+        for i in 1..n {
+            let path = if i % 10 == 0 { "a/x".to_string() } else { format!("b/{}", i % 7) };
+            tip = commit(b, Some(tip), vec![write(&path, &i.to_string())]).await.unwrap();
+        }
+        b.refs.cas_ref("main", None, Some(tip)).await.unwrap();
+        tip
+    }
+
+    /// A ref without an index (set outside the server, e.g. imported) is
+    /// scanned once; that query starts its catch-up, and later queries are
+    /// served from the index.
+    #[tokio::test]
+    async fn unindexed_ref_is_indexed_after_a_query() {
+        let b = Backend::in_memory();
+        let tip = unindexed_history(&b, 60).await;
+        let a = RepoPath::new("a").unwrap();
+        assert_eq!(b.meta.history_watermark("main").await.unwrap(), None);
+        let scan = query::log(&b, "main", Some(&a), 0).await.unwrap();
+        assert_eq!(scan.len(), 6);
+        let deadline = tokio::time::Instant::now() + crate::ops::test_support::DEADLINE;
+        while b.meta.history_watermark("main").await.unwrap() != Some(tip) {
+            assert!(tokio::time::Instant::now() < deadline, "no catch-up after the query");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(query::log(&b, "main", Some(&a), 0).await.unwrap(), scan);
+        // Served by the index: a poisoned row shows up.
+        let root = scan[scan.len() - 1].clone();
+        let bpath = RepoPath::new("b").unwrap();
+        b.meta
+            .index_history(
+                "main",
+                &[HistoryRow { path: bpath.clone(), generation: root.generation, commit: root.id }],
+            )
+            .await
+            .unwrap();
+        let got = query::log(&b, "main", Some(&bpath), 0).await.unwrap();
+        assert!(got.iter().any(|e| e.id == root.id));
+    }
+
+    /// Store calls of `log --path`: from the index, one history query and
+    /// no chain or changeset reads however long the history; scanning
+    /// (no index covers the rev), a few reads growing in size, not one per
+    /// 256 commits.
+    #[tokio::test]
+    async fn path_log_store_calls_are_bounded() {
+        let metrics = crate::metrics::Metrics::new();
+        let b = metrics.instrument(&Backend::in_memory());
+        let tip = unindexed_history(&b, 3000).await;
+        let a = RepoPath::new("a").unwrap();
+        let calls = |op: &str| op_calls(&metrics, "meta", op);
+
+        let (chains, sets) = (calls("first_parent_chain"), calls("get_changesets"));
+        let scan = query::log(&b, &tip.to_hex(), Some(&a), 0).await.unwrap();
+        assert_eq!(scan.len(), 300);
+        let (chains, sets) = (calls("first_parent_chain") - chains, calls("get_changesets") - sets);
+        assert!(chains <= 5, "{chains} chain reads for 3000 commits");
+        assert!(sets <= 5, "{sets} changeset reads for 3000 commits");
+
+        catch_up(&b, "main").await.unwrap();
+        for limit in [0, 20] {
+            let before: Vec<u64> =
+                ["query_history", "first_parent_chain", "get_changesets", "history_watermark"]
+                    .iter()
+                    .map(|op| calls(op))
+                    .collect();
+            let objects = op_calls(&metrics, "objects", "get_many");
+            let got = query::log(&b, "main", Some(&a), limit).await.unwrap();
+            assert_eq!(got.len(), if limit == 0 { 300 } else { 20 });
+            assert_eq!(got[..], scan[..got.len()]);
+            assert_eq!(calls("query_history") - before[0], 1);
+            assert_eq!(calls("first_parent_chain") - before[1], 0);
+            assert_eq!(calls("get_changesets") - before[2], 0);
+            assert_eq!(calls("history_watermark") - before[3], 1);
+            assert!(op_calls(&metrics, "objects", "get_many") - objects <= 1);
+        }
     }
 
     #[tokio::test]

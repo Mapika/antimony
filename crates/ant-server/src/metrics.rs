@@ -611,6 +611,7 @@ impl Metrics {
                 first_parent_chain: self.store_op("meta", "first_parent_chain"),
                 ancestors_above: self.store_op("meta", "ancestors_above"),
                 tail: self.store_op("meta", "tail"),
+                log_seqs: self.store_op("meta", "log_seqs"),
                 get_derived: self.store_op("meta", "get_derived"),
                 get_derived_many: self.store_op("meta", "get_derived_many"),
                 put_derived: self.store_op("meta", "put_derived"),
@@ -772,6 +773,7 @@ struct TimedMeta {
     first_parent_chain: StoreOp,
     ancestors_above: StoreOp,
     tail: StoreOp,
+    log_seqs: StoreOp,
     get_derived: StoreOp,
     get_derived_many: StoreOp,
     put_derived: StoreOp,
@@ -823,6 +825,10 @@ impl MetaStore for TimedMeta {
 
     async fn tail(&self, after: u64, limit: usize) -> StoreResult<Vec<(u64, ObjectId)>> {
         self.tail.time(self.inner.tail(after, limit)).await
+    }
+
+    async fn log_seqs(&self, ids: &[ObjectId]) -> StoreResult<Vec<Option<u64>>> {
+        self.log_seqs.time(self.inner.log_seqs(ids)).await
     }
 
     async fn get_derived(&self, kind: &str, key: &[u8]) -> StoreResult<Option<Bytes>> {

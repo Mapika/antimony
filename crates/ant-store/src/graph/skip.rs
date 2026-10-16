@@ -235,9 +235,20 @@ pub(super) async fn nth_first_parent(
     id: ObjectId,
     n: u64,
 ) -> Result<Option<Option<ObjectId>>> {
-    let Some(mut e) = entry(b, id).await? else { return Ok(None) };
+    let Some(e) = entry(b, id).await? else { return Ok(None) };
     let Some(depth) = e.depth.checked_sub(n) else { return Ok(Some(None)) };
-    let mut at = id;
+    Ok(descend(b, id, e, depth).await?.map(|(at, _)| Some(at)))
+}
+
+/// From `at` (entry `e`) down its first-parent chain to the commit at
+/// `depth` (at most `e.depth`): O(log depth) entry reads. `None` when an
+/// entry on the way is unreadable.
+async fn descend(
+    b: &Backend,
+    mut at: ObjectId,
+    mut e: Entry,
+    depth: u64,
+) -> Result<Option<(ObjectId, Entry)>> {
     while e.depth > depth {
         let next = if e.jump_depth >= depth && e.jump != at {
             e.jump
@@ -250,5 +261,84 @@ pub(super) async fn nth_first_parent(
         let Some(ne) = read(b, next).await? else { return Ok(None) };
         (at, e) = (next, ne);
     }
-    Ok(Some(Some(at)))
+    Ok(Some((at, e)))
+}
+
+/// Where two first-parent chains meet ([`first_parent_meet`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Meet {
+    /// The newest commit on both chains (below it they are the same).
+    pub id: ObjectId,
+    pub generation: u64,
+    /// First-parent steps from `x` and from `y` down to it.
+    pub from_x: u64,
+    pub from_y: u64,
+}
+
+/// Where `x`'s and `y`'s first-parent chains meet; `Some(None)` when they
+/// never do (different roots). `None` when a chain cannot be indexed (see
+/// [`entry`]).
+///
+/// Reads both entries in one call, filling in missing ones `x` first (pass
+/// the newer commit as `x`: when both are missing, `y`'s fill then stops
+/// at the entries `x`'s wrote). Brings the deeper side up to the other's
+/// depth ([`descend`]), then descends both in lockstep: jump pointers
+/// depend only on depth, so both sides jump to the same depth, and they
+/// jump while their jump targets still differ (the chains meet below),
+/// else step to their first parents. The same search as
+/// [`on_first_parent_chain`]: O(log depth) steps, each one
+/// `get_derived_many` of the two entries.
+pub(super) async fn first_parent_meet(
+    b: &Backend,
+    x: ObjectId,
+    y: ObjectId,
+) -> Result<Option<Option<Meet>>> {
+    let Some([ex, ey]) = read_pair(b, [x, y]).await? else { return Ok(None) };
+    let ex = match ex {
+        Some(e) => e,
+        None => match entry(b, x).await? {
+            Some(e) => e,
+            None => return Ok(None),
+        },
+    };
+    let ey = match ey {
+        Some(e) => e,
+        None => match entry(b, y).await? {
+            Some(e) => e,
+            None => return Ok(None),
+        },
+    };
+    let depth = ex.depth.min(ey.depth);
+    let (Some((mut a, mut ea)), Some((mut c, mut ec))) =
+        futures::try_join!(descend(b, x, ex, depth), descend(b, y, ey, depth))?
+    else {
+        return Ok(None);
+    };
+    loop {
+        if a == c {
+            return Ok(Some(Some(Meet {
+                id: a,
+                generation: ea.generation,
+                from_x: ex.depth - ea.depth,
+                from_y: ey.depth - ea.depth,
+            })));
+        }
+        if ea.depth != ec.depth || ea.jump_depth != ec.jump_depth {
+            return Ok(None); // not a well-formed index: let the caller walk
+        }
+        let (Some(pa), Some(pc)) = (ea.parent, ec.parent) else {
+            // Two different roots.
+            return Ok(Some(None));
+        };
+        let next = if ea.jump != ec.jump && ea.jump != a { [ea.jump, ec.jump] } else { [pa, pc] };
+        let Some([Some(na), Some(nc)]) = read_pair(b, next).await? else { return Ok(None) };
+        (a, ea, c, ec) = (next[0], na, next[1], nc);
+    }
+}
+
+/// Two entries with one `get_derived_many` (`None` for a malformed reply).
+async fn read_pair(b: &Backend, ids: [ObjectId; 2]) -> Result<Option<[Option<Entry>; 2]>> {
+    let keys: Vec<&[u8]> = ids.iter().map(|id| id.as_bytes().as_slice()).collect();
+    let found = b.meta.get_derived_many(SKIP_KIND, &keys).await?;
+    Ok(<[_; 2]>::try_from(found).ok().map(|v| v.map(|v| v.and_then(|v| Entry::decode(&v)))))
 }

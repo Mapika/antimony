@@ -93,6 +93,19 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let objects =
         if timed_out { put_objects.items() } else { stats.commits + stats.trees + stats.blobs };
 
+    // The ref's path-history index, as a server would build it after a
+    // land (and `ant import` does): `log --path` and blame need it. Not
+    // part of the import throughput.
+    let history = if timed_out {
+        None
+    } else {
+        let start = Instant::now();
+        let n = ant_server::ops::history::catch_up(&backend, &args.ant_ref)
+            .await
+            .context("history index")?;
+        Some((n, start.elapsed().as_secs_f64()))
+    };
+
     let pg = match args.store.pg_url() {
         Some(url) => Some(pg_size(url, args.store.pg_schema()).await?),
         None => None,
@@ -134,6 +147,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     );
     if let Some(r) = rss {
         println!("peak RSS        {:.1} MiB", mib(r));
+    }
+    if let Some((n, secs)) = history {
+        println!("history index   {n} commits in {secs:.2}s (after the import, not in its wall)");
     }
     if let Some((total, tables)) = &pg {
         println!("pg schema size  {:.1} MiB", mib(*total));
@@ -186,6 +202,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .with("object_bytes_written", put_objects.bytes())
         .with("peak_rss_bytes", rss)
         .with("writer_store_s", writer_secs)
+        .with("history_index_commits", history.map(|h| h.0))
+        .with("history_index_s", history.map(|h| h.1))
         .with("pg_schema_bytes", pg.as_ref().map(|p| p.0))
         .with("s3_objects", s3.map(|s| s.0))
         .with("s3_bytes", s3.map(|s| s.1))

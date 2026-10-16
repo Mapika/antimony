@@ -19,6 +19,10 @@ pub async fn run(a: ImportArgs) -> Result<Outcome> {
         .get_ref(&a.ref_name)
         .await?
         .ok_or_else(|| anyhow!("import did not create ref {}", a.ref_name))?;
+    // The ref's path-history index (`log --path`, blame), as a server
+    // builds it after a land: otherwise the first queries scan the history.
+    let indexed = ant_server::ops::history::catch_up(&backend, &a.ref_name).await?;
+    eprintln!("history index: {indexed} commits");
     if let Some(policy) = &a.policy {
         let acl = Acl::load(policy)?;
         if let Some(policy) = acl.policy() {
