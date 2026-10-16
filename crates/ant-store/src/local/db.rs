@@ -173,8 +173,10 @@ impl Db {
                 .map_err(be)?;
             Some((stx, thread))
         };
+        let restart = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let checkpointer = {
             let (ctx, crx) = mpsc::sync_channel::<()>(1);
+            let flag = restart.clone();
             let ckpt = open_conn(
                 path,
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -183,9 +185,9 @@ impl Db {
             let wal = wal.clone();
             let thread = std::thread::Builder::new()
                 .name("ant-sqlite-checkpoint".into())
-                .spawn(move || checkpoint_loop(ckpt, &wal, crx))
+                .spawn(move || checkpoint_loop(ckpt, &wal, crx, &flag))
                 .map_err(be)?;
-            (ctx, thread)
+            (ctx, thread, restart)
         };
         let (tx, rx) = mpsc::channel::<Job>();
         let thread = std::thread::Builder::new()
@@ -297,7 +299,11 @@ fn writer_loop(
     rx: mpsc::Receiver<Job>,
     feed: RefFeed,
     syncer: Option<(mpsc::Sender<Synced>, std::thread::JoinHandle<()>)>,
-    checkpointer: (mpsc::SyncSender<()>, std::thread::JoinHandle<()>),
+    checkpointer: (
+        mpsc::SyncSender<()>,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ),
 ) {
     // A raw job met while collecting a group waits for the next round.
     let mut held: Option<Job> = None;
@@ -338,6 +344,9 @@ fn writer_loop(
         run_group(&conn, jobs, &feed, sync_tx.as_ref());
         // Coalescing nudge: the checkpointer looks at the WAL's size.
         let _ = checkpointer.0.try_send(());
+        if checkpointer.2.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            restart_wal(&conn);
+        }
     }
     drop(sync_tx);
     if let Some((tx, thread)) = syncer {
@@ -461,12 +470,44 @@ fn sync_loop(wal: PathBuf, rx: mpsc::Receiver<Synced>, feed: RefFeed) {
 
 /// WAL size above which the checkpointer copies frames into the database.
 const CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
+/// WAL size above which the writer restarts the WAL from its beginning.
+const RESTART_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Restart the WAL (between groups, on the write connection): SQLite only
+/// starts writing the WAL from its beginning again once every frame is in
+/// the database *and* no reader still uses the WAL, which a steady stream
+/// of short reads never allows by itself; the WAL would grow without bound
+/// (seen: 1.3 GB in 30 s of landing). `RESTART` waits for the readers of
+/// the moment (milliseconds) and makes the next write start over; the file
+/// is then cut back to `journal_size_limit`.
+fn restart_wal(conn: &Connection) {
+    let started = std::time::Instant::now();
+    let r: rusqlite::Result<(i64, i64, i64)> =
+        conn.query_row("PRAGMA wal_checkpoint(RESTART)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        });
+    match r {
+        Ok((busy, log, done)) => tracing::debug!(
+            busy,
+            frames = log,
+            checkpointed = done,
+            ms = started.elapsed().as_millis() as u64,
+            "local store WAL restart"
+        ),
+        Err(error) => tracing::warn!(%error, "local store WAL restart failed"),
+    }
+}
 
 /// The checkpointer: on each nudge from the writer, a passive checkpoint
 /// when the WAL has grown past [`CHECKPOINT_BYTES`], on its own connection,
 /// so the writer never stops for one (SQLite's automatic checkpoint is off).
 /// A checkpoint syncs the WAL before copying and the database after.
-fn checkpoint_loop(conn: Connection, wal: &Path, rx: mpsc::Receiver<()>) {
+fn checkpoint_loop(
+    conn: Connection,
+    wal: &Path,
+    rx: mpsc::Receiver<()>,
+    restart: &std::sync::atomic::AtomicBool,
+) {
     while rx.recv().is_ok() {
         let size = std::fs::metadata(wal).map_or(0, |m| m.len());
         if size < CHECKPOINT_BYTES {
@@ -478,12 +519,17 @@ fn checkpoint_loop(conn: Connection, wal: &Path, rx: mpsc::Receiver<()>) {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             });
         match r {
-            Ok((_, log, done)) => tracing::debug!(
-                frames = log,
-                checkpointed = done,
-                ms = started.elapsed().as_millis() as u64,
-                "local store checkpoint"
-            ),
+            Ok((_, log, done)) => {
+                tracing::debug!(
+                    frames = log,
+                    checkpointed = done,
+                    ms = started.elapsed().as_millis() as u64,
+                    "local store checkpoint"
+                );
+                if size >= RESTART_BYTES {
+                    restart.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             Err(error) => tracing::warn!(%error, "local store checkpoint failed"),
         }
     }
