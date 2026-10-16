@@ -112,7 +112,10 @@ binary's supported version is printed by `ant admin schema` as `supported <n>`.
   after which running servers of the previous release must not keep
   serving once new servers write. A rolling upgrade is still possible by
   starting the new servers with `--pack-frames false` until the old ones
-  are gone (`docs/operations.md`, Upgrading). Changing a record format again
+  are gone; old servers already running keep working, but none can be
+  started again once the first new server has migrated the schema
+  (`docs/operations.md`, Upgrading). `scripts/upgrade-test.sh` checks the
+  upgrade from the previous release before each release. Changing a record format again
   requires a new magic and a schema version bump.
 - Table and column names are an implementation detail: use the API, the
   CLI, or `ant admin` rather than reading tables directly. Operational

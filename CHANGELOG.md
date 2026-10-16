@@ -25,6 +25,12 @@ Planned as 0.2.0 (storage format change, schema version 6).
   origin without the endpoint (404/405) it falls back to conditional
   `GET /o/<id>` as before. `ant_cacheserve_authz_total{result}` metric;
   `ant-bench checkout --cache-tier-forward [--cache-tier-no-batch]`.
+- `scripts/upgrade-test.sh`: the upgrade from a released version (default:
+  the previous tag, built in a temporary worktree) to the checkout on real
+  Postgres + S3, in place and rolling, with byte-identical reads, `git fsck`
+  of the export, client skew both ways, `ant admin gc` and the refused
+  downgrade; run before every release (`docs/release.md`). Run from 0.1.0
+  with git/git as extra corpus: every check passes.
 
 ### Changed
 
@@ -35,8 +41,11 @@ Planned as 0.2.0 (storage format change, schema version 6).
   stay readable, and objects without a look-alike are still written in the
   old single-object format. Servers that support only schema version 5
   cannot read frames and refuse the migrated schema; for a rolling upgrade
-  start new servers with `--pack-frames false` (`ANT_PACK_FRAMES`) until
-  every server runs this release (`docs/operations.md`, Upgrading). The
+  start new servers (and `ant import`) with `--pack-frames false`
+  (`ANT_PACK_FRAMES`) until every server runs this release. The first new
+  server migrates the schema whatever the flag: 0.1.x servers already
+  running keep working, but none can be started again, and going back to
+  0.1.x means restoring the backup (`docs/operations.md`, Upgrading). The
   migration adds a nullable column (`object_index.share`, a frame member's
   share of the frame's bytes for `ant admin gc` byte counts) and rewrites
   nothing. It ships in a minor release (0.2.0), as `docs/compatibility.md`

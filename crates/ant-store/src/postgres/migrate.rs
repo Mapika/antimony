@@ -81,7 +81,7 @@ pub static MIGRATIONS: [Migration; SCHEMA_VERSION as usize] = [
         version: 6,
         name: "pack_frames",
         description: "S3 packs may hold multi-object frames (unreadable by versions before \
-                      0.1.5); objects in a frame record their share of its bytes",
+                      0.2.0); objects in a frame record their share of its bytes",
         ddl: pack_frames,
     },
 ];
