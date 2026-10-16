@@ -10,10 +10,25 @@ release of the 0.x series may change.
 
 ## [0.2.2] - 2026-10-16
 
-Patch release: no storage or protocol changes.
+Patch release: no storage or protocol changes (the shared disk cache gains
+an additive `batches/` directory; its format version stays 1).
 
 ### Fixed
 
+- Processes sharing a cache could fetch the same objects twice when they
+  started at nearly the same moment (`cache_tier
+  concurrent_processes_share_fetches` failed about 3 runs in 100): since the
+  0.2.0 cold-checkout fix a process alone on its cache fetches without
+  per-object claims, and a peer arriving during such a batch did not know
+  what it was fetching. A process alone now announces each batch with one
+  file under `<cache>/batches/` (its ids, locked while the fetch runs) before
+  it checks for peers, so of two simultaneous starters one always sees the
+  other; a peer waits for an announced batch instead of fetching its ids
+  (same 30 s bound and fallback as a claim). Separately, a tree bundle's own
+  tree is now stored after the rest of the bundle: a peer that found it in
+  the cache walked on below it and re-fetched subtrees whose files were
+  still being written. The lone process keeps its fast path: one small file
+  per batch, no per-object claim files.
 - `ant admin repack` could hang (until the S3 operation timeout, then
   fail): while it waited for pack uploads it stopped polling the segments
   it was reading, and a paused read keeps the S3 request slots it holds

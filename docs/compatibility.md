@@ -143,7 +143,9 @@ binary's supported version is printed by `ant admin schema` as `supported <n>`.
 - Additions inside a format that older binaries ignore do not change its
   version: `gc/` (size counter, locks, `gc/tiers` counters), `claims/`
   (cross-process fetch claims), `live/` (registrations of the processes
-  using the cache) and, for a cache tier, `bundles/` (bundle
+  using the cache), `batches/` (announcements of batches fetched without
+  per-object claims: the batch's ids, 32 raw bytes each, in a file locked
+  while the fetch runs) and, for a cache tier, `bundles/` (bundle
   index) sit next to `objects/`, which keeps its layout.
 - A **missing marker means version 1**, the layout from before markers
   existed; those caches and workspaces keep working.

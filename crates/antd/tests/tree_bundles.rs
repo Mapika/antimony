@@ -281,3 +281,46 @@ async fn unusable_bundles_are_discarded() {
         assert!(remote.http_requests().bundles > 1, "kind {kind}");
     }
 }
+
+/// Local store that records the ids of each `put_many`, in order.
+#[derive(Default)]
+struct RecordingStore {
+    inner: ant_store::memory::MemoryObjectStore,
+    puts: std::sync::Mutex<Vec<Vec<ObjectId>>>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for RecordingStore {
+    async fn get_many(&self, ids: &[ObjectId]) -> ant_store::Result<Vec<Option<EncodedObject>>> {
+        self.inner.get_many(ids).await
+    }
+    async fn put_many(&self, objects: &[EncodedObject]) -> ant_store::Result<()> {
+        self.puts.lock().unwrap().push(objects.iter().map(EncodedObject::id).collect());
+        self.inner.put_many(objects).await
+    }
+    async fn has_many(&self, ids: &[ObjectId]) -> ant_store::Result<Vec<bool>> {
+        self.inner.has_many(ids).await
+    }
+}
+
+/// The tree a bundle was fetched for is stored after everything else the
+/// bundle delivered: another process that finds it in the shared cache
+/// walks on below it at once (without waiting for the fetcher), so the
+/// subtrees and blobs must already be there, or it fetches them again.
+#[tokio::test]
+async fn a_bundles_own_tree_is_stored_last() {
+    let f = fixture().await;
+    let remote = RemoteObjectStore::connect(&f.grpc_url, Some(&f.http_url)).await.unwrap();
+    let local = Arc::new(RecordingStore::default());
+    let rt = ReadThrough::new(local.clone(), Arc::new(remote.clone()))
+        .verified_upstream()
+        .with_tree_bundles(remote);
+    let got = rt.get_trees_bundled(&[f.tree]).await.unwrap();
+    assert!(got[0].is_some());
+    let puts = local.puts.lock().unwrap().clone();
+    let (last, earlier) = puts.split_last().expect("bundle stored");
+    assert_eq!(last, &vec![f.tree], "the bundle's tree comes last, alone");
+    let below: usize = earlier.iter().map(Vec::len).sum();
+    assert!(below > 100, "subtrees and blobs stored before it: {below}");
+    assert!(earlier.iter().flatten().all(|id| *id != f.tree));
+}
