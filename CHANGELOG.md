@@ -104,7 +104,8 @@ deploying.
   restricted path are tagged with a zone and reported as missing by id to
   principals who cannot read them. `ant admin reindex-acl` tags history
   imported or written before a policy existed. The threat model and its
-  limits are in the README.
+  limits are in
+  [docs/access-control.md](docs/access-control.md) (in the README at 0.1.0).
 - gRPC on `:7420`; HTTP on `:7421` serving immutable objects at `GET /o/<id>`
   (`Cache-Control: immutable`, so any CDN is the cache tier), `/healthz`,
   `/readyz` (checks Postgres and S3), `/metrics`, `/debug/stats` (admin only)
@@ -294,7 +295,8 @@ Also in this release:
   names and ids of restricted entries, and commit metadata (messages,
   authors, ids, parents) is visible to every authenticated principal.
   Response timing still differs slightly between missing and hidden objects.
-  Tokens are bearer secrets: run behind TLS. See the README's threat model.
+  Tokens are bearer secrets: run behind TLS. See the threat model
+  ([docs/access-control.md](docs/access-control.md)).
 - **Ancestry through merged-in branches is a walk.** Reachability that only
   goes through second parents (a topic commit merged long ago, or a negative
   answer far back) still reads every commit above the target's generation,

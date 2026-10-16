@@ -1,65 +1,157 @@
+<!-- logo/banner goes here -->
 # antimony
 
-Server-centric source control for **agent fleets on large monorepos**, inspired
-by the design described in Anthropic's
-[*Redesigning source control*](https://www.anthropic.com/engineering/redesigning-source-control).
+Source control for agent fleets.
 
-Git's object model with SHA-256 ids, but none of git's operating model:
-clients are always online, history lives on the server, and nobody pushes.
+[![ci](https://img.shields.io/github/actions/workflow/status/Mapika/antimony/ci.yml?branch=main&label=ci)](https://github.com/Mapika/antimony/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![release](https://img.shields.io/github/v/release/Mapika/antimony?include_prereleases&label=release)](https://github.com/Mapika/antimony/releases)
+
+When dozens of AI agents commit to one branch of a large monorepo, git's
+operating model gets in the way: every agent clones the whole repository,
+pushes race and fail, rebases repeat, merge queues serialize the fleet, and
+`log` and `blame` walk history on each client. antimony keeps git's object
+format and moves everything else to the server: the server builds commits and
+lands them onto the moving tip itself, workspaces are lazy and sparse, and
+history is an API. It is written in Rust, stores data in Postgres and S3, can
+import any git repository with identical SHA-256 ids, serves a read-only git
+export for plain git clients, and is licensed Apache-2.0.
+
+## What it does
 
 - **Server-side commits.** An agent sends file edits against a base commit;
-  the server builds trees and the commit. Cost scales with the change, not the
-  repo.
-- **Land instead of push.** `Land` rebases onto the moving tip server-side
-  (with 3-way text merges) and advances the ref by compare-and-swap. No merge
-  queue, no global lock; conflicts come back as a list of paths. Retries are
-  idempotent and stacked commits land together.
-- **No packfiles, no repo maintenance.** Objects are content-addressed rows in
-  Postgres (small) or S3 (large). Immutable reads are plain HTTP
-  (`GET /o/<id>`, `Cache-Control: immutable`), so any CDN or HTTP cache is the
-  cache tier.
-- **Lazy, sparse clients.** Workspaces materialize only what matches their
-  sparse patterns, through a disk cache shared by every agent on the machine;
-  a FUSE mount gives an instant read-only view of any commit.
-- **API-first.** `ls`, `cat`, `log`, `diff` need no checkout at all.
-- **Git interop.** Import any git repo (ids match git's own SHA-256
-  conversion exactly); `git clone` (full, `--filter=blob:none`, `--depth`) and
+  the server builds the trees and the commit. Cost scales with the change,
+  not the repository.
+- **Land instead of push.** `Land` rebases onto the current tip on the server
+  (3-way text merges) and advances the ref by compare-and-swap. No merge
+  queue, no global lock; conflicts come back as a list of paths, retries are
+  idempotent, stacked commits land together.
+- **Lazy, sparse workspaces.** Workspaces materialize only the paths that
+  match their sparse patterns, through one disk cache shared by every agent
+  on the machine; a FUSE workspace shows the whole tree instantly and fetches
+  content on first read.
+- **History as an API.** `ls`, `cat`, `log`, `blame`, `diff`, `merge-base`
+  and "did this land, and as which commit?" are server queries that need no
+  checkout. `ant ref watch` streams every land to post-merge CI.
+- **Git compatible.** Objects are git objects with SHA-256 ids; `ant import`
+  converts any git repository with ids equal to git's own SHA-256
+  conversion, and `git clone` (full, `--filter=blob:none`, `--depth`) and
   `git fetch` work against the server for humans and IDEs.
+- **No repository maintenance.** Objects live in Postgres (small) and S3
+  packs (large); immutable reads are plain HTTP (`GET /o/<id>`,
+  `Cache-Control: immutable`), so any CDN, or the built-in `ant cache-serve`,
+  is the cache tier.
+- **Built for a fleet.** Stateless server replicas, directory-level access
+  control that also protects objects by id, rate limits and load shedding,
+  Prometheus metrics.
 
-## Documentation
+## How it works
 
-- [Architecture](docs/architecture.md): object model, storage, write and read
-  paths, clients, git interop, access control.
-- [Operations](docs/operations.md): running a server, imports, policies,
-  sizing, local services, benchmarks.
-- [Operator guide](docs/operator-guide.md): topology, sizing, fleet workflow,
-  metrics and alerts, failure runbook, backups.
-- [Compatibility](docs/compatibility.md): what each 0.x release keeps stable
-  (API, Postgres schema, on-disk formats, CLI output) and how deprecations work.
-- [Changelog](CHANGELOG.md) and [release checklist](docs/release.md).
+Clients are always online and history lives on the server. An agent's
+workspace holds files and a local cache; a submit sends the edits, the server
+builds the commit, and a land replays it onto the tip in a group-commit batch
+with one compare-and-swap on the ref. Any number of `ant serve` replicas
+share one Postgres (refs, commit graph, changesets, path-history index,
+objects up to 4 KiB) and one S3 bucket (larger objects, compressed in packs).
+Replicas keep only caches of immutable data, so they are interchangeable.
 
-## Layout
+```mermaid
+flowchart LR
+    agents["Agents: ant CLI, sparse or FUSE workspaces, shared disk cache"]
+    tier["ant cache-serve (optional HTTP cache tier)"]
+    git["Humans, IDEs: git clone / fetch"]
+    servers["ant serve replicas (stateless)"]
+    pg[("Postgres: refs, commit graph, changesets, history index, small objects")]
+    s3[("S3: large objects in packs")]
 
-| crate | role |
+    agents -->|"gRPC: submit, land, queries, ref watch"| servers
+    agents -->|"HTTP: GET /o/id, /t/tree"| tier
+    tier -->|"misses, permission checks"| servers
+    git -->|"git smart HTTP v2, read-only"| servers
+    servers --> pg
+    servers --> s3
+```
+
+Details: [architecture](docs/architecture.md) (object model, write and read
+paths, tree bundles, access control) and the
+[operator guide](docs/operator-guide.md) (topology, sizing, runbook).
+
+## Numbers
+
+Measured on one WSL2 development machine (20 cores) with Postgres and
+SeaweedFS S3 running locally on the same host. They are indicative, not
+guarantees: real networks, managed Postgres and real S3 will move them.
+Sources: the [final pre-release scorecard](docs/scorecard/2026-10-14-final.md)
+(27 of 27 rows pass), [CHANGELOG](CHANGELOG.md) and [ROADMAP](ROADMAP.md).
+
+| measure (v0.1.0) | result |
 |---|---|
-| `ant-core` | object model: SHA-256 ids, blobs/trees/commits (git format), paths |
-| `ant-store` | store traits, Postgres / S3 / tiered / in-memory implementations, commit graph |
-| `ant-server` | ops (changeset, land, query, history), gRPC, HTTP object endpoint, binary |
-| `ant-gitserve` | read-only git smart-HTTP (protocol v2) export |
-| `ant-gitbridge` | git → antimony import |
-| `antd` | client engine: shared disk cache, read-through, sparse workspaces |
-| `ant-fuse` | lazy FUSE views: read-only and copy-on-write workspaces |
-| `ant-auth` | token + path/ref access policy |
-| `ant-cli` | the `ant` command |
-| `ant-bench` | load and scale harness |
+| Landing on one ref, 64 concurrent agents, Postgres + S3 | 4,138 lands/s, p99 26.5 ms, 0 aborts, exact history |
+| `create_changeset` p50, 16 agents | 2.0 ms |
+| Soak: 4 replicas × 1,000 agents × 30 min | 266k lands, 0 errors, exact history, flat RSS |
+| Import rust-lang/rust (343k commits, 1.1 GB pack) | 110 s (3,124 commits/s), 1.6 GiB peak RSS |
+| Queries on rust-lang/rust | path log 18 ms; blame 363 ms first, 10 ms cached; `merge-base main main~2000` 10 ms; sparse workspace 134 ms |
+| Checkout, synthetic 96k-file tree (medians) | cold 2.5 s, warm 1.1 s, `status` 0.1 s |
+| git export, `clone --filter=blob:none` | git/git 7.0 s (native git 5.9 s); rust-lang/rust 33 s (native git 30 s) |
+
+On `main`, unreleased (planned 0.2.0):
+
+| measure | result |
+|---|---|
+| Stored size of a git/git import vs its git pack (303 MiB) | 901 MiB, 3.0× (v0.1.0: 4,094 MiB, 13.5×) |
+| Blame after landing 1–100 commits elsewhere (1,700-line file, 1,200 versions) | 3.3–3.9 ms (v0.1.0: 95–168 ms) |
+
+## How it compares to git
+
+antimony is not a git replacement for every workflow. It targets one case:
+many always-online writers on one large repository.
+
+Where antimony is ahead:
+
+- **Concurrent landing on one branch.** The server rebases and lands; agents
+  never fetch, rebase and retry a rejected push. Throughput above is with 64
+  agents on a single ref.
+- **History queries at scale.** Path log and blame read a per-ref index, so
+  their cost does not grow with history length, and no client needs the
+  history at all.
+- **Sparse and lazy clients.** An agent fetches only what it reads, through a
+  cache shared by every agent on the machine.
+
+Where git is ahead:
+
+- **Storage size.** antimony stores more than a git pack: about 14× for
+  rust-lang/rust in v0.1.0, 3.0× for git/git on `main`.
+- **Offline work.** antimony clients need the server for submit, land,
+  history and any object not yet cached.
+- **Ecosystem.** git has hosting, code review, CI integrations and tooling.
+  antimony has no code review, and its export accepts no pushes: writes go
+  through `ant submit` / `ant land`.
+- **Maturity and platforms.** antimony is 0.x; lazy FUSE workspaces are Linux
+  only and release binaries are x86_64 Linux.
+
+A head-to-head report against git on the same machine is in preparation and
+will be published under [docs/scorecard/](docs/scorecard/).
+<!-- TODO: link the head-to-head git comparison report once it lands in docs/scorecard/ -->
 
 ## Quickstart
 
-Needs Rust, `git` and `curl`. It runs against an in-memory throwaway server;
-for a durable one add Postgres and an S3-compatible store (`docker compose up
--d`, or `scripts/dev-services.sh start` without Docker) and see "Importing a
-large history" below. Run it from the repository root; the demo lives in
-`/tmp/ant-demo`.
+Needs `git` and `curl`, plus one of:
+
+- **A release binary** (x86_64 Linux) from
+  [Releases](https://github.com/Mapika/antimony/releases): unpack
+  `ant-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`, check it against
+  `SHA256SUMS`, put the directory holding `ant` on your `PATH`, and skip the
+  first two lines below.
+- **Rust** (1.90 or newer) to build from source, as below.
+- **Docker** for the server: `docker run -d -p 7420:7420 -p 7421:7421
+  ghcr.io/mapika/antimony:0.1.0 serve --memory` can replace the `ant serve`
+  line of step 1 (the client steps still need an `ant` binary).
+
+The quickstart runs against an in-memory throwaway server; for a durable one
+add Postgres and an S3-compatible store (`docker compose up -d`, or
+`scripts/dev-services.sh start` without Docker) and see
+[docs/operations.md](docs/operations.md). Run it from the repository root;
+the demo lives in `/tmp/ant-demo`.
 
 ```sh
 cargo build --release                      # one binary: target/release/ant (server + client)
@@ -115,174 +207,101 @@ curl -s http://127.0.0.1:7421/metrics | grep '^ant_land_outcomes'
 kill $SERVER_PID; cd / && rm -rf /tmp/ant-demo
 ```
 
-Exit codes: `0` ok, `1` error (`error: ...` on stderr, plus `hint: ...` when
-there is an obvious fix), `2` land or update conflict. After a land conflict
-(or to pick up others' work) run `ant ws update`: it moves the workspace to
-the tip of the ref it was created at (or `--to <rev>`) and carries local
-edits over with the server's 3-way merge. Overlapping edits are written with
-`<<<<<<< upstream` / `>>>>>>> local` markers and shown as `C` by `ant status`;
-fix them, run `ant ws resolve <path>...`, then submit and land again.
-`ant ref set` refuses to move a ref backwards or sideways without `--force`.
+Exit codes: `0` ok, `1` error (`error: ...` plus an optional `hint: ...` on
+stderr), `2` land or update conflict. More in [docs/usage.md](docs/usage.md):
+conflicts and `ws update`, lazy workspaces, access control in two minutes,
+importing large histories, Docker, several replicas.
 
-Optional: `ant ws new /tmp/lazy --lazy` mounts a writable copy-on-write
-workspace over FUSE (needs `/dev/fuse` and `fusermount3`; `ant ws unmount
-/tmp/lazy` keeps the edits; if its FUSE daemon dies, `ant ws remount /tmp/lazy`
-recovers the workspace with its edits), and `ant mount main /tmp/view` gives a read-only
-view.
+## Using it
 
-### Access control in two minutes
+| task | command |
+|---|---|
+| Start a workspace | `ant ws new <dir> [--at <rev>] [--sparse <pattern>]...` or `--lazy` (FUSE) |
+| See local changes | `ant status [--ignored]` |
+| Commit on the server | `ant submit -m <message>` |
+| Land onto a ref | `ant land [--ref <name>] [<commit>]` (exit 2 on conflict) |
+| Catch up, resolve conflicts | `ant ws update [--to <rev>]`, then `ant ws resolve <path>...` |
+| Read without a checkout | `ant ls <rev>[:<path>]`, `ant cat <rev>:<path>`, `ant mount <rev> <dir>` |
+| History | `ant log [<rev> \| <a>..<b>] [-n N] [-- <path>]` |
+| Blame | `ant blame <rev>:<path>` |
+| Diff | `ant diff [--patch [-U N]] [--merge-base] <a> <b> [-- <path>...]` |
+| Merge base | `ant merge-base <a> <b>` |
+| Did it land, as what? | `ant landed-as <commit> [--ref <name>]` |
+| Stream lands to CI | `ant ref watch <ref> [--from <rev>]` |
+| Refs | `ant ref get`, `list`, `set` (`--force` for non-fast-forward), `init` |
+| Client cache | `ant cache stats`, `ant cache gc`, `ant cache seed <rev>[:<path>]` |
+| Cache tier | `ant cache-serve --cache <dir> --upstream <origin-http-url>` |
+| Import from git | `ant import <git-dir> [--git-ref refs/heads/main] [--ref main] <store flags>` |
+| Clone with plain git | `git clone [--filter=blob:none \| --depth N] http://<server>:7421/repo.git` |
+| Run a server | `ant serve [--memory \| --pg-url ... --s3-endpoint ...] [--policy policy.toml]` |
+| Administer | `ant admin schema`, `ant admin gc`, `ant admin reindex-acl` |
 
-Restart the server with a policy; `/healthz`, `/readyz` and `/metrics` stay
-unauthenticated (use `--metrics-listen 127.0.0.1:9100` to move metrics off the
-public port).
-
-```sh
-TOKEN=$(openssl rand -hex 16)
-cat > policy.toml <<EOF
-[[principal]]
-name = "agent-1"
-token_sha256 = "$(printf %s "$TOKEN" | sha256sum | cut -d' ' -f1)"
-admin = true
-
-[[path]]
-prefix = ""
-read = ["*"]
-write = ["*"]
-
-[[ref]]
-pattern = "main"
-update = ["agent-1"]
-land = ["*"]
-EOF
-ant serve --policy policy.toml &
-ant log main -n 1                          # error: missing bearer token (+ hint)
-ANT_TOKEN=$TOKEN ant log main -n 1
-git clone http://x:$TOKEN@127.0.0.1:7421/repo.git   # the token is the Basic-auth password
-```
-
-One binary, `ant`, is both the server and the client; the standalone
-`ant-server` binary is a thin wrapper around `ant serve`. Clients find the
-server via `ANT_SERVER` (default `http://127.0.0.1:7420`).
-`ant serve --memory` starts an empty throwaway server. `ant import` writes
-straight to the stores, so it cannot feed an in-memory server; instead create
-the first commit with `ant ref init [<ref>]` (an empty root commit) and fill it
-from a workspace with `ant submit` and `ant land`, as in the Quickstart.
-`ant completions <bash|zsh|fish|...>` prints a shell completion script.
-
-### Importing a large history
-
-`ant import` converts in parallel and keeps memory flat (a fixed-size memo, byte-bounded
-caches); the Linux kernel's 1.5M commits need about 1.5 GiB of anonymous memory. Large
-objects (above `--inline-threshold`) are bundled into packs in S3 with an index in
-Postgres, so S3 sees thousands of large requests instead of millions of small ones.
-For a one-off bulk load, `ANT_PG_BULK=1` commits object inserts without waiting for the
-WAL flush; commit records and refs still commit synchronously, so a crash can only lose
-objects that nothing references yet. `ANT_IMPORT_WORKERS` sets the conversion threads.
-The ref is published with a compare-and-swap against the tip the import started from: a
-land that moves the ref meanwhile is never overwritten (the import fails; its commits are
-recorded and a re-run publishes them). With `ANT_IMPORT_DEFERRED=1` on Postgres, objects,
-commits, changesets and mappings are acknowledged before their WAL flush. Each target ref
-gets a private witness lock (`import-witness/<ref>`, taken before any write; lands on the
-ref are not blocked), and before the swap the witness session commits a marker ref
-synchronously, which proves that no database crash happened and flushes everything before
-it. A crash mid-import leaves a consistent prefix and a re-run continues incrementally.
-It is off by default: it cuts `put_commits` about 10x but, in measurements on a
-disk-bound machine, the wait moved to the object writes without a net gain.
-
-### Docker
-
-```sh
-docker build -t antimony .                       # one image, entrypoint `ant`
-docker compose --profile server up -d --build    # postgres + s3 + `ant serve` on :7420/:7421
-ANT_SERVER=http://127.0.0.1:7420 ant ref list
-```
-
-The image is `debian:bookworm-slim` + `fuse3`. Containers that use FUSE mounts
-need `--device /dev/fuse --cap-add SYS_ADMIN`. Any `ant` command works as the
-container command, e.g. `docker run antimony import ...`.
-
-## Running several server replicas
-
-Any number of `ant serve` processes can share one Postgres (and S3). A server
-keeps no state that matters across requests besides caches of immutable data,
-so replicas are interchangeable. Lands on one ref are batched per process;
-the batch leaders of different processes take turns through a per-ref
-Postgres advisory lock, held across reading the tip, replaying and the CAS.
-The ref CAS remains the correctness guarantee; the lock only avoids racing.
-
-Each process opens up to `--pg-max-connections` (default 64) query connections
-plus `--pg-lock-connections` (default 8) lock connections. Size them so that
-replicas × (both) stays under the database's `max_connections`. Setting
-`--pg-lock-connections 0` disables the locks, which is fine for a single
-process. `--pg-lock-timeout` (default `10s`) bounds the wait for a ref lock. `ant-bench soak` exercises this setup end to end.
+Output is one record per line; the full contract is in the module docs of
+[`crates/ant-cli/src/main.rs`](crates/ant-cli/src/main.rs). Clients find the
+server via `ANT_SERVER` (default `http://127.0.0.1:7420`) and send
+`ANT_TOKEN` when the server has a policy. `ant <command> --help` documents
+every flag; `ant completions <shell>` prints a completion script.
 
 ## Status
 
-Pre-1.0 (v0.1), built in the open with AI agents. Every capability above is
-covered end to end against real Postgres + S3 and FUSE, with property tests
-for codecs, changeset construction, landing (single and multi-replica) and
-garbage collection. Measured performance is in `docs/scorecard/`; open work
-and known limitations are in `ROADMAP.md` and `CHANGELOG.md`; compatibility
-guarantees are in `docs/compatibility.md`.
+- **v0.1.0** (2026-10-16) is the first release: working end to end against
+  real Postgres and S3, FUSE included, covered by unit, integration and
+  property tests (codecs, changesets, landing single and multi-replica,
+  garbage collection).
+- **0.2.0 is in progress on `main`**: a storage format change (look-alike
+  objects compressed together in S3 packs, schema version 6), incremental
+  blame, and a cache tier that batches permission checks
+  (`POST /o/check`). See [Unreleased](CHANGELOG.md#unreleased).
+- **Known limitations**: one Postgres primary (no multi-region); FUSE
+  workspaces are Linux only; the git export is read-only; no code review;
+  storage is larger than a git pack; commit latency is bounded by one
+  durable Postgres commit; restricted tree entry names and commit metadata
+  are visible to every authenticated principal. Full list:
+  [CHANGELOG, known limitations](CHANGELOG.md#known-limitations).
 
-## Access control and threat model
+Open work is in [ROADMAP.md](ROADMAP.md); how antimony maps onto the design it
+recreates is in [docs/scion-gap.md](docs/scion-gap.md).
 
-`ant serve --policy policy.toml` (or `ANT_POLICY`) turns on access control;
-without it the server runs in open mode and logs a warning. The policy
-format (principals with SHA-256-hashed bearer tokens, longest-prefix path
-rules, ref rules, admins) is documented in `crates/ant-auth`. Clients send
-`ANT_TOKEN`: as `authorization: Bearer` on gRPC and HTTP, and as the Basic
-auth password (any user name) for `git clone`. Missing or unknown tokens get
-`unauthenticated` / 401, denials `permission_denied` / 403.
+## Documentation
 
-**What is protected**
+- [Usage](docs/usage.md): conflicts and `ws update`, lazy workspaces, access
+  control quickstart, large imports, Docker, several replicas.
+- [Architecture](docs/architecture.md): crates, object model, storage, write
+  and read paths, clients, git interop, access control.
+- [Access control and threat model](docs/access-control.md): what a policy
+  protects and its v1 limitations.
+- [Operations](docs/operations.md): running a server, S3 timeouts, metrics,
+  imports, policies, sizing, upgrading, local services, benchmarks.
+- [Operator guide](docs/operator-guide.md): topology, sizing, cache tier,
+  fleet workflow, rate limits, metrics and alerts, failure runbook, backups.
+- [Compatibility](docs/compatibility.md): what each 0.x release keeps stable
+  (API, Postgres schema, on-disk formats, CLI output) and how deprecations
+  work.
+- [Scorecards](docs/scorecard/): measured performance against the v1
+  targets.
+- [Gap analysis](docs/scion-gap.md) against "Redesigning source control".
+- [Lazy-workspace write performance contract](docs/contracts/rw-write-performance.md).
+- [Changelog](CHANGELOG.md), [roadmap](ROADMAP.md) and
+  [release checklist](docs/release.md).
 
-- *File content under unreadable paths*: `ReadPath`, `Blame`, `Diff`
-  (including patches and path prefixes) and `Log` / `LogRange` with a path
-  behave as if those paths did not exist.
-- *Objects by id*: every blob and tree written under a restricted path rule
-  (a *zone*) is tagged with that zone, so `GetObjects`, `HasObjects` and
-  `GET /o/<id>` report it exactly like a missing object (same code, body and
-  headers). Content is readable by id if *any* place it is stored is
-  readable: the same bytes at a public path are not secret. Objects outside
-  the root zone are served with `Cache-Control: private`. Tree bundles
-  (`GET /t/<tree-id>`) never carry such objects in a `public` response, and
-  bundles that depend on the caller are `private, no-store`
-  (`docs/architecture.md`).
-- *Read by copy*: `CreateChangeset` may reference a blob by id only if the
-  caller can read it or uploaded it; otherwise it is "not found". Fresh
-  uploads stay hidden from everyone until a changeset places them.
-- *Writes*: every changed path must be writable — for `CreateChangeset` ops,
-  for every commit `Land` replays (or, for a fast-forward, the net tree diff,
-  which also stops reverts disguised as merges), and for `UpdateRef` moves
-  (tree diff between old and new target). `Land`/`UpdateRef` also need the
-  ref rule. Checks run per request before a land joins a group-commit batch,
-  so a denied request never affects others. Only admins may upload trees or
-  commits.
-- *git export*: needs read access to everything (403 otherwise), because the
-  export cannot filter trees without changing commit ids.
+## Contributing
 
-**Known v1 limitations**
+Contributor conventions are in [AGENTS.md](AGENTS.md) (also `CLAUDE.md`):
+crate layout, error style per layer, performance rules and the development
+loop. Tests are the spec: behaviour is pinned by unit, integration and
+property tests, and a change never weakens, deletes or ignores one. CI
+rejects code that is not `cargo fmt`-formatted or has clippy warnings. The
+compatibility surfaces in [docs/compatibility.md](docs/compatibility.md)
+change only deliberately.
 
-- Structure is not secret: readable trees (e.g. the root) list restricted
-  entry *names and ids*; clients need them to sparse-skip. Commit metadata
-  (messages, authors, ids, parents) is visible to every authenticated
-  principal, including `Log` without a path.
-- Objects written before the policy existed, by `ant import`, or by an admin
-  through `PutObjects` (trees/commits) are untagged, i.e. public, until
-  `ant admin reindex-acl <rev> --history` (`ant import --policy` runs it).
-  Path-rule changes need a reindex; read/write list changes do not.
-- Creating a ref (land onto a missing ref, `UpdateRef` with no expected
-  value) needs only the ref rule: there is no previous content to protect.
-- Tagging races can only over-restrict: concurrent first writes of identical
-  bytes to a public and a restricted path may leave the object hidden by id
-  (path reads still work). Error codes are uniform, but response timing
-  still differs slightly between missing and hidden objects.
-- Workspaces of principals who cannot read everything must be sparse around
-  restricted paths. The client disk cache is shared per machine: principals
-  sharing a cache directory share whatever it holds.
-- Tokens are bearer secrets: run behind TLS.
+## Acknowledgements
+
+antimony is an open-source recreation of the ideas in Anthropic's
+[*Redesigning source control at Anthropic*](https://www.anthropic.com/engineering/redesigning-source-control),
+which describes Scion, Anthropic's in-house version control system. antimony
+is an independent project: it is not affiliated with or endorsed by
+Anthropic.
 
 ## License
 
-Apache-2.0
+[Apache-2.0](LICENSE)

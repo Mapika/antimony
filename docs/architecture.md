@@ -5,6 +5,23 @@ are always online, history and writes live on the server, and nothing is
 pushed. This document describes how the pieces fit; the code's module docs
 hold the detailed contracts.
 
+## Crates
+
+| crate | role |
+|---|---|
+| `ant-core` | object model: SHA-256 ids, blobs/trees/commits in git format, repo paths, 3-way merge rules (`merge`, shared by land and `ws update`) |
+| `ant-store` | `ObjectStore`/`RefStore`/`MetaStore` traits; in-memory, Postgres, S3 and tiered implementations; conformance suites; `graph` primitives (tree diff, commit recording, ancestry) |
+| `ant-proto` | gRPC definitions (`proto/ant.proto`) and core ↔ protobuf conversions |
+| `ant-auth` | access policy: tokens, principals, path and ref rules |
+| `ant-server` | `ops` (changeset, land, query, history), `acl`, gRPC (`rpc`), HTTP object endpoint (`http`), `serve` (startup shared with `ant serve`) |
+| `ant-gitserve` | read-only git smart-HTTP (protocol v2) export |
+| `ant-gitbridge` | git → antimony import |
+| `antd` | client engine: shared disk cache, read-through, remote store, sparse workspaces, workspace update planning (`update`) |
+| `ant-cache` | cache tier (`ant cache-serve`): `/o/` and `/t/` from a budgeted disk cache, forward-auth or open, bundle index, metrics |
+| `ant-fuse` | lazy FUSE views: read-only (`filesystem`) and copy-on-write workspaces (`rw`) |
+| `ant-cli` | the `ant` command (client and `ant serve`) |
+| `ant-bench` | load and scale harness (`import`, `fleet`, `checkout`, `soak`) |
+
 ## Object model (`ant-core`)
 
 Objects are git objects (`blob`, `tree`, `commit`) in git's encoding, hashed
@@ -286,4 +303,5 @@ path rules (read/write), ref rules (update/land) and admins.
 - **Writes are checked per path:** for changesets, for every commit a land
   replays, and for ref moves.
 
-See the README's threat model for the v1 limitations.
+See [access-control.md](access-control.md) for the threat model and its v1
+limitations.

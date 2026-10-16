@@ -570,7 +570,7 @@ that ref, and `ant ref set main <id> --force` as agent-1 fails with
 `error: cannot update ref main` plus the hint to check the policy. For team
 isolation add `[[path]]` rules with narrower `prefix`, `read` and `write`
 lists, and make the workspaces of principals that cannot read everything
-sparse around the restricted paths (see the README threat model). The git
+sparse around the restricted paths (see the [threat model](access-control.md)). The git
 export (`/repo.git`) needs read access to everything.
 
 Ref names are `/`-separated (`main`, `release/1.2`, `agents/agent-7/fix`).
