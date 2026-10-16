@@ -139,7 +139,18 @@ pub struct PgStore {
     feed: std::sync::Arc<notify::PgFeed>,
     /// Drops the schema with the last clone of the store (scratch stores only).
     _cleanup: Option<std::sync::Arc<SchemaGuard>>,
+    /// History-index rows written since this process last analyzed the
+    /// table (see [`ANALYZE_HISTORY_ROWS`]).
+    history_rows: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// History-index rows one process writes before it refreshes the table's
+/// planner statistics (`ANALYZE history`). A freshly built index (after an
+/// import, or a ref's first catch-up) otherwise looks empty to the planner
+/// until autovacuum gets to it, and path queries walk `history_by_gen`
+/// filtering every row of the ref instead of reading `history_by_path`
+/// (milliseconds become tens of milliseconds on a large history).
+const ANALYZE_HISTORY_ROWS: u64 = 50_000;
 
 /// Drops a Postgres schema (`DROP SCHEMA ... CASCADE`) when it goes out of
 /// scope, including when a test panics. The drop runs on its own thread and
@@ -574,6 +585,7 @@ impl PgStore {
             schema: schema.to_owned(),
             async_object_commit: false,
             _cleanup: None,
+            history_rows: Default::default(),
         })
     }
 
@@ -636,6 +648,7 @@ impl PgStore {
             schema: schema.to_owned(),
             async_object_commit,
             _cleanup: None,
+            history_rows: Default::default(),
         })
     }
 }
@@ -1028,6 +1041,16 @@ impl MetaStore for PgStore {
             .execute(&self.pool)
             .await
             .map_err(be)?;
+        }
+        let written = rows.len() as u64;
+        let since =
+            self.history_rows.fetch_add(written, std::sync::atomic::Ordering::Relaxed) + written;
+        if since >= ANALYZE_HISTORY_ROWS {
+            self.history_rows.store(0, std::sync::atomic::Ordering::Relaxed);
+            // Best effort: the rows are written; stale statistics only cost speed.
+            if let Err(error) = sqlx::query("ANALYZE history").execute(&self.pool).await {
+                tracing::warn!(%error, "analyzing the history index failed");
+            }
         }
         Ok(())
     }
@@ -1424,6 +1447,19 @@ impl MetaStore for PgStore {
             .collect()
     }
 
+    async fn log_seqs(&self, ids: &[ObjectId]) -> Result<Vec<Option<u64>>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query("SELECT commit_id, seq FROM log WHERE commit_id = ANY($1)")
+            .bind(ids_to_vecs(ids))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(be)?;
+        let seqs: HashMap<ObjectId, u64> = rows.iter().map(log_entry).collect::<Result<_>>()?;
+        Ok(ids.iter().map(|id| seqs.get(id).copied()).collect())
+    }
+
     async fn get_derived(&self, kind: &str, key: &[u8]) -> Result<Option<Bytes>> {
         let row = sqlx::query("SELECT value FROM derived WHERE kind = $1 AND key = $2")
             .bind(kind)
@@ -1713,6 +1749,44 @@ mod tests {
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_history_index_conforms() {
         conformance::history_index(Arc::new(fresh().await)).await;
+    }
+
+    /// A large index build refreshes the planner statistics, so path
+    /// queries read `history_by_path` right away (not every row of the ref
+    /// through `history_by_gen`, as with the statistics of an empty table).
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_large_history_writes_analyze_the_table() {
+        let s = fresh().await;
+        let analyzed = || async {
+            sqlx::query_scalar::<_, f32>(
+                "SELECT reltuples FROM pg_class WHERE oid = 'history'::regclass",
+            )
+            .fetch_one(&s.pool)
+            .await
+            .unwrap()
+        };
+        let row = |i: u64| crate::HistoryRow {
+            path: RepoPath::new(format!("d{}/f{}", i % 50, i % 1000)).unwrap(),
+            generation: i,
+            commit: ObjectId([(i % 251) as u8; 32]),
+        };
+        let small: Vec<_> = (0..1000).map(row).collect();
+        s.index_history("main", &small).await.unwrap();
+        assert!(analyzed().await < 1.0, "not analyzed after a small write");
+        let large: Vec<_> = (1000..(1000 + ANALYZE_HISTORY_ROWS)).map(row).collect();
+        s.index_history("main", &large).await.unwrap();
+        assert!(analyzed().await > 10_000.0, "{}", analyzed().await);
+        let plan: Vec<String> = sqlx::query_scalar(
+            "EXPLAIN SELECT DISTINCT generation, commit_id FROM history \
+             WHERE ref = 'main' AND (path = 'd7/f7' OR path LIKE 'd7/f7/%') \
+             AND generation <= 9223372036854775807 \
+             ORDER BY generation DESC, commit_id DESC LIMIT 9223372036854775807",
+        )
+        .fetch_all(&s.pool)
+        .await
+        .unwrap();
+        assert!(plan.iter().any(|l| l.contains("history_by_path")), "{plan:#?}");
     }
 
     #[tokio::test]

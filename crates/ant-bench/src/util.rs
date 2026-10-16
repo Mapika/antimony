@@ -319,6 +319,7 @@ pub struct TimedMeta {
     first_parent_chain: Arc<Counter>,
     ancestors_above: Arc<Counter>,
     tail: Arc<Counter>,
+    log_seqs: Arc<Counter>,
     get_derived: Arc<Counter>,
     put_derived: Arc<Counter>,
 }
@@ -376,6 +377,10 @@ impl MetaStore for TimedMeta {
 
     async fn tail(&self, after: u64, limit: usize) -> Result<Vec<(u64, ObjectId)>> {
         timed(&self.tail, 1, self.inner.tail(after, limit)).await
+    }
+
+    async fn log_seqs(&self, ids: &[ObjectId]) -> Result<Vec<Option<u64>>> {
+        timed(&self.log_seqs, ids.len() as u64, self.inner.log_seqs(ids)).await
     }
 
     async fn get_derived(&self, kind: &str, key: &[u8]) -> Result<Option<Bytes>> {
@@ -447,6 +452,7 @@ pub fn instrument(backend: &Backend, m: &Metrics, prefix: &str) -> Backend {
             first_parent_chain: c("first_parent_chain"),
             ancestors_above: c("ancestors_above"),
             tail: c("tail"),
+            log_seqs: c("log_seqs"),
             get_derived: c("get_derived"),
             put_derived: c("put_derived"),
         }),

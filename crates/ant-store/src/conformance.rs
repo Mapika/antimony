@@ -203,6 +203,12 @@ pub async fn meta_store(s: Arc<dyn MetaStore>) {
     assert_eq!(s.tail(s1, 10).await.unwrap(), vec![(s2, c2)]);
     assert_eq!(s.tail(0, 1).await.unwrap(), vec![(s1, c1)]);
     assert_eq!(s.tail(s2, 10).await.unwrap(), vec![]);
+    // Sequence numbers by id (the log order is a topological order).
+    assert_eq!(
+        s.log_seqs(&[c2, ObjectId([3; 32]), c1, c2]).await.unwrap(),
+        vec![Some(s2), None, Some(s1), Some(s2)]
+    );
+    assert_eq!(s.log_seqs(&[]).await.unwrap(), vec![]);
 
     // Concurrent appends get distinct, increasing sequence numbers.
     let mut tasks = Vec::new();
@@ -286,6 +292,10 @@ pub async fn meta_store_batch(s: Arc<dyn MetaStore>) {
     assert_eq!(
         s.tail(0, 10).await.unwrap(),
         vec![(pre, id(1)), (seqs[0], id(2)), (seqs[2], id(3)), (seqs[3], id(4))]
+    );
+    assert_eq!(
+        s.log_seqs(&[id(4), id(1), id(3), id(2)]).await.unwrap(),
+        vec![Some(seqs[3]), Some(pre), Some(seqs[2]), Some(seqs[0])]
     );
     // Idempotent re-run returns the same sequence numbers.
     assert_eq!(s.put_commits(batch).await.unwrap(), seqs);

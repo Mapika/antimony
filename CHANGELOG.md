@@ -66,6 +66,35 @@ Planned as 0.2.0 (storage format change, schema version 6).
   unchanged (~90 ms); repeated blame 2.3 -> 3.3 ms. A typed derived-data
   layer, `ant_store::derive` (`Derivation`: versioned kind, key, codec,
   recursive rule, eager/deferred policy; batched get/put), carries it.
+- Path history (`ant log <ref> --path`) is served from the ref's history
+  index right after an import: `ant import` and `ant-bench import` build it
+  (git/git, 24k first-parent commits: 1.3 s), and a path query or blame on
+  a ref the index cannot serve (no index yet, e.g. a ref set straight in
+  the store; lag past 4096 commits; a non-fast-forward move) schedules its
+  catch-up, so only the first queries scan. Before, an imported ref was
+  never indexed until something landed on it, and every path log scanned
+  the whole first-parent history. A path scan's chain/changeset reads now
+  double from 256 up to 4096 commits (git/git: 95 round-trip pairs -> 10),
+  and a Postgres server analyzes the `history` table after writing 50k
+  index rows (a freshly built index otherwise looks empty to the planner
+  until autovacuum runs, and path queries filter every row of the ref:
+  14 ms instead of 1 ms on git/git). git/git on Postgres + S3, 6 paths,
+  warm server, CLI wall time: whole history 210 ms -> 6.7 ms (git
+  `log --first-parent` with commit-graph Bloom filters: 101 ms), newest 20
+  23.4 ms -> 5.3 ms (git 11.7 ms).
+- `merge-base` of a branch far off a long first-parent chain is decided
+  from the first parents instead of a walk over everything newer than the
+  branch point: the skip index finds where the two first-parent chains
+  meet (both descend in lockstep, O(log n) entry reads); the branch side's
+  ancestry above that commit is read (at most 1024 commits), and its
+  commits are shown not to be ancestors of the other side because they
+  were recorded after it (`MetaStore::log_seqs`: the commit log is a
+  topological order), or both sides' short ancestries are intersected.
+  Anything else walks as before; answers are unchanged (oracle property
+  tests on random diverged histories, in memory and on Postgres). git/git,
+  a commit on `main~12198` against `main`: 193 ms -> 9.3 ms (git 54 ms); a
+  3-commit branch off `main~2000` on a 342k-commit merge-heavy synthetic
+  history reads 4 store calls / 70 commits.
 - `ant import` cuts object batches at 64 MiB instead of 16 MiB (still at
   most 1024 objects), so more versions of a path share a batch and a frame.
 - Stored size: a git/git import (82k commits; git pack of what `master`

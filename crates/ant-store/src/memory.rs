@@ -215,6 +215,11 @@ impl MetaStore for MemoryMetaStore {
         Ok(m.log[start..].iter().take(limit).copied().collect())
     }
 
+    async fn log_seqs(&self, ids: &[ObjectId]) -> Result<Vec<Option<u64>>> {
+        let m = self.inner.lock();
+        Ok(ids.iter().map(|id| m.commits.get(id).map(|(seq, _, _)| *seq)).collect())
+    }
+
     async fn get_derived(&self, kind: &str, key: &[u8]) -> Result<Option<Bytes>> {
         Ok(self.inner.lock().derived.get(&(kind.to_string(), key.to_vec())).cloned())
     }
