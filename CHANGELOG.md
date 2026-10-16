@@ -8,6 +8,22 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-16
+
+Patch release: no storage or protocol changes.
+
+### Fixed
+
+- `ant admin repack` could hang (until the S3 operation timeout, then
+  fail): while it waited for pack uploads it stopped polling the segments
+  it was reading, and a paused read keeps the S3 request slots it holds
+  (`--s3-max-concurrency`), which the uploads it waited for needed. It now
+  keeps every running read going and applies backpressure by not starting
+  new segments while uploads are behind.
+- Tests: S3 test prefixes get a random suffix
+  (`<label>-t<secs>-<random>`); two tests starting in the same second
+  shared a prefix and one's cleanup deleted the other's data.
+
 ## [0.2.1] - 2026-10-16
 
 Patch release: no storage or protocol changes; servers and clients of 0.2.0 interoperate. Agents need this client to reach a server behind an `https://` proxy.
@@ -53,12 +69,6 @@ Patch release: no storage or protocol changes; servers and clients of 0.2.0 inte
   machine with an unresponsive FUSE mount; it now uses `syncfs` on the
   cache's filesystem. `--no-dedup` now applies to the normal phases too, and
   each phase reports its kernel CPU time (`cpu_sys_s`).
-- `ant admin repack` could hang (until the S3 operation timeout, then
-  fail): while it waited for pack uploads it stopped polling the segments
-  it was reading, and a paused read keeps the S3 request slots it holds
-  (`--s3-max-concurrency`), which the uploads it waited for needed. It now
-  keeps every running read going and applies backpressure by not starting
-  new segments while uploads are behind.
 
 ## [0.2.0] - 2026-10-16
 
@@ -474,7 +484,8 @@ Also in this release:
   around restricted paths, and principals sharing a cache directory share
   what it holds.
 
-[Unreleased]: https://github.com/Mapika/antimony/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/Mapika/antimony/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/Mapika/antimony/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Mapika/antimony/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Mapika/antimony/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Mapika/antimony/releases/tag/v0.1.0

@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "ant-auth"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ant-core",
  "hex",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "ant-bench"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ant-cache",
  "ant-core",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cache"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ant-auth",
  "ant-core",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ant-auth",
  "ant-cache",
@@ -171,7 +171,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "diffy",
@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "ant-fuse"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ant-core",
  "ant-store",
@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "ant-gitbridge"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ant-core",
  "ant-store",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "ant-gitserve"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ant-core",
  "ant-gitbridge",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "ant-proto"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ant-core",
  "bytes",
@@ -251,7 +251,7 @@ dependencies = [
 
 [[package]]
 name = "ant-server"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ant-auth",
  "ant-core",
@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "ant-store"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ant-core",
  "async-trait",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "antd"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ant-auth",
  "ant-core",
