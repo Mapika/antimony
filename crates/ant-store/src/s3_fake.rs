@@ -1,6 +1,8 @@
 //! A scripted fake S3 endpoint for tests: a tiny HTTP/1.1 server that answers
 //! the n-th request with the n-th scripted behaviour (the last repeats).
-//! GET bodies are `byte(i) = i % 251` over the requested range.
+//! GET bodies are `byte(i) = i % 251` over the requested range. It counts the
+//! requests being worked on (from the request head read to the start of the
+//! response), and their peak.
 
 use std::{
     net::SocketAddr,
@@ -30,13 +32,24 @@ pub(crate) enum Act {
     Reset,
     /// 429 `SlowDown`, with `Retry-After` seconds when given.
     Throttle(Option<u32>),
-    /// A non-retryable status.
+    /// An error status (`AccessDenied` body).
     Status(u16),
+    /// A full, correct response after a pause of this many milliseconds.
+    Slow(u64),
 }
 
 pub(crate) struct Fake {
     pub addr: SocketAddr,
     pub hits: Arc<AtomicUsize>,
+    /// Most requests worked on at once.
+    pub peak: Arc<AtomicUsize>,
+}
+
+/// Requests being worked on now, and their peak.
+#[derive(Clone, Default)]
+struct Load {
+    now: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
 }
 
 pub(crate) fn byte_at(i: u64) -> u8 {
@@ -48,15 +61,17 @@ pub(crate) async fn spawn(script: Vec<Act>) -> Fake {
     let addr = listener.local_addr().expect("addr");
     let hits = Arc::new(AtomicUsize::new(0));
     let counter = hits.clone();
+    let load = Load::default();
+    let peak = load.peak.clone();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else { return };
             let n = counter.fetch_add(1, Ordering::SeqCst);
             let act = script[n.min(script.len() - 1)];
-            tokio::spawn(handle(stream, act));
+            tokio::spawn(handle(stream, act, load.clone()));
         }
     });
-    Fake { addr, hits }
+    Fake { addr, hits, peak }
 }
 
 /// Fast timeouts so failure paths take fractions of a second.
@@ -67,6 +82,10 @@ pub(crate) fn fast_timeouts(max_attempts: u32) -> S3Timeouts {
         min_throughput: 1_000_000_000,
         operation: Duration::from_secs(20),
         max_attempts,
+        retry_budget: Duration::from_secs(20),
+        backoff_base: Duration::from_millis(10),
+        backoff_cap: Duration::from_millis(100),
+        max_concurrency: 64,
     }
 }
 
@@ -82,7 +101,7 @@ pub(crate) fn config(fake: &Fake, timeouts: S3Timeouts) -> S3Config {
     }
 }
 
-async fn handle(mut stream: TcpStream, act: Act) {
+async fn handle(mut stream: TcpStream, act: Act, load: Load) {
     // Request head (and, for PUT, whatever body is already in flight).
     let mut head = Vec::new();
     let mut buf = [0u8; 4096];
@@ -111,17 +130,26 @@ async fn handle(mut stream: TcpStream, act: Act) {
         Some((a.trim().parse::<u64>().ok()?, b.trim().parse::<u64>().ok()?))
     });
     let (start, len) = range.map_or((0, 0), |(a, b)| (a, b - a + 1));
+    // Worked on until the response starts: the client holds its slot from
+    // before connecting until the response is read, so this never counts more
+    // requests than the client has in flight.
+    let now = load.now.fetch_add(1, Ordering::SeqCst) + 1;
+    load.peak.fetch_max(now, Ordering::SeqCst);
+    if let Act::Slow(ms) = act {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+    load.now.fetch_sub(1, Ordering::SeqCst);
     let body: Vec<u8> = (start..start + len).map(byte_at).collect();
     let header = |status: &str, extra: &str, len: usize| {
         format!("HTTP/1.1 {status}\r\nContent-Length: {len}\r\nConnection: close\r\n{extra}\r\n")
     };
     match act {
-        Act::Ok if is_get => {
+        Act::Ok | Act::Slow(_) if is_get => {
             let h = header("206 Partial Content", "", body.len());
             let _ = stream.write_all(h.as_bytes()).await;
             let _ = stream.write_all(&body).await;
         }
-        Act::Ok => {
+        Act::Ok | Act::Slow(_) => {
             let _ = stream.write_all(header("200 OK", "", 0).as_bytes()).await;
         }
         Act::Stall | Act::Truncate => {

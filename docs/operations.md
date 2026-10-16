@@ -35,27 +35,57 @@ terminate TLS. Put a reverse proxy (or a gRPC-aware load balancer) in front
 of both ports.
 
 
-### S3 timeouts and retries
+### S3 timeouts, retries and throttling
 
 Every S3 request is bounded, so a stalled or throttling object store fails a
 request with an error instead of hanging it (and the read budget it holds).
 An attempt covers the request **and the whole response body**; it may take
-`--s3-timeout + size / --s3-min-throughput`. Throttling (429, 503,
-`SlowDown`), 5xx, connection resets, timeouts and truncated bodies are retried
-with jittered exponential backoff (100 ms doubling to 5 s; a `Retry-After`
-header is honoured, up to 30 s). Only GET, HEAD, PUT and DELETE of
-content-addressed or idempotent keys are issued, so retries are safe. After
-the last attempt the caller gets a `backend error: s3 <op> <key>: gave up
-after N attempt(s) ...` (clone and RPC fail cleanly). `/readyz` probes S3
-with one attempt.
+`--s3-timeout + size / --s3-min-throughput`.
+
+**Retries.** Throttling (429, 503, `SlowDown`), other 5xx, connection errors,
+timeouts and bodies that break off or come up short are retried with
+exponential backoff and full jitter: the pause after attempt *n* is random
+in 0 .. min(5 s, 100 ms x 2^(n-1)); a longer `Retry-After` is honoured (up
+to 30 s). An operation keeps retrying for `--s3-retry-budget` (60 s),
+counted from its first failure, so a few seconds of throttling cost latency,
+not a failed clone or `ant admin gc`. Client errors (403, 404, ...) and
+corrupt data fail at once. Only GET, HEAD, PUT and DELETE of
+content-addressed or idempotent keys are issued, so retries are safe. When
+the budget (or `--s3-max-attempts`, or `--s3-operation-timeout`) runs out
+the caller gets a `backend error: s3 <op> <key>: gave up after N attempt(s)
+...` (clone and RPC fail cleanly). `/readyz` probes S3 with one attempt.
+
+**Concurrency.** A process keeps at most `--s3-max-concurrency` (32) S3
+requests in flight; more wait for a slot (a retry waits again; its pause
+holds none). Bursts such as the `ant admin gc` mark, `ant admin repack`,
+clone planning and checkout bundles therefore queue in the process instead
+of overrunning the store. Object stores throttle beyond some in-flight
+volume: SeaweedFS answers 429 once a volume server has more than
+`-volume.concurrentDownloadLimitMB` (default 64 MiB) of downloads in flight,
+counting whole storage chunks (`-filer.maxMB`, 4 MiB) rather than requested
+ranges, so with its defaults about 16 concurrent range reads saturate one
+volume server; the filer then breaks the response off mid-body. Raise that
+limit on a dedicated SeaweedFS, or lower `--s3-max-concurrency`; AWS S3
+sustains thousands of GETs per second per prefix, so a server there may
+raise it (64-128). Several processes (replicas, `ant admin gc`, imports)
+share the store's limits: budget their sum.
 
 | flag | env | default |
 |---|---|---|
 | `--s3-connect-timeout` | `ANT_S3_CONNECT_TIMEOUT` | `5s` |
 | `--s3-timeout` (fixed part of an attempt) | `ANT_S3_TIMEOUT` | `30s` |
 | `--s3-min-throughput` (bytes/s) | `ANT_S3_MIN_THROUGHPUT` | `10000000` |
-| `--s3-operation-timeout` (retries included) | `ANT_S3_OPERATION_TIMEOUT` | `5m` |
-| `--s3-max-attempts` (1 = no retries) | `ANT_S3_MAX_ATTEMPTS` | `5` |
+| `--s3-retry-budget` (retrying after the first failure) | `ANT_S3_RETRY_BUDGET` | `60s` |
+| `--s3-max-attempts` (1 = no retries, 0 = no limit) | `ANT_S3_MAX_ATTEMPTS` | `0` |
+| `--s3-operation-timeout` (slot wait and retries included) | `ANT_S3_OPERATION_TIMEOUT` | `5m` |
+| `--s3-max-concurrency` (requests in flight per process) | `ANT_S3_MAX_CONCURRENCY` | `32` |
+
+Watch `ant_s3_retries_total{reason}` (`throttled`, `server_error`,
+`network`, `body`, `timeout`): a steady trickle under load is the backoff
+doing its job; `ant_s3_gave_up_total` rising means operations failed after
+the budget (S3 down or throttling for longer than the budget). A sustained
+`ant_s3_requests_queued` with `ant_s3_requests_in_flight` at
+`ant_s3_max_concurrency` means S3 requests are the bottleneck.
 
 Large objects of one write (an import batch, a land) that look alike
 (versions of one file or directory) are compressed together in frames of at
@@ -102,6 +132,9 @@ balancer checks should use `/readyz`; see the operator guide.
 | `ant_ref_watch_events_total`, `ant_ref_watch_coalesced_events_total` | | ref events sent to watchers; of those, events covering an unknown number of moves (catch-ups, gap fills, slow watchers) |
 | `ant_build_info` | `version`, `git` | always 1 |
 | `ant_pg_pool_size`, `_idle`, `_in_use`, `_max` | | Postgres query pool (0 without Postgres) |
+| `ant_s3_retries_total` | `reason` (`throttled`, `server_error`, `network`, `body`, `timeout`) | S3 attempts retried (see S3 timeouts, retries and throttling) |
+| `ant_s3_gave_up_total` | | S3 operations that failed after retrying |
+| `ant_s3_requests_in_flight`, `ant_s3_requests_queued`, `ant_s3_max_concurrency` | | S3 requests in flight, waiting for a slot, and the slots (0 without S3) |
 
 `ref` labels are capped: the 64 most recently landed-on or indexed refs get
 their own value, all others report as `ref="other"`. Useful starting alerts:

@@ -107,14 +107,28 @@ pub struct StoreArgs {
     #[arg(long, env = "ANT_S3_MIN_THROUGHPUT", default_value_t = 10_000_000)]
     s3_min_throughput: u64,
 
-    /// Longest one S3 operation may take, retries included.
+    /// Longest one S3 operation may take, waiting for a request slot,
+    /// retries and pauses included.
     #[arg(long, env = "ANT_S3_OPERATION_TIMEOUT", default_value = "5m", value_parser = parse_duration)]
     s3_operation_timeout: std::time::Duration,
 
-    /// Attempts per S3 operation (1 = no retries). Throttling, 5xx,
-    /// connection errors, timeouts and truncated bodies are retried.
-    #[arg(long, env = "ANT_S3_MAX_ATTEMPTS", default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
+    /// How long an S3 operation keeps retrying transient failures
+    /// (throttling, 5xx, connection errors, timeouts, cut-off bodies),
+    /// counted from its first failure. Pauses back off exponentially with
+    /// full jitter, up to 5 s each (longer if the server sends Retry-After).
+    #[arg(long, env = "ANT_S3_RETRY_BUDGET", default_value = "60s", value_parser = parse_duration)]
+    s3_retry_budget: std::time::Duration,
+
+    /// Attempts per S3 operation at most (1 = no retries; 0 = no limit, the
+    /// retry budget decides).
+    #[arg(long, env = "ANT_S3_MAX_ATTEMPTS", default_value_t = 0)]
     s3_max_attempts: u32,
+
+    /// S3 requests in flight per process at most; more wait for a slot, so
+    /// bursts queue here instead of overrunning (and being throttled by)
+    /// the object store.
+    #[arg(long, env = "ANT_S3_MAX_CONCURRENCY", default_value_t = ant_store::s3::DEFAULT_MAX_CONCURRENCY as u32, value_parser = clap::value_parser!(u32).range(1..))]
+    s3_max_concurrency: u32,
 
     /// Objects whose encoded size is at most this many bytes live in Postgres;
     /// larger ones go to S3 (only with --s3-*).
@@ -176,6 +190,9 @@ impl StoreArgs {
                 min_throughput: self.s3_min_throughput,
                 operation: self.s3_operation_timeout,
                 max_attempts: self.s3_max_attempts,
+                retry_budget: self.s3_retry_budget,
+                max_concurrency: self.s3_max_concurrency as usize,
+                ..S3Timeouts::default()
             },
         }))
     }

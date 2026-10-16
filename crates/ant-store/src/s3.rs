@@ -15,26 +15,45 @@
 //! - Every request is bounded: a connect timeout, a per-attempt timeout that
 //!   covers the whole response body (`attempt + size / min_throughput`) and an
 //!   overall operation timeout ([`S3Timeouts`]). Throttling (429, 503,
-//!   `SlowDown`), 5xx, connection errors, timeouts and truncated bodies are
-//!   retried with jittered exponential backoff (honouring `Retry-After`) up to
-//!   `max_attempts`; GET, HEAD and PUT of content-addressed keys are
-//!   idempotent. The SDK's own retries are disabled so attempts do not
-//!   multiply. After the last attempt a `StoreError::Backend` names the
-//!   operation, key and last failure.
+//!   `SlowDown`), 5xx, connection errors, timeouts and truncated or cut-off
+//!   bodies are retried with exponential backoff and full jitter (a pause of
+//!   up to `backoff_base * 2^n`, at most `backoff_cap`; a longer
+//!   `Retry-After` is honoured) for as long as `retry_budget` allows,
+//!   counted from the operation's first failure (and up to `max_attempts`,
+//!   if set). GET, HEAD and PUT of content-addressed keys are idempotent.
+//!   Client errors (403, 404, ...) and corrupt data fail at once. The SDK's
+//!   own retries are disabled so attempts do not multiply. After giving up a
+//!   `StoreError::Backend` names the operation, key and last failure.
+//! - At most `max_concurrency` requests per store (clones share the limit)
+//!   are in flight; more wait for a slot, so bursts (GC mark, repack, clone
+//!   planning, checkout bundles) queue in the process instead of overrunning
+//!   the backend, which throttles beyond some in-flight volume. A retry waits
+//!   for a slot again; the backoff pause holds none.
+//! - Process-wide counters ([`stats`]): retries by reason, operations that
+//!   gave up, requests in flight and waiting for a slot.
 //! - `ensure_bucket` creates the bucket if it does not exist ("already owned
 //!   by you" counts as success).
 
-use std::{collections::HashSet, future::Future, time::Duration};
+use std::{
+    collections::HashSet,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use ant_core::{EncodedObject, ObjectId};
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{
     config::{retry::RetryConfig, timeout::TimeoutConfig},
-    error::{DisplayErrorContext, SdkError},
+    error::{DisplayErrorContext, ProvideErrorMetadata, SdkError},
 };
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
+use tokio::sync::Semaphore;
 
 use crate::{BLOCKING_THRESHOLD, ObjectStore, Result, StoreError, ZSTD_LEVEL};
 
@@ -42,12 +61,15 @@ use crate::{BLOCKING_THRESHOLD, ObjectStore, Result, StoreError, ZSTD_LEVEL};
 const FANOUT: usize = 64;
 /// Size assumed for the per-attempt timeout of a read whose size is unknown.
 const UNKNOWN_SIZE: u64 = 16 * 1024 * 1024;
-/// Longest pause between attempts, including a server's `Retry-After`.
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Longest `Retry-After` honoured.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Default [`S3Timeouts::max_concurrency`].
+pub const DEFAULT_MAX_CONCURRENCY: usize = 32;
 
 type HttpResponse = aws_sdk_s3::config::http::HttpResponse;
 
-/// Timeout and retry policy of the S3 client (see the module docs).
+/// Timeout, retry and concurrency policy of the S3 client (see the module
+/// docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct S3Timeouts {
     /// Establishing a TCP/TLS connection.
@@ -58,10 +80,22 @@ pub struct S3Timeouts {
     /// Slowest acceptable transfer rate, bytes per second: an attempt moving
     /// `n` bytes may take `attempt + n / min_throughput`.
     pub min_throughput: u64,
-    /// Everything about one operation, retries and pauses included.
+    /// Everything about one operation, waiting for a slot, retries and
+    /// pauses included.
     pub operation: Duration,
-    /// Attempts per operation (1 = no retry).
+    /// Attempts per operation (1 = no retry, 0 = no limit: the retry budget
+    /// decides).
     pub max_attempts: u32,
+    /// How long after its first failed attempt an operation keeps retrying
+    /// transient failures.
+    pub retry_budget: Duration,
+    /// The pause after the first failed attempt is drawn from `0..=base`,
+    /// and the range doubles per attempt...
+    pub backoff_base: Duration,
+    /// ...up to `0..=cap`.
+    pub backoff_cap: Duration,
+    /// Requests in flight per store at most (shared by its clones).
+    pub max_concurrency: usize,
 }
 
 impl Default for S3Timeouts {
@@ -71,7 +105,11 @@ impl Default for S3Timeouts {
             attempt: Duration::from_secs(30),
             min_throughput: 10_000_000,
             operation: Duration::from_secs(300),
-            max_attempts: 5,
+            max_attempts: 0,
+            retry_budget: Duration::from_secs(60),
+            backoff_base: Duration::from_millis(100),
+            backoff_cap: Duration::from_secs(5),
+            max_concurrency: DEFAULT_MAX_CONCURRENCY,
         }
     }
 }
@@ -80,6 +118,81 @@ impl S3Timeouts {
     /// Time one attempt moving `bytes` bytes may take.
     fn attempt_for(&self, bytes: u64) -> Duration {
         self.attempt + Duration::from_secs_f64(bytes as f64 / self.min_throughput.max(1) as f64)
+    }
+
+    /// Pause after failed attempt `n` (1-based): full jitter over
+    /// `0..=min(cap, base * 2^(n-1))`.
+    fn backoff(&self, n: u32) -> Duration {
+        let ceiling = self
+            .backoff_base
+            .saturating_mul(1u32 << n.saturating_sub(1).min(20))
+            .min(self.backoff_cap);
+        ceiling.mul_f64(rand::random::<f64>())
+    }
+}
+
+/// Why an attempt is retried (`ant_s3_retries_total{reason}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reason {
+    /// 429, 503 or a `SlowDown` error code.
+    Throttled = 0,
+    /// Other 5xx, 408, 425.
+    ServerError = 1,
+    /// The request could not be sent or its response not read (connection
+    /// refused or reset, malformed response).
+    Network = 2,
+    /// The response body broke off, came up short or failed mid-stream.
+    Body = 3,
+    /// The attempt timed out.
+    Timeout = 4,
+}
+
+/// Retry reasons, in the order of [`S3Stats::retries`].
+pub const RETRY_REASONS: [&str; 5] = ["throttled", "server_error", "network", "body", "timeout"];
+
+static RETRIES: [AtomicU64; 5] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static GAVE_UP: AtomicU64 = AtomicU64::new(0);
+static IN_FLIGHT: AtomicI64 = AtomicI64::new(0);
+static QUEUED: AtomicI64 = AtomicI64::new(0);
+
+/// Process-wide S3 client counters (all stores), for metrics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct S3Stats {
+    /// Attempts retried, per [`RETRY_REASONS`] (cumulative).
+    pub retries: [u64; 5],
+    /// Operations that failed after retrying: budget, attempts or operation
+    /// timeout exhausted (cumulative).
+    pub gave_up: u64,
+    /// Requests in flight now.
+    pub in_flight: i64,
+    /// Requests waiting for a slot now (`max_concurrency`).
+    pub queued: i64,
+}
+
+/// The current [`S3Stats`].
+pub fn stats() -> S3Stats {
+    S3Stats {
+        retries: std::array::from_fn(|i| RETRIES[i].load(Ordering::Relaxed)),
+        gave_up: GAVE_UP.load(Ordering::Relaxed),
+        in_flight: IN_FLIGHT.load(Ordering::Relaxed),
+        queued: QUEUED.load(Ordering::Relaxed),
+    }
+}
+
+/// Adds one to a gauge while alive (also when its future is dropped).
+struct GaugeGuard(&'static AtomicI64);
+
+impl GaugeGuard {
+    fn new(g: &'static AtomicI64) -> Self {
+        g.fetch_add(1, Ordering::Relaxed);
+        Self(g)
+    }
+}
+
+impl Drop for GaugeGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -146,6 +259,8 @@ pub struct S3ObjectStore {
     bucket: String,
     prefix: String,
     timeouts: S3Timeouts,
+    /// Request slots (`max_concurrency`).
+    slots: Arc<Semaphore>,
 }
 
 /// Outcome of one failed attempt.
@@ -153,45 +268,53 @@ enum Attempt {
     /// Transient: try again, after `after` if the server asked for a pause.
     Retry {
         why: String,
+        reason: Reason,
         after: Option<Duration>,
     },
     Fatal(StoreError),
 }
 
+impl Attempt {
+    /// A failure while receiving the response body.
+    fn body(why: String) -> Self {
+        Attempt::Retry { why, reason: Reason::Body, after: None }
+    }
+}
+
 fn retry_after(resp: &HttpResponse) -> Option<Duration> {
     let secs: f64 = resp.headers().get("retry-after")?.trim().parse().ok()?;
-    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs).min(MAX_BACKOFF))
+    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs).min(MAX_RETRY_AFTER))
 }
 
 /// Sort an SDK failure into retryable and fatal.
 fn classify<E>(op: &str, what: &str, e: SdkError<E, HttpResponse>) -> Attempt
 where
-    E: std::error::Error + Send + Sync + 'static,
+    E: std::error::Error + ProvideErrorMetadata + Send + Sync + 'static,
 {
     let status = e.raw_response().map(|r| r.status().as_u16());
     let after = e.raw_response().and_then(retry_after);
-    let transient_status = |s: u16| matches!(s, 408 | 425 | 429 | 500..=504);
-    let retry = match &e {
-        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_) => {
-            true
+    let reason = match &e {
+        SdkError::TimeoutError(_) => Some(Reason::Timeout),
+        SdkError::DispatchFailure(_) | SdkError::ResponseError(_) => Some(Reason::Network),
+        SdkError::ServiceError(s) => {
+            let code = s.err().code();
+            if matches!(status, Some(429 | 503))
+                || matches!(code, Some("SlowDown" | "Throttling" | "ThrottlingException"))
+            {
+                Some(Reason::Throttled)
+            } else if status.is_some_and(|s| matches!(s, 408 | 425 | 500..=599)) {
+                Some(Reason::ServerError)
+            } else {
+                None
+            }
         }
-        SdkError::ServiceError(_) => status.is_some_and(transient_status),
-        _ => false,
+        _ => None,
     };
     let why = DisplayErrorContext(&e).to_string();
-    if retry {
-        Attempt::Retry { why, after }
-    } else {
-        Attempt::Fatal(backend_error(format!("s3 {op} {what}: {why}")))
+    match reason {
+        Some(reason) => Attempt::Retry { why, reason, after },
+        None => Attempt::Fatal(backend_error(format!("s3 {op} {what}: {why}"))),
     }
-}
-
-/// Pause after failed attempt `n`: 100 ms doubling to 5 s, jittered over its
-/// upper half.
-fn backoff(n: u32) -> Duration {
-    let cap =
-        Duration::from_millis(100u64 << n.saturating_sub(1).min(6)).min(Duration::from_secs(5));
-    cap.mul_f64(0.5 + 0.5 * rand::random::<f64>())
 }
 
 /// A [`StoreError::Backend`] carrying `msg` (failed requests, corrupt bodies).
@@ -212,13 +335,20 @@ impl S3ObjectStore {
             bucket: cfg.bucket.clone(),
             prefix: cfg.prefix.clone(),
             timeouts: cfg.timeouts,
+            slots: Arc::new(Semaphore::new(cfg.timeouts.max_concurrency.max(1))),
         })
     }
 
+    /// Requests this store keeps in flight at most.
+    pub fn max_concurrency(&self) -> usize {
+        self.timeouts.max_concurrency.max(1)
+    }
+
     /// Run `attempt` until it succeeds, fails for good, or the policy
-    /// ([`S3Timeouts`]) is exhausted. Each attempt, body included, is bounded
-    /// by `attempt_timeout`; dropping a timed-out attempt cancels it, which
-    /// releases whatever it held.
+    /// ([`S3Timeouts`]) is exhausted. Each attempt holds a request slot and,
+    /// body included, is bounded by `attempt_timeout` (waiting for the slot
+    /// is not); dropping a timed-out attempt cancels it, which releases
+    /// whatever it held.
     async fn retrying<T, F, Fut>(
         &self,
         op: &'static str,
@@ -234,37 +364,75 @@ impl S3ObjectStore {
         let started = tokio::time::Instant::now();
         let run = async {
             let mut n = 0u32;
+            let mut first_failure: Option<tokio::time::Instant> = None;
             loop {
                 n += 1;
-                let outcome = match tokio::time::timeout(attempt_timeout, attempt()).await {
-                    Ok(r) => r,
-                    Err(_) => Err(Attempt::Retry {
-                        why: format!("attempt timed out after {attempt_timeout:?}"),
-                        after: None,
-                    }),
+                let outcome = {
+                    let waiting = GaugeGuard::new(&QUEUED);
+                    let _slot = self.slots.acquire().await.map_err(StoreError::backend)?;
+                    drop(waiting);
+                    let _running = GaugeGuard::new(&IN_FLIGHT);
+                    match tokio::time::timeout(attempt_timeout, attempt()).await {
+                        Ok(r) => r,
+                        Err(_) => Err(Attempt::Retry {
+                            why: format!("attempt timed out after {attempt_timeout:?}"),
+                            reason: Reason::Timeout,
+                            after: None,
+                        }),
+                    }
                 };
-                let (why, after) = match outcome {
+                let (why, reason, after) = match outcome {
                     Ok(v) => return Ok(v),
                     Err(Attempt::Fatal(e)) => return Err(e),
-                    Err(Attempt::Retry { why, after }) => (why, after),
+                    Err(Attempt::Retry { why, reason, after }) => (why, reason, after),
                 };
-                let pause = after.map_or_else(|| backoff(n), |a| a.max(backoff(n)));
-                if n >= t.max_attempts.max(1) || started.elapsed() + pause >= t.operation {
+                let failing = first_failure.get_or_insert_with(tokio::time::Instant::now).elapsed();
+                let jitter = t.backoff(n);
+                let pause = after.map_or(jitter, |a| a.max(jitter));
+                let attempts_left = t.max_attempts == 0 || n < t.max_attempts;
+                if !attempts_left
+                    || failing + pause > t.retry_budget
+                    || started.elapsed() + pause >= t.operation
+                {
+                    GAVE_UP.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(op, what, attempts = n, "s3 request failed, giving up: {why}");
                     return Err(backend_error(format!(
                         "s3 {op} {what}: gave up after {n} attempt(s) in {:?}: {why}",
                         started.elapsed()
                     )));
                 }
-                tracing::warn!(op, what, attempt = n, ?pause, "s3 request failed, retrying: {why}");
+                RETRIES[reason as usize].fetch_add(1, Ordering::Relaxed);
+                // Under throttling many requests retry once or twice: log the
+                // stubborn ones (the counters have them all).
+                if n >= 3 {
+                    tracing::warn!(
+                        op,
+                        what,
+                        attempt = n,
+                        ?pause,
+                        "s3 request failed, retrying: {why}"
+                    );
+                } else {
+                    tracing::debug!(
+                        op,
+                        what,
+                        attempt = n,
+                        ?pause,
+                        "s3 request failed, retrying: {why}"
+                    );
+                }
                 tokio::time::sleep(pause).await;
             }
         };
         match tokio::time::timeout(t.operation, run).await {
             Ok(r) => r,
-            Err(_) => Err(backend_error(format!(
-                "s3 {op} {what}: operation timed out after {:?}",
-                t.operation
-            ))),
+            Err(_) => {
+                GAVE_UP.fetch_add(1, Ordering::Relaxed);
+                Err(backend_error(format!(
+                    "s3 {op} {what}: operation timed out after {:?}",
+                    t.operation
+                )))
+            }
         }
     }
 
@@ -454,13 +622,13 @@ impl S3ObjectStore {
                 .body
                 .collect()
                 .await
-                .map_err(|e| Attempt::Retry { why: format!("reading body: {e}"), after: None })?
+                .map_err(|e| Attempt::body(format!("reading body: {e}")))?
                 .into_bytes();
             if body.len() as u64 != len {
-                return Err(Attempt::Retry {
-                    why: format!("short range read ({} of {len} bytes)", body.len()),
-                    after: None,
-                });
+                return Err(Attempt::body(format!(
+                    "short range read ({} of {len} bytes)",
+                    body.len()
+                )));
             }
             Ok(body)
         })
@@ -489,10 +657,11 @@ impl S3ObjectStore {
                     }
                     Err(e) => return Err(classify("get", key, e)),
                 };
-                let body = resp.body.collect().await.map_err(|e| Attempt::Retry {
-                    why: format!("reading body: {e}"),
-                    after: None,
-                })?;
+                let body = resp
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|e| Attempt::body(format!("reading body: {e}")))?;
                 Ok(Some(body.into_bytes()))
             })
             .await?;
@@ -754,5 +923,145 @@ mod tests {
         let t = S3Timeouts::default();
         assert_eq!(t.attempt_for(0), Duration::from_secs(30));
         assert_eq!(t.attempt_for(100_000_000), Duration::from_secs(40));
+    }
+
+    #[test]
+    fn default_policy_rides_out_throttling() {
+        let t = S3Timeouts::default();
+        // Tens of seconds of transient failures, not ~1 s of attempts.
+        assert!(t.retry_budget >= Duration::from_secs(30), "{t:?}");
+        assert_eq!(t.max_attempts, 0, "the budget, not an attempt count, decides");
+        assert!(t.backoff_cap >= Duration::from_secs(2) && t.backoff_cap <= t.retry_budget);
+        assert!(t.operation > t.retry_budget);
+        assert_eq!(t.max_concurrency, DEFAULT_MAX_CONCURRENCY);
+    }
+
+    #[test]
+    fn backoff_is_full_jitter_below_a_cap() {
+        let t = S3Timeouts::default();
+        let mut short = 0;
+        for n in 1..=40u32 {
+            let ceiling = (t.backoff_base * 2u32.pow(n.min(20) - 1)).min(t.backoff_cap);
+            for _ in 0..50 {
+                let p = t.backoff(n);
+                assert!(p <= ceiling, "attempt {n}: {p:?} > {ceiling:?}");
+                if n >= 10 && p < t.backoff_cap / 2 {
+                    short += 1;
+                }
+            }
+        }
+        // Full jitter: late pauses spread over the whole range, not its top.
+        assert!(short > 0);
+    }
+
+    #[tokio::test]
+    async fn throttling_storm_within_the_budget_succeeds() {
+        // What SeaweedFS and S3 do under load: 429, 503 SlowDown, bodies
+        // cut off mid-stream, resets and 5xx, for a while.
+        let script = vec![
+            Act::Throttle(None),
+            Act::Status(503),
+            Act::Truncate,
+            Act::Reset,
+            Act::Status(500),
+            Act::Throttle(None),
+            Act::Truncate,
+            Act::Status(503),
+            Act::Truncate,
+            Act::Throttle(None),
+            Act::Ok,
+        ];
+        let before = stats();
+        let (s, fake) = store_for(script, 0).await;
+        let got = s.get_range("k", 11, LEN).await.unwrap();
+        assert_eq!(&got[..], &expected(11)[..]);
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 11);
+        let after = stats();
+        // Other tests of this process count too: at least ours.
+        let delta = |i: usize| after.retries[i] - before.retries[i];
+        assert!(delta(Reason::Throttled as usize) >= 5, "{after:?}");
+        assert!(delta(Reason::Body as usize) >= 3, "{after:?}");
+        assert!(delta(Reason::ServerError as usize) >= 1, "{after:?}");
+        assert!(delta(Reason::Network as usize) >= 1, "{after:?}");
+    }
+
+    #[tokio::test]
+    async fn permanent_throttling_gives_up_when_the_budget_is_spent() {
+        let fake = spawn(vec![Act::Throttle(None)]).await;
+        let mut t = fast_timeouts(0);
+        t.retry_budget = Duration::from_secs(1);
+        let s = S3ObjectStore::connect(&config(&fake, t)).await.unwrap();
+        let before = stats().gave_up;
+        let start = Instant::now();
+        let err = s.get_range("k", 0, LEN).await.unwrap_err();
+        let took = start.elapsed();
+        assert!(matches!(err, StoreError::Backend(_)));
+        assert!(err.to_string().contains("gave up after"), "{err}");
+        // Retried for the budget (less at most one pause), then stopped.
+        assert!(took >= Duration::from_millis(850), "{took:?}");
+        assert!(took < Duration::from_secs(3), "{took:?}");
+        assert!(fake.hits.load(Ordering::SeqCst) > 5);
+        assert!(stats().gave_up > before);
+    }
+
+    #[tokio::test]
+    async fn retry_after_beyond_the_budget_gives_up_at_once() {
+        let fake = spawn(vec![Act::Throttle(Some(5)), Act::Ok]).await;
+        let mut t = fast_timeouts(0);
+        t.retry_budget = Duration::from_secs(1);
+        let s = S3ObjectStore::connect(&config(&fake, t)).await.unwrap();
+        let start = Instant::now();
+        assert!(matches!(s.get_range("k", 0, LEN).await, Err(StoreError::Backend(_))));
+        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn not_found_is_not_retried() {
+        let (s, fake) = store_for(vec![Act::Status(404)], 0).await;
+        assert!(matches!(s.get_range("k", 0, LEN).await, Err(StoreError::Backend(_))));
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn requests_in_flight_are_bounded() {
+        let fake = spawn(vec![Act::Slow(30)]).await;
+        let mut t = fast_timeouts(1);
+        t.max_concurrency = 4;
+        let s = S3ObjectStore::connect(&config(&fake, t)).await.unwrap();
+        assert_eq!(s.max_concurrency(), 4);
+        // A burst far wider than the limit, through clones (they share it).
+        let reads = (0..48u64).map(|i| {
+            let s = s.clone();
+            async move { s.get_range("k", i * 100, LEN).await.map(|b| (i, b)) }
+        });
+        for r in futures::future::join_all(reads).await {
+            let (i, body) = r.unwrap();
+            assert_eq!(&body[..], &expected(i * 100)[..]);
+        }
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 48);
+        let peak = fake.peak.load(Ordering::SeqCst);
+        assert!(peak <= 4, "peak {peak}");
+        assert!(peak >= 2, "the burst should run concurrently: peak {peak}");
+    }
+
+    #[tokio::test]
+    async fn retries_wait_for_a_slot_again() {
+        // Throttled requests do not keep their slot through the pause, and
+        // never exceed the limit when they come back.
+        let script = (0..16).map(|_| Act::Throttle(None)).chain([Act::Slow(10)]).collect();
+        let fake = spawn(script).await;
+        let mut t = fast_timeouts(0);
+        t.max_concurrency = 2;
+        let s = S3ObjectStore::connect(&config(&fake, t)).await.unwrap();
+        let reads = (0..8u64).map(|i| {
+            let s = s.clone();
+            async move { s.get_range("k", i, LEN).await }
+        });
+        for r in futures::future::join_all(reads).await {
+            r.unwrap();
+        }
+        assert!(fake.peak.load(Ordering::SeqCst) <= 2);
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 16 + 8);
     }
 }
