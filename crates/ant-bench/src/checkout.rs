@@ -23,7 +23,7 @@ use antd::workspace::{Sparse, Workspace};
 use anyhow::{Context as _, Result};
 
 use crate::json::J;
-use crate::util::{Metrics, TimedObjects, cpu_total, dir_size, mib, write_json};
+use crate::util::{Metrics, TimedObjects, cpu_seconds, dir_size, mib, write_json};
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -68,7 +68,8 @@ pub struct Args {
     /// requests/objects that reached the server.
     #[arg(long, default_value_t = 0)]
     pub clients: usize,
-    /// With `--clients`: turn off cross-process fetch claims.
+    /// Turn off cross-process fetch claims (as `ANT_CACHE_DEDUP=0` does for
+    /// `ant`), for the normal phases and `--clients`.
     #[arg(long)]
     pub no_dedup: bool,
     #[arg(long, default_value = "main")]
@@ -111,6 +112,8 @@ struct Iter {
 struct Phase {
     secs: f64,
     cpu: f64,
+    /// Of `cpu`, seconds in the kernel (filesystem work shows up here).
+    cpu_sys: f64,
     files: u64,
     bytes: u64,
     ws_calls: u64,
@@ -139,7 +142,8 @@ async fn materialize(
             .context("opening cache")?,
     );
     let net = Arc::new(TimedObjects::new(Arc::new(remote.clone()), &metrics, "net"));
-    let mut read_through = ReadThrough::over_disk(disk, net).verified_upstream();
+    let mut read_through =
+        ReadThrough::over_disk(disk, net).with_cross_process_dedup(!a.no_dedup).verified_upstream();
     if !a.no_tree_bundles {
         read_through = read_through.with_tree_bundles(remote.clone());
     }
@@ -149,7 +153,7 @@ async fn materialize(
     let tree = rt.read_commit(&commit).await?.tree;
     let http0 = remote.http_requests();
     let origin0 = cdn.map_or(0, |c| c.origin_requests());
-    let cpu0 = cpu_total();
+    let cpu0 = cpu_seconds().unwrap_or_default();
     let start = Instant::now();
     let ws = Workspace::materialize_with(
         rt.as_ref(),
@@ -163,7 +167,8 @@ async fn materialize(
     let secs = start.elapsed().as_secs_f64();
     let http = remote.http_requests();
     let origin_requests = cdn.map_or(0, |c| c.origin_requests()) - origin0;
-    let cpu = cpu_total() - cpu0;
+    let cpu1 = cpu_seconds().unwrap_or_default();
+    let (cpu, cpu_sys) = (cpu1.0 + cpu1.1 - cpu0.0 - cpu0.1, cpu1.1 - cpu0.1);
     let w = work.to_path_buf();
     let (files, bytes) = tokio::task::spawn_blocking(move || dir_size(&w, Some(".ant"))).await?;
     let (wsc, nc) = (metrics.counter("ws.get_many"), metrics.counter("net.get_many"));
@@ -171,6 +176,7 @@ async fn materialize(
         Phase {
             secs,
             cpu,
+            cpu_sys,
             files,
             bytes,
             ws_calls: wsc.calls(),
@@ -192,6 +198,7 @@ fn phase_json(p: &Phase) -> J {
     J::obj()
         .with("secs", p.secs)
         .with("cpu_s", p.cpu)
+        .with("cpu_sys_s", p.cpu_sys)
         .with("files", p.files)
         .with("bytes", p.bytes)
         .with("files_per_s", p.files as f64 / p.secs)
@@ -221,13 +228,14 @@ fn iter_json(i: &Iter) -> J {
 
 fn print_phase(name: &str, p: &Phase) {
     println!(
-        "  {name:<5} {:>8.3}s  {:>8} files  {:>9.1} MiB  {:>9.0} files/s  {:>8.1} MiB/s  cpu {:.2}s | ws: {} get_many/{} obj | net: {} calls/{} obj/{:.1} MiB, call-time sum {:.2}s | http: {} /o/ + {} /t/ requests, {} reached origin",
+        "  {name:<5} {:>8.3}s  {:>8} files  {:>9.1} MiB  {:>9.0} files/s  {:>8.1} MiB/s  cpu {:.2}s (sys {:.2}s) | ws: {} get_many/{} obj | net: {} calls/{} obj/{:.1} MiB, call-time sum {:.2}s | http: {} /o/ + {} /t/ requests, {} reached origin",
         p.secs,
         p.files,
         mib(p.bytes),
         p.files as f64 / p.secs,
         mib(p.bytes) / p.secs,
         p.cpu,
+        p.cpu_sys,
         p.ws_calls,
         p.ws_objects,
         p.net_calls,
@@ -317,7 +325,7 @@ pub async fn run(a: Args) -> Result<()> {
         // Cold: no cache, no workspace.
         wipe(&a.cache)?;
         wipe(&work)?;
-        settle("before cold").await;
+        settle(&a.cache, "before cold").await;
         let (cold, _ws, _) =
             materialize(&a, &remote, cdn.as_ref(), &work, commit, sparse.clone()).await?;
         let (cache_files, cache_bytes) = dir_size(&a.cache, None);
@@ -327,7 +335,7 @@ pub async fn run(a: Args) -> Result<()> {
             Some(cdn) => {
                 wipe(&a.cache)?;
                 wipe(&work)?;
-                settle("before proxy").await;
+                settle(&a.cache, "before proxy").await;
                 Some(materialize(&a, &remote, Some(cdn), &work, commit, sparse.clone()).await?.0)
             }
             None => None,
@@ -338,7 +346,7 @@ pub async fn run(a: Args) -> Result<()> {
         if a.warm_delay_secs > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(a.warm_delay_secs)).await;
         }
-        settle("before warm").await;
+        settle(&a.cache, "before warm").await;
         let (warm, ws, rt) =
             materialize(&a, &remote, cdn.as_ref(), &work, commit, sparse.clone()).await?;
 
@@ -452,9 +460,27 @@ fn floats(v: &[f64]) -> J {
 /// before the next timed phase, so deferred writeback of work done outside the
 /// timing is not charged to it. A cold phase right after a heavy import was
 /// measured at 5x its settled time otherwise. The wait is printed, not timed.
-async fn settle(what: &str) {
+/// Flush dirty pages of the filesystem holding `dir` (its nearest existing
+/// ancestor) before a timed phase, so writeback from the previous phase is
+/// not measured. `syncfs`, not `sync`: a global `sync` also waits on every
+/// other mounted filesystem, and one unresponsive FUSE mount anywhere on the
+/// machine would hang the benchmark forever.
+async fn settle(dir: &Path, what: &str) {
     let t = Instant::now();
-    let _ = tokio::task::spawn_blocking(|| unsafe { libc::sync() }).await;
+    let dir = dir.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        use std::os::fd::AsRawFd;
+        let open = dir
+            .ancestors()
+            .filter(|d| !d.as_os_str().is_empty())
+            .chain([Path::new(".")])
+            .find_map(|d| std::fs::File::open(d).ok());
+        if let Some(f) = open {
+            // SAFETY: `f` is an open file descriptor for the whole call.
+            unsafe { libc::syncfs(f.as_raw_fd()) };
+        }
+    })
+    .await;
     let s = t.elapsed().as_secs_f64();
     if s > 0.5 {
         println!("  (sync {what}: {s:.1}s)");
@@ -472,7 +498,7 @@ async fn concurrent_clients(
 ) -> Result<()> {
     wipe(&a.cache)?;
     wipe(work)?;
-    settle("before clients").await;
+    settle(&a.cache, "before clients").await;
     let start = Instant::now();
     let mut tasks = Vec::new();
     for i in 0..a.clients {

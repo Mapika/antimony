@@ -12,7 +12,8 @@
 //!   -C <dir>                        start directory for workspace discovery
 //! Object reads go through `ReadThrough(DiskObjectStore(cache), RemoteObjectStore)`.
 //! Processes sharing a cache directory fetch each missing object once (claim
-//! files under `<cache>/claims`; ANT_CACHE_DEDUP=0 turns that off).
+//! files under `<cache>/claims`, taken while another process is registered
+//! under `<cache>/live`; ANT_CACHE_DEDUP=0 turns that off).
 //!
 //! Output contract (stdout, one record per line, no decoration). Ids are
 //! 64-char lowercase hex. Errors go to stderr as `error: <message>` with exit
