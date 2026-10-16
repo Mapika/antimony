@@ -8,19 +8,23 @@
 //!   transaction, each inside its own savepoint: a failing job rolls back
 //!   alone, the others commit. Callers are answered only after the commit,
 //!   so a returned write is visible to every later read.
-//! - **Durability.** The database runs in WAL mode. A group commits with
-//!   `synchronous = FULL` (the WAL is fsynced before the commit returns) if
-//!   any of its jobs is durable, and with `NORMAL` (no fsync; the commit
-//!   survives a crash of this process, not of the OS) if all of them were
-//!   made inside [`crate::deferred_durability`]. The WAL is one append-only
-//!   file, so a FULL commit's fsync also covers every NORMAL commit before
-//!   it: a land's deferred writes become durable with its publish (see
-//!   `super` for why that is the same argument as Postgres's).
+//! - **Durability, pipelined.** The database runs in WAL mode with
+//!   `synchronous = NORMAL`: a commit appends to the WAL without an fsync
+//!   (it survives a crash of this process, not of the OS). Durable jobs are
+//!   answered by a second thread, the *syncer*, only after an `fdatasync`
+//!   of the WAL file that started after their commit; meanwhile the writer
+//!   already runs the next group. One fsync covers every commit before it
+//!   (the WAL is appended in commit order), so durable jobs of many groups
+//!   share it. A checkpoint (SQLite's automatic one, every 1000 pages)
+//!   syncs the WAL before it copies frames into the database and syncs the
+//!   database afterwards, so committed data is always in a synced WAL or a
+//!   synced database. Non-durable jobs are answered right after the
+//!   commit; see `super` for which writes those are and why that is sound.
 //! - **Readers.** Up to `readers` connections, opened on first use and
 //!   reused; each read runs on the blocking pool (`spawn_blocking`), never
 //!   on an async worker. WAL readers never block the writer or each other.
-//! - **Ref moves** a job makes are announced on the feed after its group
-//!   commits, in commit order; a job that rolled back announces nothing.
+//! - **Ref moves** a job makes are announced on the feed once they are
+//!   durable, in commit order; a job that rolled back announces nothing.
 
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -72,8 +76,7 @@ pub struct DbOptions {
     pub readers: usize,
     /// SQLite page cache per connection, in KiB.
     pub cache_kib: u32,
-    /// Never fsync at commit (`synchronous = NORMAL` for every group): see
-    /// `LocalOptions::sync`.
+    /// Never fsync at commit (no syncer): see `LocalOptions::sync`.
     pub no_fsync: bool,
 }
 
@@ -145,21 +148,49 @@ impl Db {
                 path.display()
             )));
         }
-        // FULL until a group says otherwise; the WAL file is truncated back
-        // after checkpoints that let it grow beyond 64 MiB.
-        let sync = if options.no_fsync { "NORMAL" } else { "FULL" };
-        conn.execute_batch(&format!(
-            "PRAGMA synchronous = {sync}; PRAGMA journal_size_limit = 67108864;"
-        ))
+        // Commits never fsync themselves (the syncer does); the WAL file is
+        // truncated back after checkpoints that let it grow beyond 64 MiB.
+        conn.execute_batch(
+            "PRAGMA synchronous = NORMAL; PRAGMA journal_size_limit = 67108864; \
+             PRAGMA wal_autocheckpoint = 0;",
+        )
         .map_err(sql_err)?;
         init(&conn)?;
+        let wal = {
+            let mut w = path.as_os_str().to_owned();
+            w.push("-wal");
+            PathBuf::from(w)
+        };
+        let syncer = if options.no_fsync {
+            None
+        } else {
+            let (stx, srx) = mpsc::channel::<Synced>();
+            let feed = feed.clone();
+            let wal = wal.clone();
+            let thread = std::thread::Builder::new()
+                .name("ant-sqlite-sync".into())
+                .spawn(move || sync_loop(wal, srx, feed))
+                .map_err(be)?;
+            Some((stx, thread))
+        };
+        let checkpointer = {
+            let (ctx, crx) = mpsc::sync_channel::<()>(1);
+            let ckpt = open_conn(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                256,
+            )?;
+            let wal = wal.clone();
+            let thread = std::thread::Builder::new()
+                .name("ant-sqlite-checkpoint".into())
+                .spawn(move || checkpoint_loop(ckpt, &wal, crx))
+                .map_err(be)?;
+            (ctx, thread)
+        };
         let (tx, rx) = mpsc::channel::<Job>();
         let thread = std::thread::Builder::new()
             .name("ant-sqlite-writer".into())
-            .spawn({
-                let no_fsync = options.no_fsync;
-                move || writer_loop(conn, rx, feed, no_fsync)
-            })
+            .spawn(move || writer_loop(conn, rx, feed, syncer, checkpointer))
             .map_err(be)?;
         Ok(Self {
             path: path.to_owned(),
@@ -254,10 +285,23 @@ impl Db {
     }
 }
 
-fn writer_loop(conn: Connection, rx: mpsc::Receiver<Job>, feed: RefFeed, no_fsync: bool) {
-    let mut synchronous_full = !no_fsync;
+/// Durable completions (and the ref moves of their group) waiting for the
+/// fsync of their commit.
+struct Synced {
+    done: Vec<Completion>,
+    moves: Vec<RefMove>,
+}
+
+fn writer_loop(
+    conn: Connection,
+    rx: mpsc::Receiver<Job>,
+    feed: RefFeed,
+    syncer: Option<(mpsc::Sender<Synced>, std::thread::JoinHandle<()>)>,
+    checkpointer: (mpsc::SyncSender<()>, std::thread::JoinHandle<()>),
+) {
     // A raw job met while collecting a group waits for the next round.
     let mut held: Option<Job> = None;
+    let sync_tx = syncer.as_ref().map(|(tx, _)| tx.clone());
     loop {
         let first = match held.take() {
             Some(j) => j,
@@ -267,14 +311,17 @@ fn writer_loop(conn: Connection, rx: mpsc::Receiver<Job>, feed: RefFeed, no_fsyn
             },
         };
         if first.raw {
-            if !no_fsync
-                && !synchronous_full
-                && conn.execute_batch("PRAGMA synchronous = FULL").is_ok()
-            {
-                synchronous_full = true;
-            }
             let (_, done) = (first.run)(Some(&conn), &mut Effects::default());
-            done(Ok(()));
+            match &sync_tx {
+                Some(tx) => {
+                    if let Err(mpsc::SendError(s)) =
+                        tx.send(Synced { done: vec![done], moves: vec![] })
+                    {
+                        s.done.into_iter().for_each(|d| d(Ok(())));
+                    }
+                }
+                None => done(Ok(())),
+            }
             continue;
         }
         let mut jobs = vec![first];
@@ -288,20 +335,32 @@ fn writer_loop(conn: Connection, rx: mpsc::Receiver<Job>, feed: RefFeed, no_fsyn
                 Err(_) => break,
             }
         }
-        let durable = !no_fsync && jobs.iter().any(|j| j.durable);
-        if durable != synchronous_full {
-            let pragma = if durable { "FULL" } else { "NORMAL" };
-            if conn.execute_batch(&format!("PRAGMA synchronous = {pragma}")).is_ok() {
-                synchronous_full = durable;
-            }
-        }
-        run_group(&conn, jobs, &feed);
+        run_group(&conn, jobs, &feed, sync_tx.as_ref());
+        // Coalescing nudge: the checkpointer looks at the WAL's size.
+        let _ = checkpointer.0.try_send(());
     }
+    drop(sync_tx);
+    if let Some((tx, thread)) = syncer {
+        drop(tx);
+        let _ = thread.join();
+    }
+    drop(checkpointer.0);
+    let _ = checkpointer.1.join();
     // Last connection to close checkpoints the WAL into the database.
     let _ = conn.close();
 }
 
-fn run_group(conn: &Connection, jobs: Vec<Job>, feed: &RefFeed) {
+/// A commit group slower than this is logged (with where the time went).
+const SLOW_GROUP: std::time::Duration = std::time::Duration::from_millis(200);
+
+fn run_group(
+    conn: &Connection,
+    jobs: Vec<Job>,
+    feed: &RefFeed,
+    sync: Option<&mpsc::Sender<Synced>>,
+) {
+    let started = std::time::Instant::now();
+    let n = jobs.len();
     if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
         let msg = e.to_string();
         for job in jobs {
@@ -325,24 +384,128 @@ fn run_group(conn: &Connection, jobs: Vec<Job>, feed: &RefFeed) {
         if ok {
             moves.extend(fx.moves);
         }
-        completions.push(done);
+        completions.push((job.durable, done));
     }
-    match conn.execute_batch("COMMIT") {
-        Ok(()) => {
-            for m in moves {
+    let ran = started.elapsed();
+    let commit = conn.execute_batch("COMMIT");
+    let total = started.elapsed();
+    tracing::trace!(
+        jobs = n,
+        run_us = ran.as_micros() as u64,
+        commit_us = (total - ran).as_micros() as u64,
+        "local store commit group"
+    );
+    if total >= SLOW_GROUP {
+        tracing::warn!(
+            jobs = n,
+            run_ms = ran.as_millis() as u64,
+            commit_ms = (total - ran).as_millis() as u64,
+            "slow local store commit group"
+        );
+    }
+    if let Err(e) = commit {
+        let _ = conn.execute_batch("ROLLBACK");
+        let msg = e.to_string();
+        for (_, done) in completions {
+            done(Err(StoreError::InvalidArgument(format!("local store: commit: {msg}"))));
+        }
+        return;
+    }
+    let Some(sync) = sync else {
+        // No fsyncs at all (`LocalSync::Normal`).
+        for m in moves {
+            feed.moved(m);
+        }
+        for (_, done) in completions {
+            done(Ok(()));
+        }
+        return;
+    };
+    let mut durable = Vec::new();
+    for (d, done) in completions {
+        if d { durable.push(done) } else { done(Ok(())) }
+    }
+    if durable.is_empty() && moves.is_empty() {
+        return;
+    }
+    if let Err(mpsc::SendError(s)) = sync.send(Synced { done: durable, moves }) {
+        // The syncer is gone (it only stops after the writer): answer here.
+        for done in s.done {
+            done(Err(StoreError::InvalidArgument("local store: syncer stopped".into())));
+        }
+    }
+}
+
+/// The syncer: fsync the WAL for every batch of durable completions queued
+/// since the last fsync, then answer them and announce their ref moves.
+fn sync_loop(wal: PathBuf, rx: mpsc::Receiver<Synced>, feed: RefFeed) {
+    let mut file: Option<(std::fs::File, u64)> = None;
+    while let Ok(first) = rx.recv() {
+        let mut batch = vec![first];
+        while let Ok(more) = rx.try_recv() {
+            batch.push(more);
+        }
+        let result = fsync_wal(&wal, &mut file);
+        for s in batch {
+            for m in s.moves {
                 feed.moved(m);
             }
-            for done in completions {
-                done(Ok(()));
+            for done in s.done {
+                done(result.as_ref().map(|_| ()).map_err(|e| {
+                    StoreError::InvalidArgument(format!("local store: fsync of the WAL: {e}"))
+                }));
             }
         }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            let msg = e.to_string();
-            for done in completions {
-                done(Err(StoreError::InvalidArgument(format!("local store: commit: {msg}"))));
-            }
+    }
+}
+
+/// WAL size above which the checkpointer copies frames into the database.
+const CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The checkpointer: on each nudge from the writer, a passive checkpoint
+/// when the WAL has grown past [`CHECKPOINT_BYTES`], on its own connection,
+/// so the writer never stops for one (SQLite's automatic checkpoint is off).
+/// A checkpoint syncs the WAL before copying and the database after.
+fn checkpoint_loop(conn: Connection, wal: &Path, rx: mpsc::Receiver<()>) {
+    while rx.recv().is_ok() {
+        let size = std::fs::metadata(wal).map_or(0, |m| m.len());
+        if size < CHECKPOINT_BYTES {
+            continue;
         }
+        let started = std::time::Instant::now();
+        let r: rusqlite::Result<(i64, i64, i64)> =
+            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            });
+        match r {
+            Ok((_, log, done)) => tracing::debug!(
+                frames = log,
+                checkpointed = done,
+                ms = started.elapsed().as_millis() as u64,
+                "local store checkpoint"
+            ),
+            Err(error) => tracing::warn!(%error, "local store checkpoint failed"),
+        }
+    }
+    let _ = conn.close();
+}
+
+/// `fdatasync` the WAL file, (re)opening it when SQLite replaced it.
+fn fsync_wal(path: &Path, file: &mut Option<(std::fs::File, u64)>) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let ino = match std::fs::metadata(path) {
+        Ok(m) => m.ino(),
+        // No WAL file: every commit has been checkpointed into the
+        // database, which the checkpoint synced.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if file.as_ref().is_none_or(|(_, i)| *i != ino) {
+        *file = Some((std::fs::File::open(path)?, ino));
+    }
+    match file {
+        Some((f, _)) => f.sync_data(),
+        None => Ok(()),
     }
 }
 

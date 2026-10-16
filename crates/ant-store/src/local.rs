@@ -51,10 +51,22 @@
 //! publish (a FULL commit) makes its deferred objects, commits and
 //! changesets durable first; and losing NORMAL commits takes an OS crash,
 //! which also ends the process holding the ref lock, so a publish that
-//! succeeds proves none were lost since the lock was taken. Pack bytes are
-//! fsynced before their index rows are written ([`packs`]). The history
-//! index is written with `NORMAL` too: its watermark (FULL) is always moved
-//! after the rows it covers.
+//! succeeds proves none were lost since the lock was taken.
+//!
+//! The same argument covers every write of this process, deferred or not:
+//! one process owns the directory, so an OS crash that loses a NORMAL
+//! commit also ends every operation that came after it. Only writes that
+//! make data reachable or acknowledge a unit of work are therefore fsynced:
+//! commit records (`put_commits`: a created changeset), ref moves and land
+//! publishes, history watermarks. Objects, packed-object index rows,
+//! derived data and history-index rows commit with `NORMAL` and become
+//! durable with the next fsynced commit, which always precedes anything
+//! that references them (a commit record, a ref move). After an OS crash
+//! the store is consistent: no ref or commit record points at a lost
+//! object; at worst an upload acknowledged just before the crash has to be
+//! repeated (the changeset that would use it fails with "not found").
+//! Pack bytes are always fsynced before their index rows are written
+//! ([`packs`]): pack files are outside the WAL's ordering.
 
 pub(crate) mod db;
 pub mod gc;
@@ -503,7 +515,9 @@ impl ObjectStore for LocalStore {
         }
         rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         rows.dedup_by(|a, b| a.0 == b.0);
-        let durable = !crate::durability_deferred();
+        // Made durable by the commit or ref move that references it (see
+        // "Durability" in the module docs).
+        let durable = false;
         self.db()
             .write(durable, move |c, _| {
                 let now = now_secs();
@@ -594,7 +608,9 @@ impl PackIndex for LocalStore {
             return Ok(());
         }
         let entries = entries.to_vec();
-        let durable = !crate::durability_deferred();
+        // Made durable by the commit or ref move that references it (see
+        // "Durability" in the module docs).
+        let durable = false;
         self.db()
             .write(durable, move |c, _| {
                 let now = now_secs();
@@ -1074,7 +1090,9 @@ impl MetaStore for LocalStore {
             return Ok(());
         }
         let kind = kind.to_owned();
-        let durable = !crate::durability_deferred();
+        // Made durable by the commit or ref move that references it (see
+        // "Durability" in the module docs).
+        let durable = false;
         self.db().write(durable, move |c, _| insert_derived(c, &kind, &entries)).await
     }
 
