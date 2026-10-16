@@ -130,7 +130,13 @@ impl RemoteObjectStore {
             )),
             None => BearerAuth(None),
         };
-        let channel = Channel::from_shared(grpc_url.to_owned())?.connect().await?;
+        let mut endpoint = Channel::from_shared(grpc_url.to_owned())?;
+        if grpc_url.starts_with("https://") {
+            // Servers do not terminate TLS themselves; a proxy in front of them does.
+            endpoint = endpoint
+                .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())?;
+        }
+        let channel = endpoint.connect().await?;
         let client = AntClient::with_interceptor(Retrying::new(channel, retry), auth)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
