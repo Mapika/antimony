@@ -8,6 +8,22 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+### Added
+
+- Batch read-permission check: `POST /o/check` (up to 4096 raw object ids in,
+  one flag byte per id out: readable / private) answers exactly what
+  `GET /o/<id>` would for the caller, sharing its authorization code, and
+  reports a hidden object like a missing one. Additive; metrics route
+  `object_checks`. `ant cache-serve --auth forward` uses it: concurrent hits
+  of one principal are batched into one request (`--authz-window-ms`, default
+  2), allowed decisions are reused for `--authz-ttl-secs` (default 30; 0 =
+  always ask; the TTL is the window in which a revoked principal can still
+  read objects the cache holds), and tree bundles seen `public` are rebuilt
+  from disk after one batched check instead of being forwarded. Against an
+  origin without the endpoint (404/405) it falls back to conditional
+  `GET /o/<id>` as before. `ant_cacheserve_authz_total{result}` metric;
+  `ant-bench checkout --cache-tier-forward [--cache-tier-no-batch]`.
+
 ## [0.1.0] - 2026-10-16
 
 First release. Working end to end against real Postgres and S3, covered by

@@ -24,8 +24,8 @@ use ant_server::ops::changeset::{self, ChangesetRequest, FileOp, WriteContent};
 use ant_server::ops::land::{self, LandOutcome};
 use ant_server::ops::{OpError, query};
 use ant_server::serve::spawn_local;
-use ant_store::Backend;
 use ant_store::graph::{build_tree, write_commit};
+use ant_store::{Backend, ObjectStoreExt};
 use bytes::Bytes;
 use common::wire::{blob_file, delete_file, write_file};
 use tonic::Code;
@@ -1675,4 +1675,225 @@ async fn watching_a_ref_needs_read_access_to_it() {
     // Admins read every ref.
     let mut a = s.client(Some(ADMIN));
     a.watch_ref(watch("release")).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// batch read-permission check (`POST /o/check`)
+// ---------------------------------------------------------------------------
+
+/// One `POST /o/check`: status, `Cache-Control` and, for 200, the flag byte
+/// per id.
+async fn check_ids(
+    s: &Server,
+    ids: &[ObjectId],
+    token: Option<&str>,
+) -> (u16, Option<String>, Vec<u8>) {
+    let body: Vec<u8> = ids.iter().flat_map(|i| i.0).collect();
+    let mut req = s.http.post(format!("{}/o/check", s.http_base)).body(body);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status().as_u16();
+    let cache = resp.headers().get("cache-control").map(|v| v.to_str().unwrap().to_owned());
+    (status, cache, resp.bytes().await.unwrap().to_vec())
+}
+
+/// Every object id reachable from `root` (trees and blobs).
+async fn reachable(b: &Backend, root: ObjectId) -> Vec<ObjectId> {
+    let mut out = vec![root];
+    let mut i = 0;
+    while i < out.len() {
+        let obj = b.objects.get(&out[i]).await.unwrap().unwrap();
+        if obj.kind() == ObjectKind::Tree {
+            for e in Tree::decode(obj.body()).unwrap().entries() {
+                if !out.contains(&e.id) {
+                    out.push(e.id);
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The equivalence: for each id, the check says "readable" exactly when
+/// `GET /o/{id}` answers 200, and "private" exactly when that answer is
+/// `private`. Missing and hidden objects are both plain `0`. Callers GET
+/// refuses with 401 are refused by the check too.
+async fn assert_check_equals_get(s: &Server, ids: &[ObjectId], tokens: &[Option<&str>]) {
+    for token in tokens {
+        let (status, cache, flags) = check_ids(s, ids, *token).await;
+        let first = s.http_get(&ids[0], *token).await.status().as_u16();
+        if first == 401 {
+            assert_eq!(status, 401, "{token:?}");
+            assert_eq!(cache.as_deref(), Some("no-store"));
+            continue;
+        }
+        assert_eq!(status, 200, "{token:?}");
+        assert_eq!(cache.as_deref(), Some("no-store"));
+        assert_eq!(flags.len(), ids.len());
+        for (id, flag) in ids.iter().zip(flags) {
+            let get = s.http_get(id, *token).await;
+            let served = get.status() == 200;
+            assert_eq!(
+                flag & 1 != 0,
+                served,
+                "{token:?} {id}: flag {flag} vs GET {}",
+                get.status()
+            );
+            let private = served
+                && get
+                    .headers()
+                    .get("cache-control")
+                    .is_some_and(|v| v.to_str().unwrap().starts_with("private"));
+            assert_eq!(flag & 2 != 0, private, "{token:?} {id}");
+            assert_eq!(flag & !3, 0, "only the defined bits");
+            if flag & 1 == 0 {
+                assert_eq!(flag, 0, "a refusal carries no other information");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn batch_check_matches_get_on_the_seeded_repo() {
+    let (s, tip) = seeded().await;
+    let commit = s.backend.objects.get(&tip).await.unwrap().unwrap();
+    let root = Commit::decode(commit.body()).unwrap().tree;
+    let mut ids = reachable(&s.backend, root).await;
+    ids.push(ObjectId([0x5a; 32])); // never stored
+    ids.push(blob_id("TOPSECRET\n")); // duplicate of a hidden one
+    let tokens = [Some(READER), Some(WRITER), Some(ADMIN), Some("bogus"), None];
+    assert_check_equals_get(&s, &ids, &tokens).await;
+
+    // The reader's view in particular: the secret is exactly as absent as
+    // an id that was never stored.
+    let missing = ObjectId([0x5a; 32]);
+    let ids = [blob_id(SECRET), missing, blob_id("readme\n")];
+    let (_, _, flags) = check_ids(&s, &ids, Some(READER)).await;
+    assert_eq!(flags, vec![0, 0, 1]);
+    let (_, _, flags) = check_ids(&s, &[blob_id(SECRET)], Some(WRITER)).await;
+    assert_eq!(flags, vec![3]);
+}
+
+#[tokio::test]
+async fn batch_check_validates_its_input() {
+    let (s, _) = seeded().await;
+    let url = format!("{}/o/check", s.http_base);
+    let post = |body: Vec<u8>| s.http.post(&url).bearer_auth(READER).body(body).send();
+    assert_eq!(post(vec![]).await.unwrap().status(), 200, "no ids: an empty answer");
+    assert_eq!(post(vec![0; 33]).await.unwrap().status(), 400);
+    assert_eq!(post(vec![0; 32 * 4097]).await.unwrap().status(), 413);
+    let r = post(vec![0; 32 * 4096]).await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.bytes().await.unwrap().len(), 4096);
+    // Not a GET route, and the single-object route is unaffected.
+    assert_eq!(s.http.get(&url).bearer_auth(READER).send().await.unwrap().status(), 405);
+    assert_eq!(s.http_get(&blob_id("readme\n"), Some(READER)).await.status(), 200);
+}
+
+mod check_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    const PATHS: [&str; 8] = ["f", "z", "a/f", "a/g", "a/b/f", "c/f", "c/d/g", "c/d/h"];
+    const CONTENTS: [&str; 4] = ["one\n", "two\n", "three\n", "four\n"];
+    const PREFIXES: [&str; 3] = ["a", "a/b", "c"];
+    const READS: [&str; 5] =
+        [r#"["*"]"#, r#"["group:g1"]"#, r#"["group:g2"]"#, r#"["group:g1", "group:g2"]"#, r#"[]"#];
+
+    fn policy(root_read: usize, rules: &[Option<usize>]) -> Policy {
+        let principal = |name: &str, groups: &str| {
+            format!(
+                "[[principal]]\nname = \"{name}\"\ntoken_sha256 = \"{}\"\ngroups = {groups}\n",
+                hex(hash_token(&format!("t-{name}")))
+            )
+        };
+        let mut text = String::new();
+        text += &principal("p1", r#"["g1"]"#);
+        text += &principal("p2", r#"["g2"]"#);
+        text += &principal("p3", r#"["g1", "g2"]"#);
+        text += &principal("p4", "[]");
+        text += &format!(
+            "[[principal]]\nname = \"root\"\ntoken_sha256 = \"{}\"\nadmin = true\n",
+            hex(hash_token("t-root"))
+        );
+        text += &format!("[[path]]\nprefix = \"\"\nread = {}\nwrite = []\n", READS[root_read]);
+        for (prefix, read) in PREFIXES.iter().zip(rules) {
+            if let Some(r) = read {
+                text +=
+                    &format!("[[path]]\nprefix = \"{prefix}\"\nread = {}\nwrite = []\n", READS[*r]);
+            }
+        }
+        Policy::parse(&text).unwrap()
+    }
+
+    async fn run_case(
+        root_read: usize,
+        rules: Vec<Option<usize>>,
+        files: Vec<(usize, usize)>,
+        unknown: Vec<u8>,
+    ) -> Result<(), TestCaseError> {
+        let policy = policy(root_read, &rules);
+        let backend = Backend::in_memory();
+        let files: Vec<(&str, &[u8])> =
+            files.iter().map(|(p, c)| (PATHS[*p], CONTENTS[*c].as_bytes())).collect();
+        if files.is_empty() {
+            return Ok(());
+        }
+        let root = build_tree(backend.objects.as_ref(), &files).await.unwrap();
+        let commit = write_commit(
+            &backend,
+            &Commit {
+                tree: root,
+                parents: vec![],
+                author: sig(),
+                committer: sig(),
+                extra_headers: vec![],
+                message: "c\n".into(),
+            },
+        )
+        .await
+        .unwrap();
+        acl::reindex(&backend, &policy, commit).await.unwrap();
+        let s = Server::start_on(backend, Acl::new(policy)).await;
+        let mut ids = reachable(&s.backend, root).await;
+        ids.extend(unknown.iter().map(|b| ObjectId([*b; 32])));
+        ids.push(ids[0]);
+        let tokens = [
+            Some("t-p1"),
+            Some("t-p2"),
+            Some("t-p3"),
+            Some("t-p4"),
+            Some("t-root"),
+            Some("bogus"),
+            None,
+        ];
+        assert_check_equals_get(&s, &ids, &tokens).await;
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(common::config(24))]
+
+        /// `POST /o/check` and `GET /o/{id}` authorize identically, over
+        /// random policies (root and zone rules), repositories (the same
+        /// content at several paths, so objects carry several tags) and
+        /// principals, with unknown and duplicated ids.
+        #[test]
+        fn batch_check_equals_per_object_get(
+            root_read in 0usize..READS.len(),
+            rules in prop::collection::vec(prop::option::of(0usize..READS.len()), PREFIXES.len()),
+            files in prop::collection::vec((0usize..PATHS.len(), 0usize..CONTENTS.len()), 0..9),
+            unknown in prop::collection::vec(any::<u8>(), 0..3),
+        ) {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_case(root_read, rules, files, unknown))?;
+        }
+    }
 }

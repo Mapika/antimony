@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ant-auth.workspace = true
 ant-core.workspace = true
 ant-proto.workspace = true
 ant-store.workspace = true
@@ -21,7 +22,6 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-ant-auth.workspace = true
 ant-server.workspace = true
 prometheus-parse.workspace = true
 tempfile.workspace = true

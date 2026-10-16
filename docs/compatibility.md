@@ -53,6 +53,7 @@ Late additions in 0.1.0 (all additive; an older server answers a new RPC with
 | `DiffRequest` fields 3-6 | `path_prefixes`, `merge_base`, `patch`, `context_lines` |
 | `DiffResponse` fields 2-3, `PathChange.patch` (7), `FilePatch`, `Hunk` | merge base used, per-file unified hunks, truncation flag |
 | HTTP `GET /t/<tree-id>` | tree bundle: the tree, its blobs and whole subdirectories in one zstd-framed body (`ant_proto::bundle`, magic `ANTBNDL1`); same caching and access rules as `/o/` (see `docs/architecture.md`) |
+| HTTP `POST /o/check` | batch read-permission check for cache tiers: body = up to 4096 raw 32-byte object ids, answer = one byte per id (bit 0: `GET /o/<id>` would serve this caller; bit 1: it would be `private`), `Content-Type: application/x-ant-check`, `x-ant-check: 1`, `no-store`; authorization is exactly that of `GET /o/<id>`, and a hidden object is reported like a missing one. Metrics route `object_checks`. Absent on older servers (404/405): `ant cache-serve` detects that and falls back to conditional `GET /o/<id>` |
 
 The bundle format follows the object endpoint's rules: what a URL returns
 never changes shape; a new layout gets a new magic *and* a new route (HTTP

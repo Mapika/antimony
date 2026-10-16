@@ -398,6 +398,44 @@ pub async fn readable(
     Ok(hidden.into_iter().map(|h| !h || rescued.next().unwrap_or(false)).collect())
 }
 
+/// What an HTTP read of an object would be, per id (index-aligned): the
+/// decision `GET /o/{id}` makes before touching object bytes, shared by that
+/// endpoint and `POST /o/check` so the two cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadAccess {
+    /// The principal may read the object (if it exists).
+    pub readable: bool,
+    /// The object lies outside the root zone, so responses for it must not
+    /// be stored by shared caches. Always `false` when `readable` is false
+    /// (it is not looked up, and must not be disclosed).
+    pub private: bool,
+}
+
+/// [`ReadAccess`] of `access` (`None`: no policy, everything is readable and
+/// public) for each of `ids`. The private flag is only looked up for
+/// readable objects, as `GET /o/{id}` does.
+pub async fn read_access(
+    b: &Backend,
+    access: Option<&Access>,
+    ids: &[ObjectId],
+) -> Result<Vec<ReadAccess>, StoreError> {
+    let Some(access) = access else {
+        return Ok(vec![ReadAccess { readable: true, private: false }; ids.len()]);
+    };
+    let policy = &access.policy;
+    let readable = readable(b, policy, &access.principal, ids).await?;
+    let ok_ids: Vec<ObjectId> =
+        ids.iter().zip(&readable).filter(|(_, r)| **r).map(|(id, _)| *id).collect();
+    let mut private = private_many(b, policy, &ok_ids).await?.into_iter();
+    Ok(readable
+        .into_iter()
+        .map(|readable| ReadAccess {
+            readable,
+            private: readable && private.next().unwrap_or(true),
+        })
+        .collect())
+}
+
 /// Write `(kind, key)` markers with bounded concurrency (the trait has no
 /// bulk write). All writes finish before returning; the first error wins.
 async fn put_markers(b: &Backend, puts: Vec<(String, Vec<u8>)>) -> Result<(), StoreError> {

@@ -140,6 +140,8 @@ async fn tier_with(upstream: &str, auth: AuthMode, budget: u64) -> anyhow::Resul
         auth,
         disk: disk.clone(),
         retry: RetryPolicy::none(),
+        authz_ttl: ant_cache::DEFAULT_AUTHZ_TTL,
+        authz_window: ant_cache::DEFAULT_AUTHZ_WINDOW,
     })
     .await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

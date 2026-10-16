@@ -228,6 +228,16 @@ pub struct CacheServeArgs {
     /// disk.
     #[arg(long, value_enum, env = "ANT_CACHE_AUTH", default_value = "forward")]
     pub auth: CacheAuth,
+    /// With `--auth forward`: seconds an allowed read decision for a
+    /// principal is reused before the origin is asked again (0: always ask).
+    /// Bounds how long a revoked principal can still read objects this cache
+    /// holds.
+    #[arg(long, env = "ANT_CACHE_AUTHZ_TTL", default_value_t = 30)]
+    pub authz_ttl_secs: u64,
+    /// With `--auth forward`: milliseconds permission checks wait to be
+    /// batched into one request to the origin (`POST /o/check`).
+    #[arg(long, env = "ANT_CACHE_AUTHZ_WINDOW_MS", default_value_t = 2)]
+    pub authz_window_ms: u64,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
