@@ -167,10 +167,11 @@ pub const FRESHEN_AFTER: Duration = Duration::from_secs(3600);
 /// (`ant-gitbridge`).
 pub const DEFAULT_ROOT_KINDS: [&str; 2] = ["land/landed-as/v1", "git-import/commit/v1"];
 /// Derived-data kinds keyed by `<commit id><suffix>` whose rows go with their
-/// commit: the blame cache (`ant-server` `ops::history`) and the
-/// first-parent skip index ([`crate::graph::SKIP_KIND`]; an entry points
-/// only at its commit's ancestors, which live at least as long).
-pub const DEFAULT_COMMIT_KEYED_KINDS: [&str; 2] = ["blame/v1", crate::graph::SKIP_KIND];
+/// commit: blame (`ant-server` `ops::history`: `blame/v1` per tip, older
+/// servers; `blame/v2` per last commit touching the path) and the
+/// first-parent skip index ([`crate::graph::SKIP_KIND`]). Their values point
+/// only at the key commit's ancestors, which live at least as long.
+pub const DEFAULT_COMMIT_KEYED_KINDS: [&str; 3] = ["blame/v1", "blame/v2", crate::graph::SKIP_KIND];
 
 /// Attempts at storing objects that a concurrent collection keeps deleting.
 pub(super) const STORE_ATTEMPTS: usize = 8;

@@ -44,14 +44,30 @@
 //! that commit introduced; lines surviving to the file's creation belong to
 //! the creating commit. A producer task reads change batches (16, doubling
 //! to 128) and starts their blob `get_many`s a few batches ahead of the
-//! walk. Results are cached as derived data `"blame/v1"`,
-//! key = rev id ++ path bytes, value = compact encoding.
+//! walk.
+//!
+//! Blame is recursively derived data (`ant_store::derive`, kind
+//! [`Blame`], `"blame/v2"`): the value is keyed by `(L, path)` where `L` is
+//! the last commit on `rev`'s first-parent chain that changed `path` (the
+//! first entry of its history, whose new blob is the file at `rev`), so all
+//! revisions sharing that last change share one value. Value of `(L, path)`
+//! = the previous version's value pushed through the line map of `L`'s
+//! change, lines `L` introduced owned by `L` (`Blame::derive`). Evaluated
+//! iteratively: every history batch is probed for stored values (one
+//! `get_derived_many`, alongside its blob reads), and the walk stops at the
+//! first version that has one, taking the owners of the lines still open
+//! from it; so after a change to the file only that change is diffed.
+//! Deferred policy: only the queried `(L, path)` is stored. A stored value
+//! is used only when its version's blob is the one being walked and its
+//! line count matches. Older servers' `"blame/v1"` rows (keyed by rev
+//! commit) are no longer read; GC deletes both kinds with their commits.
 //! Binary (non-UTF-8) files → `InvalidArgument`. Missing path → `NotFound`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use ant_core::{ObjectId, RepoPath};
+use ant_store::derive::{self, Derivation, Policy};
 use ant_store::{Backend, ChangeKind, HistoryRow, PathChange, StoreError};
 use bytes::Bytes;
 
@@ -66,8 +82,12 @@ const INDEX_BATCH: usize = 1000;
 const CHAIN_CHUNK: usize = 8192;
 /// Attempts before `catch_up` gives up on a ref that keeps moving.
 const MAX_ROUNDS: usize = 4;
-/// Derived-data kind for cached blame results.
-pub(crate) const BLAME_KIND: &str = "blame/v1";
+/// Derived-data kind of [`Blame`] values (keyed by the last commit changing
+/// the path); `"blame/v1"` (keyed by the queried commit) is no longer used.
+pub(crate) const BLAME_KIND: &str = "blame/v2";
+/// Index rows read before the rest of a file's history (most blames end at
+/// a stored value within the first few versions).
+const INDEX_FIRST_PAGE: usize = 64;
 /// Largest batch of changes (and previous-version blobs) fetched per blame step.
 const BLAME_CHUNK: usize = 128;
 /// First (small) batch of a blame walk, so short histories fetch little.
@@ -316,6 +336,67 @@ fn rev_ref(rev: &str) -> Option<&str> {
         .then_some(base)
 }
 
+/// How a path's history at a `rev` naming a ref splits between commits the
+/// ref's index does not cover yet and the index (see [`lagging_path_log`]).
+struct IndexPlan {
+    /// The indexed ref.
+    base: String,
+    /// Unindexed commits above the watermark that touch the path (or lie
+    /// under it), newest first, at most the requested limit.
+    lag: Vec<(u64, ObjectId)>,
+    /// The rest comes from `base`'s index at generations up to this.
+    max_generation: u64,
+}
+
+/// The [`IndexPlan`] for `rev` (resolved to `tip`), decided by one read of
+/// the ref's watermark; `None` when the index cannot serve it (see
+/// [`lagging_path_log`]).
+async fn index_plan(
+    b: &Backend,
+    rev: &str,
+    tip: ObjectId,
+    path: &RepoPath,
+    limit: usize,
+) -> OpResult<Option<IndexPlan>> {
+    let Some(base) = rev_ref(rev) else { return Ok(None) };
+    let Some(wm) = b.meta.history_watermark(base).await? else { return Ok(None) };
+    let [Some(tip_node), Some(wm_node)] =
+        <[_; 2]>::try_from(cache::get_nodes(b, &[tip, wm]).await?).unwrap_or([None, None])
+    else {
+        return Ok(None);
+    };
+    let base = base.to_string();
+    if tip_node.generation <= wm_node.generation {
+        // Without this, a watermark that caught up between resolving `tip`
+        // and reading it sent the query to a full changeset scan.
+        if !is_first_parent_ancestor(b, tip, wm).await? {
+            return Ok(None);
+        }
+        return Ok(Some(IndexPlan { base, lag: Vec::new(), max_generation: tip_node.generation }));
+    }
+    // Generations strictly decrease along the chain: it is at most the gap long.
+    let gap = usize::try_from(tip_node.generation - wm_node.generation).unwrap_or(usize::MAX);
+    let chain = b.meta.first_parent_chain(tip, Some(wm), MAX_LAG.min(gap)).await?;
+    if chain.last().and_then(|n| n.parents.first()) != Some(&wm) {
+        return Ok(None);
+    }
+    let ids: Vec<ObjectId> = chain.iter().map(|n| n.id).collect();
+    let sets = cache::get_changesets(b, &ids).await?;
+    let mut lag = Vec::new();
+    for (node, set) in chain.iter().zip(sets) {
+        if lag.len() >= limit {
+            break;
+        }
+        let set = set.ok_or_else(|| OpError::NotFound(format!("changeset of {}", node.id)))?;
+        if set.iter().any(|c| c.path.starts_with(path)) {
+            lag.push((node.generation, node.id));
+        }
+    }
+    // Bounded by the watermark's generation: rows a concurrent catch-up adds
+    // for the commits just scanned are not returned twice.
+    Ok(Some(IndexPlan { base, lag, max_generation: wm_node.generation }))
+}
+
 /// `log --path` for a `rev` naming a ref (`tip` = the commit it resolved
 /// to), decided by one read of that ref's watermark:
 /// - `tip` at or behind the watermark on its first-parent chain (caught up,
@@ -336,46 +417,12 @@ pub async fn lagging_path_log(
     path: &RepoPath,
     limit: usize,
 ) -> OpResult<Option<Vec<LogEntry>>> {
-    let Some(base) = rev_ref(rev) else { return Ok(None) };
-    let Some(wm) = b.meta.history_watermark(base).await? else { return Ok(None) };
     let limit = if limit == 0 { usize::MAX } else { limit };
-    let [Some(tip_node), Some(wm_node)] =
-        <[_; 2]>::try_from(cache::get_nodes(b, &[tip, wm]).await?).unwrap_or([None, None])
-    else {
-        return Ok(None);
-    };
-    if tip_node.generation <= wm_node.generation {
-        // Without this, a watermark that caught up between resolving `tip`
-        // and reading it sent the query to a full changeset scan.
-        if !is_first_parent_ancestor(b, tip, wm).await? {
-            return Ok(None);
-        }
-        let hits = b.meta.query_history(base, path, tip_node.generation, limit).await?;
-        return log_entries(b, hits).await.map(Some);
-    }
-    // Generations strictly decrease along the chain: it is at most the gap long.
-    let gap = usize::try_from(tip_node.generation - wm_node.generation).unwrap_or(usize::MAX);
-    let chain = b.meta.first_parent_chain(tip, Some(wm), MAX_LAG.min(gap)).await?;
-    if chain.last().and_then(|n| n.parents.first()) != Some(&wm) {
-        return Ok(None);
-    }
-    let ids: Vec<ObjectId> = chain.iter().map(|n| n.id).collect();
-    let sets = cache::get_changesets(b, &ids).await?;
-    let mut hits = Vec::new();
-    for (node, set) in chain.iter().zip(sets) {
-        if hits.len() >= limit {
-            break;
-        }
-        let set = set.ok_or_else(|| OpError::NotFound(format!("changeset of {}", node.id)))?;
-        if set.iter().any(|c| c.path.starts_with(path)) {
-            hits.push((node.generation, node.id));
-        }
-    }
+    let Some(plan) = index_plan(b, rev, tip, path, limit).await? else { return Ok(None) };
+    let mut hits = plan.lag;
     if hits.len() < limit {
-        // Bounded by the watermark's generation: rows a concurrent catch-up
-        // adds for the commits just scanned are not returned twice.
         let rest = limit - hits.len();
-        hits.extend(b.meta.query_history(base, path, wm_node.generation, rest).await?);
+        hits.extend(b.meta.query_history(&plan.base, path, plan.max_generation, rest).await?);
     }
     log_entries(b, hits).await.map(Some)
 }
@@ -386,11 +433,61 @@ pub async fn lagging_path_log(
 
 /// Where the (newest-first) list of commits touching one file comes from.
 enum FileHistory {
-    Indexed(VecDeque<ObjectId>),
-    Scan { next: Option<ObjectId>, buf: VecDeque<ObjectId> },
+    /// A ref's index: `queue` first (unindexed commits above the watermark),
+    /// then index rows at generations `<= below`, read in two pages (a small
+    /// one for the common case of a recently touched file, then the rest).
+    Indexed {
+        queue: VecDeque<ObjectId>,
+        base: String,
+        below: u64,
+        page: IndexPage,
+    },
+    Scan {
+        next: Option<ObjectId>,
+        buf: VecDeque<ObjectId>,
+    },
+}
+
+enum IndexPage {
+    First,
+    /// The rest: rows at generations `<= below`, minus the first page's.
+    Rest(HashSet<ObjectId>),
+    Done,
 }
 
 impl FileHistory {
+    /// The history of `path` at `rev` (= commit `id`): from an index when one
+    /// covers it (see [`index_plan`], [`indexed_ref_for`]), else a scan of
+    /// first-parent changesets.
+    async fn open(b: &Backend, rev: &str, id: ObjectId, path: &RepoPath) -> OpResult<Self> {
+        if let Some(plan) = index_plan(b, rev, id, path, usize::MAX).await? {
+            return Ok(FileHistory::Indexed {
+                queue: plan.lag.into_iter().map(|(_, c)| c).collect(),
+                base: plan.base,
+                below: plan.max_generation,
+                page: IndexPage::First,
+            });
+        }
+        Ok(match indexed_ref_for(b, rev, id).await? {
+            Some(base) => {
+                let g = b
+                    .meta
+                    .get_commits(&[id])
+                    .await?
+                    .pop()
+                    .flatten()
+                    .map_or(u64::MAX, |n| n.generation);
+                FileHistory::Indexed {
+                    queue: VecDeque::new(),
+                    base,
+                    below: g,
+                    page: IndexPage::First,
+                }
+            }
+            None => FileHistory::Scan { next: Some(id), buf: VecDeque::new() },
+        })
+    }
+
     /// Up to `n` further `(commit, change)` pairs for exactly `path`; empty
     /// means the history is exhausted.
     async fn next(
@@ -401,24 +498,49 @@ impl FileHistory {
     ) -> OpResult<Vec<(ObjectId, PathChange)>> {
         let mut out = Vec::new();
         while out.is_empty() {
-            let (queue, next) = match self {
-                FileHistory::Indexed(q) => (q, None),
-                FileHistory::Scan { next, buf } => (buf, Some(next)),
+            let ids: Vec<ObjectId> = match self {
+                FileHistory::Indexed { queue, base, below, page } => {
+                    if queue.is_empty() {
+                        match std::mem::replace(page, IndexPage::Done) {
+                            IndexPage::Done => break,
+                            IndexPage::First => {
+                                let hits = b
+                                    .meta
+                                    .query_history(base, path, *below, INDEX_FIRST_PAGE)
+                                    .await?;
+                                if hits.len() == INDEX_FIRST_PAGE {
+                                    *below = hits.last().map_or(0, |(g, _)| *g);
+                                    *page = IndexPage::Rest(hits.iter().map(|(_, c)| *c).collect());
+                                }
+                                queue.extend(hits.into_iter().map(|(_, c)| c));
+                            }
+                            IndexPage::Rest(seen) => {
+                                let hits =
+                                    b.meta.query_history(base, path, *below, usize::MAX).await?;
+                                queue.extend(
+                                    hits.into_iter().map(|(_, c)| c).filter(|c| !seen.contains(c)),
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    let take = queue.len().min(n);
+                    queue.drain(..take).collect()
+                }
+                FileHistory::Scan { next, buf } => {
+                    if buf.is_empty() {
+                        let Some(from) = *next else { break };
+                        let chunk = b.meta.first_parent_chain(from, None, INDEX_BATCH).await?;
+                        *next = chunk.last().and_then(|c| c.parents.first().copied());
+                        buf.extend(chunk.iter().map(|c| c.id));
+                        if buf.is_empty() {
+                            break;
+                        }
+                    }
+                    let take = buf.len().min(INDEX_BATCH);
+                    buf.drain(..take).collect()
+                }
             };
-            let scan = next.is_some();
-            if queue.is_empty() {
-                let Some(from) = next.as_ref().and_then(|n| **n) else { break };
-                let chunk = b.meta.first_parent_chain(from, None, INDEX_BATCH).await?;
-                if let Some(slot) = next {
-                    *slot = chunk.last().and_then(|c| c.parents.first().copied());
-                }
-                queue.extend(chunk.iter().map(|c| c.id));
-                if queue.is_empty() {
-                    break;
-                }
-            }
-            let take = queue.len().min(if scan { INDEX_BATCH } else { n });
-            let ids: Vec<ObjectId> = queue.drain(..take).collect();
             for (id, set) in ids.iter().zip(b.meta.get_changesets(&ids).await?) {
                 if let Some(c) = set.into_iter().flatten().find(|c| c.path == *path) {
                     out.push((*id, c));
@@ -453,17 +575,63 @@ fn encode_blame(owners: &[ObjectId]) -> Bytes {
     out.into()
 }
 
-fn decode_blame(v: &[u8], lines: usize) -> Option<Vec<ObjectId>> {
+/// The owners in an [`encode_blame`] value; `None` if malformed.
+fn decode_blame(v: &[u8]) -> Option<Vec<ObjectId>> {
     let u32_at = |o: usize| Some(u32::from_le_bytes(v.get(o..o + 4)?.try_into().ok()?) as usize);
     let n = u32_at(0)?;
     let table: Vec<ObjectId> = (0..n)
         .map(|i| ObjectId::from_bytes(v.get(4 + i * 32..36 + i * 32)?).ok())
         .collect::<Option<_>>()?;
     let base = 4 + n * 32;
-    if u32_at(base)? != lines || v.len() != base + 4 + lines * 4 {
+    let lines = u32_at(base)?;
+    if v.len() != base + 4 + lines.checked_mul(4)? {
         return None;
     }
     (0..lines).map(|i| table.get(u32_at(base + 4 + i * 4)?).copied()).collect()
+}
+
+/// Blame as recursively derived data. The value at key `(commit, path)`,
+/// `commit` changing `path` on its first-parent chain, is the owning commit
+/// of each line of `path` at `commit`; the predecessor is the previous
+/// commit changing `path` down that chain, and the change is the line map
+/// from the previous version to this one (`diff_texts`). Every revision
+/// whose last change to `path` is `commit` shares this one value.
+pub(crate) struct Blame;
+
+impl Derivation for Blame {
+    const KIND: &'static str = BLAME_KIND;
+    const POLICY: Policy = Policy::Deferred;
+    type Key = (ObjectId, RepoPath);
+    type Value = Vec<ObjectId>;
+    /// For each line of the new version, its line in the previous one.
+    type Change = Vec<Option<usize>>;
+
+    fn key((commit, path): &Self::Key) -> Vec<u8> {
+        let mut key = commit.as_bytes().to_vec();
+        key.extend(path.as_str().as_bytes());
+        key
+    }
+
+    fn encode(value: &Self::Value) -> Bytes {
+        encode_blame(value)
+    }
+
+    fn decode(_: &Self::Key, bytes: &[u8]) -> Option<Self::Value> {
+        decode_blame(bytes)
+    }
+
+    /// Introduced lines (and, with no predecessor, lines the history does not
+    /// explain because it was pruned) belong to `commit`; the others keep
+    /// their owner in the previous version.
+    fn derive(
+        (commit, _): &Self::Key,
+        map: &Self::Change,
+        parent: Option<&Self::Value>,
+    ) -> Self::Value {
+        map.iter()
+            .map(|m| m.and_then(|i| parent.and_then(|p| p.get(i)).copied()).unwrap_or(*commit))
+            .collect()
+    }
 }
 
 /// Reference implementation of [`line_map_ids`] (quadratic LCS table over the
@@ -744,44 +912,88 @@ fn utf8(bytes: &[u8], path: &RepoPath) -> OpResult<String> {
         .map_err(|_| OpError::InvalidArgument(format!("{path} is not valid UTF-8")))
 }
 
-/// One batch of a file's history with the blobs of its previous versions.
+/// Stored blame values, by the commit whose version of the file they cover.
+type Stored = HashMap<ObjectId, Vec<ObjectId>>;
+
+/// One batch of a file's history with the blobs of its previous versions and
+/// the stored blame values of its versions.
 struct BlameChunk {
     step: Vec<(ObjectId, PathChange)>,
     blobs: HashMap<ObjectId, ant_core::EncodedObject>,
+    stored: Stored,
 }
 
-async fn fetch_chunk(b: Backend, step: Vec<(ObjectId, PathChange)>) -> OpResult<BlameChunk> {
+/// The stored [`Blame`] values of the versions in `step`: one round trip.
+async fn probe(b: &Backend, path: &RepoPath, step: &[(ObjectId, PathChange)]) -> OpResult<Stored> {
+    let keys: Vec<(ObjectId, RepoPath)> = step
+        .iter()
+        .filter(|(_, c)| c.kind != ChangeKind::Deleted)
+        .map(|(commit, _)| (*commit, path.clone()))
+        .collect();
+    let found = derive::get_many::<Blame>(b.meta.as_ref(), &keys).await?;
+    Ok(keys.into_iter().zip(found).filter_map(|((commit, _), v)| Some((commit, v?))).collect())
+}
+
+/// Reads the blobs of `step` and, unless already `stored`, probes its stored
+/// values (concurrently).
+async fn fetch_chunk(
+    b: Backend,
+    path: RepoPath,
+    step: Vec<(ObjectId, PathChange)>,
+    stored: Option<Stored>,
+) -> OpResult<BlameChunk> {
     let mut ids: Vec<ObjectId> = step.iter().filter_map(|(_, c)| c.old.map(|(_, id)| id)).collect();
     ids.sort_unstable();
     ids.dedup();
-    let fetched = b.objects.get_many(&ids).await?;
+    let blobs = async { Ok::<_, OpError>(b.objects.get_many(&ids).await?) };
+    let (fetched, stored) = match stored {
+        Some(stored) => (blobs.await?, stored),
+        None => tokio::try_join!(blobs, probe(&b, &path, &step))?,
+    };
     let mut blobs = HashMap::with_capacity(ids.len());
     for (id, o) in ids.into_iter().zip(fetched) {
         blobs.insert(id, o.ok_or_else(|| OpError::not_found_object(id))?);
     }
-    Ok(BlameChunk { step, blobs })
+    Ok(BlameChunk { step, blobs, stored })
 }
 
 /// Reads a file's history ahead of the walk: a producer task pulls change
 /// batches (growing from `BLAME_FIRST_CHUNK` to `BLAME_CHUNK`) and starts
-/// their blob fetches, keeping up to `BLAME_PREFETCH` batches in flight so
-/// store latency overlaps the diffing. Dropping it stops the producer;
-/// fetches already started finish unobserved.
+/// their blob fetches and stored-value probes, keeping up to
+/// `BLAME_PREFETCH` batches in flight so store latency overlaps the diffing.
+/// Dropping it stops the producer; fetches already started finish
+/// unobserved.
 struct Prefetch {
     rx: tokio::sync::mpsc::Receiver<tokio::task::JoinHandle<OpResult<BlameChunk>>>,
     producer: tokio::task::JoinHandle<()>,
 }
 
 impl Prefetch {
-    fn start(b: Backend, path: RepoPath, mut history: FileHistory) -> Self {
+    /// `first` is the history's first batch, already read and probed.
+    fn start(
+        b: Backend,
+        path: RepoPath,
+        mut history: FileHistory,
+        first: Vec<(ObjectId, PathChange)>,
+        first_stored: Stored,
+    ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(BLAME_PREFETCH);
         let producer = tokio::spawn(async move {
-            let mut n = BLAME_FIRST_CHUNK;
+            if first.is_empty() {
+                return;
+            }
+            let task =
+                tokio::spawn(fetch_chunk(b.clone(), path.clone(), first, Some(first_stored)));
+            if tx.send(task).await.is_err() {
+                return;
+            }
+            let mut n = (BLAME_FIRST_CHUNK * 2).min(BLAME_CHUNK);
             loop {
                 match history.next(&b, &path, n).await {
                     Ok(step) if step.is_empty() => break,
                     Ok(step) => {
-                        if tx.send(tokio::spawn(fetch_chunk(b.clone(), step))).await.is_err() {
+                        let task = tokio::spawn(fetch_chunk(b.clone(), path.clone(), step, None));
+                        if tx.send(task).await.is_err() {
                             break;
                         }
                     }
@@ -869,48 +1081,55 @@ async fn diff_pairs(pairs: Vec<(Bytes, Bytes)>) -> OpResult<Vec<Option<Vec<Optio
     Ok(out)
 }
 
-/// The uncached blame walk: the commit owning each line of `text`, the file
-/// at `rev` (= commit `id`).
-async fn blame_owners(
+/// The blame walk: the commit owning each line of `head` (blob `head_blob`),
+/// the file at commit `id`, given its history (`first`: the first batch,
+/// already read, and its stored values). Walks newest to oldest, diffing
+/// each change; a version with a stored value ends the walk (that value is
+/// the fold of the rest of the history).
+async fn blame_walk(
     b: &Backend,
-    rev: &str,
     id: ObjectId,
     path: &RepoPath,
+    history: FileHistory,
+    (first, first_stored): (Vec<(ObjectId, PathChange)>, Stored),
     head: Bytes,
+    head_blob: ObjectId,
 ) -> OpResult<Vec<ObjectId>> {
     let lines = std::str::from_utf8(&head).map_or(0, |t| t.lines().count());
-    let history = match indexed_ref_for(b, rev, id).await? {
-        Some(r) => {
-            let g =
-                b.meta.get_commits(&[id]).await?.pop().flatten().map_or(u64::MAX, |n| n.generation);
-            let hits = b.meta.query_history(&r, path, g, usize::MAX).await?;
-            FileHistory::Indexed(hits.into_iter().map(|(_, id)| id).collect())
-        }
-        None => FileHistory::Scan { next: Some(id), buf: VecDeque::new() },
-    };
-    let mut chunks = Prefetch::start(b.clone(), path.clone(), history);
+    let mut chunks = Prefetch::start(b.clone(), path.clone(), history, first, first_stored);
 
     // `cur[k]` = line index, in the version being walked, of final line k.
     let mut cur: Vec<Option<usize>> = (0..lines).map(Some).collect();
     let mut owners: Vec<Option<ObjectId>> = vec![None; lines];
     let mut remaining = lines;
-    // The version being walked: the file at `rev`, then each older blob
-    // (empty before the file's creation).
+    // The version being walked: the file at `id`, then each older blob
+    // (empty before the file's creation; `walked_blob` None).
     let mut walked = head;
+    let mut walked_blob = Some(head_blob);
     let mut oldest = id;
     'walk: while remaining > 0 {
-        let Some(chunk) = chunks.next().await? else { break };
-        // The (older, newer) text pairs of this batch. Their diffs do not
-        // depend on the attribution so far: compute them in parallel, then
-        // apply them in order (stopping where the sequential walk stops).
-        let mut steps = Vec::with_capacity(chunk.step.len());
-        let mut pairs = Vec::with_capacity(chunk.step.len());
-        for (commit, change) in chunk.step {
+        let Some(BlameChunk { step, blobs, stored }) = chunks.next().await? else { break };
+        // The (older, newer) text pairs of this batch, up to a version with a
+        // stored value. Their diffs do not depend on the attribution so far:
+        // compute them in parallel, then apply them in order (stopping where
+        // the sequential walk stops).
+        let mut steps = Vec::with_capacity(step.len());
+        let mut pairs = Vec::with_capacity(step.len());
+        let mut below = None;
+        for (commit, change) in step {
             if change.kind == ChangeKind::Deleted {
                 continue;
             }
-            let older =
-                change.old.map_or_else(Bytes::new, |(_, bid)| body_bytes(&chunk.blobs[&bid]));
+            // The stored value covers exactly the version being walked.
+            if let Some(v) = stored.get(&commit)
+                && change.new.map(|(_, blob)| blob) == walked_blob
+                && v.len() == line_count(&walked)
+            {
+                below = Some(v);
+                break;
+            }
+            let older = change.old.map_or_else(Bytes::new, |(_, bid)| body_bytes(&blobs[&bid]));
+            walked_blob = change.old.map(|(_, bid)| bid);
             pairs.push((older.clone(), std::mem::replace(&mut walked, older)));
             steps.push((commit, change.old.is_none()));
         }
@@ -934,12 +1153,21 @@ async fn blame_owners(
                 break 'walk;
             }
         }
+        if let Some(v) = below {
+            for (slot, owner) in cur.iter().zip(owners.iter_mut()) {
+                if let Some(j) = *slot {
+                    *owner = v.get(j).copied();
+                }
+            }
+            break;
+        }
     }
     // History ran out (e.g. pruned): attribute leftovers to the oldest commit seen.
     let owners: Vec<ObjectId> = owners.into_iter().map(|o| o.unwrap_or(oldest)).collect();
     Ok(owners)
 }
 
+/// Per-line attribution of `path` at `rev`; see the module docs.
 pub async fn blame(b: &Backend, rev: &str, path: &RepoPath) -> OpResult<Vec<BlameLine>> {
     let id = query::resolve_rev(b, rev).await?;
     let info = query::read_path(b, rev, path, true)
@@ -951,16 +1179,26 @@ pub async fn blame(b: &Backend, rev: &str, path: &RepoPath) -> OpResult<Vec<Blam
     let text = utf8(&content, path)?;
     let lines: Vec<&str> = text.lines().collect();
 
-    let mut key = id.as_bytes().to_vec();
-    key.extend(path.as_str().as_bytes());
-    if let Some(v) = b.meta.get_derived(BLAME_KIND, &key).await?
-        && let Some(owners) = decode_blame(&v, lines.len())
+    let mut history = FileHistory::open(b, rev, id, path).await?;
+    let first = history.next(b, path, BLAME_FIRST_CHUNK).await?;
+    let stored = probe(b, path, &first).await?;
+    // The last commit that changed the file (to exactly this content): the
+    // key of the value, shared by every revision since.
+    let last = first
+        .first()
+        .filter(|(_, c)| {
+            c.kind != ChangeKind::Deleted && c.new.map(|(_, blob)| blob) == Some(info.id)
+        })
+        .map(|(commit, _)| *commit);
+    if let Some(v) = last.and_then(|l| stored.get(&l))
+        && v.len() == lines.len()
     {
-        return Ok(attribute(owners, lines));
+        return Ok(attribute(v.clone(), lines));
     }
-
-    let owners = blame_owners(b, rev, id, path, content).await?;
-    b.meta.put_derived(BLAME_KIND, &key, encode_blame(&owners)).await?;
+    let owners = blame_walk(b, id, path, history, (first, stored), content, info.id).await?;
+    if let Some(l) = last {
+        derive::put::<Blame>(b.meta.as_ref(), &(l, path.clone()), &owners).await?;
+    }
     Ok(attribute(owners, lines))
 }
 
@@ -1357,7 +1595,12 @@ mod tests {
             Some(r) => {
                 let g = b.meta.get_commits(&[id]).await?.pop().flatten().unwrap().generation;
                 let hits = b.meta.query_history(&r, path, g, usize::MAX).await?;
-                FileHistory::Indexed(hits.into_iter().map(|(_, id)| id).collect())
+                FileHistory::Indexed {
+                    queue: hits.into_iter().map(|(_, id)| id).collect(),
+                    base: r,
+                    below: 0,
+                    page: IndexPage::Done,
+                }
             }
             None => FileHistory::Scan { next: Some(id), buf: VecDeque::new() },
         };
@@ -1411,88 +1654,166 @@ mod tests {
     }
 
     /// Deterministic pseudo-random histories (edits, deletions and
-    /// re-additions, CRLF, empty files, absent final newline): the optimised
-    /// blame equals the oracle for every version, indexed and not, cached
-    /// and not.
+    /// re-additions, CRLF, empty files, absent final newline, commits that
+    /// leave the file alone, merges of side branches whose first-parent
+    /// changeset rewrites the file): the incremental blame equals the oracle
+    /// for every version and for side commits, indexed (caught up or
+    /// lagging) and not, blamed oldest first (each from its predecessor's
+    /// stored value), newest first (cold walks) or shuffled, cached and not.
     #[tokio::test]
     async fn blame_equals_oracle_on_random_histories() {
-        for seed in 0..12u64 {
-            let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-            let mut next = move |m: usize| {
-                rng ^= rng << 13;
-                rng ^= rng >> 7;
-                rng ^= rng << 17;
-                (rng % m as u64) as usize
-            };
-            let b = Backend::in_memory();
-            let nl = if seed % 3 == 0 { "\r\n" } else { "\n" };
-            let mut lines: Vec<String> = (0..next(40)).map(|i| format!("init {i}")).collect();
-            let render = |l: &[String]| {
-                let mut t = l.join(nl);
-                if !l.is_empty() && !l.len().is_multiple_of(5) {
-                    t.push_str(nl);
-                }
-                t
-            };
-            let c0 =
-                commit(&b, None, vec![write("f", &render(&lines)), write("o", "x")]).await.unwrap();
-            land(&b, "main", c0).await.unwrap();
-            let mut tip = c0;
-            let mut exists = true;
-            let mut tips = vec![tip];
-            for step in 0..60 {
-                let op = if !exists {
-                    exists = true;
-                    lines = (0..next(30)).map(|i| format!("again {step} {i}")).collect();
-                    write("f", &render(&lines))
-                } else if next(15) == 0 {
-                    exists = false;
-                    delete("f")
-                } else {
-                    for _ in 0..1 + next(4) {
-                        let at = next(lines.len() + 1);
-                        match next(3) {
-                            0 => lines.insert(at, format!("new {step} {}", next(5))),
-                            1 if at < lines.len() => {
-                                lines.remove(at);
-                            }
-                            _ if at < lines.len() => lines[at] = format!("mod {step} {}", next(3)),
-                            _ => {}
-                        }
-                    }
-                    if next(8) == 0 {
-                        lines.reverse();
-                    }
-                    write("f", &render(&lines))
-                };
-                tip = landed(&b, tip, vec![op, write("o", &step.to_string())]).await;
-                tips.push(tip);
-            }
-            if seed % 2 == 0 {
-                catch_up(&b, "main").await.unwrap();
-            }
-            let path = RepoPath::new("f").unwrap();
-            for t in tips {
-                let rev = t.to_string();
-                if query::read_path(&b, &rev, &path, true).await.unwrap().is_none() {
-                    continue;
-                }
-                let want = blame_oracle(&b, &rev, &path).await.unwrap();
-                assert_eq!(blame(&b, &rev, &path).await.unwrap(), want, "seed {seed} {rev}");
-                assert_eq!(blame(&b, &rev, &path).await.unwrap(), want, "cached, seed {seed}");
-            }
+        for seed in 0..24u64 {
+            blame_matches_oracle_on(seed, 60).await;
         }
     }
 
-    /// Micro-benchmark: first blame of a long-lived 1700-line file with 1200
-    /// versions, optimised vs the reference walk. In memory by default; with
+    /// [`blame_equals_oracle_on_random_histories`] with more and longer
+    /// histories (`PROPTEST_CASES` seeds, default 24).
+    #[tokio::test]
+    #[ignore = "slow; run by the deeper property tier"]
+    async fn blame_equals_oracle_on_many_random_histories() {
+        let cases = std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
+        for seed in 1000..1000 + cases {
+            blame_matches_oracle_on(seed, 120).await;
+        }
+    }
+
+    async fn blame_matches_oracle_on(seed: u64, steps: usize) {
+        let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move |m: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % m as u64) as usize
+        };
+        let b = Backend::in_memory();
+        let nl = if seed.is_multiple_of(3) { "\r\n" } else { "\n" };
+        let mut lines: Vec<String> = (0..next(40)).map(|i| format!("init {i}")).collect();
+        let render = |l: &[String]| {
+            let mut t = l.join(nl);
+            if !l.is_empty() && !l.len().is_multiple_of(5) {
+                t.push_str(nl);
+            }
+            t
+        };
+        let edit = |lines: &mut Vec<String>, step: usize, next: &mut dyn FnMut(usize) -> usize| {
+            for _ in 0..1 + next(4) {
+                let at = next(lines.len() + 1);
+                match next(3) {
+                    0 => lines.insert(at, format!("new {step} {}", next(5))),
+                    1 if at < lines.len() => {
+                        lines.remove(at);
+                    }
+                    _ if at < lines.len() => lines[at] = format!("mod {step} {}", next(3)),
+                    _ => {}
+                }
+            }
+            if next(8) == 0 {
+                lines.reverse();
+            }
+        };
+        let c0 =
+            commit(&b, None, vec![write("f", &render(&lines)), write("o", "x")]).await.unwrap();
+        land(&b, "main", c0).await.unwrap();
+        let mut tip = c0;
+        let mut exists = true;
+        let mut revs = vec![tip];
+        for step in 0..steps {
+            if step == steps / 2 && seed.is_multiple_of(2) {
+                // Indexed up to here; later commits lag behind the watermark.
+                catch_up(&b, "main").await.unwrap();
+            }
+            if exists && next(8) == 0 {
+                // A side branch forked from an earlier version, merged with
+                // the file as the side has it.
+                let fork = revs[next(revs.len())];
+                let mut side_lines: Vec<String> = match read(&b, fork, "f").await {
+                    Some(t) => t.lines().map(str::to_owned).collect(),
+                    None => Vec::new(),
+                };
+                edit(&mut side_lines, step + 1000, &mut next);
+                let side = commit(&b, Some(fork), vec![write("f", &render(&side_lines))]).await;
+                let side = side.unwrap();
+                let side_tip = if next(2) == 0 {
+                    edit(&mut side_lines, step + 2000, &mut next);
+                    commit(&b, Some(side), vec![write("f", &render(&side_lines))]).await.unwrap()
+                } else {
+                    side
+                };
+                let mut merged = side_lines.clone();
+                if next(2) == 0 {
+                    edit(&mut merged, step + 3000, &mut next);
+                }
+                let tree = commit(&b, Some(tip), vec![write("f", &render(&merged))]).await.unwrap();
+                let tree = b.meta.get_commits(&[tree]).await.unwrap()[0].clone().unwrap().tree;
+                let merge = ant_core::Commit {
+                    tree,
+                    parents: vec![tip, side_tip],
+                    author: crate::ops::test_support::sig(),
+                    committer: crate::ops::test_support::sig(),
+                    extra_headers: vec![],
+                    message: format!("merge {step}\n").into_bytes(),
+                };
+                let merge = ant_store::graph::write_commit(&b, &merge).await.unwrap();
+                let moved = b.refs.cas_ref("main", Some(tip), Some(merge)).await.unwrap();
+                assert_eq!(moved, ant_store::CasOutcome::Updated);
+                lines = merged;
+                revs.extend([side, side_tip, merge]);
+                tip = merge;
+                continue;
+            }
+            let mut ops = vec![write("o", &step.to_string())];
+            if !exists {
+                exists = true;
+                lines = (0..next(30)).map(|i| format!("again {step} {i}")).collect();
+                ops.push(write("f", &render(&lines)));
+            } else if next(15) == 0 {
+                exists = false;
+                ops.push(delete("f"));
+            } else if next(3) != 0 {
+                // Otherwise only `o` changes: this tip shares the last change.
+                edit(&mut lines, step, &mut next);
+                ops.push(write("f", &render(&lines)));
+            }
+            tip = landed(&b, tip, ops).await;
+            revs.push(tip);
+        }
+        let path = RepoPath::new("f").unwrap();
+        let mut order: Vec<String> = revs.iter().map(ObjectId::to_string).collect();
+        match seed % 3 {
+            0 => {}
+            1 => order.reverse(),
+            _ => {
+                for i in (1..order.len()).rev() {
+                    order.swap(i, next(i + 1));
+                }
+            }
+        }
+        // Ref revs too: "main" (lagging on even seeds), "main~3" (indexed).
+        order.splice(order.len() / 2..order.len() / 2, ["main".to_string(), "main~3".into()]);
+        for rev in order {
+            if query::read_path(&b, &rev, &path, true).await.unwrap().is_none() {
+                continue;
+            }
+            let want = blame_oracle(&b, &rev, &path).await.unwrap();
+            assert_eq!(blame(&b, &rev, &path).await.unwrap(), want, "seed {seed} {rev}");
+            assert_eq!(blame(&b, &rev, &path).await.unwrap(), want, "cached, seed {seed} {rev}");
+        }
+    }
+
+    /// Micro-benchmark: blame of a long-lived 1700-line file with 1200
+    /// versions: the reference walk, first blames (cold, at different
+    /// versions), cached, after landing 1/10/100 commits that leave the file
+    /// alone, and after commits that change it (incremental; with the index
+    /// caught up and lagging). In memory by default; with
     /// `ANT_BLAME_BENCH_SCHEMA=<schema>` on Postgres (localhost:54329) and S3
-    /// (localhost:9009, bucket `ant-blame`) like a deployment. Run with
+    /// (localhost:9009, bucket `ANT_BLAME_BENCH_BUCKET`, default `ant-blame`)
+    /// like a deployment. Run with
     /// `cargo test -p ant-server --release --lib blame_bench -- --ignored --nocapture`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "benchmark"]
     async fn blame_bench() {
-        use std::time::Instant;
+        use std::time::{Duration, Instant};
         let b = match std::env::var("ANT_BLAME_BENCH_SCHEMA") {
             Err(_) => Backend::in_memory(),
             Ok(schema) => {
@@ -1501,12 +1822,14 @@ mod tests {
                     #[command(flatten)]
                     store: crate::config::StoreArgs,
                 }
+                let bucket =
+                    std::env::var("ANT_BLAME_BENCH_BUCKET").unwrap_or_else(|_| "ant-blame".into());
                 let args = <Args as clap::Parser>::parse_from([
                     "bench",
                     "--pg-url=postgres://ant:ant@localhost:54329/ant",
                     &format!("--pg-schema={schema}"),
                     "--s3-endpoint=http://localhost:9009",
-                    "--s3-bucket=ant-blame",
+                    &format!("--s3-bucket={bucket}"),
                     "--s3-access-key=x",
                     "--s3-secret-key=x",
                 ]);
@@ -1524,11 +1847,16 @@ mod tests {
         let c0 = commit(&b, None, vec![write("f", &(lines.join("\n") + "\n"))]).await.unwrap();
         land(&b, "main", c0).await.unwrap();
         let mut tip = c0;
-        for step in 0..if cfg!(debug_assertions) { 150 } else { 1200 } {
-            let k = if step % 10 == 0 { 2 } else { 1 + next(3) };
+        let mut tips = vec![c0];
+        let mut edit = |lines: &mut Vec<String>, step: usize| {
+            let k = if step.is_multiple_of(10) { 2 } else { 1 + next(3) };
             for e in 0..k {
                 // every tenth commit edits both ends of the file
-                let at = if step % 10 == 0 { [3, lines.len() - 3][e] } else { next(lines.len()) };
+                let at = if step.is_multiple_of(10) {
+                    [3, lines.len() - 3][e]
+                } else {
+                    next(lines.len())
+                };
                 match next(3) {
                     0 => lines.insert(at, format!("    new {step} {e}")),
                     1 => {
@@ -1537,39 +1865,83 @@ mod tests {
                     _ => lines[at] = format!("    mod {step} {e}"),
                 }
             }
+        };
+        let versions = if cfg!(debug_assertions) { 150 } else { 1200 };
+        for step in 0..versions {
+            edit(&mut lines, step);
             tip = landed(&b, tip, vec![write("f", &(lines.join("\n") + "\n"))]).await;
+            tips.push(tip);
         }
         catch_up(&b, "main").await.unwrap();
         let path = RepoPath::new("f").unwrap();
-        let rev = tip.to_string();
-        let (mut reference, mut first, mut cached) = (vec![], vec![], vec![]);
-        let mut want = None;
-        blame(&b, &rev, &path).await.unwrap(); // populates the cache
-        for _ in 0..5 {
-            let t = Instant::now();
-            let w = blame_oracle(&b, &rev, &path).await.unwrap();
-            reference.push(t.elapsed());
-            let t = Instant::now();
-            let text = utf8(&read(&b, tip, "f").await.unwrap().into_bytes(), &path).unwrap();
-            let got = blame_owners(&b, &rev, tip, &path, Bytes::from(text)).await.unwrap();
-            first.push(t.elapsed());
-            assert_eq!(got, w.iter().map(|l| l.commit).collect::<Vec<_>>());
-            want = Some(w);
-            let t = Instant::now();
-            blame(&b, &rev, &path).await.unwrap();
-            cached.push(t.elapsed());
-        }
-        assert!(want.is_some());
-        for (name, v) in
-            [("reference", &mut reference), ("first", &mut first), ("cached", &mut cached)]
-        {
+        let time = |d: &mut Vec<Duration>, t: Instant| d.push(t.elapsed());
+        let report = |name: &str, v: &mut Vec<Duration>| {
             v.sort();
             println!(
-                "blame {name}: median {:?} (min {:?}, max {:?})",
+                "blame {name}: median {:?} (min {:?}, max {:?}, n {})",
                 v[v.len() / 2],
                 v[0],
-                v[v.len() - 1]
+                v[v.len() - 1],
+                v.len()
             );
+        };
+        let mut reference = vec![];
+        let rev = tip.to_string();
+        for _ in 0..3 {
+            let t = Instant::now();
+            blame_oracle(&b, &rev, &path).await.unwrap();
+            time(&mut reference, t);
+        }
+        report("reference walk", &mut reference);
+        // Cold: newest version first, then older ones (nothing stored below).
+        let mut first = vec![];
+        for i in 0..5 {
+            let rev = tips[tips.len() - 1 - 7 * i].to_string();
+            let t = Instant::now();
+            let got = blame(&b, &rev, &path).await.unwrap();
+            time(&mut first, t);
+            if i == 0 {
+                assert_eq!(got, blame_oracle(&b, &rev, &path).await.unwrap());
+            }
+        }
+        report("first", &mut first);
+        let mut cached = vec![];
+        for _ in 0..5 {
+            let t = Instant::now();
+            blame(&b, "main", &path).await.unwrap();
+            time(&mut cached, t);
+        }
+        report("cached", &mut cached);
+        // Commits that leave the file alone: the value is shared.
+        for n in [1, 10, 100] {
+            for i in 0..n {
+                tip = landed(&b, tip, vec![write("g", &format!("{n} {i}"))]).await;
+            }
+            catch_up(&b, "main").await.unwrap();
+            let mut after = vec![];
+            let t = Instant::now();
+            blame(&b, "main", &path).await.unwrap();
+            time(&mut after, t);
+            report(&format!("after {n} commits to other paths"), &mut after);
+        }
+        // Commits that change the file: derived from the previous value.
+        for lagging in [false, true] {
+            let mut incremental = vec![];
+            for i in 0..5 {
+                edit(&mut lines, 7 + versions + i);
+                tip = landed(&b, tip, vec![write("f", &(lines.join("\n") + "\n"))]).await;
+                if !lagging {
+                    catch_up(&b, "main").await.unwrap();
+                }
+                let t = Instant::now();
+                let got = blame(&b, "main", &path).await.unwrap();
+                time(&mut incremental, t);
+                if i == 0 {
+                    assert_eq!(got, blame_oracle(&b, "main", &path).await.unwrap());
+                }
+            }
+            let index = if lagging { "lagging" } else { "caught up" };
+            report(&format!("after a commit changing it (index {index})"), &mut incremental);
         }
     }
 
@@ -1577,9 +1949,102 @@ mod tests {
     async fn blame_roundtrip_encoding() {
         let ids = [ObjectId([1; 32]), ObjectId([2; 32]), ObjectId([1; 32])];
         let enc = encode_blame(&ids);
-        assert_eq!(decode_blame(&enc, 3).unwrap(), ids);
-        assert!(decode_blame(&enc, 2).is_none());
-        assert!(decode_blame(&enc[..enc.len() - 1], 3).is_none());
+        assert_eq!(decode_blame(&enc).unwrap(), ids);
+        assert!(decode_blame(&enc[..enc.len() - 1]).is_none());
+        assert!(decode_blame(&[]).is_none());
+        let mut long = enc.to_vec();
+        long.push(0);
+        assert!(decode_blame(&long).is_none());
+        // An owner index outside the table.
+        let mut bad = enc.to_vec();
+        let at = bad.len() - 4;
+        bad[at] = 7;
+        assert!(decode_blame(&bad).is_none());
+    }
+
+    /// The derivation's own rule, folded bottom-up over every version
+    /// (`derive::fold`), is the walk's answer at every version.
+    #[tokio::test]
+    async fn blame_fold_equals_walk() {
+        let b = Backend::in_memory();
+        let versions = [
+            "a\nb\nc\n",
+            "a\nB\nc\nd\n",
+            "z\na\nB\nc\nd\n",
+            "z\na\nc\nd\nB\n",
+            "z\na\nc\nd\nB\n\nend",
+        ];
+        let c0 = commit(&b, None, vec![write("f", versions[0])]).await.unwrap();
+        land(&b, "main", c0).await.unwrap();
+        let mut commits = vec![c0];
+        for (i, v) in versions.iter().enumerate().skip(1) {
+            let tip = landed(&b, commits[i - 1], vec![write("f", v)]).await;
+            commits.push(tip);
+        }
+        let path = RepoPath::new("f").unwrap();
+        let chain = commits.iter().enumerate().map(|(i, c)| {
+            let old = if i == 0 { "" } else { versions[i - 1] };
+            ((*c, path.clone()), diff_texts(old, versions[i]))
+        });
+        let folded = derive::fold::<Blame>(None, chain);
+        for ((c, _), owners) in folded {
+            let got: Vec<ObjectId> =
+                blame(&b, &c.to_hex(), &path).await.unwrap().iter().map(|l| l.commit).collect();
+            assert_eq!(got, owners);
+        }
+    }
+
+    /// Revisions sharing the last change to a file share one stored value,
+    /// keyed by that change; a later change is derived from it (a planted
+    /// value shows through), not walked again; a value that does not fit
+    /// the version (line count) is ignored.
+    #[tokio::test]
+    async fn blame_is_keyed_by_the_last_change_and_derived_from_it() {
+        let b = Backend::in_memory();
+        let c0 = commit(&b, None, vec![write("f", "a\nb\nc\n")]).await.unwrap();
+        land(&b, "main", c0).await.unwrap();
+        let c1 = landed(&b, c0, vec![write("f", "a\nB\nc\n")]).await;
+        let c2 = landed(&b, c1, vec![write("g", "1\n")]).await;
+        let c3 = landed(&b, c2, vec![write("g", "2\n")]).await;
+        catch_up(&b, "main").await.unwrap();
+        let f = RepoPath::new("f").unwrap();
+        let key = |c: ObjectId| (c, f.clone());
+        let at_c1 = blame(&b, &c1.to_hex(), &f).await.unwrap();
+        let stored = derive::get::<Blame>(b.meta.as_ref(), &key(c1)).await.unwrap();
+        assert_eq!(stored, Some(vec![c0, c1, c0]));
+        for rev in [c2.to_hex(), c3.to_hex(), "main".into(), "main~1".into()] {
+            assert_eq!(blame(&b, &rev, &f).await.unwrap(), at_c1, "{rev}");
+        }
+        for c in [c2, c3] {
+            assert_eq!(derive::get::<Blame>(b.meta.as_ref(), &key(c)).await.unwrap(), None);
+        }
+        // Plant a (wrong, but well-formed) value for c1: c4's blame takes the
+        // owners of its unchanged lines from it.
+        let planted = ObjectId([7; 32]);
+        let c1b = landed(&b, c3, vec![write("f", "x\ny\nz\n")]).await;
+        b.meta
+            .put_derived(BLAME_KIND, &Blame::key(&key(c1b)), encode_blame(&[planted; 3]))
+            .await
+            .unwrap();
+        let c4 = landed(&b, c1b, vec![write("f", "x\nY\nz\n")]).await;
+        let got: Vec<_> =
+            blame(&b, "main", &f).await.unwrap().into_iter().map(|l| l.commit).collect();
+        assert_eq!(got, vec![planted, c4, planted]);
+        // A planted value with the wrong line count is not used.
+        let c5 = landed(&b, c4, vec![write("f", "x\nY\nz\nw\n")]).await;
+        b.meta
+            .put_derived(BLAME_KIND, &Blame::key(&key(c5)), encode_blame(&[planted; 2]))
+            .await
+            .unwrap();
+        let got: Vec<_> =
+            blame(&b, "main", &f).await.unwrap().into_iter().map(|l| l.commit).collect();
+        assert_eq!(got, vec![planted, c4, planted, c5]);
+        // Rows of the old per-revision kind are ignored.
+        let c6 = landed(&b, c5, vec![write("g", "3\n")]).await;
+        let mut v1_key = c6.as_bytes().to_vec();
+        v1_key.extend(b"f");
+        b.meta.put_derived("blame/v1", &v1_key, encode_blame(&[planted; 4])).await.unwrap();
+        assert_eq!(blame(&b, "main", &f).await.unwrap().last().unwrap().commit, c5);
     }
 
     /// Micro-benchmark: 20k-commit linear history in Postgres. Prints

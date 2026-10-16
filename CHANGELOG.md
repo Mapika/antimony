@@ -8,6 +8,22 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+### Performance
+
+- Blame is incremental: its value is keyed by the last commit that changed
+  the path (derived kind `blame/v2`, replacing the per-revision `blame/v1`
+  cache, whose rows are no longer read and are still collected by GC), so
+  every revision since shares it, and a new change is derived from the
+  previous version's stored value plus one line diff instead of walking the
+  history again; output is byte-identical (property-tested against the
+  previous walk on random histories with merges). Postgres + S3, 1,700-line
+  file with 1,200 versions: blame after landing 1/10/100 commits elsewhere
+  95-168 ms -> 3.3-3.9 ms; after a commit changing the file 93 ms -> 12 ms
+  (165 ms -> 8 ms while the history index lags the ref); first blame
+  unchanged (~90 ms); repeated blame 2.3 -> 3.3 ms. A typed derived-data
+  layer, `ant_store::derive` (`Derivation`: versioned kind, key, codec,
+  recursive rule, eager/deferred policy; batched get/put), carries it.
+
 ### Added
 
 - Batch read-permission check: `POST /o/check` (up to 4096 raw object ids in,
