@@ -1,4 +1,12 @@
-<!-- logo/banner goes here -->
+<p align="center">
+  <a href="https://github.com/Mapika/antimony">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/readme-banner-dark.png">
+      <img alt="antimony: source control for agent fleets" src="docs/brand/readme-banner-light.png" width="100%">
+    </picture>
+  </a>
+</p>
+
 # antimony
 
 Source control for agent fleets.
@@ -146,7 +154,7 @@ Needs `git` and `curl`, plus one of:
   first two lines below.
 - **Rust** (1.90 or newer) to build from source, as below.
 - **Docker** for the server: `docker run -d -p 7420:7420 -p 7421:7421
-  ghcr.io/mapika/antimony:0.1.0 serve --memory` can replace the `ant serve`
+  ghcr.io/mapika/antimony:0.2.0 serve --memory` can replace the `ant serve`
   line of step 1 (the client steps still need an `ant` binary).
 
 The quickstart runs against an in-memory throwaway server; for a durable one
