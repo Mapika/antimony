@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ant_core::{EncodedObject, ObjectKind};
+use ant_core::{EncodedObject, ObjectId, ObjectKind};
 use ant_store::Backend;
 use anyhow::{Result, anyhow, bail, ensure};
 use bytes::Bytes;
@@ -34,7 +34,12 @@ use tokio::sync::{
 
 use ant_core::delta;
 
-use crate::{protocol::packet, select::Selection, walk};
+use crate::{
+    cache::{self, Base as BasePack},
+    protocol::packet,
+    select::Selection,
+    walk,
+};
 
 pub type Chunk = Result<Bytes, io::Error>;
 const SIDEBAND: usize = 65515;
@@ -53,9 +58,18 @@ const MAX_WORKERS: usize = 8;
 const MAX_BASE: usize = 8 << 20;
 const MAX_DEPTH: u8 = 50;
 const CONTEXT_DEPTH: u8 = MAX_DEPTH / 2;
-/// Delta candidates: the previous objects at the same path (git's default
-/// `pack.window`), bounded in bytes including their block indices.
+/// Delta candidates: the previous blobs at the same path (git's default
+/// `pack.window`)...
 const WINDOW: usize = 10;
+/// ...or trees: small, sorted by size and the bulk of a blobless clone. A
+/// wider window is cheap for them (git/git blobless: pack 81.7 -> 70.5 MiB
+/// for about 0.3 s more of the export's 5 s); either is bounded in bytes,
+/// block indices included.
+const TREE_WINDOW: usize = 40;
+
+fn window(kind: ObjectKind) -> usize {
+    if kind == ObjectKind::Tree { TREE_WINDOW } else { WINDOW }
+}
 const WINDOW_BYTES: usize = 16 << 20;
 /// zlib level of every entry (git's default `core.compression`).
 const LEVEL: u32 = 6;
@@ -204,8 +218,9 @@ impl Window {
     fn push(&mut self, object: EncodedObject, base: Base, depth: u8) {
         let bytes = object.body().len();
         self.bytes += bytes;
+        let window = window(object.kind());
         self.candidates.push_back(Candidate { object, index: None, bytes, base, depth });
-        while self.candidates.len() > WINDOW || self.bytes > WINDOW_BYTES {
+        while self.candidates.len() > window || self.bytes > WINDOW_BYTES {
             let Some(evicted) = self.candidates.pop_front() else { break };
             self.bytes -= evicted.bytes;
             self.recycle(evicted);
@@ -257,19 +272,44 @@ fn eligible(object: &EncodedObject, deltas: bool) -> bool {
     deltas && object.kind() != ObjectKind::Commit && object.body().len() <= MAX_BASE
 }
 
-/// Append `input` as one zlib stream. The compressor (a few hundred KiB of
-/// state) is reused for every entry of a segment rather than allocated per
-/// object, which also keeps the allocator from fragmenting.
-fn deflate(compress: &mut Compress, input: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
-    compress.reset();
-    loop {
-        out.reserve(input.len() / 4 + 64);
-        let read = usize::try_from(compress.total_in()).map_err(io::Error::other)?;
-        let status = compress
-            .compress_vec(&input[read..], out, FlushCompress::Finish)
-            .map_err(io::Error::other)?;
-        if status == Status::StreamEnd {
-            return Ok(());
+/// Compressed output is produced in pieces of this size.
+const DEFLATE_SCRATCH: usize = 256 << 10;
+
+/// zlib for the entries of one segment. The compressor (a few hundred KiB of
+/// state) is reused for every entry rather than allocated per object, which
+/// also keeps the allocator from fragmenting. It writes into a small,
+/// initialized scratch buffer: `Compress::compress_vec` zero-fills the whole
+/// spare capacity of its output on every call (flate2's Rust backends), and
+/// on a segment buffer of megabytes that cost more than compressing.
+struct Deflater {
+    compress: Compress,
+    scratch: Vec<u8>,
+}
+
+impl Deflater {
+    fn new(level: u32) -> Self {
+        Self { compress: Compress::new(Compression::new(level), true), scratch: Vec::new() }
+    }
+
+    /// Append `input` to `out` as one zlib stream.
+    fn append(&mut self, input: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+        self.compress.reset();
+        if self.scratch.is_empty() {
+            self.scratch = vec![0; DEFLATE_SCRATCH];
+        }
+        loop {
+            let read = usize::try_from(self.compress.total_in()).map_err(io::Error::other)?;
+            let before = self.compress.total_out();
+            let status = self
+                .compress
+                .compress(&input[read..], &mut self.scratch, FlushCompress::Finish)
+                .map_err(io::Error::other)?;
+            let written =
+                usize::try_from(self.compress.total_out() - before).map_err(io::Error::other)?;
+            out.extend_from_slice(&self.scratch[..written]);
+            if status == Status::StreamEnd {
+                return Ok(());
+            }
         }
     }
 }
@@ -278,7 +318,7 @@ fn encode_segment(work: Work) -> io::Result<Segment> {
     let Work { objects, context, tail, deltas } = work;
     let mut segment = Segment { entries: Vec::with_capacity(objects.len()), data: Vec::new() };
     let mut window = Window::default();
-    let mut compress = Compress::new(Compression::new(LEVEL), true);
+    let mut deflater = Deflater::new(LEVEL);
     if let Some((path, _)) = objects.first() {
         window.reset(*path);
         for (object, entry) in context {
@@ -293,11 +333,11 @@ fn encode_segment(work: Work) -> io::Result<Segment> {
         let entry = segment.entries.len();
         let (kind, size, base, depth) = match &best {
             Some((delta, base, depth)) => {
-                deflate(&mut compress, delta, &mut segment.data)?;
+                deflater.append(delta, &mut segment.data)?;
                 (OBJ_OFS_DELTA, delta.len(), Some(*base), *depth)
             }
             None => {
-                deflate(&mut compress, object.body(), &mut segment.data)?;
+                deflater.append(object.body(), &mut segment.data)?;
                 let kind = match object.kind() {
                     ObjectKind::Commit => OBJ_COMMIT,
                     ObjectKind::Tree => OBJ_TREE,
@@ -319,33 +359,58 @@ fn encode_segment(work: Work) -> io::Result<Segment> {
 pub struct PackStats {
     pub objects: u32,
     pub deltas: u32,
+    /// Objects sent from a cached base pack (included in `objects`).
+    pub reused: u32,
     pub bytes: u64,
 }
 
 type Pending = oneshot::Receiver<io::Result<Segment>>;
 
 /// From the segmenter to the writer: segments in pack order, then the number
-/// of objects sent (only after a complete walk).
+/// of objects sent (only after a complete walk) and, when the pack is
+/// recorded as a base, their ids.
 enum Message {
     Segment(Pending),
-    Done(u64),
+    Done(u64, Option<Vec<ObjectId>>),
 }
 
 /// Pack header: signature, version 2, object count.
 const HEADER: usize = 12;
+/// Base pack entries are copied in reads of this size.
+const BASE_READ: usize = 1 << 20;
 
-fn write_pack(tx: Sender<Chunk>, mut segments: mpsc::Receiver<Message>) -> Result<PackStats> {
-    let mut spill = tempfile::SpooledTempFile::new(SPILL_MEMORY);
+trait Spill: io::Read + Write + Seek + Send {}
+impl<T: io::Read + Write + Seek + Send> Spill for T {}
+
+/// Lay out the segments, then stream the pack: header, the entries of
+/// `base` (if any) verbatim, the segments' entries, trailer. With `record`
+/// the segments' entries are spilled to a file that becomes the new base
+/// as soon as it is complete, before the pack is streamed.
+fn write_pack(
+    tx: Sender<Chunk>,
+    mut segments: mpsc::Receiver<Message>,
+    base: Option<&BasePack>,
+    record: Option<cache::Recorder>,
+) -> Result<PackStats> {
+    let mut kept = None;
+    let mut spill: Box<dyn Spill> = if record.is_some() {
+        let file = tempfile::tempfile()?;
+        kept = Some(file.try_clone()?);
+        Box::new(file)
+    } else {
+        Box::new(tempfile::SpooledTempFile::new(SPILL_MEMORY))
+    };
     let mut stats = PackStats::default();
-    let mut position = HEADER as u64;
+    let start = HEADER as u64 + base.map_or(0, |base| base.len);
+    let mut position = start;
     let mut offsets = Vec::new();
     let mut previous = Vec::new();
     let mut out = Vec::new();
     let mut keepalive = Instant::now();
-    let count = loop {
+    let (count, ids) = loop {
         let pending = match segments.blocking_recv() {
             Some(Message::Segment(pending)) => pending,
-            Some(Message::Done(count)) => break count,
+            Some(Message::Done(count, ids)) => break (count, ids),
             None => bail!("incomplete pack"),
         };
         let segment = pending.blocking_recv().map_err(|_| anyhow!("delta worker failed"))??;
@@ -378,11 +443,30 @@ fn write_pack(tx: Sender<Chunk>, mut segments: mpsc::Receiver<Message>) -> Resul
         }
     };
     ensure!(u64::from(stats.objects) == count, "incomplete pack");
+    if let (Some(record), Some(file), Some(ids)) = (record, kept, ids) {
+        record.install(ids, file, position - start)?;
+    }
+    if let Some(base) = base {
+        stats.reused = base.objects;
+        stats.objects =
+            stats.objects.checked_add(base.objects).ok_or_else(|| anyhow!("pack too large"))?;
+    }
     let mut writer =
         PackWriter { tx, hash: Sha256::new(), position: 0, pending: Vec::with_capacity(SIDEBAND) };
     writer.write_all(b"PACK")?;
     writer.write_all(&2_u32.to_be_bytes())?;
     writer.write_all(&stats.objects.to_be_bytes())?;
+    if let Some(base) = base {
+        let mut buffer = vec![0; BASE_READ];
+        let mut offset = 0;
+        while offset < base.len {
+            let take = (base.len - offset).min(BASE_READ as u64) as usize;
+            base.read_exact_at(&mut buffer[..take], offset)?;
+            writer.write_all(&buffer[..take])?;
+            offset += take as u64;
+        }
+    }
+    spill.flush()?;
     spill.rewind()?;
     io::copy(&mut spill, &mut writer)?;
     ensure!(writer.position == position, "pack spill truncated");
@@ -401,6 +485,8 @@ struct Segmenter {
     objects: Vec<(u64, EncodedObject)>,
     bytes: usize,
     context: Vec<(EncodedObject, usize)>,
+    /// Ids of every object, in order, when the pack becomes a base.
+    ids: Option<Vec<ObjectId>>,
 }
 
 impl Segmenter {
@@ -410,6 +496,9 @@ impl Segmenter {
             self.dispatch(true).await?;
         } else if self.bytes >= SEGMENT_BYTES && path_changed {
             self.dispatch(false).await?;
+        }
+        if let Some(ids) = &mut self.ids {
+            ids.push(object.id());
         }
         self.bytes += object.body().len();
         self.objects.push((path, object));
@@ -425,7 +514,7 @@ impl Segmenter {
         if carry && self.deltas {
             let path = objects.last().map(|(path, _)| *path);
             for (n, (p, object)) in objects.iter().enumerate().rev() {
-                if Some(*p) != path || next.len() == WINDOW {
+                if Some(*p) != path || next.len() == window(object.kind()) {
                     break;
                 }
                 tail = n;
@@ -457,15 +546,33 @@ impl Segmenter {
 
 /// Send the pack of `selection` (deltas only if the client takes
 /// `ofs-delta`) as sideband packets to `tx`.
+#[cfg(test)]
 pub async fn send(
     b: Backend,
     selection: Selection,
     deltas: bool,
     tx: Sender<Chunk>,
 ) -> Result<PackStats> {
+    send_with(b, selection, deltas, None, tx).await
+}
+
+/// [`send`], laid out after the entries of the base pack in
+/// `selection.excluded` (if any); with `record` (see `cache.rs`) the pack
+/// also becomes the base of its filter.
+pub async fn send_with(
+    b: Backend,
+    selection: Selection,
+    deltas: bool,
+    record: Option<cache::Recorder>,
+    tx: Sender<Chunk>,
+) -> Result<PackStats> {
+    let record = record.filter(|_| deltas);
+    let recording = record.is_some();
+    let base = selection.excluded.base.clone();
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(MAX_WORKERS);
     let (segment_tx, segment_rx) = mpsc::channel(workers);
-    let writer = tokio::task::spawn_blocking(move || write_pack(tx, segment_rx));
+    let writer =
+        tokio::task::spawn_blocking(move || write_pack(tx, segment_rx, base.as_deref(), record));
     let (part_tx, mut part_rx) = mpsc::channel::<walk::Part>(2);
     let encoder = async move {
         let mut segmenter = Segmenter {
@@ -474,6 +581,7 @@ pub async fn send(
             objects: Vec::new(),
             bytes: 0,
             context: Vec::new(),
+            ids: recording.then(Vec::new),
         };
         while let Some(part) = part_rx.recv().await {
             let (mut objects, merge) = part.objects();
@@ -497,13 +605,13 @@ pub async fn send(
         }
         segmenter
             .segments
-            .send(Message::Done(count))
+            .send(Message::Done(count, segmenter.ids.take()))
             .await
             .map_err(|_| anyhow!("pack consumer disconnected"))
     }
     .await;
     // On failure the segment channel is closed without `Done`: the writer
-    // stops without a trailer.
+    // stops without a trailer (and records nothing).
     let written = writer.await;
     finished?;
     written?
@@ -536,6 +644,17 @@ mod tests {
         deltas: bool,
         promisor: bool,
     ) -> (tempfile::TempDir, u64) {
+        receive_with(b, selection, deltas, promisor, None).await
+    }
+
+    /// [`receive`] through [`send_with`], recording a base with `record`.
+    async fn receive_with(
+        b: Backend,
+        selection: crate::select::Selection,
+        deltas: bool,
+        promisor: bool,
+        record: Option<cache::Recorder>,
+    ) -> (tempfile::TempDir, u64) {
         let dir = tempfile::tempdir().unwrap();
         git(dir.path(), &["init", "--bare", "--object-format=sha256"]).await;
         git(dir.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]).await;
@@ -556,7 +675,7 @@ mod tests {
             .unwrap();
         let mut input = child.stdin.take().unwrap();
         let (tx, mut rx) = mpsc::channel(8);
-        let sender = tokio::spawn(send(b, selection, deltas, tx));
+        let sender = tokio::spawn(send_with(b, selection, deltas, record, tx));
         let mut size = 0;
         while let Some(chunk) = rx.recv().await {
             let bytes = chunk.unwrap();
@@ -570,6 +689,21 @@ mod tests {
         let result = child.wait_with_output().await.unwrap();
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
         (dir, size)
+    }
+
+    /// Receive the pack of `selection`, recorded as a base of a new cache:
+    /// the pack directory and the base (if the selection can be one).
+    async fn record(
+        b: &Backend,
+        selection: crate::select::Selection,
+        promisor: bool,
+    ) -> (tempfile::TempDir, Option<std::sync::Arc<BasePack>>) {
+        let cache = std::sync::Arc::new(cache::PackCache::default());
+        let no_blobs = selection.no_blobs;
+        let build = cache.lock_build(no_blobs).await;
+        let recorder = cache::Recorder::new(cache.clone(), &selection, build);
+        let (dir, _) = receive_with(b.clone(), selection, true, promisor, recorder).await;
+        (dir, cache.get(no_blobs))
     }
 
     // This exercises the same planner and streaming encoder as HTTP, with real
@@ -609,6 +743,103 @@ mod tests {
         }
         assert_eq!(sizes[0], expected_undeltified);
         assert!(sizes[1] * 100 <= sizes[0] * 30);
+    }
+
+    /// Pack bytes of the single pack in `dir`.
+    fn pack_file(dir: &std::path::Path) -> Vec<u8> {
+        let packs: Vec<_> = std::fs::read_dir(dir.join("objects/pack"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|e| e == "pack"))
+            .collect();
+        assert_eq!(packs.len(), 1);
+        std::fs::read(&packs[0]).unwrap()
+    }
+
+    /// A clone recorded as a base pack; later clones reuse its entries
+    /// verbatim, followed by exactly the objects the wants add (or nothing),
+    /// and the base is refused when it does not fit the wants.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn base_pack_reuse_is_exact() {
+        use crate::select::{Fetch, select, select_after};
+        let b = Backend::in_memory();
+        let old = support::revisions(&b, None, 0..30).await;
+        let tip = support::revisions(&b, Some(old), 30..60).await;
+        let next = support::revisions(&b, Some(tip), 60..70).await;
+        let unrelated = support::revisions(&b, None, 100..102).await;
+        for no_blobs in [true, false] {
+            let fetch = |wants: Vec<ObjectId>| Fetch {
+                wants,
+                no_blobs,
+                done: true,
+                ofs_delta: true,
+                ..Default::default()
+            };
+            // Two wants, one an ancestor of the other: one tip.
+            let selection = select(&b, &fetch(vec![old, tip])).await.unwrap();
+            assert_eq!(selection.tips, [tip]);
+            let expected = crate::walk::ids(&b, selection.clone()).await.unwrap();
+            let (first, base) = record(&b, selection, no_blobs).await;
+            let base = base.expect("recorded base");
+            assert_eq!(base.objects as usize, expected.len());
+            assert!(expected.iter().all(|id| base.contains(id)));
+            let first = pack_file(first.path());
+            assert_eq!(base.len as usize, first.len() - HEADER - 32);
+
+            // Same wants: the base alone, byte for byte the same pack.
+            let selection =
+                select_after(&b, &fetch(vec![tip]), &base, usize::MAX).await.unwrap().unwrap();
+            assert!(selection.commits.is_empty());
+            let (again, _) = receive(b.clone(), selection, true, no_blobs).await;
+            assert!(pack_file(again.path()) == first);
+
+            // Wants past the base: base entries, then exactly the new objects.
+            let after = select_after(&b, &fetch(vec![next]), &base, 10).await.unwrap().unwrap();
+            assert_eq!(after.commits.len(), 10);
+            let (dir, _) = receive(b.clone(), after, true, no_blobs).await;
+            let pack = pack_file(dir.path());
+            assert!(pack[HEADER..HEADER + base.len as usize] == first[HEADER..first.len() - 32]);
+            let all = select(&b, &fetch(vec![next])).await.unwrap();
+            let all = crate::walk::ids(&b, all).await.unwrap();
+            let packed = support::packed_objects(&dir.path().join("objects/pack")).await;
+            assert_eq!(packed.len(), all.len(), "objects outside the wants, or repeated");
+            git(dir.path(), &["update-ref", "refs/heads/main", &next.to_string()]).await;
+            git(dir.path(), &["fsck", "--full", "--strict"]).await;
+
+            // Refused: too far past the base, an unrelated history, wants
+            // below the tip (the base would add objects not asked for), and
+            // a want that is not a commit.
+            assert!(select_after(&b, &fetch(vec![next]), &base, 9).await.unwrap().is_none());
+            for wants in [vec![unrelated], vec![old], vec![tip, ObjectId::empty_tree()]] {
+                let refused = select_after(&b, &fetch(wants), &base, usize::MAX).await.unwrap();
+                assert!(refused.is_none());
+            }
+            // Two independent tips: both must be reached.
+            let selection = select(&b, &fetch(vec![tip, unrelated])).await.unwrap();
+            let mut tips = selection.tips.clone();
+            tips.sort();
+            let mut expected = vec![tip, unrelated];
+            expected.sort();
+            assert_eq!(tips, expected);
+            let (_, both) = record(&b, selection, no_blobs).await;
+            let both = both.unwrap();
+            for (wants, fits) in [(vec![next], false), (vec![next, unrelated], true)] {
+                let after = select_after(&b, &fetch(wants), &both, usize::MAX).await.unwrap();
+                assert_eq!(after.is_some(), fits);
+            }
+        }
+        // Not a clone: nothing recorded.
+        let fetch = Fetch {
+            wants: vec![tip],
+            haves: vec![old],
+            done: true,
+            ofs_delta: true,
+            ..Default::default()
+        };
+        let selection = select(&b, &fetch).await.unwrap();
+        assert!(selection.tips.is_empty());
+        let (_, none) = record(&b, selection, false).await;
+        assert!(none.is_none());
     }
 
     #[tokio::test]
