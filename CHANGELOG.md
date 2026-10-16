@@ -8,6 +8,27 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+### Added
+
+- **Local mode**: `ant serve --local [<dir>]` keeps refs, metadata and small
+  objects in SQLite (WAL, one writer thread with group commit) and large
+  objects in local pack files, all in one data directory (default
+  `~/.local/share/antimony/local`): no Postgres, S3 or Docker. Low-resource
+  defaults (≤ 4 async workers, 48 MiB server caches). `ant local
+  start|stop|status` runs it in the background; `ant import`, `ant admin gc`
+  and `ant admin schema` take `--local` too (offline: one process uses a
+  directory at a time). New on-disk format, versioned
+  (`docs/compatibility.md`); flags `--local-readers`,
+  `--local-frame-cache-mib`, `--local-sync full|normal`, and for every
+  server `--worker-threads` and `--cache-mib`. `/readyz` reports `"local"`.
+- `ant admin copy-local --from <dir> <store flags>` copies a local data
+  directory into other stores (Postgres + S3): objects, commits,
+  changesets, derived data, then the refs the destination lacks.
+- `ant serve` exits cleanly (status 0) on SIGTERM and SIGINT.
+- `ant-bench fleet --server-pid <pid>` reports the server's RSS and CPU over
+  the run; `scripts/scorecard-local.sh` runs the headline benchmarks in local
+  mode. Tests that ran in memory take `ANT_TEST_BACKEND=local`.
+
 ## [0.2.2] - 2026-10-16
 
 Patch release: no storage or protocol changes (the shared disk cache gains

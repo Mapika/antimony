@@ -8,7 +8,29 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 
 use crate::memory::MemoryObjectStore;
-use crate::{ObjectStore, Result};
+use crate::{Backend, ObjectStore, Result};
+
+/// The backend that tests otherwise run in memory use, chosen by
+/// `ANT_TEST_BACKEND`: `memory` (default) or `local` (a fresh scratch local
+/// store per call, see [`local_backend`]). Lets the property suites run
+/// unchanged against local mode:
+/// `ANT_TEST_BACKEND=local cargo nextest run -p ant-server`.
+pub fn test_backend(label: &str) -> Backend {
+    match std::env::var("ANT_TEST_BACKEND").as_deref() {
+        Ok("local") => local_backend(label),
+        Ok("memory") | Ok("") | Err(_) => Backend::in_memory(),
+        Ok(other) => panic!("ANT_TEST_BACKEND={other}: expected `memory` or `local`"),
+    }
+}
+
+/// A backend on a fresh local data directory under `$TMPDIR`, deleted with
+/// the last handle to it (`LocalStore::open_scratch`).
+pub fn local_backend(label: &str) -> Backend {
+    match crate::local::LocalStore::open_scratch(label) {
+        Ok(store) => store.backend(),
+        Err(e) => panic!("opening a scratch local store: {e}"),
+    }
+}
 
 /// Postgres URL of the test services: `ANT_TEST_PG_URL`, default the dev
 /// services' database (`scripts/dev-services.sh start` or

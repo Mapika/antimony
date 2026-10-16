@@ -102,6 +102,55 @@ row lock, so a writer's deduplicated `put_many` never loses its objects.
 S3 packs get random ids and are deleted once no index row points into
 them.
 
+### Local mode (`ant_store::local`)
+
+`ant serve --local <dir>` keeps every store in one data directory, for a
+single machine running tens of agents without Postgres, S3 or Docker:
+
+| store | local-mode home |
+|---|---|
+| `ObjectStore` | objects ≤ 4 KiB as zstd rows of SQLite `objects`; larger ones in append-only pack files (`packs/<id>.pack`, same `AFR1`/single-object records as S3 packs) indexed by SQLite `object_index` |
+| `RefStore` | SQLite `refs`; compare-and-swap inside one write transaction; in-process per-ref locks whose `publish` moves the ref and writes the landed-as rows in one durable transaction |
+| `MetaStore` | SQLite `commits` (node + log sequence), `changesets`, `derived`, `history`, `history_watermark` |
+
+- **One writer, many readers.** SQLite runs in WAL mode. Every write is a
+  job for one writer thread, which runs whatever is queued (up to 256 jobs)
+  as one transaction, each job in its own savepoint (a failing job rolls back
+  alone): group commit across all callers, lands included. Reads use a small
+  pool of reader connections (default 4) on the blocking pool; WAL readers
+  never wait for the writer. Graph walks (`ancestors_above`,
+  `first_parent_chain`) are point lookups inside one reader call: without
+  network round trips, no recursive SQL is needed.
+- **Durability.** A group commits with `synchronous = FULL` (WAL fsynced
+  before anyone is answered) unless all its writes were made under
+  `deferred_durability`, which commit with `NORMAL`. The WAL is appended in
+  commit order, so a land's publish (FULL) makes its deferred objects,
+  commits and changesets durable first, the same argument as Postgres's
+  `synchronous_commit = off`: unflushed commits are lost only by an OS crash,
+  which also ends the process holding the ref lock. The fsync is pipelined:
+  commits run with `synchronous = NORMAL` and a second thread fsyncs the
+  WAL and only then answers durable writes (and announces ref moves), while
+  the writer runs the next group; land publishes are answered after that
+  fsync while the land queue already publishes its next batch. Only commit
+  records, ref moves, land publishes and history watermarks wait for an
+  fsync; objects, derived rows and history rows become durable with the
+  next one, which always precedes anything that references them. Pack bytes are fsynced
+  (shared `fdatasync`s across concurrent writers) before their index rows
+  are written. `--local-sync normal` trades power-loss durability for speed.
+- **Ref events** go on the in-process feed after the transaction commits;
+  there are no other processes to notify.
+- **One process per directory** (a lock on `<dir>/LOCK`): the server, or an
+  offline tool (`ant import`, `ant admin gc`). Garbage collection is
+  therefore offline: mark from the same roots as the Postgres collector,
+  sweep at once (no condemn or quiesce phase), delete packs without live
+  records and compact mostly-dead ones (live records appended to a new pack,
+  index rows moved durably, then the old file deleted). There is no
+  `ant admin repack` in local mode.
+- **Small footprint.** A local server runs min(4, CPUs) async workers, at
+  most 64 blocking threads, a 48 MiB server cache budget, 8 MiB SQLite page
+  cache per connection and a 16 MiB decoded-frame cache; nothing polls while
+  idle.
+
 ## Write path (`ant-server::ops`)
 
 **CreateChangeset.** A client sends file edits (write/delete with inline

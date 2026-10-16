@@ -202,7 +202,7 @@ fn memory_replicas(n: usize) -> Vec<Backend> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn memory_lands_updates_force_and_catch_up() {
-    lands_updates_force_and_catch_up(Backend::in_memory()).await;
+    lands_updates_force_and_catch_up(ant_store::testing::test_backend("watch")).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -213,6 +213,16 @@ async fn memory_replicas_land_while_watched() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn memory_slow_watcher() {
     slow_watcher(Backend::in_memory()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_lands_updates_force_and_catch_up() {
+    lands_updates_force_and_catch_up(ant_store::testing::local_backend("watch")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_slow_watcher() {
+    slow_watcher(ant_store::testing::local_backend("watch_slow")).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

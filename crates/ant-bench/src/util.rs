@@ -91,7 +91,12 @@ pub fn peak_rss_bytes() -> Option<u64> {
 
 /// (user, system) CPU seconds consumed by this process so far.
 pub fn cpu_seconds() -> Option<(f64, f64)> {
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    proc_cpu_seconds("self")
+}
+
+/// (user, system) CPU seconds consumed by process `pid` (`self`: this one).
+pub fn proc_cpu_seconds(pid: &str) -> Option<(f64, f64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // Fields after the parenthesised comm; utime/stime are fields 14/15 overall.
     let rest = &stat[stat.rfind(')')? + 2..];
     let f: Vec<&str> = rest.split_whitespace().collect();

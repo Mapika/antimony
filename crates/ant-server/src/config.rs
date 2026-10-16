@@ -1,7 +1,9 @@
 //! Store flags shared by `ant-server` and the `ant` CLI.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use ant_store::local::{LocalOptions, LocalStore, LocalSync};
 use ant_store::packed::PackedS3Store;
 use ant_store::postgres::{PgOptions, PgStore};
 use ant_store::s3::{S3Config, S3ObjectStore, S3Timeouts};
@@ -33,12 +35,42 @@ pub fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
     Ok(std::time::Duration::from_millis(ms))
 }
 
-/// Backend selection flags (`--memory` | `--pg-url` + optional `--s3-*`).
+/// Concurrency limits of a local-mode server are those of a server with a
+/// pool of this many connections (64 reads, 32 writes, 256 lands in flight).
+pub const LOCAL_LIMIT_POOL: u32 = 16;
+
+/// Backend selection flags (`--memory` | `--local [<dir>]` | `--pg-url` +
+/// optional `--s3-*`).
 #[derive(clap::Args, Debug, Clone)]
 pub struct StoreArgs {
     /// Use the in-memory backend (dev/testing). Exclusive with --pg-url.
     #[arg(long, env = "ANT_MEMORY")]
     memory: bool,
+
+    /// Local mode: every store in one data directory (SQLite metadata and
+    /// local pack files; no Postgres or S3). Without a value:
+    /// `$ANT_LOCAL_DIR`, else `$XDG_DATA_HOME/antimony/local` (default
+    /// `~/.local/share/antimony/local`). One process uses a directory at a
+    /// time.
+    #[arg(long, env = "ANT_LOCAL", num_args = 0..=1, default_missing_value = "",
+          value_name = "DIR")]
+    local: Option<PathBuf>,
+
+    /// Local mode: SQLite reader connections (reads beyond wait).
+    #[arg(long, env = "ANT_LOCAL_READERS", default_value_t = 4,
+          value_parser = clap::value_parser!(u32).range(1..=64))]
+    local_readers: u32,
+
+    /// Local mode: decoded pack frames kept in memory, MiB.
+    #[arg(long, env = "ANT_LOCAL_FRAME_CACHE_MIB", default_value_t = 16)]
+    local_frame_cache_mib: usize,
+
+    /// Local mode: `full` fsyncs every acknowledged write and land (the
+    /// default); `normal` never fsyncs at commit: nothing is lost when the
+    /// process crashes, but an OS crash or power loss can lose the last
+    /// acknowledged lands.
+    #[arg(long, env = "ANT_LOCAL_SYNC", default_value = "full", value_parser = ["full", "normal"])]
+    local_sync: String,
 
     /// Postgres URL for refs, metadata and small objects.
     #[arg(long, env = "ANT_PG_URL")]
@@ -143,6 +175,42 @@ pub struct StoreArgs {
 }
 
 impl StoreArgs {
+    /// Whether local mode is selected (`--local`).
+    pub fn is_local(&self) -> bool {
+        self.local.is_some()
+    }
+
+    /// The local data directory, when local mode is selected.
+    pub fn local_dir(&self) -> anyhow::Result<Option<PathBuf>> {
+        match &self.local {
+            None => Ok(None),
+            Some(d) if !d.as_os_str().is_empty() => Ok(Some(d.clone())),
+            Some(_) => match ant_store::local::default_dir() {
+                Some(d) => Ok(Some(d)),
+                None => bail!("--local: no directory given and $HOME is not set"),
+            },
+        }
+    }
+
+    /// Options of the local store (`--local`).
+    pub fn local_options(&self) -> LocalOptions {
+        LocalOptions {
+            readers: self.local_readers as usize,
+            inline_threshold: self.inline_threshold,
+            frame_cache_bytes: self.local_frame_cache_mib.saturating_mul(1 << 20),
+            pack_frames: self.pack_frames,
+            migrate: !self.no_migrate,
+            sync: if self.local_sync == "normal" { LocalSync::Normal } else { LocalSync::Full },
+            ..LocalOptions::default()
+        }
+    }
+
+    /// The basis of the default concurrency limits (`crate::limits`): the
+    /// Postgres query-pool size, or [`LOCAL_LIMIT_POOL`] in local mode.
+    pub fn limit_pool(&self) -> u32 {
+        if self.is_local() { LOCAL_LIMIT_POOL } else { self.pg_max_connections }
+    }
+
     /// The Postgres query-pool size (also the basis of the default
     /// concurrency limits, `crate::limits`).
     pub fn pg_max_connections(&self) -> u32 {
@@ -204,6 +272,21 @@ impl StoreArgs {
     /// [`Self::backend`] plus the Postgres and S3 stores (pool metrics and
     /// readiness probes), where configured.
     pub async fn backend_with_probes(&self) -> anyhow::Result<(Backend, Probes)> {
+        if let Some(dir) = self.local_dir()? {
+            if self.memory || self.pg_url.is_some() {
+                bail!("--local, --memory and --pg-url are mutually exclusive");
+            }
+            if self.s3_config()?.is_some() {
+                bail!("--s3-* flags require --pg-url, not --local");
+            }
+            let options = self.local_options();
+            let store = tokio::task::spawn_blocking(move || LocalStore::open(&dir, &options))
+                .await
+                .context("opening the local data directory")?
+                .context("opening the local data directory")?;
+            let backend = store.backend();
+            return Ok((backend, Probes { local: Some(store), ..Probes::default() }));
+        }
         match (self.memory, self.pg_url.as_deref()) {
             (true, None) => {
                 if self.s3_config()?.is_some() {
@@ -247,11 +330,11 @@ impl StoreArgs {
                 };
                 Ok((
                     Backend { objects, refs: pg.clone(), meta: pg.clone() },
-                    Probes { pg: Some(pg), s3: s3_probe },
+                    Probes { pg: Some(pg), s3: s3_probe, ..Probes::default() },
                 ))
             }
             (true, Some(_)) => bail!("--memory and --pg-url are mutually exclusive"),
-            (false, None) => bail!("exactly one of --memory or --pg-url is required"),
+            (false, None) => bail!("exactly one of --memory, --local or --pg-url is required"),
         }
     }
 }

@@ -13,6 +13,7 @@ pub mod conformance;
 pub mod derive;
 pub mod feed;
 pub mod graph;
+pub mod local;
 pub mod memory;
 pub mod packed;
 pub mod postgres;
@@ -250,7 +251,23 @@ pub trait RefLockRelease: Send + Sync {
     ) -> Result<CasOutcome> {
         Err(StoreError::InvalidArgument("this ref lock cannot publish".into()))
     }
+
+    /// See [`RefLock::publish_pipelined`]. The default publishes durably
+    /// ([`Self::publish`]) and returns a resolved [`Durability`].
+    async fn publish_pipelined(
+        &mut self,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+        kind: &str,
+        derived: Vec<(Vec<u8>, Bytes)>,
+    ) -> Result<(CasOutcome, Durability)> {
+        let out = self.publish(expected, new, kind, derived).await?;
+        Ok((out, Box::pin(async { Ok(()) })))
+    }
 }
+
+/// Resolves once a pipelined publish is durable ([`RefLock::publish_pipelined`]).
+pub type Durability = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
 
 /// Exclusive write access to one ref, from [`RefStore::lock_ref`]. Dropping
 /// it without [`RefLock::release`] also releases it, possibly later (e.g.
@@ -307,6 +324,29 @@ impl RefLock {
     ) -> Result<CasOutcome> {
         match &mut self.0 {
             Some(lock) if lock.can_publish() => lock.publish(expected, new, kind, derived).await,
+            _ => Err(StoreError::InvalidArgument("this ref lock cannot publish".into())),
+        }
+    }
+
+    /// [`Self::publish`] that may return as soon as the move is committed
+    /// (visible to readers), before it is durable, with a [`Durability`]
+    /// that resolves once it is (or fails if it cannot be made durable).
+    /// Lets a land queue publish its next batch (a later commit, so durable
+    /// no earlier than this one) while this one's fsync is in flight; its
+    /// requests must not be answered before the [`Durability`] resolves.
+    /// Stores without a cheaper path (Postgres) publish durably and return
+    /// a resolved one.
+    pub async fn publish_pipelined(
+        &mut self,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+        kind: &str,
+        derived: Vec<(Vec<u8>, Bytes)>,
+    ) -> Result<(CasOutcome, Durability)> {
+        match &mut self.0 {
+            Some(lock) if lock.can_publish() => {
+                lock.publish_pipelined(expected, new, kind, derived).await
+            }
             _ => Err(StoreError::InvalidArgument("this ref lock cannot publish".into())),
         }
     }

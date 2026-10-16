@@ -88,9 +88,9 @@ fn summary(outcomes: Vec<OpResult<LandOutcome>>) -> Vec<Result<LandOutcome, Stri
     outcomes.into_iter().map(|o| o.map_err(|e| e.to_string())).collect()
 }
 
-async fn check(changes: Vec<Change>) -> Result<(), TestCaseError> {
-    let batched = Backend::in_memory();
-    let sequential = Backend::in_memory();
+async fn check(make: fn(&str) -> Backend, changes: Vec<Change>) -> Result<(), TestCaseError> {
+    let batched = make("batched");
+    let sequential = make("sequential");
     let (seed, ids) = create(&batched, &changes).await;
     let (seed2, ids2) = create(&sequential, &changes).await;
     prop_assert_eq!(seed, seed2);
@@ -140,6 +140,18 @@ proptest! {
         changes in prop::collection::vec(change(), 1..24)
     ) {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(check(changes))?;
+        rt.block_on(check(ant_store::testing::test_backend, changes))?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+    /// The same on local stores (SQLite + pack files).
+    #[test]
+    fn batch_replay_matches_sequential_landing_local(
+        changes in prop::collection::vec(change(), 1..24)
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(check(ant_store::testing::local_backend, changes))?;
     }
 }

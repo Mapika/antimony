@@ -318,7 +318,7 @@ proptest! {
     fn ancestry_queries_match_the_oracle(d in dag(24), limit in 0usize..4) {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let result: Result<(), String> = rt.block_on(async {
-            let b = Backend::in_memory();
+            let b = ant_store::testing::test_backend("query_props");
             let ids = build(&b, &d).await;
             let o = Oracle::new(&d, ids);
             let n = d.0.len();
@@ -372,7 +372,7 @@ proptest! {
     ) {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let result: Result<(), String> = rt.block_on(async {
-            let b = Backend::in_memory();
+            let b = ant_store::testing::test_backend("query_props");
             let (d, main) = merge_heavy_dag(merges, seed);
             let ids = build(&b, &d).await;
             let o = Oracle::new(&d, ids);
@@ -425,7 +425,7 @@ proptest! {
     ) {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let result: Result<(), String> = rt.block_on(async {
-            let b = Backend::in_memory();
+            let b = ant_store::testing::test_backend("query_props");
             let (d, main, tips) = diverged_dag(steps, late, seed);
             let ids = build(&b, &d).await;
             let o = Oracle::new(&d, ids);
@@ -433,6 +433,29 @@ proptest! {
         });
         prop_assert!(result.is_ok(), "{:?} with {} steps, {} late, seed {}", result, steps, late, seed);
     }
+}
+
+/// The larger DAGs of the Postgres variants below, on a local store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ancestry_queries_match_the_oracle_local() {
+    let b = ant_store::testing::local_backend("query_props");
+    let (d, main, tips) = diverged_dag(1500, 8, 5);
+    let ids = build(&b, &d).await;
+    let o = Oracle::new(&d, ids);
+    check(&b, &o, diverged_pairs(d.0.len(), &main, &tips, 5, 120), 0).await.unwrap();
+    let b = ant_store::testing::local_backend("query_props");
+    let (d, main) = merge_heavy_dag(600, 11);
+    let ids = build(&b, &d).await;
+    let o = Oracle::new(&d, ids);
+    check(&b, &o, merge_heavy_pairs(d.0.len(), &main, 11, 120), 0).await.unwrap();
+    let b = ant_store::testing::local_backend("query_props");
+    let d = fixed_dag(300, 7);
+    let ids = build(&b, &d).await;
+    let o = Oracle::new(&d, ids);
+    let n = d.0.len();
+    let pairs: Vec<(usize, usize)> =
+        (0..n).step_by(7).flat_map(|x| (0..n).step_by(11).map(move |y| (x, y))).collect();
+    check(&b, &o, pairs, 5).await.unwrap();
 }
 
 #[tokio::test]

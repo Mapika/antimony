@@ -98,6 +98,65 @@ the last 64 MiB of decoded frames. `--pack-frames false`
 schema version 6 read (see Upgrading). `ant admin repack` rewrites the
 history as delta frames afterwards (`docs/operator-guide.md`, Repacking).
 
+## Local mode (one machine, no Postgres or S3)
+
+For one workstation running a few tens of agents, `--local` replaces
+Postgres and S3 with one data directory (SQLite metadata and small objects,
+pack files for large objects; see `docs/architecture.md`, Local mode):
+
+```sh
+ant local start                        # ant serve --local in the background; prints started <pid> <grpc> <http>
+ant local status                       # running <pid> <grpc> <http> (exit 0) | busy | stopped (exit 1)
+ant local stop                         # SIGTERM, waits until the directory is released
+ant serve --local /data/ant            # the same in the foreground, any directory
+```
+
+- **Directory.** `--local` without a value (and `ant local --dir`
+  omitted) means `$ANT_LOCAL_DIR`, else `$XDG_DATA_HOME/antimony/local`
+  (`~/.local/share/antimony/local`). `ant local start` keeps `server.pid`
+  and `server.log` there and passes extra `ant serve` flags after `--`
+  (`ant local start -- --policy policy.toml`).
+- **One process per directory.** The server holds `<dir>/LOCK`; offline
+  tools fail at once while it runs (`is in use by another process`). Import
+  and collect with the server stopped:
+  `ant local stop && ant import <git-dir> --local && ant admin gc --local && ant local start`.
+- **Durability.** By default every acknowledged write and land is fsynced
+  (group commit shares the fsyncs). `--local-sync normal` skips the fsync at
+  commit: a crash of the server loses nothing, an OS crash or power loss can
+  lose the last acknowledged lands (the database stays consistent).
+- **Resources.** Defaults: async workers min(4, CPUs) (`--worker-threads`),
+  server caches 48 MiB (`--cache-mib`), 4 SQLite readers
+  (`--local-readers`) with 8 MiB page cache each, decoded-frame cache 16 MiB
+  (`--local-frame-cache-mib`), concurrency limits of a 16-connection pool.
+  Idle, the server does no work at all.
+- **Garbage collection** (`ant admin gc --local`) is offline and immediate
+  (no quiesce wait): same roots and grace period as on Postgres, then packs
+  without live objects are deleted, packs at least half dead are compacted,
+  and the database is vacuumed when a quarter of it is free. `ant admin
+  repack` is not available in local mode.
+- **Backups.** Stop the server (or use SQLite's `.backup` on `meta.db`) and
+  copy the directory; pack files are append-only and never rewritten except
+  by `ant admin gc --local`.
+- **Moving to Postgres + S3** (or to another directory): stop the server
+  and copy the directory into the new stores, then serve those:
+
+  ```sh
+  ant local stop
+  ant admin copy-local --from ~/.local/share/antimony/local \
+      --pg-url postgres://... --pg-schema ant --s3-endpoint ... --s3-bucket ...
+  # objects <n> / commits <n> / derived <n> / refs <n>
+  ant serve --pg-url postgres://... --pg-schema ant --s3-endpoint ...
+  ```
+
+  Every object, commit record, changeset and derived row (landed-as and
+  import mappings, blame caches) is copied, then the refs the destination
+  does not have yet (others are listed as `skipped <ref> <id>` and left
+  alone). Ids do not change, so workspaces keep working against the new
+  server once `ANT_SERVER` points at it; the path-history index is rebuilt
+  on first use. The copy is idempotent: an interrupted one is run again.
+  (A mirror clone of the git export is not a way back in: the export is
+  SHA-256 and `ant import` reads SHA-1 repositories only.)
+
 ## Metrics and logs
 
 **Metrics.** `GET /metrics` on the HTTP port returns Prometheus (OpenMetrics
@@ -217,6 +276,12 @@ immediately.
   default 8, per process; ref-lock waits are bounded by `--pg-lock-timeout`,
   default 10s). Under sustained bulk import, autovacuum on `objects`
   shows up; give it I/O headroom.
+- **Local mode** (`docs/scorecard/2026-10-16-local-mode.md`, a busy
+  machine): about 500–1,000 lands/s at 16–50 agents (1,786/s in a quiet
+  moment), bounded by the single SQLite writer and fsync rather than CPU
+  (under one core); idle 16 MiB RSS and no CPU; under 50 agents 170–300
+  MiB; git/git import about 6,000 commits/s; checkouts and queries as fast
+  as on Postgres + S3.
 - **Clients:** the shared disk cache defaults to 20 GiB
   (`--cache-bytes` / `ANT_CACHE_BYTES`). Sparse workspaces keep checkouts
   proportional to what an agent actually touches.
@@ -342,4 +407,8 @@ not for deleted objects).
 
 - `scripts/scorecard.sh` runs the full v1 benchmark set on a quiet machine and
   writes a markdown report.
+- `scripts/scorecard-local.sh` runs the local-mode set (idle footprint,
+  fleets of 16 and 50 agents, git/git import, queries, checkouts, clones),
+  each server a separate `ant local start` process; run it under
+  `scripts/bench-lock.sh`.
 - `ant-bench` (`import`, `fleet`, `checkout`) runs individual measurements.

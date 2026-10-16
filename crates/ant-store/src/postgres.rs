@@ -113,18 +113,7 @@ macro_rules! live {
 /// one fsync per batch.
 const BULK_ENV: &str = "ANT_PG_BULK";
 
-/// Location of a packed object: the record of `len` bytes at `off` of pack
-/// `pack` (a frame shared with other objects, or the object alone).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct IndexEntry {
-    pub id: ObjectId,
-    pub pack: [u8; 16],
-    pub off: u64,
-    pub len: u32,
-    /// The part of a shared frame's bytes attributed to this object (`None`:
-    /// the whole record). Written, never read back by readers.
-    pub share: Option<u32>,
-}
+pub(crate) use crate::packed::IndexEntry;
 
 #[derive(Clone)]
 pub struct PgStore {

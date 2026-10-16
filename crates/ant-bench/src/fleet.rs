@@ -22,7 +22,10 @@ use rand::rngs::StdRng;
 
 use crate::json::J;
 use crate::rpc::{Client, agent_rng, connect, hex, read_back, seed_ref, sig, write_op};
-use crate::util::{Lat, Metrics, cpu_seconds, instrument, mib, peak_rss_bytes, write_json};
+use crate::util::{
+    Lat, Metrics, cpu_seconds, instrument, mib, peak_rss_bytes, proc_cpu_seconds,
+    proc_status_bytes, write_json,
+};
 
 const HOT_PATH: &str = "hot/counter.txt";
 const HOT_LINES: usize = 50;
@@ -40,6 +43,10 @@ pub struct Args {
     /// Serve in-process using the store flags below.
     #[arg(long)]
     pub embedded: bool,
+    /// Pid of the server process (with `--server`): report its RSS and CPU
+    /// time over the run (e.g. `ant local start` prints it).
+    #[arg(long, requires = "server")]
+    pub server_pid: Option<u32>,
     /// Files written per changeset.
     #[arg(long, default_value_t = 4)]
     pub files_per_change: usize,
@@ -403,6 +410,26 @@ pub async fn run(args: Args) -> Result<i32> {
         seed: args.seed,
     };
     let cpu0 = cpu_seconds().unwrap_or((0.0, 0.0));
+    let server_pid = args.server_pid.map(|p| p.to_string());
+    let server_status = server_pid.as_ref().map(|p| format!("/proc/{p}/status"));
+    let server_cpu0 = server_pid.as_deref().and_then(proc_cpu_seconds);
+    let server_rss0 = server_status.as_deref().and_then(|s| proc_status_bytes(s, "VmRSS"));
+    // The server's peak RSS during the run, sampled.
+    let sample_until = Instant::now() + Duration::from_secs(args.duration);
+    let sampler = server_status.clone().map(|path| {
+        tokio::spawn(async move {
+            let mut peak = 0u64;
+            loop {
+                if let Some(rss) = proc_status_bytes(&path, "VmRSS") {
+                    peak = peak.max(rss);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if Instant::now() >= sample_until {
+                    break peak;
+                }
+            }
+        })
+    });
     let start = Instant::now();
     let deadline = start + Duration::from_secs(args.duration);
     let handles: Vec<_> = (0..args.agents)
@@ -419,6 +446,13 @@ pub async fn run(args: Args) -> Result<i32> {
     }
     let wall = start.elapsed().as_secs_f64();
     let cpu1 = cpu_seconds().unwrap_or((0.0, 0.0));
+    let server_cpu1 = server_pid.as_deref().and_then(proc_cpu_seconds);
+    let server_peak = match sampler {
+        Some(h) => h.await.ok(),
+        None => None,
+    };
+    let server_hwm = server_status.as_deref().and_then(|s| proc_status_bytes(s, "VmHWM"));
+    let server_cpu = server_cpu0.zip(server_cpu1).map(|(a, b)| (b.0 - a.0, b.1 - a.1));
 
     let last: Vec<(String, Vec<u8>)> = std::mem::take(&mut tot.last).into_iter().collect();
     let v = verify(&mut admin, &args.ref_name, start_tip, &tot, last, agent_failures).await?;
@@ -461,6 +495,20 @@ pub async fn run(args: Args) -> Result<i32> {
         println!("peak RSS        {:.1} MiB (client + embedded server)", mib(r));
     }
     println!("cpu             user {:.1}s sys {:.1}s", cpu1.0 - cpu0.0, cpu1.1 - cpu0.1);
+    if let Some(pid) = &server_pid {
+        println!(
+            "server {pid}      RSS before {:.1} MiB, peak during run {:.1} MiB (VmHWM {:.1} MiB)",
+            mib(server_rss0.unwrap_or(0)),
+            mib(server_peak.unwrap_or(0)),
+            mib(server_hwm.unwrap_or(0))
+        );
+        if let Some((u, s)) = server_cpu {
+            println!(
+                "server cpu      user {u:.1}s sys {s:.1}s ({:.2} cores)",
+                (u + s) / wall.max(1e-9)
+            );
+        }
+    }
     if mode == "embedded" {
         metrics.print("server-side store timing (calls from all RPCs)");
     }
@@ -497,6 +545,11 @@ pub async fn run(args: Args) -> Result<i32> {
         .with("peak_rss_bytes", peak_rss_bytes())
         .with("cpu_user_s", cpu1.0 - cpu0.0)
         .with("cpu_sys_s", cpu1.1 - cpu0.1)
+        .with("server_rss_before_bytes", server_rss0)
+        .with("server_rss_peak_bytes", server_peak)
+        .with("server_vmhwm_bytes", server_hwm)
+        .with("server_cpu_user_s", server_cpu.map(|c| c.0))
+        .with("server_cpu_sys_s", server_cpu.map(|c| c.1))
         .with("history_growth", v.history_growth.map(|n| n as u64))
         .with("files_checked", v.files_checked)
         .with("invariants_pass", pass)

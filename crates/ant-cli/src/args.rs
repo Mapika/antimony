@@ -192,6 +192,12 @@ pub enum Command {
     },
     /// Run the antimony server (gRPC + HTTP object endpoint).
     Serve(Box<ant_server::serve::ServeArgs>),
+    /// A local-mode server (`ant serve --local`) in the background
+    /// (`local start`, `local stop`, `local status`).
+    Local {
+        #[command(subcommand)]
+        cmd: LocalCmd,
+    },
     /// Print a shell completion script.
     Completions {
         /// Target shell.
@@ -286,6 +292,11 @@ pub enum AdminCmd {
     /// commit records and S3 packs of aborted lands, abandoned changesets
     /// and failed imports. Safe while servers run; interrupted runs resume.
     Gc(GcArgs),
+    /// Copy a local data directory (`--local`) into the stores given by the
+    /// store flags, e.g. Postgres + S3: objects, commits, changesets,
+    /// derived data, then the refs the destination lacks. Offline (no
+    /// server may use the directory); idempotent.
+    CopyLocal(CopyLocalArgs),
     /// Rewrite stored objects with deltas chosen across the whole history
     /// (git-gc-style), keeping recent revisions one decode away. Postgres +
     /// S3 stores; safe while servers run; run again to resume.
@@ -383,6 +394,17 @@ pub struct SchemaArgs {
     /// start unless `--no-migrate`).
     #[arg(long)]
     pub migrate: bool,
+    #[command(flatten)]
+    pub store: StoreArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct CopyLocalArgs {
+    /// The local data directory to copy (default: `$ANT_LOCAL_DIR`, else
+    /// `~/.local/share/antimony/local`).
+    #[arg(long)]
+    pub from: Option<PathBuf>,
+    /// Destination store flags.
     #[command(flatten)]
     pub store: StoreArgs,
 }
@@ -655,4 +677,38 @@ mod tests {
         let cli = Cli::try_parse_from(["ant", "ref", "set", "main", "x", "--force"]).unwrap();
         assert!(matches!(cli.command, Command::Ref { cmd: RefCmd::Set { force: true, .. } }));
     }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LocalCmd {
+    /// Start `ant serve --local <dir>` in the background (nothing to do when
+    /// it already runs).
+    Start(LocalStartArgs),
+    /// Stop the background server of a data directory.
+    Stop(LocalDirArgs),
+    /// Whether a server uses the data directory.
+    Status(LocalDirArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct LocalDirArgs {
+    /// Data directory (default: `$ANT_LOCAL_DIR`, else
+    /// `~/.local/share/antimony/local`).
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct LocalStartArgs {
+    #[command(flatten)]
+    pub dir: LocalDirArgs,
+    /// gRPC listen address.
+    #[arg(long, default_value = "127.0.0.1:7420")]
+    pub grpc_listen: std::net::SocketAddr,
+    /// HTTP listen address.
+    #[arg(long, default_value = "127.0.0.1:7421")]
+    pub http_listen: std::net::SocketAddr,
+    /// More `ant serve` flags, after `--` (e.g. `-- --policy policy.toml`).
+    #[arg(last = true)]
+    pub serve_args: Vec<String>,
 }

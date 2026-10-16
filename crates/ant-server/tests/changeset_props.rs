@@ -259,7 +259,7 @@ async fn run_case(
     specs: Vec<OpSpec>,
     strict: bool,
 ) -> Result<(), TestCaseError> {
-    let b = Backend::in_memory();
+    let b = ant_store::testing::test_backend("changeset_props");
     let base = if use_base { base } else { Model::new() };
     let base_tree = store_model(&b, &base).await;
     let base_id = if use_base { Some(base_commit(&b, base_tree).await) } else { None };

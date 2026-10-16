@@ -210,6 +210,26 @@ const TREE_BUDGET: usize = 64 << 20;
 const COMMIT_BUDGET: usize = 8 << 20;
 const NODE_BUDGET: usize = 16 << 20;
 const CHANGESET_BUDGET: usize = 16 << 20;
+/// Sum of the default budgets of one store's caches.
+pub const DEFAULT_BUDGET_BYTES: usize =
+    TREE_BUDGET + COMMIT_BUDGET + NODE_BUDGET + CHANGESET_BUDGET;
+
+/// Total budget of the caches of one store, bytes (process-wide; read when
+/// a store's caches are created). Each cache gets its default share.
+static TOTAL_BUDGET: AtomicU64 = AtomicU64::new(DEFAULT_BUDGET_BYTES as u64);
+
+/// Set the total budget of the caches created from now on (e.g. smaller in
+/// local mode). Each cache keeps its share of [`DEFAULT_BUDGET_BYTES`];
+/// every cache may hold up to twice its budget (two generations).
+pub fn set_cache_budget(total_bytes: usize) {
+    TOTAL_BUDGET.store(total_bytes as u64, Ordering::Relaxed);
+}
+
+/// `budget` scaled to the configured total.
+fn share(budget: usize) -> usize {
+    let total = TOTAL_BUDGET.load(Ordering::Relaxed) as u128;
+    (budget as u128 * total / DEFAULT_BUDGET_BYTES as u128) as usize
+}
 
 pub(crate) const NODE_WEIGHT: usize = 160;
 
@@ -253,15 +273,15 @@ fn scoped<S: ?Sized, C>(
 
 pub(crate) fn objects(store: &Arc<dyn ObjectStore>) -> Arc<ObjectCaches> {
     scoped(&OBJECTS, store, || ObjectCaches {
-        trees: Cache::new(TREE_BUDGET, TREES),
-        commits: Cache::new(COMMIT_BUDGET, COMMITS),
+        trees: Cache::new(share(TREE_BUDGET), TREES),
+        commits: Cache::new(share(COMMIT_BUDGET), COMMITS),
     })
 }
 
 pub(crate) fn meta(store: &Arc<dyn MetaStore>) -> Arc<MetaCaches> {
     scoped(&META, store, || MetaCaches {
-        nodes: Cache::new(NODE_BUDGET, NODES),
-        changesets: Cache::new(CHANGESET_BUDGET, CHANGESETS),
+        nodes: Cache::new(share(NODE_BUDGET), NODES),
+        changesets: Cache::new(share(CHANGESET_BUDGET), CHANGESETS),
     })
 }
 
