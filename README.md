@@ -104,34 +104,36 @@ On `main`, unreleased (planned 0.2.0):
 ## How it compares to git
 
 antimony is not a git replacement for every workflow. It targets one case:
-many always-online writers on one large repository.
+many always-online writers on one large repository. A
+[head-to-head against tuned git](docs/scorecard/2026-10-16-vs-git.md) on the
+same machine (git/git and a 96k-file synthetic tree; git with aggressive gc,
+bitmaps, commit-graph with changed-path filters, untracked cache, cone sparse
+checkout, partial clone) measured:
 
-Where antimony is ahead:
+| operation | git | antimony |
+|---|---|---|
+| landing storm, 64 agents on one branch | 15.6 commits/s, p99 1.65 s (25 push attempts per change) | 2,287 commits/s, p99 137 ms |
+| checkout of the 96k-file tree, cold / warm | 18.8 s / 10.7 s | 7.0 s / 1.2 s |
+| sparse checkout, cold / warm | 2.9 s / 1.5 s | 1.05 s / 0.19 s |
+| blame, repeated / after a new commit | 323 ms / 307 ms | 19 ms / 16 ms |
+| merge-base, ancestor 12k commits back | 56 ms | 10 ms |
+| path log, full history | 101 ms | 210 ms |
+| merge-base, diverged branches | 54 ms | 193 ms |
+| status, clean, repeated | 78 ms | 118 ms |
+| storage (git/git) | 105 MiB (`gc --aggressive`) | 901 MiB (Postgres + S3) |
+| `git clone --filter=blob:none` | 1.5 s | 32 s (from antimony's git export) |
 
-- **Concurrent landing on one branch.** The server rebases and lands; agents
-  never fetch, rebase and retry a rejected push. Throughput above is with 64
-  agents on a single ref.
-- **History queries at scale.** Path log and blame read a per-ref index, so
-  their cost does not grow with history length, and no client needs the
-  history at all.
-- **Sparse and lazy clients.** An agent fetches only what it reads, through a
-  cache shared by every agent on the machine.
+Where antimony is ahead: concurrent landing (the server rebases and lands;
+agents never fetch, rebase and retry a rejected push), checkout and sparse
+workspaces, and repeated history queries, which come from server-side
+indexes and caches with no history on the client.
 
-Where git is ahead:
-
-- **Storage size.** antimony stores more than a git pack: about 14× for
-  rust-lang/rust in v0.1.0, 3.0× for git/git on `main`.
-- **Offline work.** antimony clients need the server for submit, land,
-  history and any object not yet cached.
-- **Ecosystem.** git has hosting, code review, CI integrations and tooling.
-  antimony has no code review, and its export accepts no pushes: writes go
-  through `ant submit` / `ant land`.
-- **Maturity and platforms.** antimony is 0.x; lazy FUSE workspaces are Linux
-  only and release binaries are x86_64 Linux.
-
-A head-to-head report against git on the same machine is in preparation and
-will be published under [docs/scorecard/](docs/scorecard/).
-<!-- TODO: link the head-to-head git comparison report once it lands in docs/scorecard/ -->
+Where git is ahead: storage size, serving clones (git reuses its packs;
+antimony's export builds packs on the fly), path log and diverged merge-base
+on mid-size histories, offline work, and the ecosystem (hosting, code review,
+tooling; antimony's export accepts no pushes). antimony is 0.x; lazy FUSE
+workspaces are Linux only. The report lists the caveats: one shared machine,
+different work per change in the storm, and git's weaker default durability.
 
 ## Quickstart
 

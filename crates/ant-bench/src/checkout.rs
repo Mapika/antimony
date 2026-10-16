@@ -252,7 +252,7 @@ pub async fn run(a: Args) -> Result<()> {
             let backend = ant_store::Backend::in_memory();
             let dirs = a.synthetic_dirs.unwrap_or(files / 10 * 7);
             let t = Instant::now();
-            let bytes = crate::synth::build(&backend, files, dirs, &a.rev).await?;
+            let bytes = crate::synth::build(&backend, files, dirs, &a.rev, None).await?;
             println!(
                 "synthetic: {files} files, {dirs} dirs, {:.1} MiB, built in {:.1}s",
                 mib(bytes),
