@@ -46,6 +46,11 @@
 //!   (events sent to them) and `ant_ref_watch_coalesced_events_total` (of
 //!   those, events covering an unknown number of moves: catch-ups, gap fills
 //!   and slow watchers' coalesced backlogs; see `ops::watch`).
+//! - `ant_s3_retries_total{reason=throttled|server_error|network|body|timeout}`
+//!   (S3 attempts retried), `ant_s3_gave_up_total` (S3 operations that failed
+//!   after retrying), `ant_s3_requests_in_flight`, `ant_s3_requests_queued`
+//!   (waiting for one of the `ant_s3_max_concurrency` slots); process-wide
+//!   counters of `ant_store::s3`, read on scrape.
 //! - `ant_build_info{version,git}` = 1 and, with Postgres,
 //!   `ant_pg_pool_size`, `ant_pg_pool_idle`, `ant_pg_pool_in_use`,
 //!   `ant_pg_pool_max` (0 for the in-memory backend).
@@ -151,6 +156,11 @@ struct CacheLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ReasonLabels {
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct BuildLabels {
     version: &'static str,
     git: &'static str,
@@ -236,6 +246,13 @@ pub struct Metrics {
     pg_idle: Gauge,
     pg_in_use: Gauge,
     pg_max: Gauge,
+    s3_retries: Family<ReasonLabels, Counter>,
+    s3_gave_up: Counter,
+    s3_in_flight: Gauge,
+    s3_queued: Gauge,
+    s3_max_concurrency: Gauge,
+    /// S3 client totals already folded into the counters.
+    s3_synced: Mutex<ant_store::s3::S3Stats>,
     recent_refs: Mutex<RecentRefs>,
     probes: Mutex<crate::health::Probes>,
     /// Cache lookup totals already folded into the counters (starts at the
@@ -427,7 +444,41 @@ impl Metrics {
             Gauge::default(),
         );
 
+        let s3_retries = register(
+            &mut registry,
+            "ant_s3_retries",
+            "S3 attempts retried, by reason",
+            Family::<ReasonLabels, Counter>::default(),
+        );
+        let s3_gave_up = register(
+            &mut registry,
+            "ant_s3_gave_up",
+            "S3 operations that failed after retrying (retry budget, attempts or operation timeout exhausted)",
+            Counter::default(),
+        );
+        let s3_in_flight = register(
+            &mut registry,
+            "ant_s3_requests_in_flight",
+            "S3 requests in flight",
+            Gauge::default(),
+        );
+        let s3_queued = register(
+            &mut registry,
+            "ant_s3_requests_queued",
+            "S3 requests waiting for a request slot",
+            Gauge::default(),
+        );
+        let s3_max_concurrency = register(
+            &mut registry,
+            "ant_s3_max_concurrency",
+            "Configured S3 request slots (0 without S3)",
+            Gauge::default(),
+        );
+
         // Closed label sets appear (as zeros) before their first event.
+        for reason in ant_store::s3::RETRY_REASONS {
+            let _ = s3_retries.get_or_create(&ReasonLabels { reason });
+        }
         for outcome in ["landed", "rebased", "conflict", "aborted", "denied"] {
             let _ = land_outcomes.get_or_create(&OutcomeLabels { outcome });
         }
@@ -467,6 +518,12 @@ impl Metrics {
             pg_idle,
             pg_in_use,
             pg_max,
+            s3_retries,
+            s3_gave_up,
+            s3_in_flight,
+            s3_queued,
+            s3_max_concurrency,
+            s3_synced: Mutex::new(ant_store::s3::stats()),
             recent_refs: Mutex::new(RecentRefs::default()),
             probes: Mutex::new(crate::health::Probes::default()),
             cache_synced: Mutex::new(lookup_counters()),
@@ -671,6 +728,22 @@ impl Metrics {
         }
         *synced = totals;
         drop(synced);
+
+        // S3 client: counters folded in as deltas, gauges as they are.
+        let s3 = ant_store::s3::stats();
+        let mut synced = crate::lock(&self.s3_synced);
+        for (i, reason) in ant_store::s3::RETRY_REASONS.into_iter().enumerate() {
+            self.s3_retries
+                .get_or_create(&ReasonLabels { reason })
+                .inc_by(s3.retries[i].saturating_sub(synced.retries[i]));
+        }
+        self.s3_gave_up.inc_by(s3.gave_up.saturating_sub(synced.gave_up));
+        *synced = s3;
+        drop(synced);
+        self.s3_in_flight.set(s3.in_flight);
+        self.s3_queued.set(s3.queued);
+        let slots = crate::lock(&self.probes).s3.as_ref().map_or(0, |s| s.max_concurrency());
+        self.s3_max_concurrency.set(i64::try_from(slots).unwrap_or(i64::MAX));
 
         let pg = crate::lock(&self.probes).pg.clone();
         if let Some(pg) = pg {
@@ -924,6 +997,18 @@ mod tests {
         assert!(text.contains("ant_build_info{"), "{text}");
         assert!(text.contains(r#"ant_land_outcomes_total{outcome="denied"} 0"#), "{text}");
         assert!(text.contains(r#"ant_cache_hits_total{cache="trees"}"#), "{text}");
+        for reason in ant_store::s3::RETRY_REASONS {
+            let line = format!(r#"ant_s3_retries_total{{reason="{reason}"}}"#);
+            assert!(text.contains(&line), "{text}");
+        }
+        for family in [
+            "ant_s3_gave_up_total",
+            "ant_s3_requests_in_flight",
+            "ant_s3_requests_queued",
+            "ant_s3_max_concurrency 0",
+        ] {
+            assert!(text.contains(family), "{family}: {text}");
+        }
         assert!(text.trim_end().ends_with("# EOF"));
     }
 }

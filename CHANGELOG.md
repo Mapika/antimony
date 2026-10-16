@@ -135,6 +135,27 @@ Planned as 0.2.0 (storage format change, schema version 7).
   frame per record (no delta chains), with a 64 MiB decoded-frame cache and
   a 64 MiB bound on frames being decoded per server.
 
+### Fixed
+
+- S3 throttling no longer fails `ant admin gc`, clones and reads. Transient
+  S3 failures (429, 503 `SlowDown`, 5xx, connection resets, timeouts, bodies
+  cut off mid-stream, as SeaweedFS does above its in-flight download limit)
+  were retried 5 times within about one second, so a short burst of
+  throttling failed a whole `ant admin gc` mark (`gave up after 5
+  attempt(s) in 1.05s: reading body: streaming error`). They are now retried
+  with exponential backoff and full jitter (pauses up to 5 s, `Retry-After`
+  honoured) for a time budget, `--s3-retry-budget` (`ANT_S3_RETRY_BUDGET`,
+  default 60 s, counted from the first failure); `--s3-max-attempts` now
+  defaults to 0 (no attempt limit). Client errors and corrupt data still fail
+  at once. A process keeps at most `--s3-max-concurrency`
+  (`ANT_S3_MAX_CONCURRENCY`, default 32) S3 requests in flight, so bursts
+  (GC mark, repack, clone planning, checkout bundles) queue instead of
+  overrunning the store. New metrics `ant_s3_retries_total{reason}`,
+  `ant_s3_gave_up_total`, `ant_s3_requests_in_flight`,
+  `ant_s3_requests_queued`, `ant_s3_max_concurrency`. Busy dev SeaweedFS
+  (two servers, 16 concurrent git/git clones and two `gc --dry-run`): 429s
+  749 -> 157, retried requests 564 -> 84, no failures, same throughput.
+
 ## [0.1.0] - 2026-10-16
 
 First release. Working end to end against real Postgres and S3, covered by
