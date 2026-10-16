@@ -166,8 +166,22 @@ binary's supported version is printed by `ant admin schema` as `supported <n>`.
   (cross-process fetch claims), `live/` (registrations of the processes
   using the cache), `batches/` (announcements of batches fetched without
   per-object claims: the batch's ids, 32 raw bytes each, in a file locked
-  while the fetch runs) and, for a cache tier, `bundles/` (bundle
-  index) sit next to `objects/`, which keeps its layout.
+  while the fetch runs), `packs/` (since 0.3.0, below) and, for a cache
+  tier, `bundles/` (bundle index) sit next to `objects/`, which keeps its
+  layout.
+- `packs/` (0.3.0): batches of 64 or more objects (a checkout's tree
+  bundles, batched fetches) are stored as one `<name>.pack` (`ANTPACK1`,
+  then the encoded objects back to back, uncompressed) plus `<name>.idx`
+  (`ANTPIDX1`, u32 BE count, then sorted 48-byte entries: id, u64 BE offset,
+  u32 BE length, u32 BE flags; flag bit 0 = the record is a zstd frame,
+  other bits reserved). Both are written under `.tmp.` names and renamed,
+  pack first, index last: a pack exists for readers once its index does.
+  Readers look in the packs before `objects/` and list `packs/` again on a
+  miss when it changed. Eviction counts a pack as one entry (by the pack's
+  mtime, which reads bump) and removes index then pack; a pack or index
+  without its partner is removed after an hour. Binaries before 0.3.0 ignore
+  `packs/`: they miss those objects, fetch them again into `objects/`, and
+  do not count packs toward the budget (an evictor of 0.3.0 or later does).
 - A **missing marker means version 1**, the layout from before markers
   existed; those caches and workspaces keep working.
 - Readers accept every version up to the one they were built for and

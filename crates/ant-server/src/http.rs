@@ -71,6 +71,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use bytes::Bytes;
 
 use crate::acl::{self, Access, Acl, AuthError};
 use crate::bundle::{self, Limits};
@@ -178,7 +179,13 @@ fn router_with_state(
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
         .route("/debug/stats", get(debug_stats))
-        .with_state(HttpState { backend, acl, probes: metrics.probes() });
+        .with_state(HttpState {
+            bundle_reads: Arc::new(bundle::Coalescer::new(backend.objects.clone())),
+            backend,
+            acl,
+            probes: metrics.probes(),
+            bundles: Arc::new(bundle::BundleCache::default()),
+        });
     if expose_metrics {
         router = router.merge(Router::new().route("/metrics", get(scrape)).with_state(metrics));
     }
@@ -212,12 +219,13 @@ async fn debug_stats(State(state): State<HttpState>, headers: HeaderMap) -> Resp
         }
         Ok(_) => {}
     }
-    ([(header::CONTENT_TYPE, "application/json")], stats_json()).into_response()
+    ([(header::CONTENT_TYPE, "application/json")], stats_json(&state.bundles)).into_response()
 }
 
 /// Cache entries and weights, store registrations, land queues and running
-/// catch-ups. Built by hand: the shape is fixed and no JSON crate is needed.
-fn stats_json() -> String {
+/// catch-ups, and the tree-bundle cache. Built by hand: the shape is fixed
+/// and no JSON crate is needed.
+fn stats_json(bundles: &bundle::BundleCache) -> String {
     let (caches, objects, metas) = crate::ops::cache::cache_stats();
     let caches: Vec<String> = caches
         .iter()
@@ -229,10 +237,13 @@ fn stats_json() -> String {
         })
         .collect();
     let (queues, requests) = crate::ops::land::queue_stats();
+    let (entries, bytes) = bundles.usage();
+    let (hits, misses) = bundle::cache_lookups();
     format!(
-        r#"{{"caches":[{}],"cache_stores":{{"objects":{objects},"meta":{metas}}},"land_queues":{{"queues":{queues},"requests":{requests}}},"catch_ups":{}}}"#,
+        r#"{{"caches":[{}],"cache_stores":{{"objects":{objects},"meta":{metas}}},"land_queues":{{"queues":{queues},"requests":{requests}}},"catch_ups":{},"bundle_cache":{{"entries":{entries},"bytes":{bytes},"budget_bytes":{},"hits":{hits},"misses":{misses}}}}}"#,
         caches.join(","),
         crate::ops::history::running_catch_ups(),
+        bundles.budget(),
     )
 }
 
@@ -241,6 +252,10 @@ struct HttpState {
     backend: Backend,
     acl: Acl,
     probes: crate::health::Probes,
+    /// Recently served tree bundles (`crate::bundle::BundleCache`).
+    bundles: Arc<bundle::BundleCache>,
+    /// The store as bundle builds read it (`crate::bundle::Coalescer`).
+    bundle_reads: Arc<bundle::Coalescer>,
 }
 
 fn authorization(headers: &HeaderMap) -> Option<&str> {
@@ -430,16 +445,34 @@ fn check_error(e: impl std::fmt::Display) -> Response {
 
 /// `GET /t/{hex}`: the tree bundle of `hex` (see the module docs).
 async fn get_tree_bundle(
-    State(HttpState { backend, acl, .. }): State<HttpState>,
+    State(HttpState { backend, acl, bundles, bundle_reads, .. }): State<HttpState>,
     Path(hex): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let mut res = tree_bundle(backend, acl, &hex, &headers).await;
+    let mut res = tree_bundle(backend, acl, &bundles, &bundle_reads, &hex, &headers).await;
     res.headers_mut().insert(ant_proto::bundle::HEADER, HeaderValue::from_static("1"));
     res
 }
 
-async fn tree_bundle(backend: Backend, acl: Acl, hex: &str, headers: &HeaderMap) -> Response {
+fn bundle_response(body: Bytes, cache: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(ant_proto::bundle::CONTENT_TYPE)),
+            (header::CACHE_CONTROL, HeaderValue::from_static(cache)),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn tree_bundle(
+    backend: Backend,
+    acl: Acl,
+    cached: &bundle::BundleCache,
+    reads: &bundle::Coalescer,
+    hex: &str,
+    headers: &HeaderMap,
+) -> Response {
     let access = match acl.authenticate_header(authorization(headers)) {
         Ok(a) => a,
         Err(e) => return unauthorized(BEARER_CHALLENGE, e),
@@ -455,14 +488,28 @@ async fn tree_bundle(backend: Backend, acl: Acl, hex: &str, headers: &HeaderMap)
             Err(e) => return backend_error(e, &id),
         }
     }
-    let units = match bundle::collect(backend.objects.as_ref(), id, Limits::default()).await {
+    // A cached bundle hid nothing: serve it to whoever may read all of it.
+    if let Some(hit) = cached.get(&id) {
+        let whole = match &access {
+            None => true,
+            Some(access) => match bundle_visibility(&backend, access, id, &hit.ids).await {
+                Ok((hidden, cache)) => hidden.is_empty() && cache == CACHE_IMMUTABLE,
+                Err(e) => return backend_error(e, &id),
+            },
+        };
+        if whole {
+            return bundle_response(hit.body.clone(), CACHE_IMMUTABLE);
+        }
+    }
+    let units = match bundle::collect(reads, id, Limits::default()).await {
         Ok(Some(units)) => units,
         Ok(None) => return not_found(),
         Err(e) => return backend_error(e, &id),
     };
+    let ids = bundle::visibility_ids(&units);
     let (hidden, cache) = match &access {
         None => (HashSet::new(), CACHE_IMMUTABLE),
-        Some(access) => match bundle_visibility(&backend, access, id, &units).await {
+        Some(access) => match bundle_visibility(&backend, access, id, &ids).await {
             Ok(v) => v,
             Err(e) => return backend_error(e, &id),
         },
@@ -474,14 +521,13 @@ async fn tree_bundle(backend: Backend, acl: Acl, hex: &str, headers: &HeaderMap)
     })
     .await;
     match body {
-        Ok(Ok(body)) => (
-            [
-                (header::CONTENT_TYPE, HeaderValue::from_static(ant_proto::bundle::CONTENT_TYPE)),
-                (header::CACHE_CONTROL, HeaderValue::from_static(cache)),
-            ],
-            body,
-        )
-            .into_response(),
+        Ok(Ok(body)) => {
+            let body = Bytes::from(body);
+            if hidden.is_empty() && cache == CACHE_IMMUTABLE {
+                cached.insert(id, body.clone(), ids);
+            }
+            bundle_response(body, cache)
+        }
         Ok(Err(e)) => backend_error(e, &id),
         Err(e) => backend_error(e, &id),
     }
@@ -497,27 +543,23 @@ async fn tree_bundle(backend: Backend, acl: Acl, hex: &str, headers: &HeaderMap)
 ///   caller). If the caller cannot read some remaining object, that is
 ///   hidden too and the response, now caller-specific, is
 ///   `private, no-store`; else it is `public` and immutable.
+///
+/// `ids`: [`bundle::visibility_ids`] of the bundle's units.
 async fn bundle_visibility(
     backend: &Backend,
     access: &Access,
     root: ObjectId,
-    units: &[bundle::Unit],
+    ids: &[ObjectId],
 ) -> Result<(HashSet<ObjectId>, &'static str), StoreError> {
-    let mut ids: Vec<ObjectId> = units
-        .iter()
-        .flat_map(|u| u.ids().copied().chain(u.refs.iter().copied()).collect::<Vec<_>>())
-        .collect();
-    ids.sort_unstable();
-    ids.dedup();
     let policy = &access.policy;
-    let private = acl::private_many(backend, policy, &ids).await?;
+    let private = acl::private_many(backend, policy, ids).await?;
     let root_private = ids.iter().zip(&private).any(|(id, p)| *id == root && *p);
     let mut hidden: HashSet<ObjectId> = if root_private {
         HashSet::new()
     } else {
         ids.iter().zip(&private).filter(|(_, p)| **p).map(|(id, _)| *id).collect()
     };
-    let readable = acl::readable(backend, policy, &access.principal, &ids).await?;
+    let readable = acl::readable(backend, policy, &access.principal, ids).await?;
     let mut shared = !root_private;
     for (id, ok) in ids.iter().zip(readable) {
         if !ok && hidden.insert(*id) {
@@ -547,9 +589,13 @@ mod tests {
 
     #[test]
     fn stats_json_has_expected_shape() {
-        let json = stats_json();
+        let json = stats_json(&crate::bundle::BundleCache::new(1024));
         assert!(json.starts_with(r#"{"caches":[{"name":"trees""#), "{json}");
         assert!(json.contains(r#""land_queues":{"queues":"#), "{json}");
+        assert!(
+            json.contains(r#""bundle_cache":{"entries":0,"bytes":0,"budget_bytes":1024,"#),
+            "{json}"
+        );
         assert!(json.ends_with('}'), "{json}");
         assert!(!json.contains('\n'));
     }

@@ -72,6 +72,13 @@ pub struct Args {
     /// `ant`), for the normal phases and `--clients`.
     #[arg(long)]
     pub no_dedup: bool,
+    /// Reach the server (gRPC and HTTP) through an in-process relay adding
+    /// this round trip in milliseconds (`crate::netem`).
+    #[arg(long, default_value_t = 0.0)]
+    pub rtt_ms: f64,
+    /// With the relay: cap each direction at this many Mbit/s.
+    #[arg(long)]
+    pub mbit: Option<f64>,
     #[arg(long, default_value = "main")]
     pub rev: String,
     /// Sparse pattern (repeatable); none = full checkout.
@@ -297,7 +304,17 @@ pub async fn run(a: Args) -> Result<()> {
         }
         _ => None,
     };
-    let client_http = cdn.as_ref().map(|c| c.url.clone()).or(http_url.clone());
+    let mut client_http = cdn.as_ref().map(|c| c.url.clone()).or(http_url.clone());
+    let link = crate::netem::Link::new(a.rtt_ms, a.mbit);
+    let server_url = if link.is_noop() {
+        server_url
+    } else {
+        if let Some(h) = &client_http {
+            client_http = Some(crate::netem::wrap_url(h, link).await?);
+        }
+        println!("netem: rtt +{} ms, {:?} Mbit/s per direction", a.rtt_ms, a.mbit);
+        crate::netem::wrap_url(&server_url, link).await?
+    };
     let remote = RemoteObjectStore::connect(&server_url, client_http.as_deref()).await?;
     let t = Instant::now();
     let commit = remote

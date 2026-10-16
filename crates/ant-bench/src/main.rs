@@ -18,6 +18,7 @@ mod fleet;
 mod git_fleet;
 mod import;
 mod json;
+mod netem;
 mod replicas;
 mod rpc;
 mod s3clean;
@@ -49,9 +50,11 @@ enum Cmd {
     Checkout(checkout::Args),
     /// Drive N server replicas with many agents for a long time; report per window.
     Soak(soak::Args),
+    /// Relay TCP with an added round trip and bandwidth cap (local WAN emulation).
+    Netem(netem::Args),
     /// Run a server (same as `ant serve`); used by `soak` to spawn replicas.
     #[command(hide = true)]
-    Serve(ant_server::serve::ServeArgs),
+    Serve(Box<ant_server::serve::ServeArgs>),
 }
 
 fn main() {
@@ -94,6 +97,7 @@ async fn run(cli: Cli) -> anyhow::Result<i32> {
         Cmd::Synth(args) => synth::run(args).await.map(|()| 0),
         Cmd::Checkout(args) => checkout::run(args).await.map(|()| 0),
         Cmd::Soak(args) => soak::run(args).await,
-        Cmd::Serve(args) => ant_server::serve::run(args).await.map(|()| 0),
+        Cmd::Netem(args) => netem::run(args).await.map(|()| 0),
+        Cmd::Serve(args) => ant_server::serve::run(*args).await.map(|()| 0),
     }
 }

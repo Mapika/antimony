@@ -26,23 +26,25 @@
 //!
 //! `materialize`:
 //! - `dir` must not exist or be empty (else `AlreadyExists` io error).
-//! - Walks the tree breadth-first, fetching each level's subtrees with one
-//!   `get_many` call. With a [`DirFetch`] (`materialize_with`; the CLI
+//! - Pipelined (`stream`): trees are fetched as soon as their parent is
+//!   decoded (batches of up to 64, up to 32 fetches in flight, no barrier
+//!   between depths). With a [`DirFetch`] (`materialize_with`; the CLI
 //!   passes its read-through store, which uses HTTP tree bundles when
 //!   `--http` is set), trees of directories wholly inside the sparse scope
-//!   are fetched with `DirFetch::get_dirs` instead, which may bring their
-//!   blobs and subdirectories into the cache in the same round trip. Skips subtrees that cannot contain a match
-//!   (`Sparse::may_contain_under(dir_path)`: true if any prefix pattern
-//!   starts with or is under that dir, or any glob pattern exists — globs are
-//!   not pruned).
-//! - Fetches blobs in batches of 512 ids per `get_many`, several batches in
-//!   flight at once (fetch, decode and file writes overlap). Tree levels are
-//!   decoded in parallel and all needed directories are created up front,
-//!   level by level in parallel. Each file is one `open` (mode set at
-//!   creation), one `write` and one `fstat`. Files get the right mode
+//!   are fetched with `DirFetch::get_dirs_with_contents`, and whatever came
+//!   with them (a bundle's subdirectories and blobs) is expanded and written
+//!   from memory without another request or a cache read. Skips subtrees
+//!   that cannot contain a match (`Sparse::may_contain_under(dir_path)`:
+//!   true if any prefix pattern starts with or is under that dir, or any
+//!   glob pattern exists — globs are not pruned).
+//! - Other blobs are fetched in batches of 512 ids per `get_many`. File
+//!   writes run on several blocking threads at once while the walk goes on;
+//!   parent directories are created as files need them (only directories
+//!   with files in scope exist afterwards). Each file is one `open` (mode
+//!   set at creation), one `write` and one `fstat`. Files get the right mode
 //!   (0o755 for Executable, 0o644 otherwise), symlinks via
 //!   `std::os::unix::fs::symlink`, gitlinks as empty directories (not
-//!   indexed).
+//!   indexed). Fetched content waiting for a writer is bounded (512 MiB).
 //! - Every written entry is indexed with its post-write stat.
 //!
 //! `status` (no network; uses only the index + local hashing):
@@ -79,6 +81,7 @@
 mod index;
 mod scan;
 mod sparse;
+mod stream;
 mod write;
 
 use std::collections::{HashMap, HashSet};
@@ -103,8 +106,7 @@ pub(crate) use index::{escape_path, unescape_path};
 use scan::{put_blobs, scan};
 pub use sparse::Sparse;
 use write::{
-    WriteItem, create_dirs, expand_tree, leaf_dirs, prepare_empty_dir, remove_leaf, write_items,
-    write_leaves,
+    Dest, WriteItem, expand_tree, prepare_empty_dir, remove_leaf, write_items, write_leaves,
 };
 
 const STATE_DIR: &str = ".ant";
@@ -139,6 +141,16 @@ pub trait DirFetch: Send + Sync {
     /// Like `ObjectStore::get_many(trees)` (same results, input order), but
     /// may also make the directories' contents local in the same round trip.
     async fn get_dirs(&self, trees: &[ObjectId]) -> ant_store::Result<Vec<Option<EncodedObject>>>;
+
+    /// [`get_dirs`](Self::get_dirs), plus objects that came with the trees
+    /// (e.g. a bundle's blobs and subdirectories), already stored locally:
+    /// a walk can use them without reading them back. Default: none.
+    async fn get_dirs_with_contents(
+        &self,
+        trees: &[ObjectId],
+    ) -> ant_store::Result<(Vec<Option<EncodedObject>>, Vec<(ObjectId, EncodedObject)>)> {
+        Ok((self.get_dirs(trees).await?, Vec::new()))
+    }
 }
 
 #[derive(Debug)]
@@ -171,20 +183,14 @@ impl Workspace {
         base_tree: ObjectId,
         sparse: Sparse,
     ) -> anyhow::Result<Self> {
-        let matcher = sparse.compile()?;
-
-        let leaves = walk_leaves(objects, dirs, matcher, base_tree).await?;
-
+        let matcher = Arc::new(sparse.compile()?);
         let d = dir.to_path_buf();
-        let levels = leaf_dirs(&leaves);
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            prepare_empty_dir(&d)?;
-            create_dirs(&d, &levels)
-        })
-        .await??;
+        tokio::task::spawn_blocking(move || prepare_empty_dir(&d)).await??;
 
         let mut index = Index::new();
-        for (key, entry) in write_leaves(objects, dir, &leaves, true).await? {
+        for (key, entry) in
+            stream::materialize_leaves(objects, dirs, dir, matcher, base_tree).await?
+        {
             if let Some(e) = entry {
                 index.insert(key, e);
             }
@@ -329,7 +335,7 @@ impl Workspace {
         })
         .await??;
 
-        for (key, entry) in write_leaves(objects, &self.dir, &writes, false).await? {
+        for (key, entry) in write_leaves(objects, &self.dir, &writes, Dest::Existing).await? {
             match entry {
                 Some(e) => {
                     index.insert(key, e);
@@ -393,10 +399,10 @@ impl Workspace {
             for p in &removed {
                 remove_leaf(&d, p)?;
             }
-            write_items(&d, items, false).map(|w| w.into_iter().collect())
+            write_items(&d, items, Dest::Existing).map(|w| w.into_iter().collect())
         })
         .await??;
-        written.extend(write_leaves(objects, &self.dir, &fetch, false).await?);
+        written.extend(write_leaves(objects, &self.dir, &fetch, Dest::Existing).await?);
         let d = self.dir.clone();
         let plan_paths: Vec<_> = plan
             .iter()

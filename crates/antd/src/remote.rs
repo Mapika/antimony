@@ -19,6 +19,8 @@
 //!   or decoding error, or a 404. A 404/405/501 without the `x-ant-bundle`
 //!   header means an older server without the route: bundles are then off
 //!   for this store (and its clones) and callers fetch per object.
+//! - At most 64 HTTP requests are in flight per store (shared by its clones
+//!   and by concurrent calls, e.g. a pipelined checkout's many fetches).
 //! - `http_requests()`: HTTP object and bundle requests issued so far.
 //! - `connect_with_token` sends `authorization: Bearer <token>` on every
 //!   RPC and HTTP object request (servers running with an access policy).
@@ -62,12 +64,25 @@ pub struct HttpRequests {
     pub bundles: u64,
 }
 
-#[derive(Default)]
 struct HttpState {
     objects: AtomicU64,
     bundles: AtomicU64,
     /// The server answered `/t/` like a server without the route.
     no_bundles: AtomicBool,
+    /// HTTP requests in flight, across all concurrent calls of this store
+    /// and its clones (a pipelined checkout has many calls in flight).
+    slots: tokio::sync::Semaphore,
+}
+
+impl Default for HttpState {
+    fn default() -> Self {
+        Self {
+            objects: AtomicU64::new(0),
+            bundles: AtomicU64::new(0),
+            no_bundles: AtomicBool::new(false),
+            slots: tokio::sync::Semaphore::new(HTTP_CONCURRENCY),
+        }
+    }
 }
 
 /// Adds `authorization: Bearer <token>` to every request when set.
@@ -208,6 +223,7 @@ impl RemoteObjectStore {
         if let Some(a) = &self.authorization {
             req = req.header(reqwest::header::AUTHORIZATION, a);
         }
+        let slot = self.state.slots.acquire().await.map_err(StoreError::backend)?;
         self.state.bundles.fetch_add(1, Ordering::Relaxed);
         let resp = send_get(req, &self.retry).await.map_err(StoreError::backend)?;
         let status = resp.status();
@@ -225,6 +241,7 @@ impl RemoteObjectStore {
             ))));
         }
         let body = resp.bytes().await.map_err(StoreError::backend)?;
+        drop(slot);
         let objects = tokio::task::spawn_blocking(move || decode_bundle(&body, tree))
             .await
             .map_err(StoreError::backend)??;
@@ -249,6 +266,7 @@ impl RemoteObjectStore {
                 let auth = auth.clone();
                 let state = self.state.clone();
                 async move {
+                    let _slot = state.slots.acquire().await.map_err(StoreError::backend)?;
                     state.objects.fetch_add(1, Ordering::Relaxed);
                     fetch_http_object(&http, &url, auth.as_deref(), &retry).await
                 }
