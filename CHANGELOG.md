@@ -53,6 +53,12 @@ Patch release: no storage or protocol changes; servers and clients of 0.2.0 inte
   machine with an unresponsive FUSE mount; it now uses `syncfs` on the
   cache's filesystem. `--no-dedup` now applies to the normal phases too, and
   each phase reports its kernel CPU time (`cpu_sys_s`).
+- `ant admin repack` could hang (until the S3 operation timeout, then
+  fail): while it waited for pack uploads it stopped polling the segments
+  it was reading, and a paused read keeps the S3 request slots it holds
+  (`--s3-max-concurrency`), which the uploads it waited for needed. It now
+  keeps every running read going and applies backpressure by not starting
+  new segments while uploads are behind.
 
 ## [0.2.0] - 2026-10-16
 
