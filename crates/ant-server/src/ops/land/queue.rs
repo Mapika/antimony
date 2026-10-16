@@ -26,6 +26,13 @@
 //! speculative batch is published within the turn (lock session) that wrote
 //! it. Otherwise (in-memory stores, ref lock unavailable) objects and records
 //! are written durably, then the CAS, then the mappings.
+//!
+//! **Pipelined publishes** (`RefLock::publish_pipelined`; the local store):
+//! the publish returns once committed, and the batch is answered only when
+//! its durability resolves (an fsync covering it), while the next batch
+//! already publishes. Readers may see a move a moment before it is durable;
+//! nobody who landed is told so before it is, and a later commit is never
+//! durable before an earlier one.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};

@@ -127,7 +127,14 @@ single machine running tens of agents without Postgres, S3 or Docker:
   commit order, so a land's publish (FULL) makes its deferred objects,
   commits and changesets durable first, the same argument as Postgres's
   `synchronous_commit = off`: unflushed commits are lost only by an OS crash,
-  which also ends the process holding the ref lock. Pack bytes are fsynced
+  which also ends the process holding the ref lock. The fsync is pipelined:
+  commits run with `synchronous = NORMAL` and a second thread fsyncs the
+  WAL and only then answers durable writes (and announces ref moves), while
+  the writer runs the next group; land publishes are answered after that
+  fsync while the land queue already publishes its next batch. Only commit
+  records, ref moves, land publishes and history watermarks wait for an
+  fsync; objects, derived rows and history rows become durable with the
+  next one, which always precedes anything that references them. Pack bytes are fsynced
   (shared `fdatasync`s across concurrent writers) before their index rows
   are written. `--local-sync normal` trades power-loss durability for speed.
 - **Ref events** go on the in-process feed after the transaction commits;
