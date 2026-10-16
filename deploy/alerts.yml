@@ -1,0 +1,78 @@
+# Minimal Prometheus alert rules for one antimony server (rule_files: in
+# prometheus.yml; scrape job name "antimony" -> 127.0.0.1:9100, see README.md).
+# Expressions come from docs/operator-guide.md section 5 ("Suggested alerts");
+# thresholds are starting points, tune them to your baseline.
+groups:
+  - name: antimony
+    rules:
+      - alert: AntimonyDown
+        expr: up{job="antimony"} == 0
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "ant serve is not answering scrapes"
+          description: "docker compose ps; docker compose logs --tail 200 ant"
+
+      - alert: AntimonyStoreErrors
+        expr: sum by (store, op) (rate(ant_store_errors_total[5m])) > 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "Postgres or S3 failing ({{ $labels.store }}/{{ $labels.op }})"
+          description: "Check `docker compose ps` (postgres, seaweedfs), free disk, and the ant log."
+
+      - alert: AntimonyLandsAborted
+        expr: sum(rate(ant_land_outcomes_total{outcome="aborted"}[5m])) > 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "Lands are being aborted (CAS exhaustion, database failover or store failure)"
+
+      - alert: AntimonyLandLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(ant_rpc_duration_seconds_bucket{method="Land"}[5m]))) > 0.25
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Land p99 above 250 ms (usually Postgres fsync latency or checkpoints)"
+
+      - alert: AntimonyPostgresPoolSaturated
+        expr: max by (instance) (ant_pg_pool_in_use / ant_pg_pool_max) > 0.9
+        for: 5m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Query pool above 90 percent in use"
+
+      - alert: AntimonyLoadShedding
+        expr: |
+          sum by (instance, class)
+            (rate(ant_ratelimit_rejected_total{reason=~"queue_full|queue_timeout"}[5m])) > 0
+        for: 2m
+        labels: {severity: ticket}
+        annotations:
+          summary: "The server is shedding load ({{ $labels.class }})"
+
+      - alert: AntimonyServerErrors
+        expr: |
+          sum by (method, code)
+            (rate(ant_rpc_requests_total{code=~"internal|unavailable|unknown|data_loss"}[5m])) > 0
+        for: 5m
+        labels: {severity: ticket}
+        annotations:
+          summary: "RPC errors: {{ $labels.method }} {{ $labels.code }}"
+
+      - alert: AntimonyHistoryLag
+        expr: max by (instance, ref) (ant_history_lag_commits{ref!="other"}) > 500
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "History index is not catching up on {{ $labels.ref }}"
+
+# Not in this file because compose does not run the exporters for them:
+#  - disk space of the Docker volume filesystem and of BACKUP_DIR (node_exporter:
+#    node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.15)
+#  - backup age: the mtime of $BACKUP_DIR/last-success (cron mail, healthchecks.io,
+#    or node_exporter's textfile collector)
+#  - TLS certificate expiry and external reachability: a blackbox probe of
+#    https://$ANT_DOMAIN/readyz (Caddy renews on its own; this catches port 80/443 or DNS breakage)

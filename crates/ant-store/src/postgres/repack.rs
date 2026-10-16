@@ -1051,12 +1051,12 @@ mod tests {
     async fn fresh() -> (PgStore, S3ObjectStore, Arc<dyn ObjectStore>) {
         let pg = PgStore::connect_scratch(
             &crate::testing::pg_url(),
-            &format!("t_rp_{}", rand::random::<u64>()),
+            &crate::testing::scratch_schema("rp"),
         )
         .await
         .unwrap();
         let cfg = S3Config::for_tests(&format!("rp{}", rand::random::<u64>()));
-        let s3 = S3ObjectStore::connect(&cfg).await.unwrap();
+        let s3 = S3ObjectStore::connect_scratch(&cfg).await.unwrap();
         s3.ensure_bucket().await.unwrap();
         let packed = PackedS3Store::new(pg.clone(), s3.clone());
         let tiered = TieredObjectStore::new(Arc::new(pg.clone()), Arc::new(packed), 64);

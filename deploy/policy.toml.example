@@ -1,0 +1,98 @@
+# Access policy for ant serve (compose mounts it as ./policy.toml; restart the
+# `ant` service after editing: `docker compose restart ant`). Format:
+# crates/ant-auth/src/lib.rs, threat model: docs/access-control.md.
+#
+# Tokens are bearer secrets; the policy stores only their SHA-256:
+#
+#   TOKEN=$(openssl rand -hex 16)           # give this to the agent as ANT_TOKEN
+#   printf %s "$TOKEN" | sha256sum | cut -d' ' -f1   # put this in token_sha256
+#
+# One principal per agent gives per-agent audit (the name appears in the
+# server log) and revocation (delete the entry, restart).
+#
+# Without a policy the server is in OPEN mode and anyone who can reach it can
+# read and write everything. Always run with one.
+
+# --- principals ------------------------------------------------------------
+
+# You. Bypasses every check; use for `ant ref set`, `ant admin ...`, imports.
+[[principal]]
+name = "admin"
+token_sha256 = "REPLACE_WITH_SHA256_OF_ADMIN_TOKEN"
+admin = true
+
+# One entry per agent. `groups` is how rules below address them.
+[[principal]]
+name = "agent-1"
+token_sha256 = "REPLACE_WITH_SHA256_OF_AGENT_1_TOKEN"
+groups = ["agents"]
+
+[[principal]]
+name = "agent-2"
+token_sha256 = "REPLACE_WITH_SHA256_OF_AGENT_2_TOKEN"
+groups = ["agents"]
+
+# Read-only consumer (CI, dashboards, humans browsing with `ant log` / git).
+[[principal]]
+name = "reader"
+token_sha256 = "REPLACE_WITH_SHA256_OF_READER_TOKEN"
+groups = ["readers"]
+
+# Used by deploy/git-mirror.sh. The git export needs read access to the whole
+# repository (it cannot filter trees), so this principal must be able to read
+# the root path (below, "" is readable by group:readers) or be admin.
+[[principal]]
+name = "mirror"
+token_sha256 = "REPLACE_WITH_SHA256_OF_MIRROR_TOKEN"
+groups = ["readers"]
+
+# --- paths -----------------------------------------------------------------
+# The rule with the longest matching prefix decides (rules do not merge); no
+# matching rule means denied. Everyone reads the repository, agents write it.
+[[path]]
+prefix = ""
+read = ["group:agents", "group:readers"]
+write = ["group:agents"]
+
+# Example of a restricted zone: only admin may read or change deploy secrets.
+# Agents' workspaces must then be sparse around it (see access-control.md).
+# [[path]]
+# prefix = "infra/secrets"
+# read = ["admin"]
+# write = ["admin"]
+
+# --- refs ------------------------------------------------------------------
+# First matching rule in file order decides; no match means denied.
+
+# `main`: every agent may land on it (the server queues and merges), only an
+# admin may move it by hand (`ant ref set main <id> --force`).
+[[ref]]
+pattern = "main"
+update = ["admin"]
+land = ["group:agents"]
+read = ["group:readers"]          # WatchRef, e.g. CI triggers
+
+# Scratch namespace per agent: its own refs only.
+[[ref]]
+pattern = "agents/agent-1/*"
+update = ["agent-1"]
+land = ["agent-1"]
+
+[[ref]]
+pattern = "agents/agent-2/*"
+update = ["agent-2"]
+land = ["agent-2"]
+
+# Release refs: agents may land, nothing else.
+# [[ref]]
+# pattern = "release/*"
+# update = ["admin"]
+# land = ["admin"]
+
+# --- optional per-principal rate limits -----------------------------------
+# Off by default. Size to the number of agents sharing a token; see
+# docs/operator-guide.md "Rate limits and load shedding".
+# [principal.limits] goes directly under the [[principal]] it applies to:
+#   [principal.limits]
+#   read  = { rps = 2000, burst = 4000 }
+#   write = { rps = 200 }

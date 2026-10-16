@@ -12,10 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{KillOnDrop, PG_URL, free_ports, unique_suffix};
+use common::{KillOnDrop, PG_URL, free_ports};
 
 const S3_ENDPOINT: &str = "http://localhost:9009";
-const S3_BUCKET: &str = "ant-e2e";
 
 /// Result of running one command, with helpers that dump everything on failure.
 struct Run {
@@ -229,11 +228,13 @@ fn cli_lazy_end_to_end() {
 }
 
 fn run_end_to_end(lazy: bool) {
-    let uniq = unique_suffix();
-    let schema = format!("e2e_{uniq}");
-    // Declared first, so it drops last (after the server) and also on panic.
+    let schema = ant_store::testing::scratch_schema("e2e");
+    // Declared first, so they drop last (after the server) and also on panic.
     let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
-    let prefix = format!("e2e/{uniq}/");
+    // The shared test bucket under a per-run prefix.
+    let s3_cfg = ant_store::s3::S3Config::for_tests("e2e");
+    let prefix = s3_cfg.prefix.clone();
+    let _s3 = ant_store::testing::S3PrefixGuard(s3_cfg.clone());
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
@@ -249,7 +250,7 @@ fn run_end_to_end(lazy: bool) {
         "--s3-endpoint",
         S3_ENDPOINT,
         "--s3-bucket",
-        S3_BUCKET,
+        &s3_cfg.bucket,
         "--s3-prefix",
         &prefix,
         "--s3-access-key",
@@ -599,7 +600,7 @@ fn check_bytes(ctx: &Ctx, what: &str, actual: &[u8], expected: &[u8]) {
 #[test]
 #[ignore = "needs docker compose up -d"]
 fn cli_schema_versions() {
-    let schema = format!("e2e_schema_{}", unique_suffix());
+    let schema = ant_store::testing::scratch_schema("e2e_schema");
     let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
     let tmp = tempfile::tempdir().expect("tempdir");
     let ctx = Ctx {
@@ -686,7 +687,7 @@ fn cli_schema_versions() {
 #[test]
 #[ignore = "needs docker compose up -d"]
 fn cli_gc() {
-    let schema = format!("e2e_gc_{}", unique_suffix());
+    let schema = ant_store::testing::scratch_schema("e2e_gc");
     let _schema = ant_store::postgres::SchemaGuard::new(PG_URL, &schema);
     let tmp = tempfile::tempdir().expect("tempdir");
     let ctx = Ctx {

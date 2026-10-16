@@ -8,6 +8,20 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+### Added
+
+- Clients accept `https://` gRPC server URLs (`ANT_SERVER=https://ant.example.com`),
+  verifying the TLS proxy in front of `ant serve` against the system roots
+  (`SSL_CERT_FILE` for a private CA). Before, an `https://` URL was spoken as
+  cleartext HTTP/2 and failed with `operation was canceled`.
+- `deploy/`: production single-host kit (compose with Caddy TLS, Postgres 17,
+  SeaweedFS), nightly backup and restore procedure, git mirror cron job.
+
+### Changed
+
+- Tests no longer leave Postgres schemas or S3 data behind; killed runs are
+  swept (`scripts/clean-test-data.sh`).
+
 ## [0.2.0] - 2026-10-16
 
 Storage format change (schema version 7): read docs/operations.md, "Upgrading", before upgrading from 0.1.x. Final scorecard: [docs/scorecard/2026-10-16-v0.2.0.md](docs/scorecard/2026-10-16-v0.2.0.md) (27/27); upgrade test from v0.1.0 on git/git: 90/90.

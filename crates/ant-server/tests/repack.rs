@@ -89,7 +89,7 @@ fn backend(pg: &Arc<PgStore>, s3: &S3ObjectStore) -> Backend {
 async fn repo() -> Repo {
     // Collections here do not wait for server caches.
     ant_server::ops::set_cache_max_age(Duration::ZERO);
-    let schema = format!("t_rp_{}", rand::random::<u64>());
+    let schema = ant_store::testing::scratch_schema("rp");
     let pg = Arc::new(PgStore::connect_scratch(&pg_url(), &schema).await.unwrap());
     let cfg = S3Config::for_tests(&format!("rp{}", rand::random::<u64>()));
     let guard = S3Guard(cfg.clone());

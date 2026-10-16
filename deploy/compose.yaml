@@ -1,0 +1,184 @@
+# antimony: single-host production stack (always-on server for AI agents).
+#
+#   caddy (TLS, :80/:443) -> ant serve (gRPC :7420, HTTP :7421) -> postgres + seaweedfs
+#
+# Only Caddy publishes ports. Everything else lives on the private compose
+# network. See README.md for the full procedure; copy .env.example to .env
+# first (compose refuses to start without the required variables).
+#
+# Sized for an 8 vCPU / 16 GB host. The memory limits below add up to ~12 GB so
+# the kernel keeps page cache for Postgres; lower them on a smaller host
+# (and shared_buffers in postgres.conf with them).
+
+name: antimony
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  ant:
+    image: ${ANT_IMAGE:-ghcr.io/mapika/antimony:0.2.0}
+    restart: unless-stopped
+    command: ["serve"]
+    environment:
+      ANT_PG_URL: postgres://ant:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/ant
+      ANT_PG_SCHEMA: ant
+      # One replica: no cross-replica ref locks needed (see operator guide).
+      ANT_PG_LOCK_CONNECTIONS: "0"
+      ANT_PG_MAX_CONNECTIONS: "64"
+      ANT_S3_ENDPOINT: http://seaweedfs:8333
+      ANT_S3_BUCKET: ${S3_BUCKET:-antimony}
+      ANT_S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY in .env}
+      ANT_S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY in .env}
+      ANT_S3_REGION: us-east-1
+      ANT_GRPC_LISTEN: 0.0.0.0:7420
+      ANT_HTTP_LISTEN: 0.0.0.0:7421
+      # /metrics only here, never on the public HTTP port. Not published; see
+      # the "metrics" port mapping below for host-local scraping.
+      ANT_METRICS_LISTEN: 0.0.0.0:9100
+      ANT_POLICY: /etc/antimony/policy.toml
+      ANT_LOG_FORMAT: json
+      RUST_LOG: ${ANT_LOG:-info}
+    volumes:
+      - ./policy.toml:/etc/antimony/policy.toml:ro
+    ports:
+      # Prometheus on the host (or an agent like node-exporter's sidecar) can
+      # scrape http://127.0.0.1:9100/metrics. Loopback only.
+      - "127.0.0.1:9100:9100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    healthcheck:
+      # /readyz checks Postgres and S3 (the image has bash, no curl).
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/7421 &&
+          printf 'GET /readyz HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3 &&
+          head -n1 <&3 | grep -q ' 200 '
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 3g
+    logging: *logging
+
+  postgres:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    environment:
+      POSTGRES_USER: ant
+      POSTGRES_DB: ant
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_INITDB_ARGS: "--data-checksums --encoding=UTF8 --auth-host=scram-sha-256"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres.conf:/etc/postgresql/postgresql.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ant -d ant -h 127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    # Postgres needs a clean shutdown to avoid crash recovery on every restart.
+    stop_grace_period: 2m
+    shm_size: 512mb
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 6g
+    logging: *logging
+
+  # S3 for objects larger than 4 KiB. SeaweedFS is what antimony's conformance,
+  # e2e, soak and benchmark suites run against, so it is the one combination
+  # known to work (see README.md for why not MinIO or Garage). The concurrency
+  # limits are raised exactly as in scripts/dev-services.sh: the defaults
+  # (64 MiB in flight) throttle range reads to roughly 16 at a time.
+  seaweedfs:
+    image: ${SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:3.97}
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        printf '{"identities":[{"name":"ant","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List","Tagging"]}]}' \
+          "$$S3_ACCESS_KEY" "$$S3_SECRET_KEY" > /tmp/s3.json
+        exec weed server -dir=/data -ip=seaweedfs -ip.bind=0.0.0.0 \
+          -master.volumeSizeLimitMB=2048 -volume.max=0 \
+          -volume.minFreeSpacePercent=5 \
+          -volume.concurrentDownloadLimitMB=512 -volume.concurrentUploadLimitMB=256 \
+          -filer.concurrentUploadLimitMB=256 \
+          -s3 -s3.port=8333 -s3.config=/tmp/s3.json
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY in .env}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY in .env}
+    volumes:
+      - seaweed:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O /dev/null http://127.0.0.1:9333/cluster/healthz && nc -z 127.0.0.1 8333
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 3g
+    logging: *logging
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      ANT_DOMAIN: ${ANT_DOMAIN:?set ANT_DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3 for browsers; gRPC clients use TCP
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      ant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:2019/config/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 256m
+    logging: *logging
+
+volumes:
+  pgdata:
+  seaweed:
+  caddy_data:
+  caddy_config:

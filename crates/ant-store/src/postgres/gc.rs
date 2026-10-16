@@ -1465,7 +1465,7 @@ pub(super) mod tests {
     use crate::testing::pg_url as url;
 
     async fn scratch() -> PgStore {
-        PgStore::connect_scratch(&url(), &format!("t_gc_{}", rand::random::<u64>())).await.unwrap()
+        PgStore::connect_scratch(&url(), &crate::testing::scratch_schema("gc")).await.unwrap()
     }
 
     async fn sql(s: &PgStore, stmt: &str) {

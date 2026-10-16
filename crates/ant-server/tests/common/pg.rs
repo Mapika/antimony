@@ -13,9 +13,10 @@ use futures::future::BoxFuture;
 
 pub use ant_store::testing::pg_url;
 
-/// A fresh schema name `<prefix>_<random>`.
+/// A fresh schema name `t_<prefix>_<unix secs>_<random>` (stale ones of
+/// killed runs are swept, see `ant_store::testing`).
 pub fn scratch_schema(prefix: &str) -> String {
-    format!("{prefix}_{}", rand::random::<u64>())
+    ant_store::testing::scratch_schema(prefix)
 }
 
 /// Every store of a backend on one Postgres store.

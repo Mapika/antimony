@@ -1,0 +1,76 @@
+# TLS front end for ant serve. Caddy obtains and renews the certificate for
+# $ANT_DOMAIN by itself (Let's Encrypt, HTTP-01/TLS-ALPN on 80/443: the DNS
+# A/AAAA record must already point here and both ports must be reachable).
+#
+# ant serve speaks two protocols on two ports and does not terminate TLS:
+#   :7420  gRPC (HTTP/2 cleartext = "h2c"): everything `ant` does
+#   :7421  HTTP/1.1: /o/<id> and /t/<tree> (objects, tree bundles),
+#          /repo.git (git export), /healthz, /readyz
+# One public hostname serves both: gRPC requests are recognised by their
+# `Content-Type: application/grpc` and sent to the h2c upstream, the rest goes
+# to the HTTP upstream. The metrics endpoint is on a third, private port.
+{
+	email {$ACME_EMAIL}
+	# The admin API stays inside the container (used by the healthcheck).
+	admin 127.0.0.1:2019
+}
+
+{$ANT_DOMAIN} {
+	@grpc protocol grpc
+
+	handle @grpc {
+		reverse_proxy h2c://ant:7420 {
+			# Stream responses as they come (WatchRef is a long-lived stream).
+			flush_interval -1
+			# Idle streams are fine; do not cut them off.
+			transport http {
+				versions h2c
+				read_timeout 0
+				write_timeout 0
+				dial_timeout 10s
+				keepalive 30s
+			}
+			# Ride out an `ant` restart (upgrade): keep retrying for a while
+			# instead of answering 503 at once.
+			lb_try_duration 30s
+			lb_try_interval 250ms
+			health_uri /healthz
+			health_port 7421
+			health_interval 5s
+			health_timeout 3s
+		}
+	}
+
+	handle {
+		# Never expose the debug and metrics routes publicly (the server also
+		# requires an admin token for /debug/stats, and serves /metrics only
+		# on its private listener; this is defence in depth).
+		@private path /debug/* /metrics
+		respond @private 404
+
+		reverse_proxy ant:7421 {
+			# git clone / object streams: no buffering, no response deadline.
+			flush_interval -1
+			transport http {
+				read_timeout 0
+				write_timeout 0
+				dial_timeout 10s
+			}
+			lb_try_duration 30s
+			lb_try_interval 250ms
+			health_uri /healthz
+			health_interval 5s
+			health_timeout 3s
+		}
+	}
+
+	# Objects and git packs are already compressed; large bodies are normal.
+	request_body {
+		max_size 2GB
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

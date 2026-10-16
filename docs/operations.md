@@ -32,7 +32,10 @@ logs a warning; never expose an open-mode server.
 
 Run it behind TLS. Bearer tokens are secrets, and the server itself does not
 terminate TLS. Put a reverse proxy (or a gRPC-aware load balancer) in front
-of both ports.
+of both ports. Clients (`ant`, `antd`) take an `https://` `ANT_SERVER` and
+verify the proxy's certificate against the system's trusted roots (set
+`SSL_CERT_FILE` for a private CA). A ready-made Caddy setup is in
+[deploy/](../deploy/README.md).
 
 
 ### S3 timeouts, retries and throttling
@@ -325,6 +328,15 @@ written.
 `scripts/dev-services.sh start|stop|status|wipe` runs Postgres and SeaweedFS
 as user processes on the ports the tests expect (no Docker needed).
 `docker compose up -d` is the equivalent with containers, and is what CI uses.
+
+Tests create scratch Postgres schemas (`t_<label>_<unix secs>_<random>`) and
+S3 prefixes (`<label>-t<unix secs>` in the shared `ant-test` bucket) and remove
+them when they finish, also on panic. A killed test run leaves them behind;
+every test process sweeps those older than 6 hours when it starts
+(`ANT_TEST_SWEEP_HOURS`), and `scripts/clean-test-data.sh` does the same on
+demand (`--all` when no test is running, `--drop-bucket` to also delete the
+S3 test bucket: SeaweedFS gives disk space back only for deleted buckets,
+not for deleted objects).
 
 ## Benchmarks
 

@@ -503,7 +503,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_new_schema_is_created_at_the_current_version() {
-        let schema = format!("t_mig_{}", rand::random::<u64>());
+        let schema = crate::testing::scratch_schema("mig");
         let _guard = SchemaGuard::new(&url(), &schema);
         let st = PgStore::schema_status(&url(), &schema).await.unwrap();
         assert_eq!((st.version, st.supported), (0, SCHEMA_VERSION));
@@ -543,7 +543,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_version_6_schema_upgrades_to_7() {
-        let schema = format!("t_mig_{}", rand::random::<u64>());
+        let schema = crate::testing::scratch_schema("mig");
         let _guard = SchemaGuard::new(&url(), &schema);
         let qs = quote_ident(&schema);
         let ql = qs.replace('\'', "''");
@@ -592,7 +592,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_newer_schema_is_refused() {
-        let schema = format!("t_mig_{}", rand::random::<u64>());
+        let schema = crate::testing::scratch_schema("mig");
         let s = PgStore::connect_scratch(&url(), &schema).await.unwrap();
         s.cas_ref("main", None, Some(ObjectId([1; 32]))).await.unwrap();
         let newer = SCHEMA_VERSION + 1;
@@ -628,7 +628,7 @@ mod tests {
     #[ignore = "needs postgres: docker compose up -d"]
     async fn pg_concurrent_startup_migrates_exactly_once() {
         for round in 0..3 {
-            let schema = format!("t_mig_{}", rand::random::<u64>());
+            let schema = crate::testing::scratch_schema("mig");
             let _guard = SchemaGuard::new(&url(), &schema);
             if round == 2 {
                 // An unversioned schema of the oldest layout.

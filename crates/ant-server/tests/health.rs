@@ -120,7 +120,7 @@ async fn unreachable_s3_is_not_ready() {
 async fn ready_with_postgres_and_s3() {
     let schema = common::pg::scratch_schema("health");
     let pg = PgStore::connect_scratch(&common::pg::pg_url(), &schema).await.unwrap();
-    let s3 = S3ObjectStore::connect(&S3Config::for_tests("health")).await.unwrap();
+    let s3 = S3ObjectStore::connect_scratch(&S3Config::for_tests("health")).await.unwrap();
     s3.ensure_bucket().await.unwrap();
     let probes = Probes { pg: Some(Arc::new(pg)), s3: Some(s3) };
 
