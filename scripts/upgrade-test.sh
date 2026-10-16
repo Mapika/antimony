@@ -92,6 +92,7 @@ log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT/run.log"; }
 sql() { PGPASSWORD=ant "$PSQL" -h 127.0.0.1 -p 54329 -U ant -d ant -qAtX -v ON_ERROR_STOP=1 -c "$1"; }
 FAILS=0
 pass() { echo "PASS $*" | tee -a "$RESULTS"; }
+skip() { echo "SKIP $*" | tee -a "$RESULTS"; }
 fail() { echo "FAIL $*" | tee -a "$RESULTS"; FAILS=$((FAILS + 1)); }
 # check <name> <command...>: PASS when the command succeeds.
 check() { local n="$1"; shift; if "$@" >> "$OUT/run.log" 2>&1; then pass "$n"; else fail "$n"; fi; }
@@ -333,6 +334,26 @@ fingerprint() {
 
 # refused <name> <command...>: exit 1, a `hint:` naming an upgrade, and no
 # change to the schema.
+# True when the old and the new binary support the same schema version (no
+# migration between them): then old binaries keep working on the store.
+schema_same() {
+    local o n
+    o=$("$OLD" admin schema --no-migrate "${STORE[@]}" 2>/dev/null | awk '/^supported /{print $2}')
+    n=$("$NEW" admin schema --no-migrate "${STORE[@]}" 2>/dev/null | awk '/^supported /{print $2}')
+    [ -n "$o" ] && [ "$o" = "$n" ]
+}
+# works <name> <command...>: the command runs against the store (exit 0, or
+# still serving when the timeout ends it: 124).
+works() {
+    local n="$1" rc=0
+    shift
+    timeout 20 "$@" > "$OUT/works.out" 2> "$OUT/works.err" || rc=$?
+    cat "$OUT/works.err" >> "$OUT/run.log"
+    if [ "$rc" = 0 ] || [ "$rc" = 124 ]; then pass "$n works (same schema version)"; else fail "$n: exit $rc, stderr: $(head -2 "$OUT/works.err" | tr '\n' ' ')"; fi
+}
+# Across a migration an old binary must refuse the store; without one it must
+# keep working.
+refused_or_works() { if schema_same; then works "$@"; else refused "$@"; fi; }
 refused() {
     local n="$1" rc=0 before after
     shift
@@ -395,7 +416,8 @@ inplace() {
     log "old: snapshot"
     snap "$OUT/a-old" "${o[@]:1}"
     s=$(sql "SELECT count(*) FROM $SCHEMA.derived WHERE kind = 'blame/v1'")
-    if [ "$s" -gt 0 ]; then pass "old server wrote $s blame/v1 rows"; else fail "no blame/v1 rows"; fi
+    OLD_V1=1
+    if [ "$s" -gt 0 ]; then pass "old server wrote $s blame/v1 rows"; else OLD_V1=0; skip "old version writes no blame/v1 rows (it already uses blame/v2)"; fi
     for f in ls-root cat-readme blame-history blame-dead log log-range diff-patch landed-as; do
         [ "$(cat "$OUT/a-old/$f.rc")" = 0 ] || fail "old snapshot $f failed: $(cat "$OUT/a-old/$f.stderr")"
     done
@@ -439,7 +461,9 @@ inplace() {
     # that reading one fails the identical-output checks below.
     sql "UPDATE $SCHEMA.derived SET value = '\\xdeadbeef'::bytea WHERE kind = 'blame/v1'"
     "$NEW" admin schema --no-migrate "${STORE[@]}" > "$OUT/schema-pending.txt" || true
-    if grep -q '^pending 6 pack_frames' "$OUT/schema-pending.txt"; then pass "new binary lists pending migration 6"; else fail "pending migrations: $(cat "$OUT/schema-pending.txt")"; fi
+    if schema_same; then
+        if ! grep -q '^pending ' "$OUT/schema-pending.txt"; then pass "no pending migrations (same schema version)"; else fail "unexpected pending migrations: $(cat "$OUT/schema-pending.txt")"; fi
+    elif grep -q '^pending ' "$OUT/schema-pending.txt"; then pass "new binary lists pending migrations: $(grep '^pending ' "$OUT/schema-pending.txt" | tr '\n' ' ')"; else fail "pending migrations: $(cat "$OUT/schema-pending.txt")"; fi
     local want
     want=$(awk '/^supported /{print $2}' "$OUT/schema-pending.txt")
     start_server NEW1 "$NEW"
@@ -521,12 +545,16 @@ inplace() {
     done
     local v1_dead
     v1_dead=$(sql "SELECT count(*) FROM $SCHEMA.derived WHERE kind = 'blame/v1' AND substr(key, 1, 32) = decode('$R_DEAD', 'hex')")
-    [ "$v1_dead" -gt 0 ] && pass "blame/v1 row of the unlanded commit present before gc" || fail "no blame/v1 row keyed by the unlanded commit"
+    if [ "$OLD_V1" = 1 ]; then
+        [ "$v1_dead" -gt 0 ] && pass "blame/v1 row of the unlanded commit present before gc" || fail "no blame/v1 row keyed by the unlanded commit"
+    fi
     "$NEW" admin gc --dry-run "${STORE[@]}" > "$OUT/gc-dry.txt" 2>> "$OUT/run.log"
     "$NEW" admin gc --quiesce 1s "${STORE[@]}" > "$OUT/gc.txt" 2>> "$OUT/run.log" && pass "gc after a month: $(tr '\n' ' ' < "$OUT/gc.txt")" || fail "gc after a month"
     v1_dead=$(sql "SELECT count(*) FROM $SCHEMA.derived WHERE kind = 'blame/v1' AND substr(key, 1, 32) = decode('$R_DEAD', 'hex')")
     s=$(sql "SELECT count(*) FROM $SCHEMA.derived WHERE kind = 'blame/v1'")
-    [ "$v1_dead" = 0 ] && pass "gc collected the blame/v1 rows of the dead commit ($s rows of live commits kept)" || fail "blame/v1 rows of the dead commit left: $v1_dead"
+    if [ "$OLD_V1" = 1 ]; then
+        [ "$v1_dead" = 0 ] && pass "gc collected the blame/v1 rows of the dead commit ($s rows of live commits kept)" || fail "blame/v1 rows of the dead commit left: $v1_dead"
+    fi
     # Restart: no cached state from before the collection.
     stop_server NEW1
     start_server NEW2 "$NEW"
@@ -541,12 +569,12 @@ inplace() {
     clone_check d-gc "$NEW2_HTTP" refs/heads/head
 
     log "downgrade attempt"
-    refused "old ant admin schema" "$OLD" admin schema "${STORE[@]}"
-    refused "old ant admin gc" "$OLD" admin gc --dry-run "${STORE[@]}"
-    refused "old ant import" "$OLD" import "$WORK/self.git" --git-ref refs/heads/imp --ref other "${STORE[@]}"
+    refused_or_works "old ant admin schema" "$OLD" admin schema "${STORE[@]}"
+    refused_or_works "old ant admin gc" "$OLD" admin gc --dry-run "${STORE[@]}"
+    refused_or_works "old ant import" "$OLD" import "$WORK/self.git" --git-ref refs/heads/imp --ref other "${STORE[@]}"
     read -r cp s < <(free_ports 2)
-    refused "old ant serve" "$OLD" serve "${STORE[@]}" --grpc-listen "127.0.0.1:$cp" --http-listen "127.0.0.1:$s"
-    refused "old ant serve --no-migrate" "$OLD" serve --no-migrate "${STORE[@]}" --grpc-listen "127.0.0.1:$cp" --http-listen "127.0.0.1:$s"
+    refused_or_works "old ant serve" "$OLD" serve "${STORE[@]}" --grpc-listen "127.0.0.1:$cp" --http-listen "127.0.0.1:$s"
+    refused_or_works "old ant serve --no-migrate" "$OLD" serve --no-migrate "${STORE[@]}" --grpc-listen "127.0.0.1:$cp" --http-listen "127.0.0.1:$s"
     snap "$OUT/e-after-downgrade" "$NEW" "$NEW2_GRPC" "$NEW2_HTTP" "$C/cache-new6"
     rm -f "$OUT"/e-after-downgrade/ref-src* "$OUT"/e-after-downgrade/blame-dead* "$OUT"/e-after-downgrade/merge-base*
     same "after the refused downgrade: outputs identical" "$OUT/a-cmp" "$OUT/e-after-downgrade"
@@ -569,6 +597,8 @@ rolling() {
     "${oa[@]}" -C "$C/ws-old" submit -m "old: look-alike files" > /dev/null
     check "old server A: land" "${oa[@]}" -C "$C/ws-old" land
 
+    local frames_before
+    frames_before=$(framed_rows)
     log "step 1: one new server with --pack-frames false (migrates)"
     start_server NEWA "$NEW" --pack-frames false
     s=$(sql "SELECT max(version) FROM $SCHEMA.schema_version")
@@ -583,7 +613,7 @@ rolling() {
     check "rolling: land through the new server" "${na[@]}" -C "$C/ws-new" land
     check "rolling: incremental import with --pack-frames false" \
         "$NEW" import "$WORK/self.git" --git-ref refs/heads/head --ref head --pack-frames false "${STORE[@]}"
-    s=$(framed_rows)
+    s=$(( $(framed_rows) - frames_before ))
     [ "$s" = 0 ] && pass "rolling: no frames written while --pack-frames false" || fail "rolling: $s framed index rows with frames off"
     # Old servers read what the new one wrote, and keep writing.
     "${ob[@]}" cat main:upgrade/big2/a.txt > "$C/read-ob" 2>> "$OUT/run.log" || true
@@ -603,7 +633,7 @@ rolling() {
     rm -rf "$d"
     local p1 p2
     read -r p1 p2 < <(free_ports 2)
-    refused "rolling: restarting an old server" "$OLD" serve "${STORE[@]}" --grpc-listen "127.0.0.1:$p1" --http-listen "127.0.0.1:$p2"
+    refused_or_works "rolling: restarting an old server" "$OLD" serve "${STORE[@]}" --grpc-listen "127.0.0.1:$p1" --http-listen "127.0.0.1:$p2"
 
     log "what the flag prevents: a frame read by an old server"
     start_server NEWX "$NEW"
