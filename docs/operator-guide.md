@@ -94,6 +94,47 @@ durable Postgres commit per land batch (about 5-8 ms per synchronous commit on
 that disk): your Postgres fsync latency is the first number to check on a new
 deployment.
 
+### On cloud boxes
+
+On Hetzner Cloud (ccx43 server box with Postgres, S3 and `ant serve`; a ccx33
+client box driving the fleet over the private network, RTT about 0.35 ms;
+[A/B record](scorecard/2026-10-16-hetzner-landing-ab.md)), 0.3.0 measured:
+
+| agents | lands/s | land p99 |
+|---|---|---|
+| 1 | 397-421 | 1.4-1.5 ms |
+| 16 | 2,746-2,803 | 6.0 ms |
+| 64 | 3,217-3,245 | 35-39 ms |
+
+The git/git import ran at 8,239-8,379 commits/s. Boxes of the same type vary
+by up to 2x, so measure your own. What matters on cloud machines:
+
+- **fsync latency** of the Postgres WAL disk (`pg_test_fsync`). On local NVMe
+  (0.1-0.3 ms) it is not the limit. On network block storage (1-5 ms per
+  flush) every land batch and every `create_changeset` waits one flush, so
+  expect proportionally higher latencies. Batches grow under load, so
+  throughput suffers less than latency. Keep `synchronous_commit = on`
+  (antimony relaxes it itself only where that is safe, see "Durability"
+  below). `commit_delay` made no measurable difference on NVMe.
+- **Server cores.** At 64 agents the server box used about 3.5 cores for
+  `ant serve` and 5 for Postgres.
+- **Turn on `track_io_timing` and `track_wal_io_timing`** so `pg_stat_wal`
+  shows flush times. `scripts/landing-bench.sh` samples what Postgres
+  backends wait on; mostly `LWLock:WALWrite` means commits queue for WAL
+  flushes.
+
+**Durability.** Every land is acknowledged only after one synchronous
+Postgres commit that moves the ref and records its landed-as mappings, on the
+session that holds the ref's advisory lock. The batch's new objects and
+commit records are written before it with `synchronous_commit = off`, on a
+*deferred lane* of connections (a quarter of `--pg-max-connections`). The
+WAL is sequential, so that synchronous commit flushes them too. If Postgres
+crashed in between, the lock's session is gone and the publish fails: a ref
+never points at lost data. History-index rows and watermarks are also
+written deferred (derived data, rows before the watermark that covers them,
+so a crash loses at most a suffix that the next catch-up redoes).
+`create_changeset` stays fully synchronous: a returned commit id is durable.
+
 A realistic fleet does not land continuously. The multi-replica soak (below)
 drives 1,000 agents who think about 500 ms between operations: 266k lands in
 30 minutes is about 148 lands/s across all replicas (plus the reads), far
@@ -133,8 +174,8 @@ cargo run --release -p ant-bench -- soak --replicas 2 --agents 300 --duration 60
 ### Memory per replica
 
 Budget about 700 MiB per replica to start (soak: 610-660 MiB at 1,000 agents
-with default caches). The in-process caches have fixed budgets: trees 64 MiB,
-commits 8 MiB, graph nodes 16 MiB, changesets 16 MiB, in two generations (a
+with default caches). The in-process caches have fixed budgets: trees 56 MiB,
+commits 8 MiB, graph nodes 16 MiB, changesets 16 MiB, small blobs 8 MiB, in two generations (a
 cache can briefly hold up to twice its budget). Watch `ant_cache_bytes` and
 the process RSS. On glibc the server caps malloc arenas at start
 (`--malloc-arenas` / `ANT_MALLOC_ARENAS`, default twice the CPU count up to
@@ -151,8 +192,9 @@ port.
 
 ### Postgres connection budget
 
-Each replica opens up to `--pg-max-connections` query connections (default 64)
-plus `--pg-lock-connections` lock connections (default 8; this bounds the
+Each replica opens up to `--pg-max-connections` query connections (default 64;
+a quarter of them, from four connections up, form the deferred-write lane, and
+`ant_pg_pool_max` reports the rest) plus `--pg-lock-connections` lock connections (default 8; this bounds the
 number of distinct refs being landed on at once per replica). Waiting for a
 ref lock is bounded by `--pg-lock-timeout` (`ANT_PG_LOCK_TIMEOUT`, default
 `10s`; accepts `500ms`, `10s`, `2m`); on expiry the land proceeds with CAS only.

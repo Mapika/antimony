@@ -27,13 +27,14 @@
 //! Concurrent requests are queued per backend and ref (`queue`). A detached
 //! worker takes the store's writer lock for the ref (`RefStore::lock_ref`: a
 //! Postgres advisory lock, so server replicas on one database take turns
-//! instead of racing their CAS) and holds it for a short turn of batches;
-//! when the lock is unavailable it lands with CAS only. Each batch replays up
-//! to 64 queued requests in arrival order in memory (`replay`), writes the
-//! new objects and commit records, then publishes the final tip with one
-//! CAS. Batches are pipelined: the next batch is replayed and written
-//! against the tentative tip while the previous one publishes, and is
-//! redone if that publish mismatches or fails. Conflicts do not advance the
+//! instead of racing their CAS) and holds it in turns of batches, handing
+//! it over between turns only when another session waits for it; when the
+//! lock is unavailable it lands with CAS only. Each batch replays up to 64
+//! queued requests in arrival order in memory (`replay`), writes the new
+//! objects and commit records, then publishes the final tip with one CAS.
+//! Batches are pipelined: later batches are replayed and written against
+//! the tentative tip while earlier ones write and publish, and are redone if
+//! a publish before them mismatches or fails. Conflicts do not advance the
 //! tentative tip; each reply carries the request's own resulting commit (or
 //! the tip it conflicted with). On CAS mismatch the batch is replayed from
 //! the new tip, rebasing the original commits again; after
@@ -150,3 +151,6 @@ mod batch_equivalence;
 
 #[cfg(test)]
 mod pipeline_tests;
+
+#[cfg(test)]
+mod turn_tests;

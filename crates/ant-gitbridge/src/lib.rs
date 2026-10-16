@@ -84,6 +84,8 @@ use crate::write::{Publisher, Recorder, write};
 const RECORD_COMMITS: usize = 1500;
 /// Resident file-backed memory above which mapped packs are released.
 const PACK_RSS_LIMIT: usize = 96 << 20;
+/// How often the converter releases mapped pack pages and free heap memory.
+const TRIM_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 /// Delta-base cache per git handle (one per worker thread).
 const DELTA_CACHE_BYTES: usize = 16 << 20;
 /// Largest memo, in objects (56 bytes each).
@@ -267,6 +269,7 @@ fn produce(
             }
             let r = (|| {
                 let mut chunks = 0usize;
+                let mut trimmed = std::time::Instant::now();
                 while let Some(chunk) = pipeline.next() {
                     for prep in chunk? {
                         conv.convert(prep)?;
@@ -283,9 +286,13 @@ fn produce(
                             conv.stats.fallback_ids
                         );
                     }
-                    if chunks.is_multiple_of(4) {
+                    // On a timer, not per chunk: `malloc_trim` walks every
+                    // arena (milliseconds per call) on this serial thread;
+                    // every 4 chunks it took ~40% of the conversion time.
+                    if trimmed.elapsed() >= TRIM_EVERY {
                         rss::trim_mapped_packs(PACK_RSS_LIMIT);
                         rss::release_heap();
+                        trimmed = std::time::Instant::now();
                     }
                 }
                 Ok::<(), anyhow::Error>(())

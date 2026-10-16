@@ -28,6 +28,15 @@
 //!   `clear_history` and rebuild from scratch.
 //! - Rows: for each commit on the chain, one row per path in its recorded
 //!   changeset (one batched `MetaStore::get_changesets` per batch), with the commit's generation.
+//! - The chain is walked through the node cache as far as it reaches
+//!   (recently landed commits) and the changesets come from the changeset
+//!   cache where present, so a catch-up behind a busy ref costs no chain
+//!   query.
+//! - Index writes (rows, watermark, a rebuild's clearing) use deferred
+//!   durability (`ant_store::deferred_durability`): the index is derived
+//!   data, each batch's rows commit before the watermark that covers them,
+//!   and the database log is sequential, so a crash loses at most a suffix
+//!   (never a watermark without its rows) and the next catch-up redoes it.
 //! - Batches of ≤ 1000 commits; write rows then CAS the watermark forward
 //!   (a concurrent catch-up winning the CAS is fine — rows are idempotent;
 //!   loops until the watermark is `tip` or the ref moves again).
@@ -113,8 +122,10 @@ pub struct BlameLine {
 
 /// Walk the first-parent chain from `tip` down to (excluding) `stop`, or to
 /// the root. Returns `(id, generation)` newest first and whether `stop` was
-/// reached (always false when `stop` is None). One store call per
-/// `CHAIN_CHUNK` commits.
+/// reached (always false when `stop` is None). Commits in the node cache
+/// (recently landed history, the common case of a catch-up behind a busy
+/// ref) are walked in memory; otherwise one store call per `CHAIN_CHUNK`
+/// commits.
 async fn walk_chain(
     b: &Backend,
     tip: ObjectId,
@@ -122,9 +133,18 @@ async fn walk_chain(
 ) -> OpResult<(Vec<(ObjectId, u64)>, bool)> {
     let mut out = Vec::new();
     let mut from = tip;
+    let nodes = &cache::meta(&b.meta).nodes;
     loop {
         if Some(from) == stop {
             return Ok((out, true));
+        }
+        if let Some(node) = nodes.get(&from) {
+            out.push((node.id, node.generation));
+            match node.parents.first() {
+                Some(parent) => from = *parent,
+                None => return Ok((out, false)),
+            }
+            continue;
         }
         let chunk = b.meta.first_parent_chain(from, stop, CHAIN_CHUNK).await?;
         let Some(last) = chunk.last() else {
@@ -193,7 +213,7 @@ async fn catch_up_rounds(
         let (mut chain, hit) = walk_chain(b, tip, wm).await?;
         if wm.is_some() && !hit {
             // Ref moved non-fast-forward: `chain` is the full new chain.
-            b.meta.clear_history(ref_name).await?;
+            ant_store::deferred_durability(b.meta.clear_history(ref_name)).await?;
             wm = None;
         }
         chain.reverse();
@@ -203,19 +223,23 @@ async fn catch_up_rounds(
             let end = (pos + INDEX_BATCH).min(chain.len());
             let batch = &chain[pos..end];
             let ids: Vec<ObjectId> = batch.iter().map(|(id, _)| *id).collect();
-            let sets = b.meta.get_changesets(&ids).await?;
+            let sets = cached_changesets(b, &ids).await?;
             let mut rows = Vec::new();
             for ((id, generation), set) in batch.iter().zip(sets) {
                 let set = set.ok_or_else(|| OpError::NotFound(format!("changeset of {id}")))?;
-                rows.extend(set.into_iter().map(|c| HistoryRow {
-                    path: c.path,
+                rows.extend(set.iter().map(|c| HistoryRow {
+                    path: c.path.clone(),
                     generation: *generation,
                     commit: *id,
                 }));
             }
-            b.meta.index_history(ref_name, &rows).await?;
+            // Deferred durability (see the module docs): the rows commit
+            // before the watermark that covers them.
+            ant_store::deferred_durability(b.meta.index_history(ref_name, &rows)).await?;
             let last = batch[batch.len() - 1].0;
-            if b.meta.set_history_watermark(ref_name, wm, last).await? {
+            if ant_store::deferred_durability(b.meta.set_history_watermark(ref_name, wm, last))
+                .await?
+            {
                 indexed += batch.len();
                 wm = Some(last);
                 pos = end;
@@ -239,6 +263,26 @@ async fn catch_up_rounds(
         }
     }
     Ok(indexed)
+}
+
+/// Index-aligned changesets, from the changeset cache where present (a
+/// catch-up behind a busy ref indexes what was just landed); misses are read
+/// from the store and not cached, so rebuilding a long history does not
+/// churn the cache.
+async fn cached_changesets(
+    b: &Backend,
+    ids: &[ObjectId],
+) -> OpResult<Vec<Option<Arc<Vec<PathChange>>>>> {
+    let mut out = cache::meta(&b.meta).changesets.get_many(ids);
+    let missing: Vec<ObjectId> =
+        ids.iter().zip(&out).filter(|(_, set)| set.is_none()).map(|(id, _)| *id).collect();
+    if !missing.is_empty() {
+        let mut fetched = b.meta.get_changesets(&missing).await?.into_iter();
+        for slot in out.iter_mut().filter(|set| set.is_none()) {
+            *slot = fetched.next().flatten().map(Arc::new);
+        }
+    }
+    Ok(out)
 }
 
 type CatchUpKey = (usize, String);

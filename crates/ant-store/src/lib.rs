@@ -241,6 +241,11 @@ pub trait RefLockRelease: Send + Sync {
         false
     }
 
+    /// See [`RefLock::contended`]. The default (unknown) says yes.
+    async fn contended(&mut self) -> Result<bool> {
+        Ok(true)
+    }
+
     /// See [`RefLock::publish`].
     async fn publish(
         &mut self,
@@ -293,6 +298,17 @@ impl RefLock {
         match self.0 {
             Some(lock) => lock.release().await,
             None => Ok(()),
+        }
+    }
+
+    /// Whether someone else is waiting for this lock (another server
+    /// replica, an import publishing the ref). A holder that takes turns
+    /// asks at the end of a turn and keeps the lock while nobody waits.
+    /// Stores that cannot tell, and an unheld lock, say yes.
+    pub async fn contended(&mut self) -> Result<bool> {
+        match &mut self.0 {
+            Some(lock) => lock.contended().await,
+            None => Ok(true),
         }
     }
 

@@ -181,6 +181,7 @@ pub async fn create_changeset_as(
         b.meta.put_commit(node.clone(), changes).await
     },)?;
 
+    cache::remember_blobs(b, &new_objects);
     let objects = cache::objects(&b.objects);
     objects.trees.insert_many(trees.into_iter().map(|(_, id, tree)| {
         let weight = cache::tree_weight(&tree);

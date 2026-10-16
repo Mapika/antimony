@@ -28,6 +28,52 @@ release of the 0.x series may change.
 - `ant-bench fleet --server-pid <pid>` reports the server's RSS and CPU over
   the run; `scripts/scorecard-local.sh` runs the headline benchmarks in local
   mode. Tests that ran in memory take `ANT_TEST_BACKEND=local`.
+- `scripts/landing-bench.sh` and `scripts/remote-bench.sh --what landing`
+  (`--landing-args`, `--extra-bins`): interleaved A/B runs of the landing
+  path and the import for several builds, Postgres options and server
+  arguments, with WAL, commit, CPU and Postgres wait-event statistics per
+  run. `scripts/dev-services.sh pg-restart` and `ANT_PG_OPTS`.
+
+### Performance
+
+Landing and import on cloud boxes (Hetzner ccx43 + ccx33, same-box A/B,
+[record](docs/scorecard/2026-10-16-hetzner-landing-ab.md)):
+- 64 agents: 2,335 → 3,231 lands/s, land p99 46 → 37 ms
+- `create_changeset` p50 at 64 agents: 5.5 → 3.2 ms
+- git/git import: 4,566 → 8,309 commits/s (peak RSS 0.88 → 1.03 GiB)
+
+- Land worker:
+  - It keeps the ref lock past a 20 ms turn while nobody waits for it
+    (`RefLock::contended`: `pg_locks` on Postgres, the lock table in
+    process), instead of draining its pipeline and re-locking every turn.
+    Another replica or an import still gets the lock within a turn.
+  - Batches go through three overlapping stages: in-memory replay, writes
+    (on their own task), publish. Up to two batches are prepared behind the
+    one publishing, each seeded with its predecessor's unwritten state.
+  - The batch-wide prefetch runs concurrently with the ref and mapping reads.
+- Postgres:
+  - A quarter of `--pg-max-connections` (from four up) forms a
+    deferred-write lane: sessions with `synchronous_commit = off` that serve
+    only the writes that are already deferred (a land batch's objects and
+    commit records before its durable publish, import writes under a
+    witness, history-index writes). One round trip instead of three, and no
+    queueing behind requests that wait for a WAL flush. Land and
+    `create_changeset` durability are unchanged.
+  - Query-pool connections are pinged before reuse only after a second idle.
+    sqlx pinged on every acquire: one extra round trip per statement.
+- History-index catch-up walks recently landed history through the node
+  and changeset caches instead of a recursive SQL chain query, and writes
+  its rows and watermark with deferred durability. The index is derived
+  data: rows commit before the watermark that covers them, so a crash loses
+  at most a suffix, which the next catch-up redoes.
+- A small-blob cache (8 MiB, blobs ≤ 64 KiB, taken from the tree cache's
+  budget; `ant_cache_*{cache="blobs"}`): land text merges of files that
+  agents keep editing no longer read them from the store.
+- Import: the converter releases mapped pack pages and free heap
+  (`malloc_trim`) every 250 ms instead of every 64 commits, where it took
+  about 40 % of the serial conversion time.
+- `deploy/postgres.conf`: `track_io_timing` and `track_wal_io_timing` on,
+  notes for cloud disks. The operator guide gains "On cloud boxes".
 
 ## [0.2.2] - 2026-10-16
 

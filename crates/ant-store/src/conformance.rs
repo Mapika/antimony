@@ -437,16 +437,26 @@ pub async fn ref_lock(a: Arc<dyn RefStore>, b: Arc<dyn RefStore>) {
     // Generous: a loaded shared database can stall for many seconds.
     const SOON: Duration = Duration::from_secs(60);
 
-    let held = a.lock_ref("main").await.unwrap();
+    let mut held = a.lock_ref("main").await.unwrap();
     assert!(held.is_held());
+    assert!(!held.contended().await.unwrap(), "nobody waits yet");
     let waiter = {
         let b = b.clone();
         tokio::spawn(async move { b.lock_ref("main").await.unwrap() })
     };
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!waiter.is_finished(), "a second writer must wait for the first");
-    // Other refs are independent.
-    let other = tokio::time::timeout(SOON, b.lock_ref("other")).await.unwrap().unwrap();
+    // The holder sees the waiter (a land worker then ends its turn).
+    tokio::time::timeout(SOON, async {
+        while !held.contended().await.unwrap() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the holder must see a waiting writer");
+    // Other refs are independent, and a lock on one is no waiter on another.
+    let mut other = tokio::time::timeout(SOON, b.lock_ref("other")).await.unwrap().unwrap();
+    assert!(!other.contended().await.unwrap());
     other.release().await.unwrap();
     held.release().await.unwrap();
     let second = tokio::time::timeout(SOON, waiter).await.unwrap().unwrap();

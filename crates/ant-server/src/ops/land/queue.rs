@@ -1,21 +1,32 @@
 //! Group commit: per-(backend, ref) request queues drained by a detached
 //! worker that replays each batch in memory and publishes it with one CAS.
 //!
-//! **Turns.** The worker takes the store's ref lock, lands batches while its
-//! queue is non-empty for up to [`LOCK_TURN`], then releases the lock (other
-//! replicas waiting for it get their turn) and takes it again.
+//! **Turns.** The worker takes the store's ref lock and lands batches while
+//! its queue is non-empty. Every [`LOCK_TURN`] it asks the lock whether
+//! anyone else waits for it (`RefLock::contended`: another replica, an
+//! import publishing the ref): if so, it finishes the turn, releases the
+//! lock (the waiter gets its turn) and takes it again; otherwise the turn
+//! goes on, so an uncontended ref keeps its pipeline full instead of
+//! draining it and replaying from scratch every turn.
 //!
-//! **Pipelining.** While a batch's publish is in flight, the worker drains
-//! the next batch and replays and writes it against the first batch's
-//! tentative tip, so the next batch is ready when the publish completes. The
-//! speculative batch is published only after its predecessor succeeded (its
-//! CAS expects the predecessor's tip), and it sees the predecessor's
-//! landed-as mappings before they are published (`carry`). If the
-//! predecessor's publish fails or mismatches, the speculative batch is
-//! discarded unreplied and its requests go back to the front of the queue.
-//! Its writes are unreachable and harmless: a replay rebuilds and rewrites
-//! everything it publishes. Replies are sent only after the batch's own
-//! publish (or, for a batch that moves nothing, its predecessor's).
+//! **Pipelining.** A batch goes through three stages: *prepare* (replay
+//! every request in memory on the tentative tip of the batch before it),
+//! *write* (its new objects and commit records, on a task of its own) and
+//! *publish* (one CAS, after its own writes and its predecessor's publish).
+//! The stages of consecutive batches overlap: while a batch's writes finish
+//! the worker prepares another one, and while a batch publishes it prepares
+//! (and starts writing) one more, up to [`MAX_AHEAD`] prepared batches
+//! behind the one publishing. A speculative batch is seeded with what its
+//! predecessor read and built (nodes, trees, blobs: not yet written or
+//! cached) and sees the landed-as mappings of every unpublished batch
+//! before it (`carry`). It is published only after all of them succeeded
+//! (its CAS expects its predecessor's tip). If a publish fails or
+//! mismatches, or a batch's writes fail, every batch behind it is discarded
+//! unreplied, once its writes are done, and its requests go back to the
+//! front of the queue in arrival order. Their writes are unreachable and
+//! harmless: a replay rebuilds and rewrites everything it publishes.
+//! Replies are sent only after the batch's own publish (or, for a batch that
+//! moves nothing, its predecessor's).
 //!
 //! **Durability.** When the lock can publish (`RefLock::publish`: Postgres),
 //! a batch's objects and commit records are written with deferred
@@ -50,6 +61,10 @@ use crate::metrics::Metrics;
 use crate::ops::{OpError, OpResult, cache};
 
 pub(super) const MAX_BATCH: usize = 64;
+
+/// Prepared batches a worker keeps behind the one it publishes: one whose
+/// writes are in flight and one being replayed (see the module docs).
+const MAX_AHEAD: usize = 2;
 
 /// How long a worker keeps landing under one ref lock while requests keep
 /// arriving. Short enough that replicas sharing the ref take turns often;
@@ -132,31 +147,72 @@ impl Worker {
     /// with no batch prepared and unpublished.
     async fn turn(&self, b: &Backend, lock: &mut RefLock) {
         let ref_name = self.key.ref_name.as_str();
-        let started = Instant::now();
+        let mut started = Instant::now();
         let deferred = lock.can_publish();
         // The ref's value, when this turn knows it (it published it).
         let mut known: Option<Option<ObjectId>> = None;
-        // A replayed and written batch whose predecessors are all published.
-        let mut ready: Option<Batch> = None;
+        // Prepared, unpublished batches in order, each built on its
+        // predecessor's tentative tip, their writes possibly in flight.
+        let mut pipeline: VecDeque<Batch> = VecDeque::new();
         let mut batches = 0usize;
         loop {
-            let mut current = match ready.take() {
+            let mut current = match pipeline.pop_front() {
                 Some(batch) => batch,
                 None => {
-                    if batches > 0 && started.elapsed() >= LOCK_TURN {
+                    if batches > 0 && !extend_turn(lock, &mut started).await {
                         return;
                     }
                     let Some(requests) = self.drain() else { return };
                     batches += 1;
                     let mut batch = Batch::new(requests);
-                    if let Err(error) = batch.replay(b, ref_name, known, None, deferred).await {
+                    if let Err(error) = batch.prepare(b, ref_name, known, None).await {
                         batch.fail(error);
                         known = None;
                         continue;
                     }
+                    batch.start_writes(b, deferred);
                     batch
                 }
             };
+            // While the current batch's writes finish, replay another one.
+            let mut ahead = None;
+            if pipeline.len() < MAX_AHEAD
+                && extend_turn(lock, &mut started).await
+                && let Some(requests) = self.drain()
+            {
+                batches += 1;
+                ahead = Some(Batch::new(requests));
+            }
+            let writes = current.writes.take();
+            let carry = unpublished_mappings(&current, &pipeline);
+            let newest = pipeline.back().unwrap_or(&current);
+            let (written, prepared) = futures::join!(
+                async {
+                    match writes {
+                        Some(writes) => writes.await.map_err(|error| {
+                            OpError::Aborted(format!("land writes failed: {error}"))
+                        })?,
+                        None => Ok(()),
+                    }
+                },
+                speculate(b, ref_name, deferred, ahead.as_mut(), newest, &carry)
+            );
+            if let Some(Err(error)) = prepared
+                && let Some(batch) = ahead.take()
+            {
+                batch.fail(error);
+            }
+            if let Err(error) = written {
+                // Everything built on it is void.
+                if let Some(batch) = ahead {
+                    self.requeue(batch.abandon().await);
+                }
+                self.requeue_all(&mut pipeline).await;
+                current.fail(error);
+                known = None;
+                continue;
+            }
+            pipeline.extend(ahead);
             // Read-only batches linearize at their start (already published).
             // Otherwise even conflict replies wait for the publish: their
             // tentative tips must exist in the published history.
@@ -165,25 +221,23 @@ impl Worker {
                 current.succeed();
                 continue;
             };
+            // While it publishes, replay (and write) one more.
             let mut next = None;
-            if started.elapsed() < LOCK_TURN
+            if pipeline.len() < MAX_AHEAD
+                && extend_turn(lock, &mut started).await
                 && let Some(requests) = self.drain()
             {
                 batches += 1;
                 next = Some(Batch::new(requests));
             }
-            let carry = current.state.pending.clone();
+            let carry = unpublished_mappings(&current, &pipeline);
+            let newest = pipeline.back().unwrap_or(&current);
             let mappings = current.mappings();
             let start = current.start;
-            let (published, speculated) =
-                futures::join!(publish(b, ref_name, lock, deferred, start, tip, mappings), async {
-                    match next.as_mut() {
-                        Some(next) => Some(
-                            next.replay(b, ref_name, Some(Some(tip)), Some(&carry), deferred).await,
-                        ),
-                        None => None,
-                    }
-                },);
+            let (published, speculated) = futures::join!(
+                publish(b, ref_name, lock, deferred, start, tip, mappings),
+                speculate(b, ref_name, deferred, next.as_mut(), newest, &carry)
+            );
             match published {
                 Ok((CasOutcome::Updated, durable)) => {
                     known = Some(Some(tip));
@@ -202,18 +256,23 @@ impl Worker {
                     }
                     match (next, speculated) {
                         (Some(next), Some(Err(error))) => next.fail(error),
-                        (next, _) => ready = next,
+                        (next, _) => pipeline.extend(next),
                     }
                 }
                 Ok((CasOutcome::Mismatch { actual }, _)) => {
                     if let Some(m) = current.requests.iter().find_map(|r| r.metrics.as_deref()) {
                         m.record_land_cas_retry();
                     }
+                    // Newest first, so the queue keeps arrival order.
                     if let Some(next) = next {
-                        self.requeue(next.requests);
+                        self.requeue(next.abandon().await);
                     }
-                    match current.retry(b, ref_name, actual, deferred).await {
-                        Ok(()) => ready = Some(current),
+                    self.requeue_all(&mut pipeline).await;
+                    match current.retry(b, ref_name, actual).await {
+                        Ok(()) => {
+                            current.start_writes(b, deferred);
+                            pipeline.push_front(current);
+                        }
                         Err(error) => {
                             current.fail(error);
                             known = None;
@@ -222,13 +281,22 @@ impl Worker {
                 }
                 Err(error) => {
                     if let Some(next) = next {
-                        self.requeue(next.requests);
+                        self.requeue(next.abandon().await);
                     }
+                    self.requeue_all(&mut pipeline).await;
                     current.fail(error);
                     // The lock's session may be gone: take the lock again.
                     return;
                 }
             }
+        }
+    }
+
+    /// Requeue every batch of `pipeline` (newest first, keeping arrival
+    /// order), abandoning its writes.
+    async fn requeue_all(&self, pipeline: &mut VecDeque<Batch>) {
+        while let Some(batch) = pipeline.pop_back() {
+            self.requeue(batch.abandon().await);
         }
     }
 
@@ -251,6 +319,59 @@ impl Worker {
             for request in requests.into_iter().rev() {
                 queue.push_front(request);
             }
+        }
+    }
+}
+
+/// Landed-as mappings of `current` and of every batch queued behind it, none
+/// of them published yet: a batch replayed after them must see them.
+fn unpublished_mappings(
+    current: &Batch,
+    pipeline: &VecDeque<Batch>,
+) -> BTreeMap<ObjectId, ObjectId> {
+    let mut carry = current.state.pending.clone();
+    for batch in pipeline {
+        carry.extend(batch.state.pending.iter().map(|(k, v)| (*k, *v)));
+    }
+    carry
+}
+
+/// Replay `batch` (if any) on the tentative tip of `newest`, the last
+/// unpublished batch, seeing `carry`, and start its writes. `None` when
+/// there is no batch.
+async fn speculate(
+    b: &Backend,
+    ref_name: &str,
+    deferred: bool,
+    batch: Option<&mut Batch>,
+    newest: &Batch,
+    carry: &BTreeMap<ObjectId, ObjectId>,
+) -> Option<OpResult<()>> {
+    let batch = batch?;
+    batch.state.seed(&newest.state);
+    let prepared = batch.prepare(b, ref_name, Some(newest.tip), Some(carry)).await;
+    if prepared.is_ok() {
+        batch.start_writes(b, deferred);
+    }
+    Some(prepared)
+}
+
+/// Whether the turn that began at `started` may go on: within
+/// [`LOCK_TURN`], or past it while nobody else waits for the lock (a new
+/// turn period then starts). A failed probe ends the turn.
+async fn extend_turn(lock: &mut RefLock, started: &mut Instant) -> bool {
+    if started.elapsed() < LOCK_TURN {
+        return true;
+    }
+    match lock.contended().await {
+        Ok(false) => {
+            *started = Instant::now();
+            true
+        }
+        Ok(true) => false,
+        Err(error) => {
+            tracing::warn!(%error, "probing the ref lock for waiters failed");
+            false
         }
     }
 }
@@ -281,8 +402,8 @@ async fn publish(
 }
 
 /// One group-commit batch: its requests, the replay state (kept across CAS
-/// retries: nodes, trees and blobs are immutable) and the latest replay's
-/// result.
+/// retries: nodes, trees and blobs are immutable), the latest replay's
+/// result and its writes in flight.
 struct Batch {
     requests: Vec<Request>,
     ids: Vec<ObjectId>,
@@ -291,6 +412,17 @@ struct Batch {
     start: Option<ObjectId>,
     tip: Option<ObjectId>,
     outcomes: Vec<OpResult<LandOutcome>>,
+    /// The latest replay's writes, running on their own task.
+    writes: Option<tokio::task::JoinHandle<OpResult<()>>>,
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        // Writes of a batch nobody publishes are unreachable: stop them.
+        if let Some(writes) = self.writes.take() {
+            writes.abort();
+        }
+    }
 }
 
 impl Batch {
@@ -307,6 +439,7 @@ impl Batch {
             start: None,
             tip: None,
             outcomes: Vec::new(),
+            writes: None,
         }
     }
 
@@ -315,35 +448,45 @@ impl Batch {
     }
 
     /// Replay every request in arrival order against `start` (`None`: read
-    /// the ref), then write what the replay built. `carry`: landed-as
-    /// mappings of an unpublished predecessor this replay builds on.
-    async fn replay(
+    /// the ref), in memory; [`Self::start_writes`] writes what it built.
+    /// `carry`: landed-as mappings of unpublished predecessors this replay
+    /// builds on.
+    async fn prepare(
         &mut self,
         b: &Backend,
         ref_name: &str,
         start: Option<Option<ObjectId>>,
         carry: Option<&BTreeMap<ObjectId, ObjectId>>,
-        deferred: bool,
     ) -> OpResult<()> {
-        let keys: Vec<_> = self.ids.iter().map(|id| id.as_bytes().as_slice()).collect();
-        // Independent reads, one round trip.
-        let (start, mapped) = match start {
-            Some(start) => (start, b.meta.get_derived_many(LANDED_AS, &keys).await?),
-            None => futures::try_join!(async { b.refs.get_ref(ref_name).await }, async {
-                b.meta.get_derived_many(LANDED_AS, &keys).await
-            })?,
+        let (ids, state, first) = (&self.ids, &mut self.state, self.replays == 0);
+        let keys: Vec<_> = ids.iter().map(|id| id.as_bytes().as_slice()).collect();
+        // Independent reads, concurrently: the tip and the mappings (one
+        // round trip), and on the first replay the batch-wide prefetch of
+        // nodes, then the changesets and messages a rebase needs
+        // (unrecorded ids are reported per request by `apply`).
+        let reads = async {
+            Ok::<_, OpError>(match start {
+                Some(start) => (start, b.meta.get_derived_many(LANDED_AS, &keys).await?),
+                None => futures::try_join!(async { b.refs.get_ref(ref_name).await }, async {
+                    b.meta.get_derived_many(LANDED_AS, &keys).await
+                })?,
+            })
         };
-        if self.replays == 0 {
-            // Batch-wide prefetch: nodes, then the changesets and messages a
-            // rebase needs (unrecorded ids are reported per request by `apply`).
-            self.state.prefetch(b, &self.ids).await?;
-            let recorded: Vec<_> =
-                self.ids.iter().copied().filter(|id| self.state.nodes.contains_key(id)).collect();
-            if !recorded.is_empty() {
-                cache::get_changesets(b, &recorded).await?;
-                cache::read_commits(b, &recorded).await?;
+        let prefetch = async {
+            if first {
+                state.prefetch(b, ids).await?;
+                let recorded: Vec<_> =
+                    ids.iter().copied().filter(|id| state.nodes.contains_key(id)).collect();
+                if !recorded.is_empty() {
+                    futures::try_join!(
+                        cache::get_changesets(b, &recorded),
+                        cache::read_commits(b, &recorded)
+                    )?;
+                }
             }
-        }
+            Ok(())
+        };
+        let ((start, mapped), ()) = futures::try_join!(reads, prefetch)?;
         self.replays += 1;
         for (id, mapped) in self.ids.iter().zip(mapped) {
             self.state.mappings.insert(*id, mapped);
@@ -364,16 +507,27 @@ impl Batch {
             outcomes.push(outcome);
         }
         (self.start, self.tip, self.outcomes) = (start, tip, outcomes);
-        // Every rebased commit is written and recorded before it can become
-        // reachable from the ref.
-        if self.moves() {
-            if deferred {
-                ant_store::deferred_durability(self.state.flush(b)).await?;
-            } else {
-                self.state.flush(b).await?;
-            }
-        }
         Ok(())
+    }
+
+    /// Write and record what the latest replay built, on a task of its own
+    /// (deferred durability when the lock publishes; see the module docs).
+    /// Every rebased commit is written and recorded before it can become
+    /// reachable from the ref: the worker waits for these writes before
+    /// publishing the batch.
+    fn start_writes(&mut self, b: &Backend, deferred: bool) {
+        let writes = self.state.take_writes();
+        if !self.moves() || writes.is_empty() {
+            return;
+        }
+        let b = b.clone();
+        self.writes = Some(tokio::spawn(async move {
+            if deferred {
+                ant_store::deferred_durability(writes.write(&b)).await
+            } else {
+                writes.write(&b).await
+            }
+        }));
     }
 
     /// Replay again from `actual` after a CAS mismatch, re-reading landed-as
@@ -383,7 +537,6 @@ impl Batch {
         b: &Backend,
         ref_name: &str,
         actual: Option<ObjectId>,
-        deferred: bool,
     ) -> OpResult<()> {
         if self.replays >= MAX_LAND_ATTEMPTS {
             return Err(OpError::Aborted(format!(
@@ -392,7 +545,7 @@ impl Batch {
         }
         self.state.pending.clear();
         self.state.mappings.clear();
-        self.replay(b, ref_name, Some(actual), None, deferred).await
+        self.prepare(b, ref_name, Some(actual), None).await
     }
 
     /// The landed-as mappings this batch publishes.
@@ -406,15 +559,26 @@ impl Batch {
             .collect()
     }
 
-    fn succeed(self) {
-        for (request, outcome) in self.requests.into_iter().zip(self.outcomes) {
+    /// The unanswered requests, for requeueing, once the batch's writes are
+    /// done (they are unreachable and harmless, and they finish within the
+    /// turn that started them, like everything written under the lock).
+    async fn abandon(mut self) -> Vec<Request> {
+        if let Some(writes) = self.writes.take() {
+            let _ = writes.await;
+        }
+        std::mem::take(&mut self.requests)
+    }
+
+    fn succeed(mut self) {
+        let outcomes = std::mem::take(&mut self.outcomes);
+        for (request, outcome) in std::mem::take(&mut self.requests).into_iter().zip(outcomes) {
             let _ = request.reply.send(outcome);
         }
     }
 
-    fn fail(self, error: OpError) {
+    fn fail(mut self, error: OpError) {
         let message = error.to_string();
-        for request in self.requests {
+        for request in std::mem::take(&mut self.requests) {
             let _ = request.reply.send(Err(OpError::Aborted(message.clone())));
         }
     }

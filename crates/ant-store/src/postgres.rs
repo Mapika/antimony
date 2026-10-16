@@ -22,7 +22,12 @@
 //! - Pool: `sqlx::postgres::PgPoolOptions` (default 64 connections; with
 //!   fewer, 64 concurrent agents queue on it), with `search_path` set to
 //!   the schema on every connection (`after_connect`) and JIT compilation
-//!   off (`SESSION_SETTINGS`). [`PgStore::connect_with`]
+//!   off (`SESSION_SETTINGS`). A quarter of the connections (from four up)
+//!   form the *deferred lane*: sessions opened with `synchronous_commit =
+//!   off` that serve only deferred-durability writes, in one round trip
+//!   each and without queueing behind requests that wait for a WAL flush.
+//!   Connections are pinged before reuse only after a second idle
+//!   (`ping_if_idle`). [`PgStore::connect_with`]
 //!   sets the limits ([`PgOptions`]) so several server processes fit under
 //!   the database's `max_connections`.
 //! - `lock_ref`: a session-level `pg_advisory_lock` on a hash of
@@ -36,8 +41,9 @@
 //!   in-process and with a `pg_notify` on [`crate::feed::PG_CHANNEL`] sent
 //!   after the commit by a notifier task; `watch_refs` relays every
 //!   replica's announcements from a `LISTEN` connection (`notify`).
-//! - Inside [`crate::deferred_durability`], object, changeset, commit and
-//!   derived writes commit with `SET LOCAL synchronous_commit = off`.
+//! - Inside [`crate::deferred_durability`], object, changeset, commit,
+//!   derived and history-index writes commit with `synchronous_commit =
+//!   off`: on the deferred lane, or with `SET LOCAL` when there is none.
 //! - Garbage collection ([`gc`]): objects, packed-object index rows, commits
 //!   and changesets carry their write time (`written_at`). Readers treat ids
 //!   condemned by a collection run (`gc_condemned`) as missing (object and
@@ -115,9 +121,37 @@ const BULK_ENV: &str = "ANT_PG_BULK";
 
 pub(crate) use crate::packed::IndexEntry;
 
+/// Query-pool connections idle at least this long are pinged before reuse;
+/// busier ones are handed out as they are.
+const PING_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `before_acquire` of the query pools: ping only connections that sat idle
+/// ([`PING_IDLE`]). sqlx's default pings on every acquire, which doubles the
+/// round trips of every statement and holds the connection meanwhile. A
+/// connection that broke while in use fails its statement and is replaced
+/// (sqlx tests every connection when it is released).
+fn ping_if_idle(
+    conn: &mut sqlx::PgConnection,
+    meta: sqlx::pool::PoolConnectionMetadata,
+) -> futures::future::BoxFuture<'_, std::result::Result<bool, sqlx::Error>> {
+    Box::pin(async move {
+        if meta.idle_for >= PING_IDLE {
+            sqlx::Connection::ping(conn).await?;
+        }
+        Ok(true)
+    })
+}
+
 #[derive(Clone)]
 pub struct PgStore {
     pool: sqlx::PgPool,
+    /// Connections whose sessions commit with `synchronous_commit = off`,
+    /// for deferred-durability writes ([`crate::deferred_durability`],
+    /// [`BULK_ENV`]): one round trip per write, and a lane of their own, so
+    /// a land worker's writes never queue behind requests that wait for a
+    /// WAL flush on the query pool. `None` (pools of fewer than four
+    /// connections): such writes use `SET LOCAL` on the query pool.
+    deferred: Option<sqlx::PgPool>,
     /// Connections that hold (or wait for) ref locks, separate from `pool`
     /// so lock holders can never starve the work they lock for. `None`
     /// (`lock_connections: 0`): no ref locks, for a single server process.
@@ -185,7 +219,9 @@ impl Drop for SchemaGuard {
 /// database adds up to `max_connections + lock_connections` connections.
 #[derive(Debug, Clone)]
 pub struct PgOptions {
-    /// Query pool size.
+    /// Query connections: a quarter of them (none below four) serve
+    /// deferred-durability writes (the deferred lane), the rest everything
+    /// else.
     pub max_connections: u32,
     /// Ref-lock pool size: refs that can be locked (or awaited) at once by
     /// this process. Connections close after a minute idle. 0 disables ref
@@ -348,6 +384,9 @@ impl PgStore {
         if !deferred {
             return query.fetch_all(&self.pool).await.map_err(be);
         }
+        if let Some(pool) = &self.deferred {
+            return query.fetch_all(pool).await.map_err(be);
+        }
         let mut tx = self.begin_write(true).await?;
         let rows = query.fetch_all(&mut *tx).await.map_err(be)?;
         tx.commit().await.map_err(be)?;
@@ -360,7 +399,14 @@ impl PgStore {
         deferred: bool,
     ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
         if deferred {
-            self.pool.begin_with("BEGIN; SET LOCAL synchronous_commit = off").await.map_err(be)
+            match &self.deferred {
+                Some(pool) => pool.begin().await.map_err(be),
+                None => self
+                    .pool
+                    .begin_with("BEGIN; SET LOCAL synchronous_commit = off")
+                    .await
+                    .map_err(be),
+            }
         } else {
             self.pool.begin().await.map_err(be)
         }
@@ -571,6 +617,7 @@ impl PgStore {
         Ok(Self {
             feed: notify::PgFeed::new(url, schema, pool.clone()),
             pool,
+            deferred: None,
             locks: None,
             schema: schema.to_owned(),
             async_object_commit: false,
@@ -593,8 +640,13 @@ impl PgStore {
         conn.close().await.map_err(be)?;
 
         let search_path = format!("SET search_path TO {qs}");
+        let deferred_path = search_path.clone();
+        // A quarter of the budget (none below four) is the deferred lane.
+        let deferred_connections = options.max_connections / 4;
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(options.max_connections)
+            .max_connections(options.max_connections - deferred_connections)
+            .test_before_acquire(false)
+            .before_acquire(ping_if_idle)
             .after_connect(move |conn, _meta| {
                 let stmt = search_path.clone();
                 Box::pin(async move {
@@ -605,6 +657,28 @@ impl PgStore {
             .connect_with(connect_options(url)?)
             .await
             .map_err(be)?;
+        let deferred = (deferred_connections > 0)
+            .then(|| {
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(deferred_connections)
+                    .min_connections(0)
+                    .test_before_acquire(false)
+                    .before_acquire(ping_if_idle)
+                    .after_connect(move |conn, _meta| {
+                        let stmt = deferred_path.clone();
+                        Box::pin(async move {
+                            sqlx::query(sqlx::AssertSqlSafe(stmt.as_str()))
+                                .execute(&mut *conn)
+                                .await?;
+                            Ok(())
+                        })
+                    })
+                    .connect_lazy_with(
+                        connect_options(url)?.options([("synchronous_commit", "off")]),
+                    );
+                Ok::<_, StoreError>(pool)
+            })
+            .transpose()?;
 
         // Lock waits are bounded server-side; a failed wait leaves the
         // connection clean.
@@ -634,6 +708,7 @@ impl PgStore {
         Ok(Self {
             feed: notify::PgFeed::new(url, schema, pool.clone()),
             pool,
+            deferred,
             locks,
             schema: schema.to_owned(),
             async_object_commit,
@@ -689,6 +764,20 @@ impl crate::RefLockRelease for PgRefLock {
 
     fn can_publish(&self) -> bool {
         self.conn.is_some()
+    }
+
+    /// Whether another session waits for this advisory lock (`pg_locks`).
+    async fn contended(&mut self) -> Result<bool> {
+        let Some(conn) = self.conn.as_mut() else { return Ok(true) };
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+               AND objsubid = 1 AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+               AND ((classid::bigint << 32) | objid::bigint) = hashtextextended($1, 0))",
+        )
+        .bind(&self.key)
+        .fetch_one(&mut **conn)
+        .await
+        .map_err(be)
     }
 
     /// One statement (one synchronous commit) on the lock's session: move the
@@ -1018,7 +1107,7 @@ impl MetaStore for PgStore {
             let gens: Vec<i64> = chunk.iter().map(|r| r.generation as i64).collect();
             let commits: Vec<&[u8]> =
                 chunk.iter().map(|r| r.commit.as_bytes().as_slice()).collect();
-            sqlx::query(
+            let query = sqlx::query(
                 "INSERT INTO history (ref, path, generation, commit_id) \
                  SELECT $1, t.p, t.g, t.c FROM unnest($2::text[], $3::bigint[], $4::bytea[]) \
                       AS t(p, g, c) \
@@ -1027,10 +1116,8 @@ impl MetaStore for PgStore {
             .bind(ref_name)
             .bind(&paths)
             .bind(&gens)
-            .bind(&commits)
-            .execute(&self.pool)
-            .await
-            .map_err(be)?;
+            .bind(&commits);
+            self.write(query, crate::durability_deferred()).await?;
         }
         let written = rows.len() as u64;
         let since =
@@ -1113,34 +1200,26 @@ impl MetaStore for PgStore {
         expected: Option<ObjectId>,
         new: ObjectId,
     ) -> Result<bool> {
-        let affected =
-            match expected {
-                None => {
-                    sqlx::query(
-                        "INSERT INTO history_watermark (ref, commit_id) VALUES ($1, $2) \
-                 ON CONFLICT (ref) DO NOTHING",
-                    )
-                    .bind(ref_name)
-                    .bind(new.as_bytes().as_slice())
-                    .execute(&self.pool)
-                    .await
-                }
-                Some(e) => sqlx::query(
-                    "UPDATE history_watermark SET commit_id = $3 WHERE ref = $1 AND commit_id = $2",
-                )
-                .bind(ref_name)
-                .bind(e.as_bytes().as_slice())
-                .bind(new.as_bytes().as_slice())
-                .execute(&self.pool)
-                .await,
-            }
-            .map_err(be)?
-            .rows_affected();
-        Ok(affected == 1)
+        let query = match expected {
+            None => sqlx::query(
+                "INSERT INTO history_watermark (ref, commit_id) VALUES ($1, $2) \
+                 ON CONFLICT (ref) DO NOTHING RETURNING 1",
+            )
+            .bind(ref_name)
+            .bind(new.as_bytes().as_slice()),
+            Some(e) => sqlx::query(
+                "UPDATE history_watermark SET commit_id = $3 \
+                 WHERE ref = $1 AND commit_id = $2 RETURNING 1",
+            )
+            .bind(ref_name)
+            .bind(e.as_bytes().as_slice())
+            .bind(new.as_bytes().as_slice()),
+        };
+        Ok(self.write(query, crate::durability_deferred()).await?.len() == 1)
     }
 
     async fn clear_history(&self, ref_name: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await.map_err(be)?;
+        let mut tx = self.begin_write(crate::durability_deferred()).await?;
         sqlx::query("DELETE FROM history WHERE ref = $1")
             .bind(ref_name)
             .execute(&mut *tx)
@@ -1733,6 +1812,46 @@ mod tests {
         let mut lock = s.lock_ref("main").await.unwrap();
         assert_eq!(lock.publish(None, id(7), "k", vec![]).await.unwrap(), CasOutcome::Updated);
         lock.release().await.unwrap();
+    }
+
+    /// `synchronous_commit` as a write of the given durability sees it, as a
+    /// single statement and inside a write transaction.
+    async fn commit_mode(s: &PgStore, deferred: bool) -> [String; 2] {
+        let q = || sqlx::query("SELECT current_setting('synchronous_commit') AS v");
+        let rows = s.write(q(), deferred).await.unwrap();
+        let single: String = rows[0].try_get("v").unwrap();
+        let mut tx = s.begin_write(deferred).await.unwrap();
+        let in_tx: String = q().fetch_one(&mut *tx).await.unwrap().try_get("v").unwrap();
+        tx.rollback().await.unwrap();
+        [single, in_tx]
+    }
+
+    /// Only deferred-durability writes skip the WAL flush wait: on the
+    /// deferred lane (sessions opened with `synchronous_commit = off`) or,
+    /// for pools too small for a lane, with `SET LOCAL` in their
+    /// transaction. Every other write, and the query pool itself, keeps the
+    /// database's synchronous commit.
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_only_deferred_writes_commit_asynchronously() {
+        let s = fresh().await;
+        assert!(s.deferred.is_some(), "default pools have a deferred lane");
+        assert_eq!(commit_mode(&s, false).await, ["on", "on"]);
+        assert_eq!(commit_mode(&s, true).await, ["off", "off"]);
+        // The lane never lends a connection to a durable write: the query
+        // pool still commits synchronously after the lane was used.
+        assert_eq!(commit_mode(&s, false).await, ["on", "on"]);
+
+        let small = PgStore::connect_scratch_with(
+            &crate::testing::pg_url(),
+            &crate::testing::scratch_schema("s"),
+            &PgOptions { max_connections: 3, ..PgOptions::default() },
+        )
+        .await
+        .unwrap();
+        assert!(small.deferred.is_none());
+        assert_eq!(commit_mode(&small, true).await, ["off", "off"]);
+        assert_eq!(commit_mode(&small, false).await, ["on", "on"]);
     }
 
     #[tokio::test]
