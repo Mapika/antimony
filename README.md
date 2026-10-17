@@ -108,6 +108,7 @@ local mode scorecard, the v0.2.0 scorecard (rows marked v0.2.0) and the
 | Landing, 16 agents | 2,746 to 2,803 lands/s | 2,576 lands/s, p99 7.0 ms |
 | `create_changeset` p50 | 3.2 to 3.3 ms at 64 agents, 1.4 to 1.5 ms at 16 | 1.9 ms at 16 agents |
 | Import git/git (82k commits) | 8,239 to 8,379 commits/s, 1.0 GiB peak RSS | 7,653 commits/s, 1.0 GiB peak RSS |
+| Import the Linux kernel (1,485,375 commits), one ccx53 (32 vCPU) | 237.5 s (6,254 commits/s), 3.6 GiB peak RSS | |
 | Import rust-lang/rust (343k commits, 1.1 GB pack) | | v0.2.0: 110 s (3,124 commits/s), 1.6 GiB peak RSS |
 | Soak: 4 replicas x 1,000 agents x 30 min | | v0.2.0: 266k lands, 0 errors, exact history, flat RSS |
 | Queries on git/git | path log 13.7 ms, blame 28.6 ms repeated (0.2.1, from a client over the network) | path log 9 ms, log -n 20 13 ms, blame 53 ms first, 13 ms cached |
@@ -296,6 +297,9 @@ every flag; `ant completions <shell>` prints a completion script.
 
 ## Status
 
+- **v0.4.1** (2026-10-17): the full Linux kernel imports in 4 minutes;
+  blame, patches and merges handle content that is not UTF-8; faster first
+  clone through the git export and a much faster GC mark.
 - **v0.4.0** (2026-10-17): local mode maintenance while serving
   (`ant admin gc --local`, `--gc-interval`, `ant admin repack --local`)
   and 2-6x faster local landing; local schema version 2.

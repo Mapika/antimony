@@ -8,6 +8,17 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-17
+
+Patch release: no Postgres, local schema or on-disk format changes; two new
+optional gRPC fields. 0.4.0 and 0.4.1 servers and clients interoperate.
+Follow-ups from importing the full Linux kernel (1,485,375 commits in
+237.5 s on one Hetzner ccx53, Postgres + S3 on the same box): blame,
+patches and merges of content that is not UTF-8, a faster first clone
+through the git export, and a garbage-collection mark that scales to
+kernel-size stores. The kernel figures below for the clone and the mark
+are projections from smaller stores.
+
 ### Added
 
 - gRPC (additive): `BlameLine.raw` and `Hunk.raw_lines` carry the exact
@@ -28,6 +39,21 @@ release of the 0.x series may change.
   delta under 64 bytes (pack +0.3%). New metrics
   `ant_pack_frame_decodes_total` and `ant_pack_frame_decoded_bytes_total`.
 
+- `ant admin gc` (Postgres + S3 and local mode) marks reachable data in
+  memory: commit records are loaded with one scan, trees are read level by
+  level in history order with parallel reads, and every object is expanded
+  once; the mark set is written to Postgres with one `COPY`. The mark used
+  to insert every entry of every tree into a working table, one batch at a
+  time. Dry run on a kernel-shaped synthetic history (250,000 commits,
+  2.3M objects): mark 227 s → 7-9 s before `ant admin repack`, 354 s →
+  14-29 s after it; git/git: 102 s → 1.7 s. A kernel-size store (11.7M
+  objects), which did not finish marking in 30 minutes, should mark in
+  about 1-2 minutes. The marker needs about 90 bytes per reachable object
+  while it runs (about 1 GB for the Linux kernel's history).
+- The condemn step of a Postgres collection reads only each chunk's id
+  range of the mark set instead of all of it per chunk (synthetic history:
+  14 s → 4 s, 57 s → 3-6 s after repack).
+
 ### Fixed
 
 - File content that is not UTF-8 (Latin-1 names in old histories, as in
@@ -46,23 +72,6 @@ release of the 0.x series may change.
     instead of a lossy rendering.
   - A `.gitignore` (or `.ant/ignore`) that is not UTF-8 no longer disables
     all of its rules: invalid bytes match nothing, the other lines apply.
-
-### Performance
-
-- `ant admin gc` (Postgres + S3 and local mode) marks reachable data in
-  memory: commit records are loaded with one scan, trees are read level by
-  level in history order with parallel reads, and every object is expanded
-  once; the mark set is written to Postgres with one `COPY`. The mark used
-  to insert every entry of every tree into a working table, one batch at a
-  time. Dry run on a kernel-shaped synthetic history (250,000 commits,
-  2.3M objects): mark 227 s → 7-9 s before `ant admin repack`, 354 s →
-  14-29 s after it; git/git: 102 s → 1.7 s. A kernel-size store (11.7M
-  objects), which did not finish marking in 30 minutes, should mark in
-  about 1-2 minutes. The marker needs about 90 bytes per reachable object
-  while it runs (about 1 GB for the Linux kernel's history).
-- The condemn step of a Postgres collection reads only each chunk's id
-  range of the mark set instead of all of it per chunk (synthetic history:
-  14 s → 4 s, 57 s → 3-6 s after repack).
 
 ## [0.4.0] - 2026-10-17
 
@@ -930,7 +939,8 @@ Also in this release:
   around restricted paths, and principals sharing a cache directory share
   what it holds.
 
-[Unreleased]: https://github.com/Mapika/antimony/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Mapika/antimony/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/Mapika/antimony/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Mapika/antimony/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/Mapika/antimony/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Mapika/antimony/compare/v0.3.0...v0.3.1
