@@ -40,6 +40,16 @@ release of the 0.x series may change.
   (condemned ids written or referenced again before the sweep) like
   Postgres runs, and no longer fails while a server uses the directory.
 
+### Fixed
+
+- Garbage collection (Postgres and local) reports as `missing` only ids
+  that refs, history or landed-as/import mappings reach. A collection
+  running beside `CreateChangeset` or landing counted the objects of
+  commits still being written (records and objects are written
+  concurrently, and a land batch builds on its predecessor's writes in
+  flight) as missing, and so did unreachable leftovers of a writer stopped
+  midway. Nothing was deleted wrongly; only the report was off.
+
 ## [0.3.2] - 2026-10-17
 
 Patch release: no Postgres schema or protocol changes; 0.3.x servers and

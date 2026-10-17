@@ -33,7 +33,9 @@
 //!    the store): batches of unexpanded ids are read (commit records from
 //!    `commits`, everything else through the object store) and their
 //!    children inserted. Ids written since the mark began are marked again
-//!    right before step 2.
+//!    right before step 2. Ids the published roots (refs, history, root
+//!    kinds) reach but the store lacks are reported as missing
+//!    ([`GcReport::missing`]).
 //! 2. **Condemn.** Every id not marked whose rows were all written before
 //!    the cutoff is inserted into `gc_condemned`, one id-range chunk per
 //!    statement; its object and index rows are locked and re-checked while
@@ -303,7 +305,10 @@ pub struct GcReport {
     pub cutoff: String,
     /// Ids marked reachable.
     pub live: u64,
-    /// Ids reachable but missing from the store (a store damaged earlier).
+    /// Ids reachable from published roots (refs, history, root kinds) but
+    /// missing from the store (a store damaged earlier). Ids that only rows
+    /// written after the cutoff reach are not counted: their writers may
+    /// still be storing them, or stopped before they did.
     pub missing: u64,
     /// Ids condemned (dry run: that would be).
     pub condemned: u64,
@@ -598,6 +603,7 @@ impl PgStore {
             progress,
             report: GcReport { dry_run: opts.dry_run, ..GcReport::default() },
             cutoff: 0.0,
+            count_missing: true,
         };
         if opts.dry_run { run.dry().await } else { run.real().await }?;
         // Release now rather than when the closing session ends.
@@ -646,6 +652,8 @@ struct Run<'a> {
     report: GcReport,
     /// The run's cutoff, as Unix seconds (Postgres clock).
     cutoff: f64,
+    /// Count ids found missing (expanding from published roots).
+    count_missing: bool,
 }
 
 /// Root sources (all `SELECT id, kind`). `$1`: root kinds, `$2`: since (Unix
@@ -769,8 +777,17 @@ impl Run<'_> {
                 let found = unhidden(self.objects.get_many(&read)).await?;
                 for (id, object) in read.iter().zip(found) {
                     let Some(object) = object else {
-                        self.report.missing += 1;
-                        tracing::debug!(%id, "gc: reachable object missing");
+                        // Reached from a published root: the store lost it.
+                        // Reached first from a fresh row: its writer may
+                        // still be storing it (commit records and their
+                        // objects are written concurrently, and a land
+                        // batch builds on its predecessor's writes in
+                        // flight), or stopped before it did; nothing
+                        // published needs it.
+                        if self.count_missing {
+                            self.report.missing += 1;
+                            tracing::debug!(%id, "gc: reachable object missing");
+                        }
                         continue;
                     };
                     match object.kind() {
@@ -827,6 +844,11 @@ impl Run<'_> {
             added += self.add_roots(ROOTS_HISTORY, since).await?;
         }
         added += self.add_roots(ROOTS_DERIVED, since).await?;
+        // The published roots first: what they reach and the store lacks
+        // is missing.
+        self.count_missing = true;
+        self.expand().await?;
+        self.count_missing = false;
         added += self.add_roots(ROOTS_FRESH_COMMITS, since).await?;
         self.expand().await?;
         // Objects written recently that no commit reaches yet (uploads, a
@@ -1574,6 +1596,29 @@ pub(super) mod tests {
         // Nothing left: a second run deletes nothing.
         let again = run(&s, &opts()).await;
         assert_eq!((again.objects, again.commits, again.condemned), (0, 0, 0));
+    }
+
+    /// `missing` counts what published roots reach: a fresh commit record
+    /// whose tree is not stored (a land batch whose predecessor's writes
+    /// are in flight, a writer that stopped) is not damage; a ref to it is.
+    #[tokio::test]
+    #[ignore = "needs postgres: docker compose up -d"]
+    async fn pg_missing_counts_only_what_published_roots_reach() {
+        let s = scratch().await;
+        let (c1, _, _) = commit(&s, None, "a", b"one").await;
+        s.cas_ref("main", None, Some(c1)).await.unwrap();
+        let node = CommitNode {
+            id: ObjectId([8; 32]),
+            tree: ObjectId([7; 32]),
+            parents: vec![c1],
+            generation: 2,
+            committer_time: 1,
+        };
+        s.put_commit(node.clone(), vec![]).await.unwrap();
+        let dry = GcOptions { dry_run: true, ..opts() };
+        assert_eq!(run(&s, &dry).await.missing, 0);
+        s.cas_ref("main", Some(c1), Some(node.id)).await.unwrap();
+        assert_eq!(run(&s, &dry).await.missing, 1, "the tree a ref reaches");
     }
 
     /// Regression guard (landing throughput): storing objects that exist

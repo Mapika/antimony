@@ -23,7 +23,9 @@
 //! 1. **Mark.** The closure of the roots (commit → tree and parents, tree →
 //!    entries, gitlinks skipped), in memory; commit records give tree and
 //!    parents without reading the commit object. Rows written since the
-//!    mark began are marked again right before step 2.
+//!    mark began are marked again right before step 2. Ids the published
+//!    roots (refs, history, root kinds) reach but the store lacks are
+//!    reported as missing ([`GcReport::missing`]).
 //! 2. **Condemn.** Every id with a row written before the cutoff (`start -
 //!    grace`) that is not marked is condemned: an in-memory set the store's
 //!    readers consult ([`super::Hidden`]). From then on readers treat a
@@ -164,7 +166,10 @@ pub struct GcReport {
     pub cutoff: i64,
     /// Ids marked reachable.
     pub live: u64,
-    /// Ids reachable but missing from the store.
+    /// Ids reachable from published roots (refs, history, root kinds) but
+    /// missing from the store. Ids that only rows written within the grace
+    /// period reach are not counted: their writers may still be storing
+    /// them, or stopped before they did, and nothing published needs them.
     pub missing: u64,
     /// Ids condemned (dry run: that would be).
     pub condemned: u64,
@@ -328,13 +333,15 @@ fn ids_of(
     Ok(())
 }
 
-/// Roots of a run: `(id, kind)`.
-fn roots(c: &rusqlite::Connection, opts: &GcOptions, cutoff: i64) -> Result<Vec<(ObjectId, u8)>> {
+/// Published roots of a run, `(id, kind)`: ref targets, history
+/// watermarks and index, and the derived root kinds. Everything they reach
+/// was stored before they were written; the other roots are the rows
+/// written within the grace period ([`written_since`]).
+fn published_roots(c: &rusqlite::Connection, opts: &GcOptions) -> Result<Vec<(ObjectId, u8)>> {
     let mut out = Vec::new();
     ids_of(c, "SELECT target FROM refs", None, KIND_UNKNOWN, &mut out)?;
     ids_of(c, "SELECT commit_id FROM history_watermark", None, KIND_COMMIT, &mut out)?;
     ids_of(c, "SELECT DISTINCT commit_id FROM history", None, KIND_COMMIT, &mut out)?;
-    out.extend(written_since(c, cutoff)?);
     let mut st = c.prepare("SELECT key, value FROM derived WHERE kind = ?1").sq()?;
     for kind in &opts.root_kinds {
         let mut rows = st.query([kind]).sq()?;
@@ -438,6 +445,8 @@ struct Marker<'a> {
     live: HashSet<ObjectId>,
     hidden: Option<Arc<Hidden>>,
     batch: usize,
+    /// Count ids found missing (marking from published roots).
+    count_missing: bool,
     missing: u64,
 }
 
@@ -467,8 +476,17 @@ impl Marker<'_> {
             if !read.is_empty() {
                 for (id, object) in read.iter().zip(self.objects.get_many(&read).await?) {
                     let Some(object) = object else {
-                        self.missing += 1;
-                        tracing::debug!(%id, "gc: reachable object missing");
+                        // Reached from a published root: the store lost it.
+                        // Reached first from a recent row: that row's
+                        // writer may still be storing it (commit records
+                        // and their objects are written concurrently, and a
+                        // land batch builds on its predecessor's writes in
+                        // flight), or stopped before it did; nothing
+                        // published needs it.
+                        if self.count_missing {
+                            self.missing += 1;
+                            tracing::debug!(%id, "gc: reachable object missing");
+                        }
                         continue;
                     };
                     match object.kind() {
@@ -502,14 +520,31 @@ impl Marker<'_> {
     /// Mark the rows written since `since`.
     async fn mark_since(&mut self, since: i64) -> Result<()> {
         let recent = self.store.db().read(move |c| written_since(c, since)).await?;
+        self.count_missing = false;
         self.mark(recent).await
+    }
+
+    /// Mark the roots: the published ones first (counting what they reach
+    /// that is missing), then the rows written since `cutoff`. Returns how
+    /// many roots there were.
+    async fn mark_roots(&mut self, opts: &GcOptions, cutoff: i64) -> Result<usize> {
+        let o = opts.clone();
+        let (published, recent) = self
+            .store
+            .db()
+            .read(move |c| Ok((published_roots(c, &o)?, written_since(c, cutoff)?)))
+            .await?;
+        let n = published.len() + recent.len();
+        self.count_missing = true;
+        self.mark(published).await?;
+        self.count_missing = false;
+        self.mark(recent).await?;
+        Ok(n)
     }
 
     /// Mark the roots again, and the rows written since `since`.
     async fn remark(&mut self, opts: &GcOptions, cutoff: i64, since: i64) -> Result<()> {
-        let o = opts.clone();
-        let roots = self.store.db().read(move |c| roots(c, &o, cutoff)).await?;
-        self.mark(roots).await?;
+        self.mark_roots(opts, cutoff).await?;
         self.mark_since(since).await
     }
 }
@@ -552,14 +587,14 @@ async fn collect_run(
         live: HashSet::new(),
         hidden: None,
         batch: opts.batch.max(1),
+        count_missing: true,
         missing: 0,
     };
 
     // -- 1. mark
-    let o = opts.clone();
-    let roots = store.db().read(move |c| roots(c, &o, cutoff)).await?;
-    progress(&format!("marking from {} roots", roots.len()));
-    m.mark(roots).await?;
+    progress("marking from the roots");
+    let roots = m.mark_roots(opts, cutoff).await?;
+    progress(&format!("marked from {roots} roots"));
     m.mark_since(start - MARGIN_SECS).await?;
     progress(&format!("marked {} live ids", m.live.len()));
 
@@ -1187,6 +1222,30 @@ mod tests {
         // A second run finds nothing more.
         let r = collect(&s, &gc, &|_| {}).await.unwrap();
         assert_eq!((r.objects, r.large_objects, r.commits, r.packs), (0, 0, 0, 0), "{r:?}");
+    }
+
+    /// `missing` counts what published roots reach: a recent commit record
+    /// whose tree is not stored (a land batch whose predecessor's writes
+    /// are in flight, a writer that stopped) is not damage; a ref to it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_counts_only_what_published_roots_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = LocalStore::open(dir.path(), &LocalOptions::default()).unwrap();
+        let b = s.backend();
+        let base = commit(&b, &[("f", b"x")], vec![]).await;
+        b.refs.cas_ref("main", None, Some(base)).await.unwrap();
+        let node = crate::CommitNode {
+            id: ObjectId([8; 32]),
+            tree: ObjectId([7; 32]),
+            parents: vec![base],
+            generation: 2,
+            committer_time: 1,
+        };
+        b.meta.put_commit(node.clone(), vec![]).await.unwrap();
+        let dry = GcOptions { dry_run: true, exclusive: true, ..GcOptions::default() };
+        assert_eq!(collect(&s, &dry, &|_| {}).await.unwrap().missing, 0);
+        b.refs.cas_ref("main", Some(base), Some(node.id)).await.unwrap();
+        assert_eq!(collect(&s, &dry, &|_| {}).await.unwrap().missing, 1, "the tree a ref reaches");
     }
 
     #[test]
