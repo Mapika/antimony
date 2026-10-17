@@ -513,10 +513,19 @@ impl Batch {
                 let recorded: Vec<_> =
                     ids.iter().copied().filter(|id| state.nodes.contains_key(id)).collect();
                 if !recorded.is_empty() {
-                    futures::try_join!(
+                    let (changesets, commits) = futures::join!(
                         cache::get_changesets(b, &recorded),
                         cache::read_commits(b, &recorded)
-                    )?;
+                    );
+                    changesets?;
+                    match commits {
+                        // A recorded commit whose object is missing (a
+                        // collection condemned it while it was being
+                        // landed) fails its own request, when its rebase
+                        // reads it, not the whole batch.
+                        Ok(_) | Err(ant_store::StoreError::NotFound(_)) => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
             }
             Ok(())

@@ -1011,7 +1011,7 @@ async fn local_gc_races_a_fleet_of_writers_without_losing_reachable_data() {
     let mut total = 0;
     for _ in 0..2 {
         phase_lands.store(0, Ordering::Relaxed);
-        let report = r.gc(&o).await;
+        let report = unless_a_task_ends(&mut writers, r.gc(&o)).await;
         total += report.objects + report.commits;
     }
     stop.store(true, Ordering::Relaxed);
@@ -1040,6 +1040,23 @@ fn writer_pause(n: usize) -> Duration {
 
 /// Lands per phase at the full pace.
 const PHASE_LANDS: usize = 150;
+
+/// `fut`, unless one of `tasks` (which run until told to stop) ends first:
+/// then its panic is the test's failure, at once. Without this a task that
+/// panicked was only noticed when its handle was awaited, after the phases
+/// and a deadline wait for its progress (two minutes of apparent hang).
+async fn unless_a_task_ends<T>(
+    tasks: &mut [tokio::task::JoinHandle<()>],
+    fut: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::select! {
+        out = fut => out,
+        (ended, i, _) = futures::future::select_all(tasks.iter_mut()) => match ended {
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            other => panic!("task {i} ended early: {other:?}"),
+        },
+    }
+}
 
 /// Writers land changesets (some re-storing old garbage and using it by
 /// id), readers read everything reachable, collections and repacks run,
@@ -1144,7 +1161,7 @@ async fn local_maintenance_races_writers_and_readers() {
     let mut collected = 0;
     for _ in 0..3 {
         phase_lands.store(0, Ordering::Relaxed);
-        let report = r.gc(&gc).await;
+        let report = unless_a_task_ends(&mut tasks, r.gc(&gc)).await;
         assert_eq!(report.missing, 0, "{report:?}");
         collected += report.objects + report.large_objects + report.commits;
     }
@@ -1153,7 +1170,7 @@ async fn local_maintenance_races_writers_and_readers() {
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while repacks.load(Ordering::Relaxed) < n + 2 {
         assert!(std::time::Instant::now() < deadline, "repacks stopped");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        unless_a_task_ends(&mut tasks, tokio::time::sleep(Duration::from_millis(50))).await;
     }
     stop.store(true, Ordering::Relaxed);
     for t in tasks {
