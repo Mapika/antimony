@@ -308,6 +308,8 @@ every flag; `ant completions <shell>` prints a completion script.
 
 ## Status
 
+- **v0.3.2** (2026-10-17): persistent server cache (bundles and git base
+  packs survive restarts; `--cache-dir`, `--shared-cache`, `--prewarm`).
 - **v0.3.1** (2026-10-17): faster warm checkout and cold-server reads (S3
   pack segment cache). See [CHANGELOG](CHANGELOG.md).
 - **v0.3.0** (2026-10-17): local mode (`ant serve --local`: one process,

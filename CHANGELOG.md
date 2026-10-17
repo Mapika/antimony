@@ -8,6 +8,15 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-17
+
+Patch release: no Postgres schema or protocol changes; 0.3.x servers and
+clients interoperate. The server cache (tree bundles and git base packs)
+persists across restarts on disk (`--cache-dir`) and optionally in shared S3
+(`--shared-cache`); on Hetzner the first checkout after a restart went from
+4.92 to 2.71 s and the first blobless clone from 12.1 to 4.39 s (1.46x
+native git). New cache formats are additive and versioned.
+
 ### Added
 
 - Persistent server cache: tree bundles (`GET /t/`) and the git export's
@@ -784,7 +793,8 @@ Also in this release:
   around restricted paths, and principals sharing a cache directory share
   what it holds.
 
-[Unreleased]: https://github.com/Mapika/antimony/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/Mapika/antimony/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/Mapika/antimony/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Mapika/antimony/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Mapika/antimony/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/Mapika/antimony/compare/v0.2.1...v0.2.2
