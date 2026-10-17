@@ -21,7 +21,8 @@ pushes race and fail, rebases repeat, merge queues serialize the fleet, and
 `log` and `blame` walk history on each client. antimony keeps git's object
 format and moves everything else to the server: the server builds commits and
 lands them onto the moving tip itself, workspaces are lazy and sparse, and
-history is an API. It is written in Rust, stores data in Postgres and S3, can
+history is an API. It is written in Rust, stores data in Postgres and S3 (or,
+for one machine, in a local directory with no services), can
 import any git repository with identical SHA-256 ids, serves a read-only git
 export for plain git clients, and is licensed Apache-2.0.
 
@@ -49,6 +50,9 @@ export for plain git clients, and is licensed Apache-2.0.
   packs (large); immutable reads are plain HTTP (`GET /o/<id>`,
   `Cache-Control: immutable`), so any CDN, or the built-in `ant cache-serve`,
   is the cache tier.
+- **Local mode.** `ant serve --local` runs the whole server from one
+  directory (SQLite and pack files): no Postgres, S3 or Docker, 16 MiB idle,
+  57 ms to start. See [Local mode](#local-mode-no-postgress3) below.
 - **Built for a fleet.** Stateless server replicas, directory-level access
   control that also protects objects by id, rate limits and load shedding,
   Prometheus metrics.
@@ -86,47 +90,80 @@ paths, tree bundles, access control) and the
 
 ## Numbers
 
-Measured on one WSL2 development machine (20 cores) with Postgres and
-SeaweedFS S3 running locally on the same host. They are indicative, not
-guarantees: real networks, managed Postgres and real S3 will move them.
-Sources: the [v0.2.0 scorecard](docs/scorecard/2026-10-16-v0.2.0.md)
-(27 of 27 rows pass), the [v0.1.0 scorecard](docs/scorecard/2026-10-14-final.md),
-[CHANGELOG](CHANGELOG.md) and [ROADMAP](ROADMAP.md).
+Two setups, always labelled. **Cloud**: two Hetzner Cloud boxes in one
+datacenter, the server on a ccx43 (16 dedicated vCPU, AMD EPYC Milan) with
+Postgres, SeaweedFS S3 and `ant serve`, the client on a ccx33 (8 vCPU), over
+a private network (RTT 0.2 to 0.4 ms). **Local**: one WSL2 development
+machine (20 cores) with Postgres and S3 on the same host, loopback. Numbers
+are indicative, not guarantees: managed Postgres, real S3 and other networks
+will move them, and boxes of one cloud type differ by about 20%.
+Sources: the [v0.3.0 scorecard](docs/scorecard/2026-10-17-v0.3.0.md) (local,
+27 of 27 rows pass), the
+[landing A/B](docs/scorecard/2026-10-16-hetzner-landing-ab.md),
+[network checkout](docs/scorecard/2026-10-17-hetzner-ccx43-ccx33-checkout.md),
+[cold read path](docs/scorecard/2026-10-17-hetzner-cold-read-path.md) and
+[git export clone](docs/scorecard/2026-10-16-hetzner-gitserve-clone.md)
+reports (cloud), the [local mode scorecard](docs/scorecard/2026-10-16-local-mode.md),
+the [v0.2.0 scorecard](docs/scorecard/2026-10-16-v0.2.0.md) (rows marked
+v0.2.0), [CHANGELOG](CHANGELOG.md) and [ROADMAP](ROADMAP.md).
 
-| measure | result |
-|---|---|
-| Landing on one ref, 64 concurrent agents, Postgres + S3 | 3,791 lands/s, p99 30.7 ms, 0 aborts, exact history (v0.1.0 run: 4,138/s, 26.5 ms) |
-| `create_changeset` p50, 16 agents | 2.0 ms |
-| Soak: 4 replicas × 1,000 agents × 30 min | 266k lands, 0 errors, exact history, flat RSS |
-| Import git/git (82k commits) | 7,216 commits/s, 0.9 GiB peak RSS |
-| Import rust-lang/rust (343k commits, 1.1 GB pack) | 110 s (3,124 commits/s), 1.6 GiB peak RSS |
-| Queries on git/git | path log 9 ms (6.7 ms full history, git: 101 ms); blame 47 ms first, 14 ms cached; diverged merge-base 9.3 ms (git: 54 ms) |
-| Queries on rust-lang/rust | path log 18 ms; blame 363 ms first, 10 ms cached; `merge-base main main~2000` 10 ms; sparse workspace 134 ms |
-| Checkout, synthetic 96k-file tree (medians) | cold 4.7 s, warm 1.1 s, `status` 0.1 s (cold was 2.5 s in v0.1.0; under investigation) |
-| git export, `clone --filter=blob:none` of git/git | 5.9 s |
-| Stored size of git/git vs its git pack | 901 MiB after import (3.0×; v0.1.0: 13.5×); 361 MiB after `ant admin repack` and GC (298 MiB for `git gc`, 94 MiB for `git gc --aggressive`) |
+| measure | cloud (Hetzner ccx43 + ccx33) | local (WSL2, v0.3.0) |
+|---|---|---|
+| Landing on one ref, 64 concurrent agents, Postgres + S3 | 3,217 to 3,245 lands/s, p99 35 to 39 ms (two rounds; 0.2.2: 2,328 to 2,342/s) | 4,221 lands/s, p99 30.2 ms, 0 aborts, exact history |
+| Landing, 16 agents | 2,746 to 2,803 lands/s | 2,576 lands/s, p99 7.0 ms |
+| `create_changeset` p50 | 3.2 to 3.3 ms at 64 agents, 1.4 to 1.5 ms at 16 | 1.9 ms at 16 agents |
+| Import git/git (82k commits) | 8,239 to 8,379 commits/s, 1.0 GiB peak RSS | 7,653 commits/s, 1.0 GiB peak RSS |
+| Import rust-lang/rust (343k commits, 1.1 GB pack) | | v0.2.0: 110 s (3,124 commits/s), 1.6 GiB peak RSS |
+| Soak: 4 replicas x 1,000 agents x 30 min | | v0.2.0: 266k lands, 0 errors, exact history, flat RSS |
+| Queries on git/git | path log 13.7 ms, blame 28.6 ms repeated (0.2.1, from a client over the network) | path log 9 ms, log -n 20 13 ms, blame 53 ms first, 13 ms cached |
+| Queries on rust-lang/rust | | v0.2.0: path log 18 ms; blame 363 ms first, 10 ms cached; `merge-base main main~2000` 10 ms; sparse workspace 134 ms |
+| Checkout, synthetic 96k-file tree (medians) | over the network: cold 2.4 s, warm 1.5 s; first checkout against a freshly started server 4.1 to 4.5 s | cold 2.4 s, warm 1.1 s, `status` 0.1 s |
+| git export, `clone --filter=blob:none` of git/git | 4.2 s with the base pack cached (git daemon: 2.9 s); 10.2 to 10.7 s for the first clone | 5.7 s (`.git` 77.6 MiB) |
+| Stored size of git/git vs its git pack | | v0.2.0: 901 MiB after import (3.0x); 361 MiB after `ant admin repack` and GC (298 MiB for `git gc`, 94 MiB for `git gc --aggressive`) |
+
+Local mode (`ant serve --local`, SQLite and pack files, no Postgres or S3),
+same WSL2 machine, which was busy with other builds during the run (so
+latencies are pessimistic; the [report](docs/scorecard/2026-10-16-local-mode.md)
+lists every row): 16 MiB idle RSS, 57 ms from process start to listening,
+about 1,000 lands/s with 50 agents (p99 64 ms), 172 MiB server peak RSS at 50
+agents, git/git imported in 941 MiB on disk.
 
 ## How it compares to git
 
 antimony is not a git replacement for every workflow. It targets one case:
-many always-online writers on one large repository. A
-[head-to-head against tuned git](docs/scorecard/2026-10-16-vs-git.md) on the
-same machine (git/git and a 96k-file synthetic tree; git with aggressive gc,
-bitmaps, commit-graph with changed-path filters, untracked cache, cone sparse
-checkout, partial clone) measured:
+many always-online writers on one large repository. A head-to-head against
+tuned git (git with aggressive gc, bitmaps, commit-graph with changed-path
+filters, untracked cache, cone sparse checkout, partial clone; git/git and a
+96k-file synthetic tree) was run twice: on the
+[local machine](docs/scorecard/2026-10-16-vs-git.md), and with
+[two Hetzner boxes](docs/scorecard/2026-10-16-hetzner-ccx43-ccx33-vs-git.md)
+where every git and antimony command ran on the client box over the network
+(git's history, blame and merge-base on a full local clone, as a git user
+would; antimony's as server queries). Medians:
 
-| operation | git | antimony |
-|---|---|---|
-| landing storm, 64 agents on one branch | 15.6 commits/s, p99 1.65 s (25 push attempts per change) | 2,287 commits/s, p99 137 ms |
-| checkout of the 96k-file tree, cold / warm | 18.8 s / 10.7 s | 7.0 s / 1.2 s |
-| sparse checkout, cold / warm | 2.9 s / 1.5 s | 1.05 s / 0.19 s |
-| blame, repeated / after a new commit | 323 ms / 307 ms | 19 ms / 16 ms |
-| merge-base, ancestor 12k commits back | 56 ms | 10 ms |
-| path log, full history | 101 ms | 6.7 ms (210 ms before 0.2.0) |
-| merge-base, diverged branches | 54 ms | 9.3 ms (193 ms before 0.2.0) |
-| status, clean, repeated | 78 ms | 118 ms |
-| storage (git/git) | 105 MiB (`gc --aggressive`) | 901 MiB after import, 361 MiB after `ant admin repack` (Postgres + S3) |
-| `git clone --filter=blob:none` | 1.5 s | 5.9 s quiet machine, 32 s in the loaded head-to-head run (from antimony's git export) |
+| operation | git (local) | antimony (local) | git (cloud) | antimony (cloud) |
+|---|---|---|---|---|
+| landing storm, 64 agents on one branch | 15.6 commits/s, p99 1.65 s (25 push attempts per change) | 2,287 commits/s, p99 137 ms | 7.0 commits/s, p99 24.0 s (27 attempts) | 1,909 commits/s, p99 83 ms |
+| landing storm, 16 agents | 17.9 commits/s | 2,303 commits/s | 14.2 commits/s | 1,478 commits/s |
+| checkout of the 96k-file tree, cold / warm | 18.8 s / 10.7 s | 7.0 s / 1.2 s | 24.0 s / 12.9 s | 17.1 s / 3.6 s |
+| sparse checkout, cold / warm | 2.9 s / 1.5 s | 1.05 s / 0.19 s | 3.9 s / 1.9 s | 1.8 s / 0.36 s |
+| blame, repeated | 323 ms | 19 ms | 483 ms | 28.6 ms |
+| merge-base, ancestor 12k commits back | 56 ms | 10 ms | 99 ms | 16 ms |
+| path log, full history | 101 ms | 6.7 ms | 152 ms | 13.7 ms |
+| merge-base, diverged branches | 54 ms | 9.3 ms | 98 ms | 22.6 ms |
+| status, clean, repeated | 78 ms | 118 ms | 250 ms | 276 ms |
+| storage (git/git) | 105 MiB (`gc --aggressive`) | 901 MiB after import, 361 MiB after `ant admin repack` | 105 MiB | 934 MiB after import |
+| `git clone --filter=blob:none` | 1.5 s | 5.9 s quiet machine (from antimony's git export) | 2.9 s | 29.5 s (0.2.1); 4.2 s since the export caches its base pack (git: 2.9 s) |
+
+The cloud head-to-head ran antimony 0.2.1. Since then (0.3.0 and 0.3.1) the
+same synthetic checkout measured by the
+[checkout benchmark](docs/scorecard/2026-10-17-hetzner-ccx43-ccx33-checkout.md)
+takes 2.4 s cold and 1.5 s warm over the network on the same box types; it
+is a different harness from the table's 17.1 s and 3.6 s (which includes a
+server that has not built its tree bundles yet), so the two are not a
+before and after of one run. Git export clones got much closer to git in
+0.3.0: `--depth 1` 0.97 s against 1.40 s, full history 11.4 s against 8.9 s
+([report](docs/scorecard/2026-10-16-hetzner-gitserve-clone.md)).
 
 Where antimony is ahead: concurrent landing (the server rebases and lands;
 agents never fetch, rebase and retry a rejected push), checkout and sparse
@@ -134,10 +171,12 @@ workspaces, and repeated history queries, which come from server-side
 indexes and caches with no history on the client.
 
 Where git is ahead: storage size, serving clones (git reuses its packs;
-antimony's export builds packs on the fly), offline work, and the ecosystem (hosting, code review,
-tooling; antimony's export accepts no pushes). antimony is 0.x; lazy FUSE
-workspaces are Linux only. The report lists the caveats: one shared machine,
-different work per change in the storm, and git's weaker default durability.
+antimony's export builds packs on the fly, then caches them), offline work,
+and the ecosystem (hosting, code review, tooling; antimony's export accepts
+no pushes). antimony is 0.x; lazy FUSE workspaces are Linux only. The
+reports list the caveats: dedicated vCPUs but shared disks and network in the
+cloud run, different work per change in the storm, and git's weaker default
+durability.
 
 ## Quickstart
 
@@ -145,12 +184,12 @@ Needs `git` and `curl`, plus one of:
 
 - **A release binary** (x86_64 Linux) from
   [Releases](https://github.com/Mapika/antimony/releases): unpack
-  `ant-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`, check it against
+  `ant-v0.3.1-x86_64-unknown-linux-gnu.tar.gz`, check it against
   `SHA256SUMS`, put the directory holding `ant` on your `PATH`, and skip the
   first two lines below.
 - **Rust** (1.90 or newer) to build from source, as below.
 - **Docker** for the server: `docker run -d -p 7420:7420 -p 7421:7421
-  ghcr.io/mapika/antimony:0.2.0 serve --memory` can replace the `ant serve`
+  ghcr.io/mapika/antimony:0.3.1 serve --memory` can replace the `ant serve`
   line of step 1 (the client steps still need an `ant` binary).
 
 The quickstart runs against an in-memory throwaway server; for a durable one
