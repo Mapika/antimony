@@ -82,6 +82,22 @@ share the store's limits: budget their sum.
 | `--s3-max-attempts` (1 = no retries, 0 = no limit) | `ANT_S3_MAX_ATTEMPTS` | `0` |
 | `--s3-operation-timeout` (slot wait and retries included) | `ANT_S3_OPERATION_TIMEOUT` | `5m` |
 | `--s3-max-concurrency` (requests in flight per process) | `ANT_S3_MAX_CONCURRENCY` | `32` |
+| `--s3-pack-cache-mib` (pack segment cache, 0 = off) | `ANT_S3_PACK_CACHE_MIB` | `512` |
+
+**Pack segment cache.** Large objects live in S3 packs; a request costs an
+S3 server far more than its bytes (SeaweedFS: a ranged GET costs about as
+much CPU as 0.5 MiB of body). Reads therefore fetch the aligned 64 KiB
+segments a record lies in, merge missing segments of one pack at most
+1 MiB apart into one GET of at most 8 MiB, and keep what they read in
+memory (`--s3-pack-cache-mib`, least recently used evicted first). A reader
+that needs a segment another one is fetching waits for that fetch. Packs
+never change once written, so cached bytes never go stale; records over
+1 MiB bypass the cache. A first checkout or clone against a freshly
+started server reads each segment of the packs it touches about once while
+they fit the budget (a 96k-file tree: 0.55 GiB of packs); beyond that,
+segments are evicted before their neighbours are wanted and GETs rise again.
+Size it to the packs a typical cold checkout touches; `ant_s3_pack_cache_bytes`
+and `ant_s3_pack_segments_total{result}` show its use.
 
 Watch `ant_s3_retries_total{reason}` (`throttled`, `server_error`,
 `network`, `body`, `timeout`): a steady trickle under load is the backoff

@@ -32,6 +32,24 @@ release of the 0.x series may change.
 
 ### Added
 
+- S3 pack segment cache (`--s3-pack-cache-mib`, `ANT_S3_PACK_CACHE_MIB`,
+  default 512, 0 turns it off). Packed records are read as aligned 64 KiB
+  segments of their pack: missing segments of one pack at most 1 MiB
+  apart are read with one ranged GET of at most 8 MiB, everything read is
+  kept (least recently used evicted first), and a segment another caller
+  is already reading is waited for, not read again. A checkout or clone
+  against a freshly started server no longer issues about one GET per
+  object.
+  - Synthetic 96k-file checkout, first one against a freshly started
+    server, Hetzner ccx43 + ccx33: 6.1-6.9 s → 4.1-4.5 s; S3 GETs
+    34.8k → 3.0k, bytes read 1.15 → 0.59 GiB, SeaweedFS CPU 40 → 5 s,
+    `ant serve` CPU 26 → 16 s
+    ([docs/scorecard/2026-10-17-hetzner-cold-read-path.md](docs/scorecard/2026-10-17-hetzner-cold-read-path.md)).
+  - git/git blobless clone with no cached base: S3 GETs 5.4k → 1.4k, bytes
+    272 → 118 MiB; its time is the export's delta search (CPU), not S3.
+- Metrics: `ant_s3_requests_total{op}`, `ant_s3_read_bytes_total`,
+  `ant_s3_pack_segments_total{result=hit|read}`, `ant_s3_pack_cache_bytes`.
+- `scripts/checkout-bench.sh` reports S3 GETs, bytes and server CPU per row.
 - `ant-bench checkout --warm-only` (warm checkouts against an existing
   `--cache`, no cold phase) and `--no-status`, to profile the warm path
   alone.

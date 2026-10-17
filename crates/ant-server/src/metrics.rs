@@ -49,8 +49,13 @@
 //! - `ant_s3_retries_total{reason=throttled|server_error|network|body|timeout}`
 //!   (S3 attempts retried), `ant_s3_gave_up_total` (S3 operations that failed
 //!   after retrying), `ant_s3_requests_in_flight`, `ant_s3_requests_queued`
-//!   (waiting for one of the `ant_s3_max_concurrency` slots); process-wide
-//!   counters of `ant_store::s3`, read on scrape.
+//!   (waiting for one of the `ant_s3_max_concurrency` slots),
+//!   `ant_s3_requests_total{op=get|put|head|other}` (requests sent, retries
+//!   included; ranged reads count as `get`) and `ant_s3_read_bytes_total`
+//!   (body bytes received); process-wide counters of `ant_store::s3`, read on
+//!   scrape. The S3 pack segment cache: `ant_s3_pack_segments_total{result=hit|read}`
+//!   (64 KiB segments of packs found cached or in a read already under way,
+//!   and read from S3) and `ant_s3_pack_cache_bytes` (held now).
 //! - `ant_build_info{version,git}` = 1 and, with Postgres,
 //!   `ant_pg_pool_size`, `ant_pg_pool_idle`, `ant_pg_pool_in_use`,
 //!   `ant_pg_pool_max` (0 for the in-memory backend).
@@ -156,6 +161,16 @@ struct CacheLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ResultLabels {
+    result: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct OpLabels {
+    op: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ReasonLabels {
     reason: &'static str,
 }
@@ -251,6 +266,12 @@ pub struct Metrics {
     s3_in_flight: Gauge,
     s3_queued: Gauge,
     s3_max_concurrency: Gauge,
+    s3_requests: Family<OpLabels, Counter>,
+    s3_read_bytes: Counter,
+    pack_segments: Family<ResultLabels, Counter>,
+    pack_cache_bytes: Gauge,
+    /// Segment cache totals already folded into the counters.
+    segments_synced: Mutex<ant_store::packed::SegmentStats>,
     /// S3 client totals already folded into the counters.
     s3_synced: Mutex<ant_store::s3::S3Stats>,
     recent_refs: Mutex<RecentRefs>,
@@ -475,7 +496,39 @@ impl Metrics {
             Gauge::default(),
         );
 
+        let s3_requests = register(
+            &mut registry,
+            "ant_s3_requests",
+            "S3 requests sent (retries included), by kind",
+            Family::<OpLabels, Counter>::default(),
+        );
+        let s3_read_bytes = register(
+            &mut registry,
+            "ant_s3_read_bytes",
+            "Body bytes received from S3",
+            Counter::default(),
+        );
+
+        let pack_segments = register(
+            &mut registry,
+            "ant_s3_pack_segments",
+            "64 KiB segments of S3 packs found cached (or being read) and read from S3",
+            Family::<ResultLabels, Counter>::default(),
+        );
+        let pack_cache_bytes = register(
+            &mut registry,
+            "ant_s3_pack_cache_bytes",
+            "Bytes of S3 pack segments held in memory",
+            Gauge::default(),
+        );
+
         // Closed label sets appear (as zeros) before their first event.
+        for result in ["hit", "read"] {
+            let _ = pack_segments.get_or_create(&ResultLabels { result });
+        }
+        for op in ant_store::s3::REQUEST_OPS {
+            let _ = s3_requests.get_or_create(&OpLabels { op });
+        }
         for reason in ant_store::s3::RETRY_REASONS {
             let _ = s3_retries.get_or_create(&ReasonLabels { reason });
         }
@@ -523,6 +576,11 @@ impl Metrics {
             s3_in_flight,
             s3_queued,
             s3_max_concurrency,
+            s3_requests,
+            s3_read_bytes,
+            pack_segments,
+            pack_cache_bytes,
+            segments_synced: Mutex::new(ant_store::packed::segment_stats()),
             s3_synced: Mutex::new(ant_store::s3::stats()),
             recent_refs: Mutex::new(RecentRefs::default()),
             probes: Mutex::new(crate::health::Probes::default()),
@@ -738,6 +796,24 @@ impl Metrics {
                 .inc_by(s3.retries[i].saturating_sub(synced.retries[i]));
         }
         self.s3_gave_up.inc_by(s3.gave_up.saturating_sub(synced.gave_up));
+        for (i, op) in ant_store::s3::REQUEST_OPS.into_iter().enumerate() {
+            self.s3_requests
+                .get_or_create(&OpLabels { op })
+                .inc_by(s3.requests[i].saturating_sub(synced.requests[i]));
+        }
+        self.s3_read_bytes.inc_by(s3.read_bytes.saturating_sub(synced.read_bytes));
+        let seg = ant_store::packed::segment_stats();
+        {
+            let mut done = crate::lock(&self.segments_synced);
+            self.pack_segments
+                .get_or_create(&ResultLabels { result: "hit" })
+                .inc_by(seg.hits.saturating_sub(done.hits));
+            self.pack_segments
+                .get_or_create(&ResultLabels { result: "read" })
+                .inc_by(seg.read.saturating_sub(done.read));
+            *done = seg;
+        }
+        self.pack_cache_bytes.set(i64::try_from(seg.bytes).unwrap_or(i64::MAX));
         *synced = s3;
         drop(synced);
         self.s3_in_flight.set(s3.in_flight);
@@ -1001,11 +1077,19 @@ mod tests {
             let line = format!(r#"ant_s3_retries_total{{reason="{reason}"}}"#);
             assert!(text.contains(&line), "{text}");
         }
+        for op in ant_store::s3::REQUEST_OPS {
+            let line = format!(r#"ant_s3_requests_total{{op="{op}"}}"#);
+            assert!(text.contains(&line), "{text}");
+        }
         for family in [
             "ant_s3_gave_up_total",
             "ant_s3_requests_in_flight",
             "ant_s3_requests_queued",
             "ant_s3_max_concurrency 0",
+            "ant_s3_read_bytes_total",
+            r#"ant_s3_pack_segments_total{result="hit"}"#,
+            r#"ant_s3_pack_segments_total{result="read"}"#,
+            "ant_s3_pack_cache_bytes",
         ] {
             assert!(text.contains(family), "{family}: {text}");
         }
