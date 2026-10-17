@@ -14,6 +14,20 @@ release of the 0.x series may change.
   bytes of lines that are not valid UTF-8; `line`/`lines` then hold a lossy
   rendering (U+FFFD) for older clients. Both are unset for UTF-8 content.
 
+### Performance
+
+- First clone through the git export (no cached base pack) is faster:
+  git/git blobless 5.5 → 4.5 s (as imported) and 5.2 → 4.0 s (after
+  `ant admin repack`), native git 2.4 s. Commits and root trees are sent
+  newest generation first, the order a repack stores them in, which stops
+  decoding the same delta frames over and over on merge-heavy histories
+  (decoded bytes 10.2 → 1.1 GB with a small frame cache, as on the Linux
+  kernel); concurrent reads of one pack frame decode it once; a clone is
+  planned with one ancestry query instead of one store call per level of
+  history; delta search uses every core (was at most 8) and stops at a
+  delta under 64 bytes (pack +0.3%). New metrics
+  `ant_pack_frame_decodes_total` and `ant_pack_frame_decoded_bytes_total`.
+
 ### Fixed
 
 - File content that is not UTF-8 (Latin-1 names in old histories, as in

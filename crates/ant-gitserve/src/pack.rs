@@ -53,7 +53,14 @@ const KEEPALIVE: Duration = Duration::from_secs(5);
 const SEGMENT_BYTES: usize = 1 << 20;
 /// ...or here, even inside one path (handing over context, see above).
 const SEGMENT_MAX_BYTES: usize = 16 << 20;
-const MAX_WORKERS: usize = 8;
+/// Delta workers: one per core, at most this many (a clone is mostly delta
+/// search; git's `pack.threads` uses every core too).
+const MAX_WORKERS: usize = 32;
+/// Encoded segments waiting for the writer, per worker. Segments are written
+/// in order, so one slow segment (thousands of versions of a large
+/// directory) must not stop the other workers: they keep encoding the
+/// segments behind it. Waiting segments hold their compressed entries only.
+const QUEUED_PER_WORKER: usize = 4;
 /// Larger objects are stored whole and never used as delta bases.
 const MAX_BASE: usize = 8 << 20;
 const MAX_DEPTH: u8 = 50;
@@ -70,6 +77,13 @@ const TREE_WINDOW: usize = 40;
 fn window(kind: ObjectKind) -> usize {
     if kind == ObjectKind::Tree { TREE_WINDOW } else { WINDOW }
 }
+/// A delta below this many bytes ends the search for a better base: it is
+/// one changed tree entry or a few changed lines, and no other candidate
+/// can save more than a few bytes on it. Most tree versions find such a
+/// delta in the first (nearest) candidate; trying all `TREE_WINDOW` of them
+/// cost about 10% of a blobless clone's CPU for 0.3% of its pack size
+/// (git/git: 70.86 instead of 70.65 MB).
+const SMALL_DELTA: usize = 64;
 const WINDOW_BYTES: usize = 16 << 20;
 /// zlib level of every entry (git's default `core.compression`).
 const LEVEL: u32 = 6;
@@ -160,6 +174,10 @@ struct Entry {
 struct Segment {
     entries: Vec<Entry>,
     data: Vec<u8>,
+    /// The objects' ids, in order, when the pack becomes a base (hashed
+    /// here, in parallel, rather than in the one task that cuts segments:
+    /// a clone hashes gigabytes of trees).
+    ids: Vec<ObjectId>,
 }
 
 /// Input of one delta worker.
@@ -171,6 +189,8 @@ struct Work {
     /// Objects from this index on become the next segment's context.
     tail: usize,
     deltas: bool,
+    /// Hash the objects (see `Segment::ids`).
+    ids: bool,
 }
 
 struct Candidate {
@@ -261,7 +281,11 @@ impl Window {
             let Some(index) = index else { continue };
             if let Some(delta) = delta::encode_indexed(index, candidate.object.body(), body, limit)
             {
+                let stop = delta.len() < SMALL_DELTA;
                 best = Some((delta, candidate.base, candidate.depth + 1));
+                if stop {
+                    break;
+                }
             }
         }
         best
@@ -315,8 +339,12 @@ impl Deflater {
 }
 
 fn encode_segment(work: Work) -> io::Result<Segment> {
-    let Work { objects, context, tail, deltas } = work;
-    let mut segment = Segment { entries: Vec::with_capacity(objects.len()), data: Vec::new() };
+    let Work { objects, context, tail, deltas, ids } = work;
+    let mut segment = Segment {
+        entries: Vec::with_capacity(objects.len()),
+        data: Vec::new(),
+        ids: if ids { objects.iter().map(|(_, object)| object.id()).collect() } else { Vec::new() },
+    };
     let mut window = Window::default();
     let mut deflater = Deflater::new(LEVEL);
     if let Some((path, _)) = objects.first() {
@@ -367,11 +395,10 @@ pub struct PackStats {
 type Pending = oneshot::Receiver<io::Result<Segment>>;
 
 /// From the segmenter to the writer: segments in pack order, then the number
-/// of objects sent (only after a complete walk) and, when the pack is
-/// recorded as a base, their ids.
+/// of objects sent (only after a complete walk).
 enum Message {
     Segment(Pending),
-    Done(u64, Option<Vec<ObjectId>>),
+    Done(u64),
 }
 
 /// Pack header: signature, version 2, object count.
@@ -407,13 +434,19 @@ fn write_pack(
     let mut previous = Vec::new();
     let mut out = Vec::new();
     let mut keepalive = Instant::now();
-    let (count, ids) = loop {
+    // Ids of every object, in order, when the pack becomes a base.
+    let mut ids = record.as_ref().map(|_| Vec::new());
+    let count = loop {
         let pending = match segments.blocking_recv() {
             Some(Message::Segment(pending)) => pending,
-            Some(Message::Done(count, ids)) => break (count, ids),
+            Some(Message::Done(count)) => break count,
             None => bail!("incomplete pack"),
         };
         let segment = pending.blocking_recv().map_err(|_| anyhow!("delta worker failed"))??;
+        if let Some(ids) = &mut ids {
+            ensure!(segment.ids.len() == segment.entries.len(), "segment without ids");
+            ids.extend_from_slice(&segment.ids);
+        }
         std::mem::swap(&mut offsets, &mut previous);
         offsets.clear();
         out.clear();
@@ -481,12 +514,14 @@ fn write_pack(
 /// Cuts the object stream into segments and starts a worker for each.
 struct Segmenter {
     segments: Sender<Message>,
+    /// One permit per delta worker.
+    workers: std::sync::Arc<tokio::sync::Semaphore>,
     deltas: bool,
     objects: Vec<(u64, EncodedObject)>,
     bytes: usize,
     context: Vec<(EncodedObject, usize)>,
-    /// Ids of every object, in order, when the pack becomes a base.
-    ids: Option<Vec<ObjectId>>,
+    /// Whether the pack becomes a base (its ids are needed).
+    recording: bool,
 }
 
 impl Segmenter {
@@ -496,9 +531,6 @@ impl Segmenter {
             self.dispatch(true).await?;
         } else if self.bytes >= SEGMENT_BYTES && path_changed {
             self.dispatch(false).await?;
-        }
-        if let Some(ids) = &mut self.ids {
-            ids.push(object.id());
         }
         self.bytes += object.body().len();
         self.objects.push((path, object));
@@ -529,6 +561,7 @@ impl Segmenter {
             context: std::mem::replace(&mut self.context, next),
             tail,
             deltas: self.deltas,
+            ids: self.recording,
         };
         self.bytes = 0;
         let (done, pending) = oneshot::channel();
@@ -537,8 +570,15 @@ impl Segmenter {
             .send(Message::Segment(pending))
             .await
             .map_err(|_| anyhow!("pack consumer disconnected"))?;
+        let permit = self
+            .workers
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("pack workers closed"))?;
         tokio::task::spawn_blocking(move || {
             let _ = done.send(encode_segment(work));
+            drop(permit);
         });
         Ok(())
     }
@@ -570,18 +610,19 @@ pub async fn send_with(
     let recording = record.is_some();
     let base = selection.excluded.base.clone();
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(MAX_WORKERS);
-    let (segment_tx, segment_rx) = mpsc::channel(workers);
+    let (segment_tx, segment_rx) = mpsc::channel(workers * QUEUED_PER_WORKER);
     let writer =
         tokio::task::spawn_blocking(move || write_pack(tx, segment_rx, base.as_deref(), record));
     let (part_tx, mut part_rx) = mpsc::channel::<walk::Part>(2);
     let encoder = async move {
         let mut segmenter = Segmenter {
             segments: segment_tx,
+            workers: std::sync::Arc::new(tokio::sync::Semaphore::new(workers)),
             deltas,
             objects: Vec::new(),
             bytes: 0,
             context: Vec::new(),
-            ids: recording.then(Vec::new),
+            recording,
         };
         while let Some(part) = part_rx.recv().await {
             let (mut objects, merge) = part.objects();
@@ -605,7 +646,7 @@ pub async fn send_with(
         }
         segmenter
             .segments
-            .send(Message::Done(count, segmenter.ids.take()))
+            .send(Message::Done(count))
             .await
             .map_err(|_| anyhow!("pack consumer disconnected"))
     }
@@ -961,6 +1002,7 @@ mod tests {
                 context: std::mem::take(&mut context),
                 tail,
                 deltas: true,
+                ids: false,
             };
             let segment = encode_segment(work).unwrap();
             let mut here = Vec::new();
@@ -1007,6 +1049,68 @@ mod tests {
         )
         .await;
         assert!(result.unwrap().is_err());
+    }
+
+    /// A clone is planned with one ancestry query (`select::select_all`):
+    /// exactly the commits and root trees the level-by-level walk of other
+    /// fetches selects, in the same order (newest generation first, as
+    /// `ant admin repack` stores them), with the tips a base needs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clone_planning_matches_the_level_walk_in_generation_order() {
+        use crate::select::{Fetch, select};
+        let b = Backend::in_memory();
+        let tip = support::merge_history(&b, 300).await;
+        let unrelated = support::revisions(&b, None, 1000..1003).await;
+        let wants = vec![tip, unrelated, tip];
+        let clone = select(
+            &b,
+            &Fetch {
+                wants: wants.clone(),
+                no_blobs: true,
+                done: true,
+                ofs_delta: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // A depth beyond the history takes the level walk and sends the same.
+        let walked = select(
+            &b,
+            &Fetch {
+                wants,
+                no_blobs: true,
+                done: true,
+                depth: Some(1 << 20),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(walked.shallow.is_empty() && walked.tips.is_empty());
+        assert!(clone.commits.len() > 300);
+        assert_eq!(clone.commits, walked.commits);
+        assert_eq!(clone.roots, walked.roots);
+        let mut tips = clone.tips.clone();
+        tips.sort();
+        let mut expected = vec![tip, unrelated];
+        expected.sort();
+        assert_eq!(tips, expected);
+        let nodes = b.meta.get_commits(&clone.commits).await.unwrap();
+        let order: Vec<_> = nodes
+            .iter()
+            .map(|n| {
+                let n = n.as_ref().unwrap();
+                (std::cmp::Reverse(n.generation), std::cmp::Reverse(n.committer_time), n.id)
+            })
+            .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "commits not in generation order");
+        let trees: Vec<_> = nodes.iter().map(|n| n.as_ref().unwrap().tree).collect();
+        assert_eq!(clone.roots, trees);
+        // ...and the pack of the clone is valid.
+        let (dir, _) = receive(b.clone(), clone, true, true).await;
+        git(dir.path(), &["update-ref", "refs/heads/main", &tip.to_string()]).await;
+        git(dir.path(), &["fsck", "--full", "--strict"]).await;
     }
 
     /// Counts store reads per object id.

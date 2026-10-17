@@ -55,7 +55,11 @@
 //!   (body bytes received); process-wide counters of `ant_store::s3`, read on
 //!   scrape. The S3 pack segment cache: `ant_s3_pack_segments_total{result=hit|read}`
 //!   (64 KiB segments of packs found cached or in a read already under way,
-//!   and read from S3) and `ant_s3_pack_cache_bytes` (held now).
+//!   and read from S3) and `ant_s3_pack_cache_bytes` (held now). Pack
+//!   records decoded (S3 and local packs): `ant_pack_frame_decodes_total`
+//!   (multi-object frames decompressed; reads of frames held in the decoded
+//!   frame cache, or being decoded for another reader, do not count) and
+//!   `ant_pack_frame_decoded_bytes_total` (their uncompressed bytes).
 //! - `ant_build_info{version,git}` = 1 and, with Postgres,
 //!   `ant_pg_pool_size`, `ant_pg_pool_idle`, `ant_pg_pool_in_use`,
 //!   `ant_pg_pool_max` (0 for the in-memory backend).
@@ -270,6 +274,10 @@ pub struct Metrics {
     s3_read_bytes: Counter,
     pack_segments: Family<ResultLabels, Counter>,
     pack_cache_bytes: Gauge,
+    frame_decodes: Counter,
+    frame_decoded_bytes: Counter,
+    /// Frame decode totals already folded into the counters.
+    frames_synced: Mutex<(u64, u64)>,
     /// Segment cache totals already folded into the counters.
     segments_synced: Mutex<ant_store::packed::SegmentStats>,
     /// S3 client totals already folded into the counters.
@@ -522,6 +530,19 @@ impl Metrics {
             Gauge::default(),
         );
 
+        let frame_decodes = register(
+            &mut registry,
+            "ant_pack_frame_decodes",
+            "Multi-object pack records (frames) decompressed",
+            Counter::default(),
+        );
+        let frame_decoded_bytes = register(
+            &mut registry,
+            "ant_pack_frame_decoded_bytes",
+            "Uncompressed bytes of the pack frames decompressed",
+            Counter::default(),
+        );
+
         // Closed label sets appear (as zeros) before their first event.
         for result in ["hit", "read"] {
             let _ = pack_segments.get_or_create(&ResultLabels { result });
@@ -580,6 +601,9 @@ impl Metrics {
             s3_read_bytes,
             pack_segments,
             pack_cache_bytes,
+            frame_decodes,
+            frame_decoded_bytes,
+            frames_synced: Mutex::new(ant_store::packed::frame_stats()),
             segments_synced: Mutex::new(ant_store::packed::segment_stats()),
             s3_synced: Mutex::new(ant_store::s3::stats()),
             recent_refs: Mutex::new(RecentRefs::default()),
@@ -814,6 +838,13 @@ impl Metrics {
             *done = seg;
         }
         self.pack_cache_bytes.set(i64::try_from(seg.bytes).unwrap_or(i64::MAX));
+        {
+            let frames = ant_store::packed::frame_stats();
+            let mut done = crate::lock(&self.frames_synced);
+            self.frame_decodes.inc_by(frames.0.saturating_sub(done.0));
+            self.frame_decoded_bytes.inc_by(frames.1.saturating_sub(done.1));
+            *done = frames;
+        }
         *synced = s3;
         drop(synced);
         self.s3_in_flight.set(s3.in_flight);
@@ -1090,6 +1121,8 @@ mod tests {
             r#"ant_s3_pack_segments_total{result="hit"}"#,
             r#"ant_s3_pack_segments_total{result="read"}"#,
             "ant_s3_pack_cache_bytes",
+            "ant_pack_frame_decodes_total",
+            "ant_pack_frame_decoded_bytes_total",
         ] {
             assert!(text.contains(family), "{family}: {text}");
         }

@@ -265,30 +265,56 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
 #[derive(Clone)]
 pub(crate) struct Frame {
     members: Vec<([u8; 8], usize, usize)>,
+    by_prefix: Prefixes,
     raw: Bytes,
+}
+
+/// Member indices sorted by id prefix: finding a member is a binary search,
+/// not a scan (a frame of small trees holds thousands of members, and a
+/// reader asks for hundreds of them).
+#[derive(Clone)]
+struct Prefixes(Vec<([u8; 8], u32)>);
+
+impl Prefixes {
+    fn new(prefixes: impl Iterator<Item = [u8; 8]>) -> Self {
+        let mut v: Vec<([u8; 8], u32)> = prefixes.zip(0..).collect();
+        v.sort_unstable();
+        Self(v)
+    }
+
+    /// Indices of the members whose id starts with `id`'s prefix, in
+    /// member order.
+    fn of(&self, id: &ObjectId) -> impl Iterator<Item = usize> + '_ {
+        let mut prefix = [0u8; 8];
+        prefix.copy_from_slice(&id.as_bytes()[..8]);
+        let start = self.0.partition_point(|(p, _)| *p < prefix);
+        self.0[start..].iter().take_while(move |(p, _)| *p == prefix).map(|(_, i)| *i as usize)
+    }
+
+    fn bytes(&self) -> usize {
+        self.0.len() * std::mem::size_of::<([u8; 8], u32)>()
+    }
 }
 
 impl Frame {
     /// Bytes held (for cache accounting).
     pub fn weight(&self) -> usize {
-        self.raw.len() + self.members.len() * std::mem::size_of::<([u8; 8], usize, usize)>()
+        self.raw.len()
+            + self.members.len() * std::mem::size_of::<([u8; 8], usize, usize)>()
+            + self.by_prefix.bytes()
     }
 
     /// Bytes of the members with `id`'s prefix (0 if none).
     pub fn member_len(&self, id: &ObjectId) -> usize {
-        let prefix = &id.as_bytes()[..8];
-        self.members.iter().filter(|m| m.0 == prefix).map(|m| m.2 - m.1).sum()
+        self.by_prefix.of(id).map(|i| self.members[i].2 - self.members[i].1).sum()
     }
 
     /// The member `id`, verified, copied out (so the result does not pin the
     /// whole frame in memory); `None` when no member has this id.
     pub fn get(&self, id: &ObjectId) -> Option<Result<EncodedObject>> {
-        let prefix = &id.as_bytes()[..8];
         let mut last_err = None;
-        for &(p, start, end) in &self.members {
-            if p != prefix {
-                continue;
-            }
+        for i in self.by_prefix.of(id) {
+            let (_, start, end) = self.members[i];
             let bytes = Bytes::copy_from_slice(&self.raw[start..end]);
             match EncodedObject::from_bytes(bytes).and_then(|o| o.verify(id).map(|()| o)) {
                 Ok(o) => return Some(Ok(o)),
@@ -339,7 +365,8 @@ pub(crate) fn decode_frame(record: &[u8]) -> Result<Frame> {
     if raw.len() != raw_len {
         return Err(corrupt(format!("frame data is {} bytes, header says {raw_len}", raw.len())));
     }
-    Ok(Frame { members, raw: Bytes::from(raw) })
+    let by_prefix = Prefixes::new(members.iter().map(|m| m.0));
+    Ok(Frame { members, by_prefix, raw: Bytes::from(raw) })
 }
 
 /// Decode a single-object record and verify it is `id`.
@@ -425,6 +452,7 @@ struct Memo {
 /// are rebuilt on request ([`DeltaFrame::get`]).
 pub(crate) struct DeltaFrame {
     members: Vec<DeltaEntry>,
+    by_prefix: Prefixes,
     raw: Bytes,
     memo: Mutex<Memo>,
     memo_limit: usize,
@@ -433,14 +461,16 @@ pub(crate) struct DeltaFrame {
 impl DeltaFrame {
     /// Bytes held (for cache accounting), including the memo's budget.
     pub fn weight(&self) -> usize {
-        self.raw.len() + self.members.len() * std::mem::size_of::<DeltaEntry>() + self.memo_limit
+        self.raw.len()
+            + self.members.len() * std::mem::size_of::<DeltaEntry>()
+            + self.by_prefix.bytes()
+            + self.memo_limit
     }
 
     /// Bytes rebuilding the members with `id`'s prefix costs, roughly (0 if
     /// none).
     pub fn member_len(&self, id: &ObjectId) -> usize {
-        let prefix = &id.as_bytes()[..8];
-        self.members.iter().filter(|m| m.prefix == prefix).map(|m| m.size).sum()
+        self.by_prefix.of(id).map(|i| self.members[i].size).sum()
     }
 
     /// Kind and body of member `i`, rebuilt along its chain.
@@ -499,12 +529,8 @@ impl DeltaFrame {
     /// The member `id`, rebuilt and verified; `None` when no member has
     /// this id.
     pub fn get(&self, id: &ObjectId) -> Option<Result<EncodedObject>> {
-        let prefix = &id.as_bytes()[..8];
         let mut last_err = None;
-        for (i, m) in self.members.iter().enumerate() {
-            if m.prefix != prefix {
-                continue;
-            }
+        for i in self.by_prefix.of(id) {
             let object = self.body(i).and_then(|(kind, body)| {
                 let o = EncodedObject::new(kind, &body);
                 o.verify(id).map_err(|e| corrupt(format!("object {id}: {e}")))?;
@@ -592,6 +618,7 @@ pub(crate) fn decode_delta_frame(record: &[u8]) -> Result<DeltaFrame> {
     }
     let bases: usize = members.iter().filter(|m| m.is_base).map(|m| m.size).sum();
     Ok(DeltaFrame {
+        by_prefix: Prefixes::new(members.iter().map(|m| m.prefix)),
         members,
         raw: Bytes::from(raw),
         memo: Mutex::new(Memo::default()),

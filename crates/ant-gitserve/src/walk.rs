@@ -211,6 +211,12 @@ impl Merge {
         Ok(())
     }
 
+    /// Run the merge on the blocking pool: its output, and the task.
+    fn start(self) -> (Receiver<Batch>, tokio::task::JoinHandle<Result<()>>) {
+        let (tx, rx) = mpsc::channel(2);
+        (rx, tokio::task::spawn_blocking(move || self.run(tx)))
+    }
+
     /// Objects of a group that fit one run, without a merge.
     fn into_whole(mut self) -> Result<Batch, Self> {
         if let [Run::Whole(_)] = &self.runs[..]
@@ -226,19 +232,37 @@ impl Merge {
 pub enum Part {
     Objects(Batch),
     Merge(Merge),
+    /// A merge already running on the blocking pool: its output, and the
+    /// task.
+    Merging(Receiver<Batch>, tokio::task::JoinHandle<Result<()>>),
 }
 
 impl Part {
+    /// Start a merge now (see `walk`).
+    fn start(self) -> Self {
+        match self {
+            Part::Merge(merge) => {
+                let (rx, task) = merge.start();
+                Part::Merging(rx, task)
+            }
+            part => part,
+        }
+    }
+
     /// The objects of this part, in order; merges run on the blocking pool.
     pub fn objects(self) -> (Receiver<Batch>, Option<tokio::task::JoinHandle<Result<()>>>) {
-        let (tx, rx) = mpsc::channel(2);
         match self {
             Part::Objects(batch) => {
-                // Capacity 2: never blocks.
+                let (tx, rx) = mpsc::channel(1);
+                // Capacity 1: never blocks.
                 let _ = tx.try_send(batch);
                 (rx, None)
             }
-            Part::Merge(merge) => (rx, Some(tokio::task::spawn_blocking(move || merge.run(tx)))),
+            Part::Merge(merge) => {
+                let (rx, task) = merge.start();
+                (rx, Some(task))
+            }
+            Part::Merging(rx, task) => (rx, Some(task)),
         }
     }
 }
@@ -508,7 +532,11 @@ pub async fn walk(b: Backend, selection: Selection, tx: Sender<Part>) -> Result<
         .await?;
         walk = state;
         for part in parts {
-            tx.send(part).await.map_err(|_| anyhow!("pack encoder stopped"))?;
+            // Merges start as they are queued, not when the encoder gets to
+            // them: a merge (versions of one path rebuilt in size order) is
+            // serial work, and the encoder takes parts one at a time. A
+            // merge blocks once two batches of its output wait.
+            tx.send(part.start()).await.map_err(|_| anyhow!("pack encoder stopped"))?;
         }
     }
     ensure!(walk.stash.is_empty() && walk.children.is_empty(), "unfinished export walk");

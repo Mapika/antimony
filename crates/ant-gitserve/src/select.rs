@@ -240,6 +240,43 @@ impl<T> Drop for Read<T> {
     }
 }
 
+/// Where a selected commit (and its root tree) goes in the pack: newest
+/// first by generation, then by committer time, then by id.
+///
+/// The walk from the wants is level by level (distance from the wants), but
+/// commits and root trees are read in this order instead. Consecutive root
+/// trees are then close in history, which keeps the export walk's runs of
+/// versions small (see `walk.rs`), and it is the order `ant admin repack`
+/// stores commits (and every path's versions) in: reading in level order
+/// jumps between the delta frames of a repacked store on merge-heavy
+/// histories (topic branches are many levels deep but old) and decodes each
+/// frame many times over (the Linux kernel: ~1.5M commits read 256 at a
+/// time, a 64 MiB cache of decoded frames).
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct Order {
+    generation: Reverse<u64>,
+    time: Reverse<i64>,
+    id: ObjectId,
+    tree: ObjectId,
+}
+
+impl Order {
+    fn of(node: &CommitNode) -> Self {
+        Self {
+            generation: Reverse(node.generation),
+            time: Reverse(node.committer_time),
+            id: node.id,
+            tree: node.tree,
+        }
+    }
+
+    /// The commits and their root trees, in pack order.
+    fn sorted(mut selected: Vec<Self>) -> (Vec<ObjectId>, Vec<ObjectId>) {
+        selected.sort_unstable();
+        selected.into_iter().map(|order| (order.id, order.tree)).unzip()
+    }
+}
+
 /// Plan the pack for `fetch`: walk the commits from the wants (level by
 /// level, `BATCH` at a time, up to `depth` for shallow fetches, recording the
 /// new shallow and unshallow boundaries) and collect everything the client
@@ -249,11 +286,13 @@ impl<T> Drop for Read<T> {
 /// selected root trees and not excluded. No object body but the client's
 /// trees is read here.
 pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
+    if fetch.haves.is_empty() && fetch.shallow.is_empty() && fetch.depth.is_none() {
+        return select_all(b, fetch).await;
+    }
     let mut known = Known::default();
     known.add(b, &fetch.haves).await?;
-    let mut commits = Vec::new();
+    let mut selected = Vec::new();
     let mut direct = Vec::new();
-    let mut roots = Vec::new();
     let mut shallow = Vec::new();
     let mut unshallow = Vec::new();
     let mut seen = HashSet::new();
@@ -286,8 +325,7 @@ pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
                 {
                     continue;
                 }
-                commits.push(*id);
-                roots.push((Reverse(node.generation), node.tree));
+                selected.push(Order::of(&node));
                 if clone {
                     if wanted.contains(id) {
                         tips.push(*id);
@@ -315,18 +353,14 @@ pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
     tips.retain(|id| !parents.contains(id));
     drop(parents);
     let mut excluded = HashSet::new();
-    if !roots.is_empty() || !direct.is_empty() {
+    if !selected.is_empty() || !direct.is_empty() {
         // Exact subtraction includes historical trees, including restored files.
         known.advance_to(b, 0, &fetch.shallow).await?;
         let known_roots = std::mem::take(&mut known.roots);
         drop(known);
         excluded = reachable(b, known_roots, fetch.no_blobs).await?;
     }
-    // Newest first by generation rather than by distance from the wants:
-    // consecutive root trees are then close in history, which keeps the
-    // export walk's runs of versions small (see `walk.rs`).
-    roots.sort_by_key(|(generation, _)| *generation);
-    let roots = roots.into_iter().map(|(_, tree)| tree).collect();
+    let (commits, roots) = Order::sorted(selected);
     Ok(Selection {
         commits,
         direct,
@@ -336,6 +370,50 @@ pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
         shallow,
         unshallow,
         tips,
+    })
+}
+
+/// [`select`] of a fetch with nothing to subtract and no depth (a clone, or a
+/// fetch without `have`s): every commit the wants reach, read with one
+/// ancestry query (`MetaStore::ancestors_above`, a single server-side
+/// traversal in Postgres) instead of one store call per level of history
+/// (the Linux kernel's history is ~1M levels deep, merge-heavy histories
+/// average only a few commits per level).
+async fn select_all(b: &Backend, fetch: &Fetch) -> Result<Selection> {
+    let mut wanted = Vec::new();
+    let mut direct = Vec::new();
+    let mut seen = HashSet::new();
+    for chunk in fetch.wants.chunks(BATCH) {
+        for (id, node) in chunk.iter().zip(b.meta.get_commits(chunk).await?) {
+            if !seen.insert(*id) {
+                continue;
+            }
+            match node {
+                Some(_) => wanted.push(*id),
+                // A blob or tree (or an unknown id): classified by the
+                // export walk, which reads it anyway.
+                None => direct.push(*id),
+            }
+        }
+    }
+    drop(seen);
+    let nodes = b.meta.ancestors_above(&wanted, 0, usize::MAX).await?;
+    let mut tips = Vec::new();
+    if fetch.is_clone() {
+        let parents: HashSet<ObjectId> =
+            nodes.iter().flat_map(|node| node.parents.iter().copied()).collect();
+        tips = wanted.iter().copied().filter(|id| !parents.contains(id)).collect();
+    }
+    let (commits, roots) = Order::sorted(nodes.iter().map(Order::of).collect());
+    drop(nodes);
+    Ok(Selection {
+        commits,
+        direct,
+        roots,
+        excluded: Excluded::default(),
+        no_blobs: fetch.no_blobs,
+        tips,
+        ..Default::default()
     })
 }
 
@@ -362,8 +440,7 @@ pub async fn select_after(
     }
     let base_tips: HashSet<ObjectId> = base.tips.iter().copied().collect();
     let mut reached_tips = HashSet::new();
-    let mut commits = Vec::new();
-    let mut roots = Vec::new();
+    let mut selected = Vec::new();
     let mut seen = HashSet::new();
     let mut frontier = fetch.wants.clone();
     while !frontier.is_empty() {
@@ -384,14 +461,13 @@ pub async fn select_after(
             }
         }
         for chunk in new.chunks(BATCH) {
-            for (id, node) in chunk.iter().zip(b.meta.get_commits(chunk).await?) {
+            for node in b.meta.get_commits(chunk).await? {
                 let Some(node) = node else { return Ok(None) };
-                commits.push(*id);
-                roots.push((Reverse(node.generation), node.tree));
+                selected.push(Order::of(&node));
                 next.extend(node.parents);
             }
         }
-        if commits.len() > limit {
+        if selected.len() > limit {
             return Ok(None);
         }
         frontier = next;
@@ -399,10 +475,10 @@ pub async fn select_after(
     if reached_tips.len() != base_tips.len() {
         return Ok(None);
     }
-    roots.sort_by_key(|(generation, _)| *generation);
+    let (commits, roots) = Order::sorted(selected);
     Ok(Some(Selection {
         commits,
-        roots: roots.into_iter().map(|(_, tree)| tree).collect(),
+        roots,
         excluded: Excluded { set: HashSet::new(), base: Some(base.clone()) },
         no_blobs: fetch.no_blobs,
         ..Default::default()

@@ -281,23 +281,71 @@ impl Decoded {
     }
 }
 
-/// Recently decoded frames by `(pack, offset)`, bounded by bytes.
+/// A record's place: pack and offset.
+type RecordKey = ([u8; 16], u64);
+
+/// Recently decoded frames by `(pack, offset)`, bounded by bytes, and the
+/// records some `get_many` call is reading and decoding right now.
 struct FrameCache {
-    frames: lru::LruCache<([u8; 16], u64), Arc<Decoded>>,
+    frames: lru::LruCache<RecordKey, Arc<Decoded>>,
     bytes: usize,
     limit: usize,
+    /// Records being read, by the call reading them (its serial number) and
+    /// a receiver that sees that call finish. Concurrent calls wanting
+    /// members of the same frame (a pack export reads the versions of one
+    /// path in several batches at once) wait for it instead of reading and
+    /// decoding the frame again.
+    pending: HashMap<RecordKey, (u64, tokio::sync::watch::Receiver<()>)>,
+    serial: u64,
+    /// Frames decoded by this store (tests).
+    #[cfg(test)]
+    decodes: u64,
+}
+
+/// Records a `get_many` call reads and decodes, registered in the
+/// [`FrameCache`]: dropping it (the call's reads are done, or failed, or
+/// the call was dropped) wakes the calls waiting for them.
+struct Flight {
+    cache: Arc<Mutex<FrameCache>>,
+    serial: u64,
+    keys: Vec<RecordKey>,
+    _done: tokio::sync::watch::Sender<()>,
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        let mut cache = self.cache.lock();
+        for key in &self.keys {
+            if cache.pending.get(key).is_some_and(|(serial, _)| *serial == self.serial) {
+                cache.pending.remove(key);
+            }
+        }
+    }
 }
 
 impl FrameCache {
     fn new(limit: usize) -> Self {
-        Self { frames: lru::LruCache::unbounded(), bytes: 0, limit }
+        Self {
+            frames: lru::LruCache::unbounded(),
+            bytes: 0,
+            limit,
+            pending: HashMap::new(),
+            serial: 0,
+            #[cfg(test)]
+            decodes: 0,
+        }
     }
 
     fn get(&mut self, key: &([u8; 16], u64)) -> Option<Arc<Decoded>> {
         self.frames.get(key).cloned()
     }
 
+    /// Keep a frame just decoded.
     fn insert(&mut self, key: ([u8; 16], u64), f: Arc<Decoded>) {
+        #[cfg(test)]
+        {
+            self.decodes += 1;
+        }
         if f.weight() > self.limit {
             return;
         }
@@ -393,6 +441,15 @@ static SEGMENT_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 static SEGMENT_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SEGMENT_HELD: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static SEGMENT_BYTES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+static FRAME_DECODES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FRAME_DECODED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Frames decoded and their uncompressed bytes (all stores, process-wide).
+pub fn frame_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (FRAME_DECODES.load(Relaxed), FRAME_DECODED_BYTES.load(Relaxed))
+}
 
 /// The current [`SegmentStats`].
 pub fn segment_stats() -> SegmentStats {
@@ -527,6 +584,11 @@ impl<I: PackIndex, F: PackFiles> PackedStore<I, F> {
                 let first = &group[0];
                 if let Some(f) = Decoded::decode(record) {
                     let f = Arc::new(f?);
+                    FRAME_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    FRAME_DECODED_BYTES.fetch_add(
+                        frame::frame_raw_len(record).unwrap_or(0) as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     for e in group {
                         out.push((e.id, member(&f, e)?));
                     }
@@ -755,31 +817,107 @@ impl<I: PackIndex, F: PackFiles> PackedStore<I, F> {
             .filter(|id| wanted.insert(**id))
             .filter_map(|id| index.get(id).copied())
             .collect();
-        // Members of frames decoded recently need no S3 read.
+        // Members of frames decoded recently need no S3 read; frames
+        // another call is reading are waited for (see `FrameCache::pending`).
         let mut cached: Vec<(IndexEntry, Arc<Decoded>)> = Vec::new();
         let mut fetch: Vec<IndexEntry> = Vec::with_capacity(found.len());
-        {
+        let mut waits: Vec<(tokio::sync::watch::Receiver<()>, Vec<IndexEntry>)> = Vec::new();
+        let flight = {
             let mut cache = self.frames.lock();
+            cache.serial += 1;
+            let serial = cache.serial;
+            let (done, seen) = tokio::sync::watch::channel(());
+            let mut keys = Vec::new();
+            let mut waiting: HashMap<u64, usize> = HashMap::new();
             for e in found {
-                match cache.get(&(e.pack, e.off)) {
-                    Some(f) => cached.push((e, f)),
-                    None => fetch.push(e),
+                let key = (e.pack, e.off);
+                if let Some(f) = cache.get(&key) {
+                    cached.push((e, f));
+                } else if let Some((other, rx)) =
+                    cache.pending.get(&key).filter(|(other, _)| *other != serial)
+                {
+                    let at = *waiting.entry(*other).or_insert_with(|| {
+                        waits.push((rx.clone(), Vec::new()));
+                        waits.len() - 1
+                    });
+                    waits[at].1.push(e);
+                } else {
+                    if cache.pending.insert(key, (serial, seen.clone())).is_none() {
+                        keys.push(key);
+                    }
+                    fetch.push(e);
+                }
+            }
+            Flight { cache: self.frames.clone(), serial, keys, _done: done }
+        };
+        let mut got: HashMap<ObjectId, EncodedObject> = HashMap::with_capacity(wanted.len());
+        got.extend(Self::extract(cached).await?);
+        got.extend(self.fetch(fetch).await?);
+        // Our reads are done: wake the calls waiting for them, then wait for
+        // the ones we wait for (never the other way round, so calls waiting
+        // for each other always finish).
+        drop(flight);
+        let mut again = Vec::new();
+        for (mut rx, entries) in waits {
+            // An error only means the reading call is gone: done either way.
+            let _ = rx.changed().await;
+            let mut hits = Vec::new();
+            {
+                let mut cache = self.frames.lock();
+                for e in entries {
+                    match cache.get(&(e.pack, e.off)) {
+                        Some(f) => hits.push((e, f)),
+                        // Failed, evicted, or a record that is not a frame.
+                        None => again.push(e),
+                    }
+                }
+            }
+            got.extend(Self::extract(hits).await?);
+        }
+        got.extend(self.fetch(again).await?);
+        // Objects stored one per key (before packs existed).
+        let mut legacy_ids: Vec<ObjectId> = if self.files.may_hold_unpacked() {
+            wanted.iter().filter(|id| !got.contains_key(id)).copied().collect()
+        } else {
+            Vec::new()
+        };
+        if !legacy_ids.is_empty() {
+            let condemned = self.index.condemned_among(&legacy_ids).await?;
+            legacy_ids.retain(|id| !condemned.contains(id));
+        }
+        if !legacy_ids.is_empty() {
+            for (id, obj) in legacy_ids.iter().zip(self.files.get_unpacked(&legacy_ids).await?) {
+                if let Some(obj) = obj {
+                    got.insert(*id, obj);
                 }
             }
         }
-        let mut got: HashMap<ObjectId, EncodedObject> = HashMap::with_capacity(wanted.len());
-        if !cached.is_empty() {
-            // Copying out and hashing the members.
-            let work: usize = cached.iter().map(|(e, f)| f.member_len(&e.id)).sum();
-            let extract = move || -> Result<Vec<(ObjectId, EncodedObject)>> {
-                cached.iter().map(|(e, f)| Ok((e.id, member(f, e)?))).collect()
-            };
-            let objects = if work > BLOCKING_THRESHOLD {
-                tokio::task::spawn_blocking(extract).await.map_err(StoreError::backend)??
-            } else {
-                extract()?
-            };
-            got.extend(objects);
+        Ok(ids.iter().map(|id| got.get(id).cloned()).collect())
+    }
+
+    /// Members of decoded frames, copied out and verified.
+    async fn extract(
+        cached: Vec<(IndexEntry, Arc<Decoded>)>,
+    ) -> Result<Vec<(ObjectId, EncodedObject)>> {
+        if cached.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Copying out and hashing the members.
+        let work: usize = cached.iter().map(|(e, f)| f.member_len(&e.id)).sum();
+        let extract = move || -> Result<Vec<(ObjectId, EncodedObject)>> {
+            cached.iter().map(|(e, f)| Ok((e.id, member(f, e)?))).collect()
+        };
+        if work > BLOCKING_THRESHOLD {
+            tokio::task::spawn_blocking(extract).await.map_err(StoreError::backend)?
+        } else {
+            extract()
+        }
+    }
+
+    /// Read and decode the records of `fetch`.
+    async fn fetch(&self, fetch: Vec<IndexEntry>) -> Result<Vec<(ObjectId, EncodedObject)>> {
+        if fetch.is_empty() {
+            return Ok(Vec::new());
         }
         // Records through the segment cache; large ones (and all of them
         // without the cache) with ranged reads of their own.
@@ -801,26 +939,7 @@ impl<I: PackIndex, F: PackFiles> PackedStore<I, F> {
             }
         };
         let (fetched, segmented) = futures::try_join!(direct_reads, segment_reads)?;
-        got.extend(fetched.into_iter().flatten());
-        got.extend(segmented);
-        // Objects stored one per key (before packs existed).
-        let mut legacy_ids: Vec<ObjectId> = if self.files.may_hold_unpacked() {
-            wanted.iter().filter(|id| !got.contains_key(id)).copied().collect()
-        } else {
-            Vec::new()
-        };
-        if !legacy_ids.is_empty() {
-            let condemned = self.index.condemned_among(&legacy_ids).await?;
-            legacy_ids.retain(|id| !condemned.contains(id));
-        }
-        if !legacy_ids.is_empty() {
-            for (id, obj) in legacy_ids.iter().zip(self.files.get_unpacked(&legacy_ids).await?) {
-                if let Some(obj) = obj {
-                    got.insert(*id, obj);
-                }
-            }
-        }
-        Ok(ids.iter().map(|id| got.get(id).cloned()).collect())
+        Ok(fetched.into_iter().flatten().chain(segmented).collect())
     }
 }
 
@@ -1218,6 +1337,40 @@ mod tests {
         }
         let cold = PackedS3Store::new(store.index.clone(), s3.clone());
         assert!(cold.get(&ids[0]).await.is_err());
+    }
+
+    /// Concurrent reads of members of one frame (a pack export reads the
+    /// versions of one path in several batches at once) read and decode it
+    /// once: the others wait for the first and take the members from the
+    /// decoded-frame cache. Every read still gets exactly its objects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs postgres and s3: docker compose up -d"]
+    async fn concurrent_reads_of_one_frame_decode_it_once() {
+        let (store, s3) = fresh().await;
+        let objects = history(40);
+        let ids: Vec<ObjectId> = objects.iter().map(EncodedObject::id).collect();
+        store.put_many(&objects).await.unwrap();
+        let index = store.index.lookup_index(&ids).await.unwrap();
+        let frames: HashSet<([u8; 16], u64)> = index.values().map(|e| (e.pack, e.off)).collect();
+        assert!(frames.len() < ids.len() / 4, "objects share frames: {} frames", frames.len());
+        for round in 0..5 {
+            let reader = PackedS3Store::new(store.index.clone(), s3.clone());
+            let reads = (0..16).map(|n| {
+                let reader = reader.clone();
+                // Overlapping batches, every one touching most frames.
+                let wanted: Vec<ObjectId> =
+                    ids.iter().copied().skip((n + round) % 3).step_by(2).collect();
+                async move { (reader.get_many(&wanted).await.unwrap(), wanted) }
+            });
+            for (got, wanted) in futures::future::join_all(reads).await {
+                for (object, id) in got.iter().zip(&wanted) {
+                    assert_eq!(object.as_ref().map(EncodedObject::id), Some(*id));
+                }
+            }
+            let cache = reader.frames.lock();
+            assert_eq!(cache.decodes, frames.len() as u64, "round {round}");
+            assert!(cache.pending.is_empty());
+        }
     }
 
     #[test]

@@ -20,8 +20,24 @@ fn size(out: &mut Vec<u8>, mut n: usize) {
     }
 }
 
-fn hash(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0_u64, |h, &b| h.wrapping_mul(257).wrapping_add(u64::from(b)))
+/// `257^(BLOCK - 1 - i)`: the weight of byte `i` of a block in [`hash`].
+const POWERS: [u64; BLOCK] = {
+    let mut powers = [1_u64; BLOCK];
+    let mut i = BLOCK - 1;
+    while i > 0 {
+        powers[i - 1] = powers[i].wrapping_mul(257);
+        i -= 1;
+    }
+    powers
+};
+
+/// The polynomial hash of one block, `sum(b[i] * 257^(BLOCK - 1 - i))`
+/// (wrapping): the value the rolling hash in [`encode_indexed`] keeps. A sum
+/// of independent products rather than Horner's chain of dependent
+/// multiply-adds, so it pipelines (every block of every base is hashed).
+fn hash(block: &[u8]) -> u64 {
+    debug_assert_eq!(block.len(), BLOCK);
+    block.iter().zip(POWERS).fold(0_u64, |h, (&b, p)| h.wrapping_add(u64::from(b).wrapping_mul(p)))
 }
 
 fn insert(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -104,6 +120,21 @@ impl Index {
     }
 }
 
+/// Length of the common prefix of `a` and `b`, compared a word at a time:
+/// matches of tree versions run for kilobytes.
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    let mut n = 0;
+    for (x, y) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
+        let word = |c: &[u8]| <[u8; 8]>::try_from(c).map_or(0, u64::from_le_bytes);
+        let diff = word(x) ^ word(y);
+        if diff != 0 {
+            return n + (diff.trailing_zeros() / 8) as usize;
+        }
+        n += 8;
+    }
+    n + a[n..].iter().zip(&b[n..]).take_while(|(x, y)| x == y).count()
+}
+
 /// Delta instructions turning `base` into `target`, or `None` unless they are
 /// shorter than `limit` bytes. `index` must have been built from `base`.
 pub fn encode_indexed(index: &Index, base: &[u8], target: &[u8], limit: usize) -> Option<Vec<u8>> {
@@ -120,7 +151,10 @@ pub fn encode_indexed(index: &Index, base: &[u8], target: &[u8], limit: usize) -
     while pos + BLOCK <= target.len() {
         let candidate = index.table[index.slot(rolling)];
         let offset = candidate as usize;
-        if candidate != EMPTY && base[offset..offset + BLOCK] == target[pos..pos + BLOCK] {
+        // The whole forward match at once (at least a block, or no match).
+        let matched =
+            if candidate == EMPTY { 0 } else { common_prefix(&base[offset..], &target[pos..]) };
+        if matched >= BLOCK {
             // Grow the match backwards into the pending literal, then forwards.
             let mut back = 0;
             while back < pos - literal
@@ -130,13 +164,7 @@ pub fn encode_indexed(index: &Index, base: &[u8], target: &[u8], limit: usize) -
                 back += 1;
             }
             insert(&mut out, &target[literal..pos - back]);
-            let mut length = BLOCK;
-            while offset + length < base.len()
-                && pos + length < target.len()
-                && base[offset + length] == target[pos + length]
-            {
-                length += 1;
-            }
+            let length = matched;
             copy(&mut out, offset - back, length + back);
             pos += length;
             literal = pos;
@@ -327,5 +355,38 @@ mod tests {
         }
         assert_eq!(super::apply(&base, &instructions, &mut out), Some(()));
         assert_eq!(out, base[..65536]);
+    }
+
+    /// The word-at-a-time match length and the pipelined block hash compute
+    /// exactly what their byte-at-a-time definitions do (deltas, and so
+    /// export packs and repacked records, stay byte for byte the same).
+    #[test]
+    fn fast_match_and_hash_equal_their_definitions() {
+        let mut state = 99_u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for _ in 0..2000 {
+            let len = (next() % 100) as usize;
+            let a: Vec<u8> = (0..len).map(|_| (next() % 3) as u8).collect();
+            let mut b = a.clone();
+            if !b.is_empty() && next() % 2 == 0 {
+                let at = (next() as usize) % b.len();
+                b[at] ^= 1 + (next() % 255) as u8;
+            }
+            b.truncate((next() as usize) % (len + 1));
+            let naive = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+            assert_eq!(common_prefix(&a, &b), naive);
+            assert_eq!(common_prefix(&b, &a), naive);
+        }
+        for _ in 0..1000 {
+            let block: Vec<u8> = (0..BLOCK).map(|_| next() as u8).collect();
+            let horner =
+                block.iter().fold(0_u64, |h, &b| h.wrapping_mul(257).wrapping_add(u64::from(b)));
+            assert_eq!(hash(&block), horner);
+        }
     }
 }
