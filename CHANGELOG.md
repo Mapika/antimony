@@ -62,6 +62,20 @@ S3 GETs 35k -> 3k) through a new S3 pack segment cache
   a pack evicted by another process stays readable through the open
   handle until then. No on-disk format change.
 
+### Fixed
+
+- The `repack_races_writers_readers_and_collections` test could run past
+  nextest's 300 s timeout on a slower CI runner (it normally takes 66-86 s
+  there). It was not a hang: its writers landed at a fixed pace, so a
+  slower machine grew more history during each collection round, and each
+  round's mark, which costs time in proportion to the history, took longer
+  than the one before. Writers now slow to a land a second each after 300
+  lands in a phase. They keep racing every phase, and the test's work no
+  longer grows from round to round. With marking slowed artificially by
+  10/20/40 ms per batch, the test took 408 s/over 600 s/over 600 s before
+  this change and 76/125/250 s after it. The pack segment cache made no
+  difference.
+
 ## [0.3.0] - 2026-10-17
 
 Minor release: no Postgres schema or protocol changes; 0.2.x servers and

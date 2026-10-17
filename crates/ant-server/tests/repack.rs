@@ -626,6 +626,28 @@ async fn interrupted_repack_resumes() {
     assert_eq!(readback(&r.fresh()).await, before);
 }
 
+/// How long a writer of `repack_races_writers_readers_and_collections`
+/// pauses after the `n`th land of the current phase (a collection round,
+/// or the final repacks).
+///
+/// Enough history to race over, not so much that marking it takes the
+/// test's time. Writers land at a wall-clock rate while a collection's mark
+/// (and a repack's walk, and a readback) costs time in proportion to the
+/// history, so with a fixed pause a slower machine grows more history per
+/// round, which makes the next round slower still: the work grew
+/// geometrically from round to round, and a CI runner somewhat slower than
+/// usual took the test from about 85 s past nextest's 300 s timeout. Past
+/// [`PHASE_LANDS`] lands in one phase writers slow down to a land a second
+/// each: they keep racing the phase however long it takes, but a slow phase
+/// adds little history.
+fn writer_pause(n: usize) -> Duration {
+    if n <= PHASE_LANDS { Duration::from_millis(50) } else { Duration::from_secs(1) }
+}
+
+/// Lands per phase at the full pace (a round takes 3-15 s on a developer
+/// machine, at about 40 lands per second).
+const PHASE_LANDS: usize = 300;
+
 /// Writers land changesets (some re-storing old content), readers read
 /// everything reachable, collections and repacks run, all at once. No read
 /// may fail or miss a reachable object, and everything reachable at the end
@@ -652,9 +674,13 @@ async fn repack_races_writers_readers_and_collections() {
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicUsize::new(0)),
     );
+    // Lands since the current collection round (or the final repacks)
+    // began; see `writer_pause`.
+    let phase_lands = Arc::new(AtomicUsize::new(0));
     let mut tasks = Vec::new();
     for w in 0..3usize {
-        let (r, stop, lands) = (r.clone(), stop.clone(), lands.clone());
+        let (r, stop, lands, phase_lands) =
+            (r.clone(), stop.clone(), lands.clone(), phase_lands.clone());
         tasks.push(tokio::spawn(async move {
             let mut i = 0u32;
             while !stop.load(Ordering::Relaxed) {
@@ -673,9 +699,8 @@ async fn repack_races_writers_readers_and_collections() {
                     }
                 }
                 lands.fetch_add(1, Ordering::Relaxed);
-                // Enough history to race over, not so much that marking it
-                // takes the test's time.
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                let n = phase_lands.fetch_add(1, Ordering::Relaxed) + 1;
+                tokio::time::sleep(writer_pause(n)).await;
             }
         }));
     }
@@ -723,12 +748,14 @@ async fn repack_races_writers_readers_and_collections() {
             // Old packs repacks moved rows out of age past the minimum.
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
+        phase_lands.store(0, Ordering::Relaxed);
         let report = r.pg.gc(r.b.objects.as_ref(), &gc, &|_| {}).await.unwrap();
         packs += report.packs;
         assert!(report.finished, "{report:?}");
         collected += report.objects + report.large_objects + report.commits;
     }
     // Let a repack and some reads run after the collections too.
+    phase_lands.store(0, Ordering::Relaxed);
     let n = repacks.load(Ordering::Relaxed);
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while repacks.load(Ordering::Relaxed) < n + 2 {
