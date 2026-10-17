@@ -80,8 +80,7 @@ S3 GETs 35k -> 3k) through a new S3 pack segment cache
   - Synthetic 96k-file checkout, first one against a freshly started
     server, Hetzner ccx43 + ccx33: 6.1-6.9 s → 4.1-4.5 s; S3 GETs
     34.8k → 3.0k, bytes read 1.15 → 0.59 GiB, SeaweedFS CPU 40 → 5 s,
-    `ant serve` CPU 26 → 16 s
-    ([docs/dev/scorecard/2026-10-17-hetzner-cold-read-path.md](docs/dev/scorecard/2026-10-17-hetzner-cold-read-path.md)).
+    `ant serve` CPU 26 → 16 s.
   - git/git blobless clone with no cached base: S3 GETs 5.4k → 1.4k, bytes
     272 → 118 MiB; its time is the export's delta search (CPU), not S3.
 - Metrics: `ant_s3_requests_total{op}`, `ant_s3_read_bytes_total`,
@@ -95,8 +94,7 @@ S3 GETs 35k -> 3k) through a new S3 pack segment cache
 
 - Faster warm checkout (objects already in the client cache): on Hetzner
   (ccx33 client), 96k files over the network 1.72 → 1.51 s (median of 9),
-  cold 2.68 → 2.48 s. See
-  [docs/dev/scorecard/2026-10-17-hetzner-ccx43-ccx33-checkout.md](docs/dev/scorecard/2026-10-17-hetzner-ccx43-ccx33-checkout.md).
+  cold 2.68 → 2.48 s.
   - Files are created in path order. Leaves are sorted before they reach
     the writers, so each writer creates a directory and its contents
     together and writers work in different subtrees. The walk's order made
@@ -132,10 +130,8 @@ S3 GETs 35k -> 3k) through a new S3 pack segment cache
 Minor release: no Postgres schema or protocol changes; 0.2.x servers and
 clients interoperate. New: local mode (`ant serve --local`, SQLite + local
 packs, no Postgres/S3). New on-disk formats are additive (local data
-directory, client cache `packs/`). Final scorecard:
-[docs/dev/scorecard/2026-10-17-v0.3.0.md](docs/dev/scorecard/2026-10-17-v0.3.0.md)
-(27/27); upgrade test from v0.2.2: 83 passed, 0 failed; cloud numbers in
-`docs/dev/scorecard/2026-10-16-hetzner-*`.
+directory, client cache `packs/`). Final scorecard: 27/27; upgrade test
+from v0.2.2: 83 passed, 0 failed; cloud numbers from two Hetzner boxes.
 
 ### Added
 
@@ -187,7 +183,7 @@ directory, client cache `packs/`). Final scorecard:
 - **Network checkout**: a 96k-file, 1.4 GiB checkout over Hetzner's private
   network now takes 2.9 s cold and 1.8 s warm, down from 14.4 s and 3.5 s.
   The client uses 13 CPU-s instead of 43. Adding 30 ms of RTT costs about
-  0.1 s (`docs/dev/scorecard/2026-10-16-hetzner-ccx43-ccx33-checkout.md`).
+  0.1 s.
   - `Workspace::materialize` overlaps the tree walk, the fetches and the
     file writes. Subtrees are requested as soon as their parent is decoded,
     with no wait between levels. Files come straight from the downloaded
@@ -218,7 +214,7 @@ directory, client cache `packs/`). Final scorecard:
   git/git (Postgres + S3, local, `--single-branch`): blobless clone 6.0-7.8 s
   -> 2.1 s (native `git daemon` 1.6 s), full clone 19-22 s -> 7.1 s (native
   6.3 s); a clone 2,000 first-parent commits past the base: 3.0 s / 10 s.
-  Hetzner ccx43 + ccx33 (docs/dev/scorecard/2026-10-16-hetzner-gitserve-clone.md):
+  Hetzner ccx43 + ccx33:
   blobless 29.5 -> 4.2 s (native 2.9 s), full 77.5 -> 11.4 s (native 8.9 s).
 - Smaller and cheaper export packs: trees try 40 delta bases instead of 10
   (git/git blobless `.git` 92.4 -> 81.4 MB, native 61.1 MB; full 160 -> 149
@@ -236,8 +232,7 @@ directory, client cache `packs/`). Final scorecard:
 
 ### Performance
 
-Landing and import on cloud boxes (Hetzner ccx43 + ccx33, same-box A/B,
-[record](docs/dev/scorecard/2026-10-16-hetzner-landing-ab.md)):
+Landing and import on cloud boxes (Hetzner ccx43 + ccx33, same-box A/B):
 - 64 agents: 2,335 → 3,231 lands/s, land p99 46 → 37 ms
 - `create_changeset` p50 at 64 agents: 5.5 → 3.2 ms
 - git/git import: 4,566 → 8,309 commits/s (peak RSS 0.88 → 1.03 GiB)
@@ -381,7 +376,7 @@ Patch release: no storage or protocol changes; servers and clients of 0.2.0 inte
 
 ## [0.2.0] - 2026-10-16
 
-Storage format change (schema version 7): read docs/operations.md, "Upgrading", before upgrading from 0.1.x. Final scorecard: [docs/dev/scorecard/2026-10-16-v0.2.0.md](docs/dev/scorecard/2026-10-16-v0.2.0.md) (27/27); upgrade test from v0.1.0 on git/git: 90/90.
+Storage format change (schema version 7): read docs/operations.md, "Upgrading", before upgrading from 0.1.x. Final scorecard: 27/27; upgrade test from v0.1.0 on git/git: 90/90.
 
 Known issue: the cold checkout of the synthetic 96k-file tree measured 4.7 s (target 5 s; 2.5 s in the 0.1.0 scorecard); to be investigated for 0.2.1 (cause: per-object cross-process claim files, see Unreleased).
 
@@ -404,7 +399,7 @@ Known issue: the cold checkout of the synthetic 96k-file tree measured 4.7 s (ta
   the previous tag, built in a temporary worktree) to the checkout on real
   Postgres + S3, in place and rolling, with byte-identical reads, `git fsck`
   of the export, client skew both ways, `ant admin gc` and the refused
-  downgrade; run before every release (`docs/dev/release.md`). Run from 0.1.0
+  downgrade; run before every release. Run from 0.1.0
   with git/git as extra corpus: every check passes.
 - `ant admin repack` (`ant_store::postgres::repack`): git-gc-style repacking
   of Postgres + S3 stores. Walks the history from every ref (newest first,
@@ -702,9 +697,9 @@ deploying.
 
 ### Performance
 
-From [docs/dev/scorecard/](docs/dev/scorecard/) (WSL2 on one development machine, one
+From the benchmark scorecards (WSL2 on one development machine, one
 Postgres and SeaweedFS S3 on the same host; numbers are indicative, not
-guarantees) and the ROADMAP status:
+guarantees) and the roadmap status:
 
 | measure | result |
 |---|---|
@@ -720,9 +715,7 @@ guarantees) and the ROADMAP status:
 | Git export | git/git: `--depth 1` 0.7 s, `blob:none` clone 88 MiB in 7.0 s (1.2x native git); rust-lang/rust `blob:none` 33 s (native 30 s) |
 | Lazy workspace writes | 72% of direct write speed, 7,700 small files/s, `cargo build` 1.27x |
 
-The final pre-release scorecard
-([docs/dev/scorecard/2026-10-14-final.md](docs/dev/scorecard/2026-10-14-final.md))
-passes all 27 rows.
+The final pre-release scorecard passes all 27 rows.
 
 Also in this release:
 

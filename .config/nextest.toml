@@ -1,4 +1,4 @@
-# Test tiers (see AGENTS.md):
+# Test tiers (see CONTRIBUTING.md):
 #   fast: cargo nextest run --workspace                      (no external services)
 #   full: cargo nextest run --workspace --run-ignored all     (Postgres/S3/FUSE/e2e)
 [profile.default]

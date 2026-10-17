@@ -10,7 +10,7 @@
 #
 # ANT_PG_OPTS: extra postgres options for start/pg-restart, e.g.
 # "-c commit_delay=50 -c shared_preload_libraries=pg_stat_statements"
-# (scripts/landing-bench.sh uses it to compare Postgres settings).
+# (to compare Postgres settings between benchmark runs).
 # Everything lives in $ANT_SERVICES_DIR (default ~/.local/share/antimony-services).
 set -eu
 

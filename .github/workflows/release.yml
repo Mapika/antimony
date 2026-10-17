@@ -1,12 +1,11 @@
 name: release
 
-# Cut by pushing a `v*` tag (see docs/dev/release.md). Builds the Linux binary,
-# attaches it to a DRAFT GitHub release (review, then publish by hand) and
-# pushes a Docker image to GHCR tagged with the version.
+# Cut by pushing a `v*` tag. Builds the Linux binary, attaches it to a DRAFT
+# GitHub release (review, then publish by hand) and pushes a Docker image to
+# GHCR tagged with the version.
 #
-# Only x86_64 Linux is built: the repository is private, so GitHub's native
-# arm64 runners are not available, and cross-compiling the whole workspace is
-# not worth the fragility for 0.1.
+# Only x86_64 Linux is built for now: cross-compiling the whole workspace for
+# arm64 is not worth the fragility.
 
 on:
   push:

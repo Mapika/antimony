@@ -3,8 +3,8 @@
 //! like `ant ws serve`, so it can be killed with SIGKILL and so client I/O
 //! never shares a process with the daemon (see `KERNEL_GATE` in `lib.rs`).
 //!
-//! - `rw_write_bench`: the write-performance contract
-//!   (`docs/dev/contracts/rw-write-performance.md`). Without `ANT_RW_BENCH=1` it
+//! - `rw_write_bench`: the write-performance contract (lazy-workspace writes
+//!   against direct writes). Without `ANT_RW_BENCH=1` it
 //!   runs a reduced smoke version and asserts nothing about speed.
 //! - `crash_*`: kill the daemon at random points of a scripted workload,
 //!   remount, and check that the workspace is a prefix of the completed

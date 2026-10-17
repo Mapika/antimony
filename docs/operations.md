@@ -338,7 +338,7 @@ immediately.
 ## Sizing notes (measured, single node, WSL2, 20 cores)
 
 - **Landing:** about 4,000 lands/s with 64 concurrent agents on Postgres +
-  S3, land p99 ≈ 30 ms, zero aborts (`docs/dev/scorecard/2026-10-14.md`).
+  S3, land p99 ≈ 30 ms, zero aborts (2026-10-14 scorecard).
   create_changeset p50 ≈ 2 ms: one durable Postgres statement per commit.
 - **Replicas:** 4 replicas × 1,000 agents for 30 minutes: 266k lands, zero
   errors, RSS levelling off at about 610–660 MiB per replica with the
@@ -360,8 +360,7 @@ immediately.
   default 8, per process; ref-lock waits are bounded by `--pg-lock-timeout`,
   default 10s). Under sustained bulk import, autovacuum on `objects`
   shows up; give it I/O headroom.
-- **Local mode** (`docs/dev/scorecard/2026-10-16-local-mode.md`, a busy
-  machine): about 500–1,000 lands/s at 16–50 agents (1,786/s in a quiet
+- **Local mode** (local-mode scorecard, a busy machine): about 500–1,000 lands/s at 16–50 agents (1,786/s in a quiet
   moment), bounded by the single SQLite writer and fsync rather than CPU
   (under one core); idle 16 MiB RSS and no CPU; under 50 agents 170–300
   MiB; git/git import about 6,000 commits/s; checkouts and queries as fast
@@ -499,10 +498,8 @@ not for deleted objects).
 
 ## Benchmarks
 
-- `scripts/scorecard.sh` runs the full v1 benchmark set on a quiet machine and
-  writes a markdown report.
-- `scripts/scorecard-local.sh` runs the local-mode set (idle footprint,
-  fleets of 16 and 50 agents, git/git import, queries, checkouts, clones),
-  each server a separate `ant local start` process; run it under
-  `scripts/bench-lock.sh`.
-- `ant-bench` (`import`, `fleet`, `checkout`) runs individual measurements.
+- `ant-bench` (`import`, `fleet`, `checkout`, `soak`) runs individual
+  measurements.
+- Run timed measurements under `scripts/bench-lock.sh`, which serializes
+  benchmarks on one machine so that concurrent runs never measure on top of
+  each other.

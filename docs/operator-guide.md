@@ -6,9 +6,8 @@ upgrade procedure) and [architecture.md](architecture.md) (how it works).
 
 **About the numbers.** Every performance figure here was measured on a single
 WSL2 development machine (20 cores, Postgres and SeaweedFS S3 running locally
-on the same box and disk, see the 2026-10-14 scorecard in
-[scorecard/](dev/scorecard/2026-10-14.md) and the soak/import notes in
-[ROADMAP.md](../ROADMAP.md)). They are useful for ratios and orders of
+on the same box and disk; the 2026-10-14 benchmark scorecard and the
+soak/import runs), unless a section says otherwise. They are useful for ratios and orders of
 magnitude. Network latency, managed Postgres, real S3 and separate hosts will
 all move them; measure your own deployment with `ant-bench` before trusting a
 capacity plan.
@@ -77,7 +76,7 @@ load. For a single replica you can set `--pg-lock-connections 0`.
 
 ### Landing and writes
 
-All from `scripts/scorecard.sh` on the dev machine, Postgres + S3, in-process
+All from the benchmark scorecard on the dev machine, Postgres + S3, in-process
 load generator (`ant-bench fleet`):
 
 | agents | lands/s | land p99 | aborts |
@@ -86,7 +85,7 @@ load generator (`ant-bench fleet`):
 | 16 | 2,226.7 | 6.8 ms | 0 |
 | 64 | 4,066.0 | 29.5 ms | 0 |
 
-ROADMAP records a median of 3,869 lands/s, p50 8.8 ms and p99 37.8 ms (27 ms
+Repeated runs measured a median of 3,869 lands/s, p50 8.8 ms and p99 37.8 ms (27 ms
 best) for 64 agents over several runs, so expect run-to-run spread of about
 10 percent. `create_changeset` p50 is 2.0-3.0 ms at 16 agents (the scorecard row
 was 3.0 ms against a target of under 3). Commit creation is bounded by one
@@ -97,8 +96,8 @@ deployment.
 ### On cloud boxes
 
 On Hetzner Cloud (ccx43 server box with Postgres, S3 and `ant serve`; a ccx33
-client box driving the fleet over the private network, RTT about 0.35 ms;
-[A/B record](dev/scorecard/2026-10-16-hetzner-landing-ab.md)), 0.3.0 measured:
+client box driving the fleet over the private network, RTT about 0.35 ms),
+0.3.0 measured:
 
 | agents | lands/s | land p99 |
 |---|---|---|
@@ -119,8 +118,8 @@ by up to 2x, so measure your own. What matters on cloud machines:
 - **Server cores.** At 64 agents the server box used about 3.5 cores for
   `ant serve` and 5 for Postgres.
 - **Turn on `track_io_timing` and `track_wal_io_timing`** so `pg_stat_wal`
-  shows flush times. `scripts/landing-bench.sh` samples what Postgres
-  backends wait on; mostly `LWLock:WALWrite` means commits queue for WAL
+  shows flush times. Sampling `pg_stat_activity.wait_event` shows what
+  Postgres backends wait on; mostly `LWLock:WALWrite` means commits queue for WAL
   flushes.
 
 **Durability.** Every land is acknowledged only after one synchronous
@@ -158,11 +157,11 @@ agent file whose content is not its last landed content, a dead replica, an
 error rate above `--max-error-rate` (0.001), an RSS growth trend above
 `--max-rss-growth-mib-per-hour` (256) after warm-up, or a window p99 more than
 `--max-p99-drift` (2x) its first window and above `--p99-floor-ms` (5 ms).
-The recorded result in ROADMAP: **4 replicas x 1,000 agents x 30 minutes: 266k
+The recorded result: **4 replicas x 1,000 agents x 30 minutes: 266k
 lands, 0 errors, exact history, flat RSS.** Replica RSS in that run was about
 610-660 MiB with default caches. (Landing p99 under the soak still spikes
-when Postgres as a whole stalls, for example at checkpoints; ROADMAP tracks
-it.)
+when Postgres as a whole stalls, for example at checkpoints; this is a
+known open issue.)
 
 Reproduce a smaller version:
 
@@ -359,7 +358,7 @@ process using one cache should be given the same `--cache-bytes`. Size it to the
 touch, multiplied by the number of distinct bases they check out.
 Sparse workspaces keep checkouts proportional to what an agent touches. Full
 96k-file checkout on the dev machine: 4.2-4.7 s cold, 1.4-1.9 s warm,
-`status` 0.09-0.18 s (ROADMAP).
+`status` 0.09-0.18 s.
 
 ### Cache tier (`ant cache-serve`)
 
@@ -1087,10 +1086,9 @@ normal shape; clients reconnect and retry idempotent lands. From 0.1.x to
 new servers until the last 0.1.x server is gone, and no 0.1.x server can be
 restarted once the first 0.2 server has started (see "Pack frames" there).
 
-**Disk discipline for big imports and scale runs** (from the contributor
-guide): check free space on the filesystem and, on WSL, on the Windows drive
-holding the disk image before large imports, and stop if a `DISK_LOW` file
-exists in the services directory.
+**Disk discipline for big imports and scale runs**: check free space on the
+filesystem (and, on WSL, on the Windows drive holding the disk image, which
+grows but does not shrink by itself) before large imports.
 
 ## 8. Checklist for a new fleet deployment
 
