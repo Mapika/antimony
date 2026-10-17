@@ -742,12 +742,19 @@ mod tests {
         let rt = Arc::new(ReadThrough::over_disk(disk.clone(), up.clone()).verified_upstream());
         let ids: Vec<ObjectId> = objs.iter().map(|o| o.id()).collect();
 
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        // Completed evictions: every reader keeps reading until at least two
+        // full evictions have finished after its first read, so the race
+        // this test is about always happens (fast readers on a slow, small
+        // runner could otherwise finish before the evictor ran at all).
+        let evictions = Arc::new(AtomicUsize::new(0));
         let evictor = {
-            let (disk, stop) = (disk.clone(), stop.clone());
+            let (disk, stop, evictions) = (disk.clone(), stop.clone(), evictions.clone());
             tokio::spawn(async move {
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                while !stop.load(Ordering::Relaxed) {
                     disk.evict_to(0).await.unwrap();
+                    evictions.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                 }
             })
@@ -755,13 +762,27 @@ mod tests {
         let readers: Vec<_> = (0..4)
             .map(|_| {
                 let (rt, ids, objs) = (rt.clone(), ids.clone(), objs.clone());
+                let evictions = evictions.clone();
                 tokio::spawn(async move {
-                    for _ in 0..40 {
+                    let mut after_first = None;
+                    let mut i = 0;
+                    loop {
+                        let before = evictions.load(Ordering::Relaxed);
                         let got = rt.get_many(&ids).await.unwrap();
                         assert_eq!(got.len(), objs.len());
                         for (g, o) in got.iter().zip(&objs) {
                             assert_eq!(g.as_ref(), Some(o));
                         }
+                        let first =
+                            *after_first.get_or_insert_with(|| evictions.load(Ordering::Relaxed));
+                        i += 1;
+                        // Eviction `first + 2` started after `first + 1` ended, so
+                        // wholly after the first read; this read started after it
+                        // finished, so it had to fetch again.
+                        if i >= 40 && before >= first + 2 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
                     }
                 })
             })
@@ -769,7 +790,7 @@ mod tests {
         for r in readers {
             r.await.unwrap();
         }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        stop.store(true, Ordering::Relaxed);
         evictor.await.unwrap();
         assert!(up.ids() > objs.len(), "evicted objects were fetched again");
     }
