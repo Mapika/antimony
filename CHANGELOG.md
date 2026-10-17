@@ -8,6 +8,34 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+### Changed
+
+- Faster warm checkout (objects already in the client cache): on Hetzner
+  (ccx33 client), 96k files over the network 1.72 → 1.51 s (median of 9),
+  cold 2.68 → 2.48 s. See
+  [docs/scorecard/2026-10-17-hetzner-ccx43-ccx33-checkout.md](docs/scorecard/2026-10-17-hetzner-ccx43-ccx33-checkout.md).
+  - Files are created in path order. Leaves are sorted before they reach
+    the writers, so each writer creates a directory and its contents
+    together and writers work in different subtrees. The walk's order made
+    ext4 on the cloud disk block in the kernel (about 40 threads waiting on
+    the filesystem) rather than use the CPU.
+  - Writers remember the directories they created: one `mkdir` per
+    directory, without failed retries and `stat`s.
+  - Blob reads no longer occupy writer slots.
+  - The workspace index is rendered without an allocation per line.
+- Client cache packs: up to 256 packs stay open per cache handle, and the
+  records a read wants from one pack are read with one `pread` per run of
+  nearby records (a warm 96k checkout: 161k → 87k `pread`s). An open pack
+  is checked again (still present, mtime to bump) once per touch interval;
+  a pack evicted by another process stays readable through the open
+  handle until then. No on-disk format change.
+
+### Added
+
+- `ant-bench checkout --warm-only` (warm checkouts against an existing
+  `--cache`, no cold phase) and `--no-status`, to profile the warm path
+  alone.
+
 ## [0.3.0] - 2026-10-17
 
 Minor release: no Postgres schema or protocol changes; 0.2.x servers and

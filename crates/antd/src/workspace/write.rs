@@ -1,5 +1,6 @@
 //! Writing tree entries to disk: materializing, resetting and updating.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -93,20 +94,37 @@ pub(super) fn umask() -> Option<u32> {
     })
 }
 
-/// Create `parent` (and missing ancestors) unless `*last` says it exists.
-/// Items arrive grouped by directory, so this is one `mkdir` per directory
-/// rather than a stat-per-component walk per file.
-pub(super) fn ensure_dir(parent: &Path, last: &mut Option<PathBuf>) -> io::Result<()> {
-    if last.as_deref() == Some(parent) {
+/// Create `parent` (and missing ancestors below `root`, which exists) unless
+/// `made` says it exists: one `mkdir` per directory a batch needs. Items
+/// arrive in path order, in which a directory's subdirectories come before
+/// its own files, so every directory made on the way down is remembered.
+/// Ancestors not known to this batch are created top-down (an existing one
+/// costs a failed `mkdir`, not a failed one per missing level below it).
+pub(super) fn ensure_dir(
+    root: &Path,
+    parent: &Path,
+    made: &mut HashSet<PathBuf>,
+) -> io::Result<()> {
+    if parent == root || made.contains(parent) {
         return Ok(());
     }
-    match fs::create_dir(parent) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::AlreadyExists && parent.is_dir() => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => fs::create_dir_all(parent)?,
-        Err(e) => return Err(e),
+    let mut missing = vec![parent];
+    let mut up = parent.parent();
+    while let Some(p) = up {
+        if p == root || !p.starts_with(root) || made.contains(p) {
+            break;
+        }
+        missing.push(p);
+        up = p.parent();
     }
-    *last = Some(parent.to_path_buf());
+    for d in missing.into_iter().rev() {
+        match fs::create_dir(d) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists && d.is_dir() => {}
+            Err(e) => return Err(e),
+        }
+        made.insert(d.to_path_buf());
+    }
     Ok(())
 }
 
@@ -154,12 +172,12 @@ pub(super) fn write_items(
 ) -> anyhow::Result<Written> {
     let fresh = dest == Dest::Fresh;
     let mut out = Vec::with_capacity(items.len());
-    let mut last_dir: Option<PathBuf> = None;
+    let mut made: HashSet<PathBuf> = HashSet::new();
     for it in items {
         let key = it.path.as_str().to_string();
         let full = dir.join(&key);
         if let Some(parent) = full.parent() {
-            ensure_dir(parent, &mut last_dir)?;
+            ensure_dir(dir, parent, &mut made)?;
         }
         if !fresh {
             remove_existing(&full).with_context(|| format!("clearing {}", full.display()))?;

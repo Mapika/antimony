@@ -101,6 +101,15 @@ pub struct Args {
     /// and the warm read pays the mtime bumps a long-lived cache would.
     #[arg(long, default_value_t = 0)]
     pub warm_delay_secs: u64,
+    /// Measure only warm checkouts against the cache already in `--cache`
+    /// (filled by an earlier run of the same tree): no cold phase, the cache
+    /// is not wiped. Lets a profiler (e.g. `strace -c`) see the warm path
+    /// alone.
+    #[arg(long, conflicts_with_all = ["cdn", "cache_tier", "clients"])]
+    pub warm_only: bool,
+    /// Skip the `status` runs after the warm checkout (reported as 0).
+    #[arg(long)]
+    pub no_status: bool,
     #[arg(long)]
     pub json: Option<PathBuf>,
 }
@@ -116,6 +125,7 @@ struct Iter {
     cache_bytes: u64,
 }
 
+#[derive(Default)]
 struct Phase {
     secs: f64,
     cpu: f64,
@@ -340,11 +350,14 @@ pub async fn run(a: Args) -> Result<()> {
     let mut iters = Vec::new();
     for it in 0..a.iterations.max(1) {
         // Cold: no cache, no workspace.
-        wipe(&a.cache)?;
-        wipe(&work)?;
-        settle(&a.cache, "before cold").await;
-        let (cold, _ws, _) =
-            materialize(&a, &remote, cdn.as_ref(), &work, commit, sparse.clone()).await?;
+        let cold = if a.warm_only {
+            Phase::default()
+        } else {
+            wipe(&a.cache)?;
+            wipe(&work)?;
+            settle(&a.cache, "before cold").await;
+            materialize(&a, &remote, cdn.as_ref(), &work, commit, sparse.clone()).await?.0
+        };
         let (cache_files, cache_bytes) = dir_size(&a.cache, None);
 
         // Proxy: empty client cache, warm shared cache in front of the origin.
@@ -368,14 +381,20 @@ pub async fn run(a: Args) -> Result<()> {
             materialize(&a, &remote, cdn.as_ref(), &work, commit, sparse.clone()).await?;
 
         // status on the unchanged workspace (twice: first may touch more state).
-        let t = Instant::now();
-        let changes = ws.status(rt.as_ref()).await?;
-        let status1 = t.elapsed().as_secs_f64();
-        let t = Instant::now();
-        let changes2 = ws.status(rt.as_ref()).await?;
-        let status2 = t.elapsed().as_secs_f64();
+        let (mut changes, mut changes2) = (Vec::new(), Vec::new());
+        let (mut status1, mut status2) = (0.0, 0.0);
+        if !a.no_status {
+            let t = Instant::now();
+            changes = ws.status(rt.as_ref()).await?;
+            status1 = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            changes2 = ws.status(rt.as_ref()).await?;
+            status2 = t.elapsed().as_secs_f64();
+        }
         println!("iteration {}", it + 1);
-        print_phase("cold", &cold);
+        if !a.warm_only {
+            print_phase("cold", &cold);
+        }
         if let Some(p) = &proxy {
             print_phase("proxy", p);
         }

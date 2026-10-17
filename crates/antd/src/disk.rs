@@ -554,6 +554,10 @@ impl Shared {
                 report.freed += f.size;
             }
         }
+        if report.freed > 0 {
+            // Removed packs held open by this handle are misses from now on.
+            self.packs.close_all();
+        }
         report.objects = remaining;
         report.bytes = total;
         let usage = self.open_lock("usage.lock")?;
@@ -996,6 +1000,63 @@ mod tests {
         s.put_many_trusted(pairs).await.unwrap();
         s.put_many(&objs).await.unwrap();
         assert_eq!(pack_files(dir.path()).len(), 2);
+    }
+
+    /// Reads of any subset of a pack, in any order and with duplicates,
+    /// return exactly the requested objects (nearby records are read in
+    /// one run; far apart and large ones separately).
+    #[tokio::test]
+    async fn pack_reads_of_scattered_subsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = DiskObjectStore::open(dir.path(), u64::MAX).unwrap();
+        // Mostly small records with large ones (beyond the run gap) between.
+        let objs: Vec<_> = (0..PACK_MIN as u64 * 2)
+            .map(|i| {
+                blob(
+                    i,
+                    if i % 17 == 0 { 70_000 + i as usize } else { 10 + (i as usize * 37) % 3000 },
+                )
+            })
+            .collect();
+        s.put_many(&objs).await.unwrap();
+        assert_eq!(pack_files(dir.path()).len(), 2);
+        let ids: Vec<ObjectId> = objs.iter().map(|o| o.id()).collect();
+        let subsets: Vec<Vec<usize>> = vec![
+            (0..objs.len()).collect(),
+            (0..objs.len()).rev().collect(),
+            (0..objs.len()).step_by(3).collect(),
+            (0..objs.len()).filter(|i| i % 17 == 0).collect(),
+            vec![5, 5, 0, objs.len() - 1, 5],
+            vec![objs.len() / 2],
+        ];
+        for t in [&s, &DiskObjectStore::open(dir.path(), u64::MAX).unwrap()] {
+            for sub in &subsets {
+                let want: Vec<ObjectId> = sub.iter().map(|&i| ids[i]).collect();
+                let got = t.get_many(&want).await.unwrap();
+                for (&i, g) in sub.iter().zip(&got) {
+                    assert_eq!(g.as_ref(), Some(&objs[i]), "object {i} of {sub:?}");
+                }
+            }
+        }
+    }
+
+    /// A pack held open by a reader and evicted by another handle is a miss
+    /// for the reader once it checks the pack again (every read with a zero
+    /// touch interval).
+    #[tokio::test]
+    async fn packs_evicted_by_another_handle_become_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let reader = DiskObjectStore::open(dir.path(), u64::MAX)
+            .unwrap()
+            .with_touch_interval(Duration::ZERO);
+        let objs = many(PACK_MIN, "evicted");
+        reader.put_many(&objs).await.unwrap();
+        assert_eq!(reader.get(&objs[0].id()).await.unwrap().as_ref(), Some(&objs[0]));
+        let other = DiskObjectStore::open(dir.path(), u64::MAX).unwrap();
+        other.evict_to(0).await.unwrap();
+        assert!(pack_files(dir.path()).is_empty());
+        assert!(reader.get(&objs[1].id()).await.unwrap().is_none());
+        assert!(reader.get(&objs[0].id()).await.unwrap().is_none());
     }
 
     /// A handle that loaded the packs before another one wrote a new pack
