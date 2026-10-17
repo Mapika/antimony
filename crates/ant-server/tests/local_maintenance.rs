@@ -1329,3 +1329,243 @@ async fn local_scheduled_collections_run_in_the_background() {
     task.abort();
     assert_eq!(readback(&r.fresh()).await, before);
 }
+
+/// What [`HeldObjects`] and [`WatchedMeta`] saw.
+#[derive(Default)]
+struct WriteOrder {
+    /// Probe on every object write (else pass writes straight through).
+    armed: AtomicBool,
+    /// A commit record write has started / finished.
+    recording: AtomicBool,
+    recorded: tokio::sync::Notify,
+    /// Commit records written while their tree or commit object was absent.
+    unordered: AtomicUsize,
+    /// Reports of the collections run while object writes were held back.
+    probes: std::sync::Mutex<Vec<GcReport>>,
+}
+
+/// Object writes held back: `put_many` first lets the rest of its task run
+/// (a commit record written concurrently starts then), waits for any such
+/// record to be written, and runs a collection before storing anything.
+/// Ordered by events, not by time.
+struct HeldObjects {
+    inner: Arc<dyn ant_store::ObjectStore>,
+    store: LocalStore,
+    seen: Arc<WriteOrder>,
+}
+
+#[async_trait::async_trait]
+impl ant_store::ObjectStore for HeldObjects {
+    async fn get_many(&self, ids: &[ObjectId]) -> ant_store::Result<Vec<Option<EncodedObject>>> {
+        self.inner.get_many(ids).await
+    }
+    async fn has_many(&self, ids: &[ObjectId]) -> ant_store::Result<Vec<bool>> {
+        self.inner.has_many(ids).await
+    }
+    async fn put_many(&self, objects: &[EncodedObject]) -> ant_store::Result<()> {
+        if self.seen.armed.load(Ordering::SeqCst) {
+            let recorded = self.seen.recorded.notified();
+            tokio::task::yield_now().await;
+            if self.seen.recording.load(Ordering::SeqCst) {
+                recorded.await;
+            }
+            let report = collect(&self.store, &gc_opts(), &|_| {}).await?;
+            self.seen.probes.lock().unwrap().push(report);
+        }
+        self.inner.put_many(objects).await
+    }
+}
+
+/// Commit record writes, checked against the objects they reference.
+struct WatchedMeta {
+    inner: Arc<dyn ant_store::MetaStore>,
+    objects: Arc<dyn ant_store::ObjectStore>,
+    seen: Arc<WriteOrder>,
+}
+
+impl WatchedMeta {
+    async fn check(&self, nodes: &[&ant_store::CommitNode]) {
+        let ids: Vec<ObjectId> = nodes.iter().flat_map(|n| [n.id, n.tree]).collect();
+        let present = self.objects.has_many(&ids).await.unwrap();
+        if present.contains(&false) {
+            self.seen.unordered.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// `write` of the records of `nodes`, flagged from its first poll on.
+    async fn recording<T>(
+        &self,
+        nodes: &[&ant_store::CommitNode],
+        write: impl std::future::Future<Output = T>,
+    ) -> T {
+        self.seen.recording.store(true, Ordering::SeqCst);
+        self.check(nodes).await;
+        let out = write.await;
+        self.seen.recording.store(false, Ordering::SeqCst);
+        self.seen.recorded.notify_waiters();
+        out
+    }
+}
+
+#[async_trait::async_trait]
+impl ant_store::MetaStore for WatchedMeta {
+    async fn put_commit(
+        &self,
+        node: ant_store::CommitNode,
+        changes: Vec<ant_store::PathChange>,
+    ) -> ant_store::Result<u64> {
+        let n = node.clone();
+        self.recording(&[&n], self.inner.put_commit(node, changes)).await
+    }
+    async fn put_commits(
+        &self,
+        commits: Vec<(ant_store::CommitNode, Vec<ant_store::PathChange>)>,
+    ) -> ant_store::Result<Vec<u64>> {
+        let nodes: Vec<ant_store::CommitNode> = commits.iter().map(|(n, _)| n.clone()).collect();
+        self.recording(&nodes.iter().collect::<Vec<_>>(), self.inner.put_commits(commits)).await
+    }
+    async fn get_commits(
+        &self,
+        ids: &[ObjectId],
+    ) -> ant_store::Result<Vec<Option<ant_store::CommitNode>>> {
+        self.inner.get_commits(ids).await
+    }
+    async fn get_changeset(
+        &self,
+        id: &ObjectId,
+    ) -> ant_store::Result<Option<Vec<ant_store::PathChange>>> {
+        self.inner.get_changeset(id).await
+    }
+    async fn get_changesets(
+        &self,
+        ids: &[ObjectId],
+    ) -> ant_store::Result<Vec<Option<Vec<ant_store::PathChange>>>> {
+        self.inner.get_changesets(ids).await
+    }
+    async fn first_parent_chain(
+        &self,
+        tip: ObjectId,
+        stop: Option<ObjectId>,
+        limit: usize,
+    ) -> ant_store::Result<Vec<ant_store::CommitNode>> {
+        self.inner.first_parent_chain(tip, stop, limit).await
+    }
+    async fn ancestors_above(
+        &self,
+        tips: &[ObjectId],
+        min_generation: u64,
+        limit: usize,
+    ) -> ant_store::Result<Vec<ant_store::CommitNode>> {
+        self.inner.ancestors_above(tips, min_generation, limit).await
+    }
+    async fn tail(&self, after: u64, limit: usize) -> ant_store::Result<Vec<(u64, ObjectId)>> {
+        self.inner.tail(after, limit).await
+    }
+    async fn log_seqs(&self, ids: &[ObjectId]) -> ant_store::Result<Vec<Option<u64>>> {
+        self.inner.log_seqs(ids).await
+    }
+    async fn get_derived(&self, kind: &str, key: &[u8]) -> ant_store::Result<Option<Bytes>> {
+        self.inner.get_derived(kind, key).await
+    }
+    async fn put_derived(&self, kind: &str, key: &[u8], value: Bytes) -> ant_store::Result<()> {
+        self.inner.put_derived(kind, key, value).await
+    }
+    async fn get_derived_many(
+        &self,
+        kind: &str,
+        keys: &[&[u8]],
+    ) -> ant_store::Result<Vec<Option<Bytes>>> {
+        self.inner.get_derived_many(kind, keys).await
+    }
+    async fn put_derived_many(
+        &self,
+        kind: &str,
+        entries: Vec<(Vec<u8>, Bytes)>,
+    ) -> ant_store::Result<()> {
+        self.inner.put_derived_many(kind, entries).await
+    }
+    async fn index_history(
+        &self,
+        ref_name: &str,
+        rows: &[ant_store::HistoryRow],
+    ) -> ant_store::Result<()> {
+        self.inner.index_history(ref_name, rows).await
+    }
+    async fn query_history(
+        &self,
+        ref_name: &str,
+        prefix: &RepoPath,
+        max_generation: u64,
+        limit: usize,
+    ) -> ant_store::Result<Vec<(u64, ObjectId)>> {
+        self.inner.query_history(ref_name, prefix, max_generation, limit).await
+    }
+    async fn history_watermark(&self, ref_name: &str) -> ant_store::Result<Option<ObjectId>> {
+        self.inner.history_watermark(ref_name).await
+    }
+    async fn set_history_watermark(
+        &self,
+        ref_name: &str,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+    ) -> ant_store::Result<bool> {
+        self.inner.set_history_watermark(ref_name, expected, new).await
+    }
+    async fn clear_history(&self, ref_name: &str) -> ant_store::Result<()> {
+        self.inner.clear_history(ref_name).await
+    }
+}
+
+/// `create_changeset` and a rebasing land write objects and commit records
+/// concurrently, so a collection can see a fresh record before its objects
+/// are stored. That is no damage (nothing published reaches it yet): the
+/// collection reports nothing missing and deletes nothing the writes need.
+/// (Before `missing` counted only what published roots reach, every
+/// collection here reported the new root tree missing.)
+#[tokio::test]
+async fn local_gc_beside_writes_in_flight_reports_nothing_missing() {
+    let r = repo();
+    let seen = Arc::new(WriteOrder::default());
+    let objects: Arc<dyn ant_store::ObjectStore> = Arc::new(HeldObjects {
+        inner: r.b.objects.clone(),
+        store: r.store.clone(),
+        seen: seen.clone(),
+    });
+    let meta = Arc::new(WatchedMeta {
+        inner: r.b.meta.clone(),
+        objects: r.b.objects.clone(),
+        seen: seen.clone(),
+    });
+    let b = Backend { objects, refs: r.b.refs.clone(), meta };
+    let base = changeset(&b, None, &[("a/f", b"base\n"), ("b/g", b"base\n")]).await;
+    land_tip(&b, "main", base).await;
+    let ours = changeset(&b, Some(base), &[("a/f", b"ours\n")]).await;
+    let theirs = changeset(&b, Some(base), &[("b/g", b"theirs\n")]).await;
+    land_tip(&b, "main", theirs).await;
+
+    seen.armed.store(true, Ordering::SeqCst);
+    let c = changeset(&b, Some(base), &[("a/new", b"new\n"), ("c/d/e", b"deep\n")]).await;
+    let changeset_probes = seen.probes.lock().unwrap().len();
+    let changeset_unordered = seen.unordered.load(Ordering::SeqCst);
+    match land(&b, "main", ours).await.unwrap() {
+        LandOutcome::Landed { rebased: true, .. } => {}
+        other => panic!("expected a rebased land: {other:?}"),
+    }
+    seen.armed.store(false, Ordering::SeqCst);
+
+    let probes = std::mem::take(&mut *seen.probes.lock().unwrap());
+    assert!(changeset_probes > 0, "create_changeset wrote no objects");
+    assert!(probes.len() > changeset_probes, "the land wrote no objects");
+    // The window is real: records were written before their objects.
+    assert!(changeset_unordered > 0, "create_changeset's record came after its objects");
+    assert!(seen.unordered.load(Ordering::SeqCst) > changeset_unordered, "land's too");
+    for p in &probes {
+        assert_eq!(p.missing, 0, "{p:?}");
+    }
+    assert!(stored(r.store.dir(), &c).await > 0);
+    assert_eq!(r.gc(&gc_opts()).await.missing, 0);
+    let tip = r.b.refs.get_ref("main").await.unwrap();
+    let after = readback(&r.fresh()).await;
+    assert!(tip.is_some_and(|t| after.contains_key(&t)));
+    assert!(r.fresh().objects.get_many(&[c]).await.unwrap()[0].is_some());
+}
