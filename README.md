@@ -1,8 +1,8 @@
 <p align="center">
   <a href="https://github.com/Mapika/antimony">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/readme-banner-dark.png">
-      <img alt="antimony: source control for agent fleets" src="docs/brand/readme-banner-light.png" width="100%">
+      <source media="(prefers-color-scheme: dark)" srcset="docs/dev/brand/readme-banner-dark.png">
+      <img alt="antimony: source control for agent fleets" src="docs/dev/brand/readme-banner-light.png" width="100%">
     </picture>
   </a>
 </p>
@@ -97,14 +97,14 @@ a private network (RTT 0.2 to 0.4 ms). **Local**: one WSL2 development
 machine (20 cores) with Postgres and S3 on the same host, loopback. Numbers
 are indicative, not guarantees: managed Postgres, real S3 and other networks
 will move them, and boxes of one cloud type differ by about 20%.
-Sources: the [v0.3.0 scorecard](docs/scorecard/2026-10-17-v0.3.0.md) (local,
+Sources: the [v0.3.0 scorecard](docs/dev/scorecard/2026-10-17-v0.3.0.md) (local,
 27 of 27 rows pass), the
-[landing A/B](docs/scorecard/2026-10-16-hetzner-landing-ab.md),
-[network checkout](docs/scorecard/2026-10-17-hetzner-ccx43-ccx33-checkout.md),
-[cold read path](docs/scorecard/2026-10-17-hetzner-cold-read-path.md) and
-[git export clone](docs/scorecard/2026-10-16-hetzner-gitserve-clone.md)
-reports (cloud), the [local mode scorecard](docs/scorecard/2026-10-16-local-mode.md),
-the [v0.2.0 scorecard](docs/scorecard/2026-10-16-v0.2.0.md) (rows marked
+[landing A/B](docs/dev/scorecard/2026-10-16-hetzner-landing-ab.md),
+[network checkout](docs/dev/scorecard/2026-10-17-hetzner-ccx43-ccx33-checkout.md),
+[cold read path](docs/dev/scorecard/2026-10-17-hetzner-cold-read-path.md) and
+[git export clone](docs/dev/scorecard/2026-10-16-hetzner-gitserve-clone.md)
+reports (cloud), the [local mode scorecard](docs/dev/scorecard/2026-10-16-local-mode.md),
+the [v0.2.0 scorecard](docs/dev/scorecard/2026-10-16-v0.2.0.md) (rows marked
 v0.2.0), [CHANGELOG](CHANGELOG.md) and [ROADMAP](ROADMAP.md).
 
 | measure | cloud (Hetzner ccx43 + ccx33) | local (WSL2, v0.3.0) |
@@ -123,7 +123,7 @@ v0.2.0), [CHANGELOG](CHANGELOG.md) and [ROADMAP](ROADMAP.md).
 
 Local mode (`ant serve --local`, SQLite and pack files, no Postgres or S3),
 same WSL2 machine, which was busy with other builds during the run (so
-latencies are pessimistic; the [report](docs/scorecard/2026-10-16-local-mode.md)
+latencies are pessimistic; the [report](docs/dev/scorecard/2026-10-16-local-mode.md)
 lists every row): 16 MiB idle RSS, 57 ms from process start to listening,
 about 1,000 lands/s with 50 agents (p99 64 ms), 172 MiB server peak RSS at 50
 agents, git/git imported in 941 MiB on disk.
@@ -135,8 +135,8 @@ many always-online writers on one large repository. A head-to-head against
 tuned git (git with aggressive gc, bitmaps, commit-graph with changed-path
 filters, untracked cache, cone sparse checkout, partial clone; git/git and a
 96k-file synthetic tree) was run twice: on the
-[local machine](docs/scorecard/2026-10-16-vs-git.md), and with
-[two Hetzner boxes](docs/scorecard/2026-10-16-hetzner-ccx43-ccx33-vs-git.md)
+[local machine](docs/dev/scorecard/2026-10-16-vs-git.md), and with
+[two Hetzner boxes](docs/dev/scorecard/2026-10-16-hetzner-ccx43-ccx33-vs-git.md)
 where every git and antimony command ran on the client box over the network
 (git's history, blame and merge-base on a full local clone, as a git user
 would; antimony's as server queries). Medians:
@@ -157,13 +157,13 @@ would; antimony's as server queries). Medians:
 
 The cloud head-to-head ran antimony 0.2.1. Since then (0.3.0 and 0.3.1) the
 same synthetic checkout measured by the
-[checkout benchmark](docs/scorecard/2026-10-17-hetzner-ccx43-ccx33-checkout.md)
+[checkout benchmark](docs/dev/scorecard/2026-10-17-hetzner-ccx43-ccx33-checkout.md)
 takes 2.4 s cold and 1.5 s warm over the network on the same box types; it
 is a different harness from the table's 17.1 s and 3.6 s (which includes a
 server that has not built its tree bundles yet), so the two are not a
 before and after of one run. Git export clones got much closer to git in
 0.3.0: `--depth 1` 0.97 s against 1.40 s, full history 11.4 s against 8.9 s
-([report](docs/scorecard/2026-10-16-hetzner-gitserve-clone.md)).
+([report](docs/dev/scorecard/2026-10-16-hetzner-gitserve-clone.md)).
 
 Where antimony is ahead: concurrent landing (the server rebases and lands;
 agents never fetch, rebase and retry a rejected push), checkout and sparse
@@ -337,9 +337,11 @@ every flag; `ant completions <shell>` prints a completion script.
   [CHANGELOG, known limitations](CHANGELOG.md#known-limitations).
 
 Open work is in [ROADMAP.md](ROADMAP.md); how antimony maps onto the design it
-recreates is in [docs/scion-gap.md](docs/scion-gap.md).
+recreates is in [docs/dev/scion-gap.md](docs/dev/scion-gap.md).
 
 ## Documentation
+
+### Using antimony
 
 - [Usage](docs/usage.md): conflicts and `ws update`, lazy workspaces, access
   control quickstart, large imports, Docker, several replicas.
@@ -357,14 +359,30 @@ recreates is in [docs/scion-gap.md](docs/scion-gap.md).
 - [Compatibility](docs/compatibility.md): what each 0.x release keeps stable
   (API, Postgres schema, on-disk formats, CLI output) and how deprecations
   work.
-- [Scorecards](docs/scorecard/): measured performance against the v1
-  targets.
-- [Gap analysis](docs/scion-gap.md) against "Redesigning source control".
-- [Lazy-workspace write performance contract](docs/contracts/rw-write-performance.md).
-- [Changelog](CHANGELOG.md), [roadmap](ROADMAP.md) and
-  [release checklist](docs/release.md).
+- [Changelog](CHANGELOG.md).
 
 ## Contributing
+
+### Developer documentation
+
+Internal and contributor material lives in [docs/dev/](docs/dev/); the website
+publishes only the user documentation above.
+
+- [Release checklist](docs/dev/release.md): gates, scorecard, tagging.
+- [Remote benchmarks](docs/dev/remote-bench.md): the Hetzner two-box harness
+  (`scripts/remote-bench.sh`) and the other benchmark scripts
+  (`scripts/scorecard.sh`, `vs-git.sh`, `checkout-bench.sh`,
+  `landing-bench.sh`, `upgrade-test.sh`).
+- [Scorecards](docs/dev/scorecard/): raw benchmark reports against the v1
+  targets, one file per run.
+- [Gap analysis](docs/dev/scion-gap.md) against "Redesigning source control".
+- [Lazy-workspace write performance contract](docs/dev/contracts/rw-write-performance.md):
+  an internal design contract for `ant-fuse` writes.
+- [Roadmap](ROADMAP.md) and [brand assets](docs/dev/brand/).
+- `scripts/check-md-links.py`: checks relative links and anchors in every
+  Markdown file.
+
+### Conventions
 
 Contributor conventions are in [AGENTS.md](AGENTS.md) (also `CLAUDE.md`):
 crate layout, error style per layer, performance rules and the development

@@ -1,6 +1,6 @@
 name: release
 
-# Cut by pushing a `v*` tag (see docs/release.md). Builds the Linux binary,
+# Cut by pushing a `v*` tag (see docs/dev/release.md). Builds the Linux binary,
 # attaches it to a DRAFT GitHub release (review, then publish by hand) and
 # pushes a Docker image to GHCR tagged with the version.
 #
