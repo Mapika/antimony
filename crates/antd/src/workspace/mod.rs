@@ -37,11 +37,15 @@
 //!   that cannot contain a match (`Sparse::may_contain_under(dir_path)`:
 //!   true if any prefix pattern starts with or is under that dir, or any
 //!   glob pattern exists — globs are not pruned).
-//! - Other blobs are fetched in batches of 512 ids per `get_many`. File
-//!   writes run on several blocking threads at once while the walk goes on;
-//!   parent directories are created as files need them (only directories
-//!   with files in scope exist afterwards). Each file is one `open` (mode
-//!   set at creation), one `write` and one `fstat`. Files get the right mode
+//! - Other blobs are fetched in batches of 512 ids per `get_many`, apart
+//!   from the writers. File writes run on several blocking threads at once,
+//!   in path order (leaves are sorted before they are handed out, so each
+//!   writer creates a directory and its contents together); parent
+//!   directories are created as files need them (only directories with
+//!   files in scope exist afterwards). Each file is one `open`
+//!   (`O_CREAT|O_EXCL`, mode set at creation), one `write` and one `fstat`,
+//!   never synced (workspace files need no durability beyond the OS; the
+//!   `.ant/` state files are written as before). Files get the right mode
 //!   (0o755 for Executable, 0o644 otherwise), symlinks via
 //!   `std::os::unix::fs::symlink`, gitlinks as empty directories (not
 //!   indexed). Fetched content waiting for a writer is bounded (512 MiB).

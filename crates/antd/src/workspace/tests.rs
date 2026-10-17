@@ -244,6 +244,56 @@ async fn parallel_scan_many_dirs_and_deletions() {
     assert_eq!(summary, expect);
 }
 
+/// Directories are created by the walk: exactly those on the way to a file
+/// in scope, also when only a deeper level has files, and never one whose
+/// files are all out of scope (a glob pattern does not prune the walk).
+#[tokio::test]
+async fn only_directories_with_files_in_scope_are_created() {
+    let objs = MemoryObjectStore::default();
+    let mut files: Vec<(String, Vec<u8>)> = vec![
+        ("a/b/c/d/BUILD".into(), b"1".to_vec()),
+        ("a/x.rs".into(), b"2".to_vec()),
+        ("e/f/g.rs".into(), b"3".to_vec()),
+        ("BUILD".into(), b"4".to_vec()),
+    ];
+    // Wide and deep enough for many concurrent expansions and writers.
+    for i in 0..3000 {
+        files.push((format!("w{}/v{}/u{}/f{i}", i % 13, i % 29, i % 5), vec![b'z'; i % 300]));
+    }
+    files.push(("w0/v0/u0/BUILD".into(), b"5".to_vec()));
+    let refs: Vec<(&str, &[u8])> = files.iter().map(|(a, b)| (a.as_str(), b.as_slice())).collect();
+    let t = build_tree(&objs, &refs).await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("globbed");
+    let ws =
+        Workspace::materialize(&objs, &dir, C, t, Sparse::new(vec!["**/BUILD".into()]).unwrap())
+            .await
+            .unwrap();
+    let mut dirs = Vec::new();
+    let mut stack = vec![dir.clone()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() && e.file_name() != ".ant" {
+                dirs.push(e.path().strip_prefix(&dir).unwrap().to_str().unwrap().to_string());
+                stack.push(e.path());
+            }
+        }
+    }
+    dirs.sort();
+    assert_eq!(dirs, ["a", "a/b", "a/b/c", "a/b/c/d", "w0", "w0/v0", "w0/v0/u0"]);
+    assert_eq!(fs::read(dir.join("a/b/c/d/BUILD")).unwrap(), b"1");
+    assert!(ws.status(&objs).await.unwrap().is_empty());
+
+    let dir = tmp.path().join("full");
+    let ws = Workspace::materialize(&objs, &dir, C, t, Sparse::all()).await.unwrap();
+    for (path, body) in &files {
+        assert_eq!(&fs::read(dir.join(path)).unwrap(), body, "{path}");
+    }
+    assert!(ws.status(&objs).await.unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn reset_to_new_base() {
     let objs = Arc::new(MemoryObjectStore::default());

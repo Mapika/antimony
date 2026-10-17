@@ -119,18 +119,29 @@ pub(super) fn index_mtime(dir: &Path) -> anyhow::Result<Option<i64>> {
 }
 
 pub(super) fn render_index(index: &Index) -> String {
-    let mut out = String::new();
+    use std::fmt::Write as _;
+    // One buffer, no allocation per line (a 96k-file index is ~15 MB).
+    let mut out = String::with_capacity(index.keys().map(|p| p.len() + 120).sum());
     for (path, e) in index {
-        out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            e.mode.as_octal(),
-            e.id.to_hex(),
-            e.stat.size,
-            e.stat.mtime_ns,
-            e.stat.ino,
-            e.stat.st_mode,
-            escape_path(path),
-        ));
+        // Writing to a String cannot fail.
+        out.push_str(&e.mode.as_octal());
+        out.push('\t');
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for b in e.id.as_bytes() {
+            out.push(char::from(HEX[usize::from(b >> 4)]));
+            out.push(char::from(HEX[usize::from(b & 15)]));
+        }
+        let _ = write!(
+            out,
+            "\t{}\t{}\t{}\t{}\t",
+            e.stat.size, e.stat.mtime_ns, e.stat.ino, e.stat.st_mode,
+        );
+        if path.contains(['\\', '\n']) {
+            out.push_str(&escape_path(path));
+        } else {
+            out.push_str(path);
+        }
+        out.push('\n');
     }
     out
 }

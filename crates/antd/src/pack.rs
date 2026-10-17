@@ -26,18 +26,30 @@
 //!   mtime (which reads bump at most once per touch interval, like loose
 //!   objects), removed index first. A reader that loses a pack to eviction
 //!   sees misses and refetches, as with loose objects.
+//! - Reads keep up to [`MAX_HANDLES`] packs open, so a checkout reading
+//!   ~2,000 packs in 200 batches opens each once rather than once per batch.
+//!   An open pack is checked again (`fstat`: still linked? mtime to bump?)
+//!   at most once per touch interval: a pack another process evicted stays
+//!   readable through the open handle until then (its content is immutable),
+//!   after which it is dropped and its objects are misses. Eviction by the
+//!   same handle closes its open packs at once.
+//! - The records one read wants from a pack are read with one `pread` per
+//!   run of nearby records ([`SPAN_GAP`], [`SPAN_MAX`]), not one per object;
+//!   the objects share the run's buffer.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, ErrorKind, Write};
 use std::os::unix::fs::FileExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use ant_core::{EncodedObject, ObjectId};
 use bytes::Bytes;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::par::par_map;
 
@@ -56,6 +68,14 @@ const MAX_ENTRIES: u32 = 1 << 24;
 /// A listing of the directory less than this after its last change may
 /// have missed a change within the same timestamp tick.
 const LISTING_SETTLE: Duration = Duration::from_secs(2);
+
+/// Packs kept open for reading per handle (well below the usual 1024
+/// file-descriptor limit).
+const MAX_HANDLES: usize = 256;
+/// Records of one pack at most this far apart are read with one `pread`.
+const SPAN_GAP: u64 = 64 << 10;
+/// Longest run read with one `pread` (unless a single record is longer).
+const SPAN_MAX: u64 = 4 << 20;
 
 static PACK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -78,6 +98,22 @@ struct Loc {
 pub(crate) struct Packs {
     dir: PathBuf,
     state: RwLock<State>,
+    /// Packs open for reading, by pack number.
+    open: Mutex<HashMap<u32, Handle>>,
+}
+
+/// An open pack and when it was last checked (still linked, mtime bumped).
+struct Handle {
+    file: Arc<File>,
+    checked: Instant,
+}
+
+/// Why a pack could not be opened.
+enum Unavailable {
+    /// Removed (evicted): its objects are misses until refetched.
+    Gone,
+    /// Some other error: misses for this read only.
+    Failed,
 }
 
 #[derive(Default)]
@@ -121,7 +157,49 @@ pub(crate) struct PackFile {
 
 impl Packs {
     pub(crate) fn new(root: &Path) -> Self {
-        Self { dir: root.join(DIR), state: RwLock::new(State::default()) }
+        Self {
+            dir: root.join(DIR),
+            state: RwLock::new(State::default()),
+            open: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Close every pack held open for reading (after an eviction, so that
+    /// removed packs are misses at once and their space is freed).
+    pub(crate) fn close_all(&self) {
+        self.open.lock().clear();
+    }
+
+    /// Blocking: pack `no` open for reading, checked (and its mtime bumped
+    /// when older than `touch`) at most once per `touch`.
+    fn handle(&self, no: u32, name: &str, touch: Duration) -> Result<Arc<File>, Unavailable> {
+        let now = Instant::now();
+        let held = self.open.lock().get(&no).map(|h| (h.file.clone(), h.checked));
+        if let Some((file, checked)) = &held
+            && now.duration_since(*checked) < touch
+        {
+            return Ok(file.clone());
+        }
+        let file = match held {
+            Some((file, _)) => file,
+            None => match File::open(self.path(name, PACK_EXT)) {
+                Ok(f) => Arc::new(f),
+                Err(e) if e.kind() == ErrorKind::NotFound => return Err(Unavailable::Gone),
+                Err(_) => return Err(Unavailable::Failed),
+            },
+        };
+        let meta = file.metadata().map_err(|_| Unavailable::Failed)?;
+        if meta.nlink() == 0 {
+            self.open.lock().remove(&no);
+            return Err(Unavailable::Gone);
+        }
+        crate::disk::touch(&file, meta.modified().ok(), touch);
+        let mut open = self.open.lock();
+        if open.len() >= MAX_HANDLES && !open.contains_key(&no) {
+            open.clear();
+        }
+        open.insert(no, Handle { file: file.clone(), checked: now });
+        Ok(file)
     }
 
     fn path(&self, name: &str, ext: &str) -> PathBuf {
@@ -263,13 +341,12 @@ impl Packs {
         }
         let groups: Vec<Group> = groups.into_iter().collect();
         let results = par_map(&groups, 1, |(no, (name, locs))| {
-            let file = match File::open(self.path(name, PACK_EXT)) {
+            let file = match self.handle(*no, name, touch) {
                 Ok(f) => f,
-                Err(e) if e.kind() == ErrorKind::NotFound => return Err(*no),
-                Err(_) => return Ok(Vec::new()),
+                Err(Unavailable::Gone) => return Err(*no),
+                Err(Unavailable::Failed) => return Ok(Vec::new()),
             };
-            crate::disk::touch(&file, file.metadata().ok().and_then(|m| m.modified().ok()), touch);
-            Ok(locs.iter().map(|(i, loc)| (*i, read_record(&file, loc))).collect::<Vec<_>>())
+            Ok(read_records(&file, locs))
         });
         let mut gone = Vec::new();
         for r in results {
@@ -386,16 +463,50 @@ impl Packs {
     }
 }
 
-/// Blocking: one record, decoded; `None` if unreadable or malformed.
-fn read_record(file: &File, loc: &Loc) -> Option<EncodedObject> {
-    let mut buf = vec![0u8; loc.len as usize];
-    file.read_exact_at(&mut buf, loc.off).ok()?;
-    let raw = match loc.flags {
-        0 => buf,
-        ZSTD => crate::disk::decompress(&buf)?,
+/// Blocking: the records at `locs` (request positions with locations in
+/// one pack), decoded, by position; `None` where unreadable or malformed.
+/// Nearby records are read together: one `pread` per run.
+fn read_records(file: &File, locs: &[(usize, Loc)]) -> Vec<(usize, Option<EncodedObject>)> {
+    let mut sorted: Vec<&(usize, Loc)> = locs.iter().collect();
+    sorted.sort_unstable_by_key(|(_, l)| l.off);
+    let mut out = Vec::with_capacity(locs.len());
+    let mut i = 0;
+    while i < sorted.len() {
+        let start = sorted[i].1.off;
+        let mut end = start + u64::from(sorted[i].1.len);
+        let mut j = i + 1;
+        while let Some((_, l)) = sorted.get(j) {
+            let l_end = l.off + u64::from(l.len);
+            if l.off > end.saturating_add(SPAN_GAP) || l_end.max(end) - start > SPAN_MAX {
+                break;
+            }
+            end = end.max(l_end);
+            j += 1;
+        }
+        let run = usize::try_from(end - start).ok().and_then(|n| {
+            let mut buf = vec![0u8; n];
+            file.read_exact_at(&mut buf, start).ok().map(|()| Bytes::from(buf))
+        });
+        for (pos, loc) in &sorted[i..j] {
+            let rel = (loc.off - start) as usize;
+            let obj = run
+                .as_ref()
+                .and_then(|b| decode_record(b.slice(rel..rel + loc.len as usize), loc.flags));
+            out.push((*pos, obj));
+        }
+        i = j;
+    }
+    out
+}
+
+/// One record's bytes, decoded; `None` if malformed.
+fn decode_record(data: Bytes, flags: u32) -> Option<EncodedObject> {
+    let raw = match flags {
+        0 => data,
+        ZSTD => Bytes::from(crate::disk::decompress(&data)?),
         _ => return None,
     };
-    EncodedObject::from_bytes(Bytes::from(raw)).ok()
+    EncodedObject::from_bytes(raw).ok()
 }
 
 /// Blocking: the entries of the index at `path`; `None` if missing or
