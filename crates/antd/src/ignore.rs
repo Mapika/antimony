@@ -29,6 +29,13 @@ use ::ignore::gitignore::{Gitignore, GitignoreBuilder};
 /// File name of the per-directory rule files.
 pub const GITIGNORE: &str = ".gitignore";
 
+/// The text of a rule file's bytes. Bytes that are not UTF-8 (a Latin-1
+/// comment, say) become U+FFFD: a pattern containing them matches no path
+/// (repo paths are UTF-8), and every other line keeps applying, as in git.
+pub fn lossy(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
 struct Node {
     parent: Option<Arc<Node>>,
     rules: Gitignore,
@@ -151,6 +158,17 @@ mod tests {
         let is = rules(&[("", "\u{feff}*.o\r\n[\r\nbad[\r\n*.a\r\n")]);
         assert!(is("x.o", false));
         assert!(is("x.a", false));
+    }
+
+    /// A rule file that is not UTF-8 (a Latin-1 comment and pattern) keeps
+    /// its other rules.
+    #[test]
+    fn non_utf8_rule_file_keeps_its_other_rules() {
+        let text = lossy(b"# J\xf6rg's build output\n*.o\ncaf\xe9\n".to_vec());
+        let r = Rules::none().child("", Some(&text));
+        assert!(r.is_ignored("x.o", false));
+        assert!(!r.is_ignored("caf\u{e9}", false));
+        assert_eq!(lossy(b"plain\n".to_vec()), "plain\n");
     }
 
     #[test]

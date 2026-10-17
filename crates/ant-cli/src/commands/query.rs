@@ -1,6 +1,7 @@
 //! ls / cat / blame / log / diff via RPCs (no checkout).
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 
 use ant_core::{EntryMode, RepoPath};
 use ant_proto::v1 as pb;
@@ -129,11 +130,14 @@ pub async fn log(
                 .commits
         }
     };
-    let mut out = String::new();
+    // The subject's bytes as stored (messages need not be UTF-8).
+    let mut out = Vec::new();
     for c in commits {
-        let subject = String::from_utf8_lossy(&c.message);
-        let subject = subject.lines().next().unwrap_or("");
-        writeln!(out, "{} {}", id_from(&c.id)?, subject)?;
+        let subject = c.message.split(|&b| b == b'\n').next().unwrap_or_default();
+        let subject = subject.strip_suffix(b"\r").unwrap_or(subject);
+        write!(out, "{} ", id_from(&c.id)?)?;
+        out.extend_from_slice(subject);
+        out.push(b'\n');
     }
     Ok(Outcome::ok(out))
 }
@@ -184,9 +188,12 @@ pub async fn blame(ctx: &Ctx, target: &str) -> Result<Outcome> {
         .await
         .rpc()?
         .into_inner();
-    let mut out = String::new();
+    // Each line's bytes as stored (content need not be UTF-8).
+    let mut out = Vec::new();
     for (i, l) in r.lines.iter().enumerate() {
-        writeln!(out, "{} {}\t{}", id_from(&l.commit)?, i + 1, l.line)?;
+        write!(out, "{} {}\t", id_from(&l.commit)?, i + 1)?;
+        out.extend_from_slice(l.bytes());
+        out.push(b'\n');
     }
     Ok(Outcome::ok(out))
 }
@@ -233,7 +240,7 @@ pub async fn diff(ctx: &Ctx, from: &str, to: &str, flags: DiffFlags) -> Result<O
     }
     let prefixes: Vec<RepoPath> =
         flags.paths.iter().map(|p| RepoPath::new(p.trim_matches('/'))).collect::<Result<_, _>>()?;
-    let mut out = String::new();
+    let mut out = Vec::new();
     for c in r.changes {
         if !prefixes.is_empty()
             && !RepoPath::new(c.path.as_str())
@@ -264,7 +271,8 @@ pub async fn diff(ctx: &Ctx, from: &str, to: &str, flags: DiffFlags) -> Result<O
 }
 
 /// One file of `ant diff --patch`, in the unified format `git apply` reads.
-fn write_patch(out: &mut String, c: &pb::PathChange, letter: char) -> Result<()> {
+/// Hunk lines are written as their bytes (content need not be UTF-8).
+fn write_patch(out: &mut Vec<u8>, c: &pb::PathChange, letter: char) -> Result<()> {
     let p = &c.path;
     writeln!(out, "diff --git a/{p} b/{p}")?;
     let octal = |m: i32| mode_from_pb(m).map(|m| m.as_octal());
@@ -303,8 +311,9 @@ fn write_patch(out: &mut String, c: &pb::PathChange, letter: char) -> Result<()>
             range(h.old_start, h.old_lines),
             range(h.new_start, h.new_lines)
         )?;
-        for line in &h.lines {
-            writeln!(out, "{line}")?;
+        for line in h.line_bytes() {
+            out.extend_from_slice(line);
+            out.push(b'\n');
         }
     }
     Ok(())

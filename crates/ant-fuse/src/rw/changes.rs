@@ -110,7 +110,7 @@ pub(super) fn scan_upper(state: &Path, view: Option<&BaseView<'_>>) -> io::Resul
     };
     let local = view
         .and_then(|_| fs::read(state.join("meta").join("ignore")).ok())
-        .and_then(|b| String::from_utf8(b).ok());
+        .map(antd::ignore::lossy);
     let mut level = vec![Pending {
         dir: String::new(),
         base: view.map(|v| v.tree),
@@ -145,7 +145,7 @@ pub(super) fn scan_upper(state: &Path, view: Option<&BaseView<'_>>) -> io::Resul
             for (i, entries) in listings.iter().enumerate() {
                 let upper_file = entries.iter().find(|(n, _, m, _)| n == GITIGNORE && !m.is_dir());
                 if let Some((_, _, _, full)) = upper_file {
-                    texts[i] = fs::read(full).ok().and_then(|b| String::from_utf8(b).ok());
+                    texts[i] = fs::read(full).ok().map(antd::ignore::lossy);
                 } else if let Some(id) = bases[i].gitignore {
                     fetch.push((i, id));
                 }
@@ -157,7 +157,7 @@ pub(super) fn scan_upper(state: &Path, view: Option<&BaseView<'_>>) -> io::Resul
                     return Err(other("misaligned blob batch"));
                 }
                 for ((i, _), obj) in chunk.iter().zip(found) {
-                    texts[*i] = obj.and_then(|o| String::from_utf8(o.body().to_vec()).ok());
+                    texts[*i] = obj.map(|o| antd::ignore::lossy(o.body().to_vec()));
                 }
             }
         }

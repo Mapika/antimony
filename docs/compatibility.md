@@ -59,6 +59,7 @@ Additions after 0.1.0 (additive):
 | addition | what |
 |---|---|
 | HTTP `POST /o/check` | batch read-permission check for cache tiers: body = up to 4096 raw 32-byte object ids, answer = one byte per id (bit 0: `GET /o/<id>` would serve this caller; bit 1: it would be `private`), `Content-Type: application/x-ant-check`, `x-ant-check: 1`, `no-store`; authorization is exactly that of `GET /o/<id>`, and a hidden object is reported like a missing one. Metrics route `object_checks`. Absent on older servers (404/405): `ant cache-serve` detects that and falls back to conditional `GET /o/<id>` |
+| `BlameLine.raw` (3), `Hunk.raw_lines` (6) | file content need not be UTF-8: a blame line that is not carries its bytes in `raw`, a hunk with such a line carries all its lines' bytes in `raw_lines`; the `string` fields then hold a lossy rendering (U+FFFD), so older clients print that instead of failing. Older servers answer `Blame` on such a file with `INVALID_ARGUMENT` and report its patch as `binary`; newer servers flag a side `binary` only when it contains a NUL byte |
 
 The bundle format follows the object endpoint's rules: what a URL returns
 never changes shape; a new layout gets a new magic *and* a new route (HTTP

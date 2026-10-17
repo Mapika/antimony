@@ -188,7 +188,13 @@ message BlameRequest {
 }
 message BlameLine {
   bytes commit = 1;
+  // The line without its terminator. File content need not be UTF-8: when
+  // this line is not, `line` holds its lossy rendering (U+FFFD for invalid
+  // bytes) and `raw` the exact bytes.
   string line = 2;
+  // Set exactly when the line is not valid UTF-8 (older servers refused
+  // such files with INVALID_ARGUMENT).
+  optional bytes raw = 3;
 }
 message BlameResponse { repeated BlameLine lines = 1; }
 
@@ -229,7 +235,8 @@ message DiffResponse {
 }
 // Line diff of one file, computed server side (unified-diff hunks).
 message FilePatch {
-  // A side is not text (not UTF-8, or contains NUL): no hunks.
+  // A side is binary (contains a NUL byte): no hunks. Content that is not
+  // UTF-8 is text (older servers reported it as binary).
   bool binary = 1;
   // A side exceeds the per-file limit, or the response's patch budget is
   // spent: no hunks.
@@ -245,8 +252,12 @@ message Hunk {
   uint32 new_lines = 4;
   // Each line prefixed with ' ', '-' or '+', without its line terminator;
   // a line "\ No newline at end of file" follows a side's last line when
-  // the file does not end with a newline.
+  // the file does not end with a newline. A line that is not valid UTF-8
+  // is rendered lossily here (U+FFFD); `raw_lines` has the exact bytes.
   repeated string lines = 5;
+  // Set, one entry per entry of `lines` with the same prefix, exactly when
+  // some line of the hunk is not valid UTF-8; empty otherwise.
+  repeated bytes raw_lines = 6;
 }
 
 message MergeBaseRequest {

@@ -973,3 +973,119 @@ fn cli_copy_local_into_postgres() {
         "test",
     ]);
 }
+
+/// stdout of a git command in `repo` (which must succeed).
+fn git_stdout(repo: &Path, args: &[&str]) -> Vec<u8> {
+    let out = Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("running git");
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    out.stdout
+}
+
+/// A history whose file content and commit message are not UTF-8 (Latin-1
+/// lines among UTF-8 ones, a stray 0xff, CRLF, no final newline), imported
+/// with `ant import` and served locally: `ant blame` attributes every line
+/// as `git blame` does and prints the bytes; `ant diff --patch` prints a
+/// patch `git apply` takes; `ant cat` and `ant log` print the bytes.
+#[test]
+fn cli_content_that_is_not_utf8_local() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&repo).expect("mkdir");
+    git(&repo, "2024-01-01T00:00:00+0000", &["init", "-q", "-b", "main"]);
+    let v1: &[u8] = b"line one\nMaintainer: Ana\n";
+    let v2: &[u8] = b"line one\nMaintainer: J\xf6rg M\xfcller\nMaintainer: Ana\n";
+    let v3: &[u8] =
+        b"line one\nMaintainer: J\xf6rg M\xfcller\nMaintainer: Ana\nZo\xc3\xab\r\nlast \xff";
+    write(&repo, "MAINTAINERS", v1);
+    git(&repo, "2024-01-01T00:00:00+0000", &["add", "-A"]);
+    git(&repo, "2024-01-01T00:00:00+0000", &["commit", "-q", "-m", "utf8 start"]);
+    write(&repo, "MAINTAINERS", v2);
+    git(&repo, "2024-01-02T00:00:00+0000", &["commit", "-q", "-a", "-m", "latin1 line"]);
+    write(&repo, "MAINTAINERS", v3);
+    let msg = tmp.path().join("msg");
+    fs::write(&msg, b"caf\xe9 commit\n\nbody \xff\n").expect("write msg");
+    let msg = msg.display().to_string();
+    let latin1 = ["-c", "i18n.commitEncoding=ISO-8859-1", "commit", "-q", "-a", "-F", &msg];
+    git(&repo, "2024-01-03T00:00:00+0000", &latin1);
+
+    let data = tmp.path().join("data").display().to_string();
+    let (grpc, http) = free_ports();
+    let ctx = Ctx {
+        ant: PathBuf::from(env!("CARGO_BIN_EXE_ant")),
+        env: vec![
+            ("ANT_SERVER".into(), format!("http://127.0.0.1:{grpc}")),
+            ("ANT_CACHE".into(), tmp.path().join("cache").display().to_string()),
+        ],
+    };
+    let git_dir = repo.join(".git").display().to_string();
+    ctx.run(None, &["import", &git_dir, "--git-ref", "refs/heads/main", "--local", &data]).ok();
+    let _server = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_ant"))
+            .args(["serve", "--local", &data])
+            .arg("--grpc-listen")
+            .arg(format!("127.0.0.1:{grpc}"))
+            .arg("--http-listen")
+            .arg(format!("127.0.0.1:{http}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawning ant serve"),
+    );
+    common::wait_until(|| ctx.run(None, &["ref", "get", "main"]).code() == Some(0));
+
+    // git commit (sha1) -> antimony commit, by position on the linear history.
+    let git_ids = String::from_utf8(git_stdout(&repo, &["rev-list", "main"])).unwrap();
+    let r = ctx.run(None, &["log", "main"]).ok();
+    let log: Vec<&[u8]> = r.out.stdout.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
+    check_eq(&r, "commits", log.len(), 3);
+    check_eq(&r, "latin1 subject", &log[0][65..], &b"caf\xe9 commit"[..]);
+    let ant_ids: Vec<String> =
+        log.iter().map(|l| String::from_utf8(l[..64].to_vec()).unwrap()).collect();
+    let to_ant: std::collections::HashMap<&str, &str> =
+        git_ids.lines().zip(ant_ids.iter().map(String::as_str)).collect();
+
+    // Blame: each line's owner as `git blame` has it, the line's bytes as
+    // stored (`ant blame` drops the terminator, the `\r` of a CRLF too).
+    let porcelain = git_stdout(&repo, &["blame", "--line-porcelain", "main", "--", "MAINTAINERS"]);
+    let mut want = Vec::new();
+    let mut owner = String::new();
+    let mut n = 0;
+    for line in porcelain.split(|&b| b == b'\n') {
+        if let Some(text) = line.strip_prefix(b"\t") {
+            n += 1;
+            let text = text.strip_suffix(b"\r").unwrap_or(text);
+            want.extend_from_slice(format!("{} {n}\t", to_ant[owner.as_str()]).as_bytes());
+            want.extend_from_slice(text);
+            want.push(b'\n');
+        } else if line.len() > 40 && line[..40].iter().all(u8::is_ascii_hexdigit) {
+            owner = String::from_utf8(line[..40].to_vec()).unwrap();
+        }
+    }
+    assert_eq!(n, 5);
+    let r = ctx.run(None, &["blame", "main:MAINTAINERS"]).ok();
+    if r.out.stdout != want {
+        r.fail(&format!("blame: expected {:?}", String::from_utf8_lossy(&want)));
+    }
+
+    let r = ctx.run(None, &["cat", "main:MAINTAINERS"]).ok();
+    check_eq(&r, "cat", r.out.stdout.as_slice(), v3);
+
+    // The patch from v1 to v3 applies in reverse to the checkout at v3.
+    let r = ctx.run(None, &["diff", "--patch", "main~2", "main"]).ok();
+    if r.out.stdout.windows(7).any(|w| w == b"Binary ") {
+        r.fail("content that is not UTF-8 is text");
+    }
+    let patch = tmp.path().join("p.diff");
+    fs::write(&patch, &r.out.stdout).expect("write patch");
+    let patch = patch.display().to_string();
+    git_stdout(&repo, &["apply", "-R", "--check", &patch]);
+    git_stdout(&repo, &["apply", "-R", &patch]);
+    assert_eq!(fs::read(repo.join("MAINTAINERS")).unwrap(), v1);
+}

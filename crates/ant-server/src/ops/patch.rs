@@ -12,7 +12,9 @@
 //!   both sides and merge when their contexts touch, as `diff -u` does. A
 //!   side's last line without newline is followed by the line
 //!   `\ No newline at end of file`.
-//! - A side that is not UTF-8 or contains NUL is binary: no hunks.
+//! - Content is bytes, as in git: a side containing a NUL byte is binary
+//!   (no hunks); any other content is text, UTF-8 or not (Latin-1 lines
+//!   diff like any others). Hunk lines carry the raw bytes.
 //! - [`patches`]: the patches of a diff's changes, with limits: a side over
 //!   [`MAX_FILE_BYTES`] is `too_large`; once the hunk lines of the response
 //!   exceed [`MAX_PATCH_BYTES`] the remaining files are `too_large` (without
@@ -42,7 +44,7 @@ pub const MAX_CONTEXT: usize = 100_000;
 /// Blob ids per `get_many` while computing patches.
 const BLOB_CHUNK: usize = 64;
 
-const NO_NEWLINE: &str = "\\ No newline at end of file";
+const NO_NEWLINE: &[u8] = b"\\ No newline at end of file";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FilePatch {
@@ -57,9 +59,9 @@ pub struct Hunk {
     pub old_lines: u32,
     pub new_start: u32,
     pub new_lines: u32,
-    /// `' '`, `'-'` or `'+'` and the line without its terminator, or
-    /// [`NO_NEWLINE`].
-    pub lines: Vec<String>,
+    /// `' '`, `'-'` or `'+'` and the line's bytes without its terminator
+    /// (not necessarily UTF-8), or [`NO_NEWLINE`].
+    pub lines: Vec<Vec<u8>>,
 }
 
 impl FilePatch {
@@ -77,11 +79,10 @@ impl FilePatch {
     }
 }
 
-fn is_text(b: &[u8]) -> Option<&str> {
-    if b.contains(&0) {
-        return None;
-    }
-    std::str::from_utf8(b).ok()
+/// Binary content: contains a NUL byte (git looks at the first 8000 bytes;
+/// the whole side is checked here, as before).
+fn is_binary(b: &[u8]) -> bool {
+    b.contains(&0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,12 +94,12 @@ enum Op {
 
 /// Unified-diff hunks from `old` to `new` (see the module docs).
 pub fn text_patch(old: &[u8], new: &[u8], context: usize) -> FilePatch {
-    let (Some(old), Some(new)) = (is_text(old), is_text(new)) else {
+    if is_binary(old) || is_binary(new) {
         return FilePatch::binary();
-    };
-    let ol: Vec<&str> = old.split_inclusive('\n').collect();
-    let nl: Vec<&str> = new.split_inclusive('\n').collect();
-    let mut ids: HashMap<&str, u32> = HashMap::with_capacity(ol.len() + nl.len());
+    }
+    let ol: Vec<&[u8]> = old.split_inclusive(|&c| c == b'\n').collect();
+    let nl: Vec<&[u8]> = new.split_inclusive(|&c| c == b'\n').collect();
+    let mut ids: HashMap<&[u8], u32> = HashMap::with_capacity(ol.len() + nl.len());
     let mut interned = [Vec::with_capacity(ol.len()), Vec::with_capacity(nl.len())];
     for (side, lines) in interned.iter_mut().zip([&ol, &nl]) {
         for l in lines.iter() {
@@ -155,24 +156,26 @@ pub fn text_patch(old: &[u8], new: &[u8], context: usize) -> FilePatch {
 }
 
 /// One hunk over `ops`; `before` are the ops preceding it (for the starts).
-fn hunk(ops: &[Op], before: &[Op], ol: &[&str], nl: &[&str]) -> Hunk {
+fn hunk(ops: &[Op], before: &[Op], ol: &[&[u8]], nl: &[&[u8]]) -> Hunk {
     let old_before = before.iter().filter(|o| !matches!(o, Op::Ins(_))).count();
     let new_before = before.iter().filter(|o| !matches!(o, Op::Del(_))).count();
     let old_lines = ops.iter().filter(|o| !matches!(o, Op::Ins(_))).count();
     let new_lines = ops.iter().filter(|o| !matches!(o, Op::Del(_))).count();
     let start = |before: usize, lines: usize| before + usize::from(lines > 0);
-    let no_nl = |lines: &[&str], i: usize| i + 1 == lines.len() && !lines[i].ends_with('\n');
-    let text = |l: &str| l.strip_suffix('\n').unwrap_or(l).to_string();
+    let no_nl = |lines: &[&[u8]], i: usize| i + 1 == lines.len() && !lines[i].ends_with(b"\n");
+    let text = |l: &'_ [u8]| l.strip_suffix(b"\n").unwrap_or(l).to_vec();
     let mut lines = Vec::with_capacity(ops.len());
     for op in ops {
         let (prefix, line, missing) = match *op {
-            Op::Same(o, n) => (' ', ol[o], no_nl(ol, o) || no_nl(nl, n)),
-            Op::Del(o) => ('-', ol[o], no_nl(ol, o)),
-            Op::Ins(n) => ('+', nl[n], no_nl(nl, n)),
+            Op::Same(o, n) => (b' ', ol[o], no_nl(ol, o) || no_nl(nl, n)),
+            Op::Del(o) => (b'-', ol[o], no_nl(ol, o)),
+            Op::Ins(n) => (b'+', nl[n], no_nl(nl, n)),
         };
-        lines.push(format!("{prefix}{}", text(line)));
+        let mut l = text(line);
+        l.insert(0, prefix);
+        lines.push(l);
         if missing {
-            lines.push(NO_NEWLINE.to_string());
+            lines.push(NO_NEWLINE.to_vec());
         }
     }
     let n32 = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
@@ -280,7 +283,7 @@ mod tests {
                 h.old_start, h.old_lines, h.new_start, h.new_lines
             ));
             for l in &h.lines {
-                s.push_str(l);
+                s.push_str(&String::from_utf8_lossy(l));
                 s.push('\n');
             }
         }
@@ -311,8 +314,8 @@ mod tests {
         assert_eq!(p.hunks.len(), 2);
         assert_eq!((p.hunks[0].old_start, p.hunks[0].old_lines, p.hunks[0].new_start), (1, 6, 1));
         assert_eq!((p.hunks[1].old_start, p.hunks[1].old_lines), (23, 7));
-        assert_eq!(p.hunks[1].lines.first().unwrap(), " l22");
-        assert_eq!(p.hunks[1].lines.last().unwrap(), " l28");
+        assert_eq!(p.hunks[1].lines.first().unwrap(), b" l22");
+        assert_eq!(p.hunks[1].lines.last().unwrap(), b" l28");
         // Changes 7 lines apart: contexts of 3 touch, one hunk.
         let new = old.replace("l10\n", "X\n").replace("l17\n", "Y\n");
         let p = text_patch(old.as_bytes(), new.as_bytes(), 3);
@@ -349,34 +352,51 @@ mod tests {
     #[test]
     fn binary_sides() {
         assert!(text_patch(b"a\0b", b"a", 3).binary);
-        assert!(text_patch(b"a", &[0xff, 0xfe], 3).binary);
-        assert!(text_patch(b"a", &[0xff, 0xfe], 3).hunks.is_empty());
+        assert!(text_patch(b"a", b"\xff\0", 3).binary);
+        assert!(text_patch(b"a", b"\xff\0", 3).hunks.is_empty());
+    }
+
+    /// Content that is not UTF-8 (Latin-1, stray bytes) diffs as text, the
+    /// hunk lines carrying the bytes, like git.
+    #[test]
+    fn non_utf8_text_diffs_bytewise() {
+        let p = text_patch(b"one\nJ\xf6rg\n", b"one\nJ\xc3\xb6rg\n\xff", 3);
+        assert!(!p.binary);
+        let want: Vec<&[u8]> = vec![b" one", b"-J\xf6rg", b"+J\xc3\xb6rg", b"+\xff", NO_NEWLINE];
+        assert_eq!(p.hunks.len(), 1);
+        assert_eq!(p.hunks[0].lines, want);
+        assert_eq!((p.hunks[0].old_lines, p.hunks[0].new_lines), (2, 3));
+        // Same bytes: no hunks; a one-byte change inside a UTF-8 sequence
+        // changes the line.
+        assert!(text_patch(b"\xe9\n", b"\xe9\n", 3).hunks.is_empty());
+        let p = text_patch(b"\xc3\xa9\n", b"\xc3\xa8\n", 0);
+        assert_eq!(p.hunks[0].lines, [&b"-\xc3\xa9"[..], b"+\xc3\xa8"]);
     }
 
     /// Applying the hunks to the old text gives the new text.
-    fn apply(old: &str, p: &FilePatch) -> String {
-        let old: Vec<&str> = old.lines().collect();
-        let mut out: Vec<String> = Vec::new();
+    fn apply(old: &[u8], p: &FilePatch) -> Vec<u8> {
+        let old: Vec<&[u8]> = crate::ops::history::byte_lines(old).collect();
+        let mut out: Vec<Vec<u8>> = Vec::new();
         let mut at = 0;
         for h in &p.hunks {
             let start =
                 if h.old_lines == 0 { h.old_start as usize } else { h.old_start as usize - 1 };
-            out.extend(old[at..start].iter().map(|s| s.to_string()));
+            out.extend(old[at..start].iter().map(|s| s.to_vec()));
             at = start;
             for l in &h.lines {
-                match l.as_bytes()[0] {
+                match l[0] {
                     b' ' => {
-                        out.push(l[1..].to_string());
+                        out.push(l[1..].to_vec());
                         at += 1;
                     }
                     b'-' => at += 1,
-                    b'+' => out.push(l[1..].to_string()),
+                    b'+' => out.push(l[1..].to_vec()),
                     _ => {}
                 }
             }
         }
-        out.extend(old[at..].iter().map(|s| s.to_string()));
-        out.join("\n")
+        out.extend(old[at..].iter().map(|s| s.to_vec()));
+        out.join(&b'\n')
     }
 
     proptest::proptest! {
@@ -395,14 +415,25 @@ mod tests {
                     v => if at < new.len() { new[at] = v } else { new.push(v) },
                 }
             }
-            let text = |v: &[u8]| v.iter().map(|c| format!("x{c}\n")).collect::<String>();
+            // Symbols 0-5; with an odd context, two of them are not UTF-8.
+            let text = |v: &[u8]| -> Vec<u8> {
+                v.iter()
+                    .flat_map(|&c| match c {
+                        3 if context % 2 == 1 => b"\xe9x\n".to_vec(),
+                        4 if context % 2 == 1 => b"J\xf6rg\xff\n".to_vec(),
+                        c => format!("x{c}\n").into_bytes(),
+                    })
+                    .collect()
+            };
             let (o, n) = (text(&old), text(&new));
-            let p = text_patch(o.as_bytes(), n.as_bytes(), context);
-            proptest::prop_assert_eq!(apply(&o, &p), n.lines().collect::<Vec<_>>().join("\n"));
+            let p = text_patch(&o, &n, context);
+            proptest::prop_assert!(!p.binary);
+            let want = crate::ops::history::byte_lines(&n).collect::<Vec<_>>().join(&b'\n');
+            proptest::prop_assert_eq!(apply(&o, &p), want);
             // Counts in the headers match the lines.
             for h in &p.hunks {
-                let olds = h.lines.iter().filter(|l| !l.starts_with('+')).count();
-                let news = h.lines.iter().filter(|l| !l.starts_with('-')).count();
+                let olds = h.lines.iter().filter(|l| !l.starts_with(b"+")).count();
+                let news = h.lines.iter().filter(|l| !l.starts_with(b"-")).count();
                 proptest::prop_assert_eq!(olds as u32, h.old_lines);
                 proptest::prop_assert_eq!(news as u32, h.new_lines);
             }

@@ -8,6 +8,31 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+### Added
+
+- gRPC (additive): `BlameLine.raw` and `Hunk.raw_lines` carry the exact
+  bytes of lines that are not valid UTF-8; `line`/`lines` then hold a lossy
+  rendering (U+FFFD) for older clients. Both are unset for UTF-8 content.
+
+### Fixed
+
+- File content that is not UTF-8 (Latin-1 names in old histories, as in
+  the Linux kernel's `MAINTAINERS`) is handled as bytes, like git:
+  - `ant blame` / `Blame` no longer fail with "not valid UTF-8": lines
+    split on `\n` (a CRLF's `\r` dropped, as before) and are attributed
+    exactly as for UTF-8 files; `ant blame` prints each line's bytes.
+    Stored blame values (`blame/v2`) hold only owners and stay valid.
+  - `ant diff --patch` / `Diff` patches: such files are text, not
+    `Binary files ... differ`; only a NUL byte makes a side binary. Hunk
+    lines are printed as their bytes (`git apply` takes the patch).
+  - Land rebases and `ant ws update` merge such files line by line instead
+    of reporting a conflict (binary for merging: a NUL byte in content that
+    is not UTF-8; UTF-8 content merges exactly as before).
+  - `ant log` prints a message subject that is not UTF-8 as its bytes
+    instead of a lossy rendering.
+  - A `.gitignore` (or `.ant/ignore`) that is not UTF-8 no longer disables
+    all of its rules: invalid bytes match nothing, the other lines apply.
+
 ## [0.4.0] - 2026-10-17
 
 Minor release for local mode: a local server can now be garbage-collected

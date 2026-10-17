@@ -33,8 +33,11 @@
 //!       Missing path: exit 1.
 //!   ant cat <rev>:<path>        raw blob bytes. Missing/not a blob: exit 1.
 //!   ant blame <rev>:<path>                    `<commit-id> <line-no>\t<line>` per line
+//!       (`<line>`: the line's bytes as stored, without its terminator; file
+//!       content need not be UTF-8).
 //!   ant log [<rev>] [-n N] [--path <path> | -- <path>]
 //!       `<id> <subject>` newest first, first parents; rev default `main`.
+//!       `<subject>`: the first line of the message, its bytes as stored.
 //!       `<rev>` may be a range `<a>..<b>`: the first-parent history of <b>
 //!       down to the first commit reachable from <a> (LogRange, paged by
 //!       the server; `-n` caps the total). Both ends are required.
@@ -48,8 +51,9 @@
 //!       mode <m>` / `old mode <m>` + `new mode <m>` when applicable, then
 //!       `--- a/<p>|/dev/null`, `+++ b/<p>|/dev/null` and `@@ -a[,b] +c[,d] @@`
 //!       hunks (`-U N` context lines, default 3; ` `/`-`/`+` lines and
-//!       `\ No newline at end of file`), as `git apply` reads them. Files
-//!       with a non-text side print `Binary files <old> and <new> differ`;
+//!       `\ No newline at end of file`; line bytes as stored, UTF-8 or
+//!       not), as `git apply` reads them. Files with a binary side (a NUL
+//!       byte) print `Binary files <old> and <new> differ`;
 //!       files over the server's size limits print `Large files <old> and
 //!       <new> differ` (with a `hint:` on stderr when the response budget
 //!       ran out). Mode-only changes have no `---`/`+++` lines.

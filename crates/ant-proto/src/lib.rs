@@ -65,9 +65,81 @@ impl From<v1::Signature> for ant_core::Signature {
     }
 }
 
+// File content travels in `string` fields that predate content that is not
+// UTF-8 (`BlameLine.line`, `Hunk.lines`); the exact bytes go in an added
+// `bytes` field only when the text is not UTF-8, so UTF-8 content costs
+// nothing extra and older clients get a lossy rendering.
+
+impl v1::BlameLine {
+    /// A line attributed to `commit`, from the line's bytes.
+    pub fn from_bytes(commit: Vec<u8>, line: Vec<u8>) -> Self {
+        match String::from_utf8(line) {
+            Ok(line) => v1::BlameLine { commit, line, raw: None },
+            Err(e) => {
+                let raw = e.into_bytes();
+                v1::BlameLine {
+                    commit,
+                    line: String::from_utf8_lossy(&raw).into_owned(),
+                    raw: Some(raw),
+                }
+            }
+        }
+    }
+
+    /// The line's exact bytes (`raw` when set, else `line`).
+    pub fn bytes(&self) -> &[u8] {
+        self.raw.as_deref().unwrap_or(self.line.as_bytes())
+    }
+}
+
+impl v1::Hunk {
+    /// Fills `lines` (and `raw_lines` when one is not UTF-8) from the lines'
+    /// bytes, each with its `' '`/`'-'`/`'+'` prefix.
+    pub fn set_lines(&mut self, lines: Vec<Vec<u8>>) {
+        if lines.iter().all(|l| std::str::from_utf8(l).is_ok()) {
+            self.lines =
+                lines.into_iter().map(|l| String::from_utf8(l).unwrap_or_default()).collect();
+            self.raw_lines = Vec::new();
+        } else {
+            self.lines = lines.iter().map(|l| String::from_utf8_lossy(l).into_owned()).collect();
+            self.raw_lines = lines;
+        }
+    }
+
+    /// The lines' exact bytes (`raw_lines` when set, else `lines`).
+    pub fn line_bytes(&self) -> Vec<&[u8]> {
+        if self.raw_lines.is_empty() {
+            self.lines.iter().map(String::as_bytes).collect()
+        } else {
+            self.raw_lines.iter().map(Vec::as_slice).collect()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_lines_carry_bytes_only_when_not_utf8() {
+        let l = v1::BlameLine::from_bytes(vec![1], "caf\u{e9}".into());
+        assert_eq!(
+            (l.line.as_str(), l.raw.as_ref(), l.bytes()),
+            ("caf\u{e9}", None, "caf\u{e9}".as_bytes())
+        );
+        let l = v1::BlameLine::from_bytes(vec![1], b"caf\xe9".to_vec());
+        assert_eq!((l.line.as_str(), l.bytes()), ("caf\u{fffd}", &b"caf\xe9"[..]));
+        let l = v1::BlameLine::from_bytes(vec![1], Vec::new());
+        assert_eq!((l.raw.as_ref(), l.bytes()), (None, &b""[..]));
+
+        let mut h = v1::Hunk::default();
+        h.set_lines(vec![b" a".to_vec(), b"+\xc3\xa9".to_vec()]);
+        assert_eq!((h.lines.len(), h.raw_lines.len()), (2, 0));
+        assert_eq!(h.line_bytes(), [&b" a"[..], b"+\xc3\xa9"]);
+        h.set_lines(vec![b" a".to_vec(), b"-J\xf6rg".to_vec(), b"+".to_vec()]);
+        assert_eq!(h.lines, [" a", "-J\u{fffd}rg", "+"]);
+        assert_eq!(h.line_bytes(), [&b" a"[..], b"-J\xf6rg", b"+"]);
+    }
 
     #[test]
     fn entry_modes_round_trip_and_reject_unknown_values() {

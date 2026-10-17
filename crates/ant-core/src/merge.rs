@@ -64,20 +64,28 @@ pub enum TextMerge {
     /// (`<<<<<<< ours`, `||||||| original`, `=======`, `>>>>>>> theirs`, each
     /// at the start of a line).
     Conflict(Vec<u8>),
-    /// At least one side is not UTF-8: not merged.
+    /// At least one side is binary ([`is_binary`]): not merged.
     Binary,
 }
 
-/// Line-based 3-way merge of UTF-8 texts (`diffy::merge`).
+/// Binary content for merging: a NUL byte in content that is not UTF-8.
+/// Content that is not UTF-8 is otherwise text (Latin-1 files merge like
+/// any others, as in git); UTF-8 content with a NUL stays mergeable, as it
+/// always was, so servers and clients of different versions agree on every
+/// input older ones merged.
+pub fn is_binary(content: &[u8]) -> bool {
+    content.contains(&0) && std::str::from_utf8(content).is_err()
+}
+
+/// Line-based 3-way merge of the bytes (`diffy::merge_bytes`: lines split
+/// after each `\n`; on UTF-8 input byte-for-byte what `diffy::merge` gives).
 pub fn text(base: &[u8], ours: &[u8], theirs: &[u8]) -> TextMerge {
-    let (Ok(base), Ok(ours), Ok(theirs)) =
-        (std::str::from_utf8(base), std::str::from_utf8(ours), std::str::from_utf8(theirs))
-    else {
+    if [base, ours, theirs].into_iter().any(is_binary) {
         return TextMerge::Binary;
-    };
-    match diffy::merge(base, ours, theirs) {
-        Ok(merged) => TextMerge::Clean(merged.into_bytes()),
-        Err(marked) => TextMerge::Conflict(marked.into_bytes()),
+    }
+    match diffy::merge_bytes(base, ours, theirs) {
+        Ok(merged) => TextMerge::Clean(merged),
+        Err(marked) => TextMerge::Conflict(marked),
     }
 }
 
@@ -148,7 +156,49 @@ mod tests {
         let marked = String::from_utf8(marked).unwrap();
         assert!(marked.contains("<<<<<<< ours\nours\n"), "{marked}");
         assert!(marked.contains(">>>>>>> theirs\n"), "{marked}");
-        assert_eq!(text(b"\xff", b"a", b"b"), TextMerge::Binary);
+        assert_eq!(text(b"\xff\0", b"a", b"b"), TextMerge::Binary);
+        assert_eq!(text(b"a", b"a\0\xff", b"b"), TextMerge::Binary);
+        // UTF-8 with a NUL still merges.
+        assert_eq!(text(b"\0\n", b"\0\nx\n", b"\0\n"), TextMerge::Clean(b"\0\nx\n".to_vec()));
+    }
+
+    /// Content that is not UTF-8 merges on its bytes, like git.
+    #[test]
+    fn non_utf8_texts_merge() {
+        let base = b"J\xf6rg\n2\n3\n4\n\xe9\n";
+        assert_eq!(
+            text(base, b"J\xc3\xb6rg\n2\n3\n4\n\xe9\n", b"J\xf6rg\n2\n3\n4\n\xe9\xff\n"),
+            TextMerge::Clean(b"J\xc3\xb6rg\n2\n3\n4\n\xe9\xff\n".to_vec())
+        );
+        let TextMerge::Conflict(marked) =
+            text(base, b"\xe0\n2\n3\n4\n\xe9\n", b"\xe1\n2\n3\n4\n\xe9\n")
+        else {
+            panic!("expected a conflict");
+        };
+        assert!(has_conflict_markers(&marked));
+        assert!(marked.starts_with(b"<<<<<<< ours\n\xe0\n"));
+        assert!(marked.windows(4).any(|w| w == b"\n\xe1\n>"));
+    }
+
+    proptest::proptest! {
+        /// On UTF-8 input the byte merge is exactly the string merge used
+        /// before (so land and `ws update` resolve as they did).
+        #[test]
+        fn byte_merge_equals_str_merge_on_utf8(
+            base in proptest::collection::vec(0u8..5, 0..12),
+            ours in proptest::collection::vec(0u8..5, 0..12),
+            theirs in proptest::collection::vec(0u8..5, 0..12),
+        ) {
+            let render = |v: &[u8]| -> String {
+                v.iter().map(|&c| ["a\n", "\u{e9}\n", "b\r\n", "\n", "c"][usize::from(c)]).collect()
+            };
+            let (b, o, t) = (render(&base), render(&ours), render(&theirs));
+            let want = match diffy::merge(&b, &o, &t) {
+                Ok(m) => TextMerge::Clean(m.into_bytes()),
+                Err(m) => TextMerge::Conflict(m.into_bytes()),
+            };
+            proptest::prop_assert_eq!(text(b.as_bytes(), o.as_bytes(), t.as_bytes()), want);
+        }
     }
 
     #[test]

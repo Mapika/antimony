@@ -698,6 +698,64 @@ async fn blame_rpc() {
     assert_eq!(e.code(), Code::NotFound);
 }
 
+/// File content need not be UTF-8 (Latin-1 lines in old histories): Blame
+/// and Diff patches work on the bytes, carrying them in `raw`/`raw_lines`
+/// with a lossy `line`/`lines` for older clients; UTF-8 lines carry no copy.
+#[tokio::test]
+async fn blame_and_patch_rpcs_on_content_that_is_not_utf8() {
+    let mut s = spawn_server().await;
+    let bytes = |path: &str, content: &[u8]| pb::FileOp {
+        path: path.into(),
+        op: Some(pb::file_op::Op::Write(pb::WriteOp {
+            mode: pb::EntryMode::File as i32,
+            content: Some(pb::write_op::Content::Inline(content.to_vec())),
+        })),
+    };
+    let c1 = commit(&mut s, None, vec![bytes("M", b"one\nMaintainer: Ana\n")], "c1").await;
+    let c2_ops = vec![bytes("M", b"one\nMaintainer: J\xf6rg M\xfcller\nMaintainer: Ana\n")];
+    let c2 = commit(&mut s, Some(c1.clone()), c2_ops, "c2").await;
+    let c3_text: &[u8] = b"one\nMaintainer: J\xf6rg M\xfcller\nMaintainer: Ana\nZo\xc3\xab\r\n\xff";
+    let c3 = commit(&mut s, Some(c2.clone()), vec![bytes("M", c3_text)], "c3").await;
+    s.grpc.land(pb::LandRequest { ref_name: "main".into(), commit: c3.clone() }).await.unwrap();
+    let r = s
+        .grpc
+        .blame(pb::BlameRequest { rev: "main".into(), path: "M".into() })
+        .await
+        .unwrap()
+        .into_inner();
+    let got: Vec<_> = r.lines.iter().map(|l| (l.commit.clone(), l.bytes())).collect();
+    let want: Vec<(Vec<u8>, &[u8])> = vec![
+        (c1.clone(), b"one"),
+        (c2.clone(), b"Maintainer: J\xf6rg M\xfcller"),
+        (c1.clone(), b"Maintainer: Ana"),
+        (c3.clone(), "Zo\u{eb}".as_bytes()),
+        (c3.clone(), b"\xff"),
+    ];
+    assert_eq!(got, want);
+    assert_eq!(r.lines[1].line, "Maintainer: J\u{fffd}rg M\u{fffd}ller");
+    assert!(r.lines[1].raw.is_some() && r.lines[4].raw.is_some());
+    assert!(r.lines[0].raw.is_none() && r.lines[3].raw.is_none());
+
+    let diff = |from: String, to: String| pb::DiffRequest {
+        from_rev: from,
+        to_rev: to,
+        patch: true,
+        ..Default::default()
+    };
+    let d = s.grpc.diff(diff(hex(&c1), hex(&c2))).await.unwrap().into_inner();
+    let p = d.changes[0].patch.as_ref().unwrap();
+    assert!(!p.binary, "Latin-1 is text");
+    let h = &p.hunks[0];
+    let want: [&[u8]; 3] = [b" one", b"+Maintainer: J\xf6rg M\xfcller", b" Maintainer: Ana"];
+    assert_eq!(h.line_bytes(), want);
+    assert_eq!(h.lines, [" one", "+Maintainer: J\u{fffd}rg M\u{fffd}ller", " Maintainer: Ana"]);
+    // A patch whose lines are all UTF-8 carries no raw copy.
+    let d = s.grpc.diff(diff(String::new(), hex(&c1))).await.unwrap().into_inner();
+    let h = &d.changes[0].patch.as_ref().unwrap().hunks[0];
+    assert!(h.raw_lines.is_empty());
+    assert_eq!(h.lines, ["+one", "+Maintainer: Ana"]);
+}
+
 async fn spawn_server_on(backend: Backend) -> Server {
     let server = spawn_local(backend.clone(), Acl::open()).await.unwrap();
     let grpc = AntClient::connect(server.grpc_url()).await.unwrap();

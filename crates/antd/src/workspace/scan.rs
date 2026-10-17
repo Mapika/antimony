@@ -109,11 +109,12 @@ pub(super) fn scan_dir<'a>(
         }
         entries.push((name, entry));
     }
-    // This directory's own rule file (unreadable or non-UTF-8: no rules).
+    // This directory's own rule file (unreadable: no rules; bytes that are not UTF-8 read lossily, so they
+    // match nothing but leave the other rules in force, as in git).
     let rules = if item.in_ignored {
         Rules::none()
     } else if entries.iter().any(|(n, _)| n == GITIGNORE) {
-        let text = fs::read(full_dir.join(GITIGNORE)).ok().and_then(|b| String::from_utf8(b).ok());
+        let text = fs::read(full_dir.join(GITIGNORE)).ok().map(crate::ignore::lossy);
         item.rules.child(rel, text.as_deref())
     } else {
         item.rules.clone()
@@ -184,7 +185,7 @@ pub(super) fn scan(dir: &Path, index: &Index, index_mtime: Option<i64>) -> anyho
     let mut ignored = Vec::new();
     let mut seen: Vec<&str> = Vec::with_capacity(index.len());
     let local = fs::read(state_dir(dir).join(IGNORE_FILE)).ok();
-    let local = local.and_then(|b| String::from_utf8(b).ok());
+    let local = local.map(crate::ignore::lossy);
     let base = Rules::none().child("", local.as_deref());
     let tracked = TrackedDirs::new(index);
     let mut level = vec![Dir { rel: String::new(), rules: base, in_ignored: false }];

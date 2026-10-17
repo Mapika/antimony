@@ -9,7 +9,9 @@
 //! - ours == theirs → already applied, skipped;
 //! - ours == base → theirs is applied (write or delete);
 //! - base, ours and theirs are all regular files whose mode changed on at
-//!   most one side and whose blobs are UTF-8 → 3-way text merge
+//!   most one side and whose blobs are text (UTF-8 or not; binary = a NUL
+//!   in content that is not UTF-8, `ant_core::merge::is_binary`) → 3-way
+//!   text merge on the bytes
 //!   (`ant_core::merge`, shared with client workspace updates); a clean merge writes the merged blob;
 //! - anything else (modify/delete, add/add, symlinks, binary, text merge
 //!   conflicts, structural conflicts such as a directory turned into a file)

@@ -249,12 +249,16 @@ fn patch_to_pb(p: patch::FilePatch) -> pb::FilePatch {
         hunks: p
             .hunks
             .into_iter()
-            .map(|h| pb::Hunk {
-                old_start: h.old_start,
-                old_lines: h.old_lines,
-                new_start: h.new_start,
-                new_lines: h.new_lines,
-                lines: h.lines,
+            .map(|h| {
+                let mut hunk = pb::Hunk {
+                    old_start: h.old_start,
+                    old_lines: h.old_lines,
+                    new_start: h.new_start,
+                    new_lines: h.new_lines,
+                    ..Default::default()
+                };
+                hunk.set_lines(h.lines);
+                hunk
             })
             .collect(),
     }
@@ -610,7 +614,7 @@ impl Ant for AntService {
         Ok(Response::new(pb::BlameResponse {
             lines: lines
                 .into_iter()
-                .map(|l| pb::BlameLine { commit: l.commit.0.to_vec(), line: l.line })
+                .map(|l| pb::BlameLine::from_bytes(l.commit.0.to_vec(), l.line))
                 .collect(),
         }))
     }

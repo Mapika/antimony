@@ -28,10 +28,14 @@ pub fn sig() -> Signature {
 }
 
 pub fn write(path: &str, content: &str) -> FileOp {
+    write_bytes(path, content.as_bytes())
+}
+
+pub fn write_bytes(path: &str, content: &[u8]) -> FileOp {
     FileOp::Write {
         path: RepoPath::new(path).unwrap(),
         mode: EntryMode::File,
-        content: WriteContent::Inline(Bytes::copy_from_slice(content.as_bytes())),
+        content: WriteContent::Inline(Bytes::copy_from_slice(content)),
     }
 }
 
@@ -48,11 +52,15 @@ pub async fn commit(b: &Backend, base: Option<ObjectId>, ops: Vec<FileOp>) -> Op
 }
 
 pub async fn read(b: &Backend, commit_id: ObjectId, path: &str) -> Option<String> {
+    Some(String::from_utf8(read_bytes(b, commit_id, path).await?).unwrap())
+}
+
+pub async fn read_bytes(b: &Backend, commit_id: ObjectId, path: &str) -> Option<Vec<u8>> {
     let c = b.objects.read_commit(&commit_id).await.unwrap();
     let (mode, id) =
         lookup_path(b.objects.as_ref(), c.tree, &RepoPath::new(path).unwrap()).await.unwrap()?;
     assert!(mode.is_blob(), "{path} is not a blob");
-    Some(String::from_utf8(b.objects.read_blob(&id).await.unwrap().to_vec()).unwrap())
+    Some(b.objects.read_blob(&id).await.unwrap().to_vec())
 }
 
 /// The target of `main`.
