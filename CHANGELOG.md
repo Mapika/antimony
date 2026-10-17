@@ -8,6 +8,48 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+### Added
+
+- Persistent server cache: tree bundles (`GET /t/`) and the git export's
+  base packs survive restarts, so the first checkout and the first clone
+  after a restart or deploy no longer rebuild them
+  (docs/operations.md, "Persistent server caches").
+  - `ant serve --cache-dir DIR` (`ANT_CACHE_DIR`; default `<data dir>/cache`
+    in local mode, `--no-cache-dir` to turn that off) with
+    `--cache-dir-mib` (default 4096, local 1024; LRU). Entries of different
+    repositories are kept apart; one process per directory.
+  - `--shared-cache` (`--shared-cache-mib`, default 16384): also keep
+    entries in the store's S3 bucket under `<s3 prefix>/cache/`, shared by
+    replicas (a new replica reads them instead of building).
+  - `--prewarm REF` loads or builds the bundles of a checkout of REF in the
+    background after start; `--prewarm-git blobless|full` loads or builds
+    the base pack for clones of `main`.
+  - Safe by construction: entries are checked (SHA-256) on every read and
+    dropped when damaged; a cached bundle is served only while its tree is
+    in the store and only to callers the serving process's policy lets
+    read all of it; a base pack only when every wanted commit is in the
+    store. Format: docs/compatibility.md ("Persistent server cache").
+  - `/debug/stats` reports it under `persistent_cache`.
+  - Hetzner ccx43 + ccx33, after a server restart onto a filled cache:
+    synthetic 96k-file checkout, first one 4.92 → 2.71 s (the warm-server
+    median is 2.46 s), `ant serve` CPU 23.2 → 7.7 s, S3 GETs 3.5k → 85;
+    git/git blobless clone, first one 12.1 → 4.39 s (repeat 4.30 s, native
+    `git daemon` 3.01 s: 1.46×); the 70 MiB base pack loads in 96 ms.
+  - Local (WSL2, loopback): git/git blobless clone after a restart 5.1 →
+    2.0 s (native 2.3 s); prewarmed 1.95 s.
+- `scripts/checkout-bench.sh --server-cache` (rows `<build>-persist`: a
+  server restarted onto a filled cache) and `scripts/vs-git.sh
+  --server-cache` (the clone phase meets a restarted server whose base
+  pack is on disk).
+
+### Fixed
+
+- The git export served a clone from its cached base pack without checking
+  that the wanted commits were still in the store (a want equal to a base
+  tip was not looked up); after garbage collection of such a commit a
+  client knowing its id could still clone it until the server restarted.
+  Every want is now checked.
+
 ## [0.3.1] - 2026-10-17
 
 Patch release: no storage, schema or protocol changes; 0.3.0 servers and

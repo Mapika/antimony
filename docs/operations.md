@@ -114,6 +114,74 @@ the last 64 MiB of decoded frames. `--pack-frames false`
 schema version 6 read (see Upgrading). `ant admin repack` rewrites the
 history as delta frames afterwards (`docs/operator-guide.md`, Repacking).
 
+## Persistent server caches (fast first checkout and clone after a restart)
+
+A server derives two expensive things from the stores and keeps them in
+memory: encoded tree bundles (`GET /t/`, what a checkout fetches; about
+1,900 bundles and 15 CPU-s for a 96k-file tree) and the git export's base
+packs (a complete clone pack per filter; ~7 s of delta search for git/git).
+A restarted server, or a new replica, starts without them. A **server
+cache** keeps them across restarts:
+
+```sh
+ant serve ... --cache-dir /var/cache/antimony --cache-dir-mib 4096
+ant serve ... --cache-dir /var/cache/antimony --shared-cache   # + S3, for replicas
+ant serve ... --cache-dir /var/cache/antimony --prewarm main --prewarm-git blobless
+```
+
+- `--cache-dir DIR` (`ANT_CACHE_DIR`): a directory per server process
+  (entries of different repositories are kept apart under it; a second
+  process on the same repository and directory runs without it and logs
+  why). Local mode uses `<data dir>/cache` unless `--no-cache-dir`.
+  `--cache-dir-mib` (default 4096, local mode 1024) bounds it; least
+  recently used entries go first, an entry over half the budget is not
+  kept. Size it for the bundles of the trees agents check out (about the
+  compressed size of those trees, ~0.55 GiB for the 96k-file tree) plus the
+  base packs (about a blobless or full clone of the repository).
+- `--shared-cache` (`ANT_SHARED_CACHE`, needs `--s3-*`): also keep entries
+  in the store's bucket under `<s3 prefix>/cache/`, shared by every replica:
+  a replica that misses its disk reads the entry there (and keeps a copy on
+  disk) instead of building it. `--shared-cache-mib` (default 16384) bounds
+  it; every replica deletes the oldest entries beyond it every 10 minutes.
+  (SeaweedFS frees the space of deleted objects only when the bucket is
+  deleted; prefer a disk cache alone there.)
+- `--prewarm REF` (`ANT_PREWARM`, repeatable or comma-separated): after
+  start, bring the bundles of a checkout of each ref's tree into memory
+  (from the server cache, else built), four at a time, up to the
+  in-memory bundle budget. `--prewarm-git blobless|full`: load (or build)
+  the base pack for clones of `main` with that filter. Both run in the
+  background after the listeners are up; requests are served meanwhile.
+
+The cache is best effort: entries are written in the background after a
+response (queued writes beyond 256 MiB are skipped), errors are logged
+and counted, and a damaged entry (every read checks its SHA-256) is deleted
+and rebuilt. It is safe to delete at any time with the server stopped (disk)
+or running (S3). Correctness does not depend on its content:
+
+- **Access control.** Only bundles that hid nothing are written (as for the
+  in-memory cache), with the ids their visibility depends on, and a cached
+  bundle is served to a caller only if that caller may read every one of
+  them and none lies outside the root zone, checked against the policy of
+  the serving process at the time of the request; otherwise the bundle is
+  built for the caller. Base packs are shared by every caller, as before:
+  the git export admits only principals that can read everything.
+- **Garbage collection.** A cached bundle is served only while its tree is
+  in the object store; a base pack only when every wanted commit is in the
+  store and the wants reach all its tips. The collector keeps the whole
+  closure of everything it keeps (readers see condemned objects as
+  missing), so neither ever serves a collected object, however old the
+  entry.
+
+Measured on Hetzner (ccx43 server, ccx33 client), first requests after a
+restart onto a filled cache: 96k-file checkout 4.92 → 2.71 s (server CPU
+23 → 7.7 s); git/git blobless clone 12.1 → 4.39 s (native git 3.01 s; the
+70 MiB base pack loads in about 0.1 s). The 96k tree's bundles take 0.55
+GiB on disk, git/git's blobless and full base packs 70 and 130 MiB.
+
+`/debug/stats` reports the cache under `persistent_cache` (entries, bytes,
+budget, disk and shared hits, misses, writes, corrupt entries dropped,
+evictions).
+
 ## Local mode (one machine, no Postgres or S3)
 
 For one workstation running a few tens of agents, `--local` replaces

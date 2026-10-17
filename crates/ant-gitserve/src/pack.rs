@@ -792,6 +792,13 @@ mod tests {
             assert!(selection.commits.is_empty());
             let (again, _) = receive(b.clone(), selection, true, no_blobs).await;
             assert!(pack_file(again.path()) == first);
+            // ...but only from a store that still has the wanted commit: a
+            // base outlives garbage collection of its tips (a store without
+            // them stands in for one that collected them).
+            let collected = Backend::in_memory();
+            let refused =
+                select_after(&collected, &fetch(vec![tip]), &base, usize::MAX).await.unwrap();
+            assert!(refused.is_none(), "a base served wants the store no longer has");
 
             // Wants past the base: base entries, then exactly the new objects.
             let after = select_after(&b, &fetch(vec![next]), &base, 10).await.unwrap().unwrap();

@@ -342,7 +342,7 @@ pub async fn select(b: &Backend, fetch: &Fetch) -> Result<Selection> {
 /// Plan a clone on top of a cached `base`: the commits the wants reach
 /// beyond it (the walk stops at commits in the base) and their trees, with
 /// the base's objects excluded. `None` when the base does not fit: a want
-/// is not a commit, the wants do not reach every tip of the base (the pack
+/// is not a commit the store has, the wants do not reach every tip of the base (the pack
 /// would carry objects the client did not ask for), or they reach more than
 /// `limit` commits beyond it (a new base is due).
 pub async fn select_after(
@@ -351,6 +351,15 @@ pub async fn select_after(
     base: &Arc<Base>,
     limit: usize,
 ) -> Result<Option<Selection>> {
+    // Every want must be a commit the store still has, also one the base
+    // holds (the walk below does not read those): a base outlives garbage
+    // collection (in memory, or persisted), and only what live wants reach
+    // is live (`cache.rs`).
+    for chunk in fetch.wants.chunks(BATCH) {
+        if b.meta.get_commits(chunk).await?.iter().any(Option::is_none) {
+            return Ok(None);
+        }
+    }
     let base_tips: HashSet<ObjectId> = base.tips.iter().copied().collect();
     let mut reached_tips = HashSet::new();
     let mut commits = Vec::new();

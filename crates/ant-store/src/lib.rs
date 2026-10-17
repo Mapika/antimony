@@ -20,6 +20,7 @@ pub mod postgres;
 pub mod s3;
 #[cfg(test)]
 mod s3_fake;
+pub mod server_cache;
 pub mod testing;
 pub mod tiered;
 

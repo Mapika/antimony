@@ -4,7 +4,9 @@
 //! `filter blob:none`) at `/repo.git`; `receive-pack` is refused. Packs are
 //! streamed with bounded memory and delta-compress trees and blobs against a
 //! window of other versions of the same path (see `pack.rs`, `README.md`).
-//! Complete clones reuse a cached base pack (`cache.rs`). Commits served must
+//! Complete clones reuse a cached base pack (`cache.rs`), which a server
+//! cache (`ant_store::server_cache`) can keep across restarts and share
+//! between replicas ([`Export::new`], [`Export::prewarm`]). Commits served must
 //! be recorded in the MetaStore (generation numbers bound the `have` walk).
 //!
 //! Every request sees the whole repository: the export has no per-principal
@@ -20,6 +22,7 @@ mod walk;
 use std::{collections::HashMap, sync::Arc};
 
 use ant_store::Backend;
+use ant_store::server_cache::ServerCache;
 use anyhow::Result;
 use axum::{
     Router,
@@ -37,19 +40,71 @@ use select::Fetch;
 
 /// Export a backend at `/repo.git`. Every write endpoint returns HTTP 403.
 pub fn router(backend: Backend) -> Router {
-    let state = Export { backend, cache: Arc::default() };
-    Router::new()
-        .route("/repo.git/info/refs", get(advertise))
-        .route("/repo.git/git-upload-pack", post(upload))
-        .route("/repo.git/git-receive-pack", axum::routing::any(|| async { StatusCode::FORBIDDEN }))
-        .with_state(state)
+    Export::new(backend, None).router()
 }
 
 /// One export: its backend and its cached base packs (`cache.rs`).
 #[derive(Clone)]
-struct Export {
+pub struct Export {
     backend: Backend,
     cache: Arc<cache::PackCache>,
+}
+
+impl Export {
+    /// An export of `backend` whose base packs are persisted in `persist`
+    /// (if any).
+    pub fn new(backend: Backend, persist: Option<Arc<ServerCache>>) -> Self {
+        Self { backend, cache: Arc::new(cache::PackCache::with_persistence(persist)) }
+    }
+
+    /// The routes, at `/repo.git`. Every write endpoint returns HTTP 403.
+    pub fn router(&self) -> Router {
+        Router::new()
+            .route("/repo.git/info/refs", get(advertise))
+            .route("/repo.git/git-upload-pack", post(upload))
+            .route(
+                "/repo.git/git-receive-pack",
+                axum::routing::any(|| async { StatusCode::FORBIDDEN }),
+            )
+            .with_state(self.clone())
+    }
+
+    /// Make the next clone (`blob:none` when `no_blobs`) fast: load the
+    /// persisted base pack of the filter, and if there is none or it does
+    /// not fit any more, build the clone pack of `main`, the branch `HEAD`
+    /// names (of every branch when there is no `main`), discarding the
+    /// output, so that it becomes the base. A base for `main` serves
+    /// `--single-branch` clones and, while the other branches add little
+    /// beyond it (`cache.rs`), clones of every branch too. Returns whether
+    /// a base fits now.
+    pub async fn prewarm(&self, no_blobs: bool) -> Result<bool> {
+        let refs = self.backend.refs.list_refs("").await?;
+        let mut wants: Vec<_> = match refs.iter().find(|(name, _)| name == "main") {
+            Some((_, id)) => vec![*id],
+            None => refs.into_iter().map(|(_, id)| id).collect(),
+        };
+        wants.sort_unstable();
+        wants.dedup();
+        if wants.is_empty() {
+            return Ok(false);
+        }
+        let fetch = Fetch { wants, no_blobs, done: true, ofs_delta: true, ..Fetch::default() };
+        let (selection, record) = plan_clone(&self.backend, &fetch, &self.cache).await?;
+        if record.is_none() {
+            return Ok(selection.excluded.base.is_some());
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let stats = pack::send_with(self.backend.clone(), selection, true, record, tx).await?;
+        let _ = drain.await;
+        tracing::info!(
+            no_blobs,
+            objects = stats.objects,
+            bytes = stats.bytes,
+            "git export: prewarmed"
+        );
+        Ok(self.cache.get(no_blobs).is_some())
+    }
 }
 
 fn response(body: impl Into<Body>, advertisement: bool) -> Response {
@@ -169,6 +224,27 @@ async fn refs(b: &Backend, args: &[&str]) -> Result<Vec<u8>> {
     Ok(body)
 }
 
+/// Plan a clone (`fetch.is_clone()`): on top of the cached base of its
+/// filter when that fits (after loading a persisted one if none is cached),
+/// else from scratch, holding the build lock, as the next base.
+async fn plan_clone(
+    b: &Backend,
+    fetch: &Fetch,
+    cache: &Arc<cache::PackCache>,
+) -> Result<(select::Selection, Option<cache::Recorder>)> {
+    if let Some(selection) = plan_on_base(b, fetch, cache).await? {
+        return Ok((selection, None));
+    }
+    let guard = cache.lock_build(fetch.no_blobs).await;
+    cache.load_persisted(fetch.no_blobs).await;
+    if let Some(selection) = plan_on_base(b, fetch, cache).await? {
+        return Ok((selection, None));
+    }
+    let selection = select::select(b, fetch).await?;
+    let record = cache::Recorder::new(cache.clone(), &selection, guard);
+    Ok((selection, record))
+}
+
 async fn fetch_response(export: Export, fetch: Fetch) -> Result<Response> {
     let Export { backend: b, cache } = export;
     let mut prefix = Vec::new();
@@ -193,21 +269,11 @@ async fn fetch_response(export: Export, fetch: Fetch) -> Result<Response> {
     // A clone is planned on top of the cached base pack of its filter when
     // that fits. Otherwise it waits for a base being built (which may fit),
     // or is planned from scratch and becomes the new base.
-    let mut on_base = None;
-    let mut build = None;
-    if fetch.is_clone() {
-        on_base = plan_on_base(&b, &fetch, &cache).await?;
-        if on_base.is_none() {
-            let guard = cache.lock_build(fetch.no_blobs).await;
-            on_base = plan_on_base(&b, &fetch, &cache).await?;
-            build = on_base.is_none().then_some(guard);
-        }
-    }
-    let mut selection = match on_base {
-        Some(selection) => selection,
-        None => select::select(&b, &fetch).await?,
+    let (mut selection, record) = if fetch.is_clone() {
+        plan_clone(&b, &fetch, &cache).await?
+    } else {
+        (select::select(&b, &fetch).await?, None)
     };
-    let record = build.and_then(|guard| cache::Recorder::new(cache.clone(), &selection, guard));
     let planned = started.elapsed();
     if fetch.depth.is_some() {
         prefix.extend(packet(b"shallow-info\n"));
