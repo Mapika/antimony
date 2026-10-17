@@ -291,6 +291,7 @@ pub enum AdminCmd {
     /// Delete data nothing can reach any more (garbage collection): objects,
     /// commit records and S3 packs of aborted lands, abandoned changesets
     /// and failed imports. Safe while servers run; interrupted runs resume.
+    /// With `--local`: run by the server using the directory, else offline.
     Gc(GcArgs),
     /// Copy a local data directory (`--local`) into the stores given by the
     /// store flags, e.g. Postgres + S3: objects, commits, changesets,
@@ -299,7 +300,8 @@ pub enum AdminCmd {
     CopyLocal(CopyLocalArgs),
     /// Rewrite stored objects with deltas chosen across the whole history
     /// (git-gc-style), keeping recent revisions one decode away. Postgres +
-    /// S3 stores; safe while servers run; run again to resume.
+    /// S3 stores, or `--local` (run by the server using the directory, else
+    /// offline); safe while servers run; run again to resume.
     Repack(RepackArgs),
 }
 
@@ -356,7 +358,8 @@ pub struct GcArgs {
     #[arg(long, default_value = "7d", value_parser = parse_duration)]
     pub grace: Duration,
     /// Wait between condemning data and deleting it. Must exceed the
-    /// servers' cache lifetime (10m) plus their longest request.
+    /// servers' cache lifetime (10m) plus their longest request (local
+    /// mode: skipped when no server uses the directory).
     #[arg(long, default_value = "30m", value_parser = parse_duration)]
     pub quiesce: Duration,
     /// Stop after this many delete batches (run again to resume).

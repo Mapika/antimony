@@ -12,11 +12,16 @@
 //! <dir>/meta.db             SQLite (WAL mode; -wal and -shm beside it):
 //!                           schema `local::migrate`, versioned
 //! <dir>/packs/<hex>.pack    pack files (`local::packs`)
+//! <dir>/admin.sock          a serving process's maintenance socket
+//!                           (`local::admin`)
 //! ```
 //!
 //! One process owns a directory at a time (an exclusive lock on `LOCK`):
 //! the server, or an offline tool (`ant import`, `ant admin gc`) while no
 //! server runs. Opening a directory that is in use fails at once.
+//! Maintenance runs in the owning process: garbage collection ([`gc`]) and
+//! repacking ([`repack`]), one at a time, while it serves; a server takes
+//! requests for them on its maintenance socket ([`admin`]).
 //!
 //! # Stores
 //!
@@ -68,12 +73,14 @@
 //! Pack bytes are always fsynced before their index rows are written
 //! ([`packs`]): pack files are outside the WAL's ordering.
 
+pub mod admin;
 pub mod copy;
 pub(crate) mod db;
 pub mod gc;
 
 pub mod migrate;
 pub mod packs;
+pub mod repack;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -184,6 +191,28 @@ pub fn default_dir() -> Option<PathBuf> {
 /// Entries exist only while a lock is held or awaited.
 type RefLocks = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 
+/// Ids a running collection condemned ([`gc`]): readers treat their rows
+/// (objects, packed-object index rows, commit records) as missing while the
+/// row was written before `cutoff`, exactly the rows its sweep may delete.
+pub(crate) struct Hidden {
+    pub cutoff: i64,
+    pub ids: parking_lot::RwLock<HashSet<ObjectId>>,
+}
+
+/// What one read call sees of [`Hidden`] (taken once per call).
+struct HideView<'a>(Option<(i64, parking_lot::RwLockReadGuard<'a, HashSet<ObjectId>>)>);
+
+impl<'a> HideView<'a> {
+    fn of(hidden: &'a Option<Arc<Hidden>>) -> Self {
+        Self(hidden.as_ref().map(|h| (h.cutoff, h.ids.read())))
+    }
+
+    /// Whether the row of `id` written at `written_at` reads as missing.
+    fn hides(&self, id: &ObjectId, written_at: i64) -> bool {
+        self.0.as_ref().is_some_and(|(cutoff, ids)| written_at < *cutoff && ids.contains(id))
+    }
+}
+
 struct Inner {
     dir: PathBuf,
     // Field order is drop order: the database closes (its writer thread
@@ -193,6 +222,10 @@ struct Inner {
     feed: RefFeed,
     locks: RefLocks,
     options: LocalOptions,
+    /// Condemned ids of the collection running now, if any.
+    hidden: parking_lot::RwLock<Option<Arc<Hidden>>>,
+    /// Held by the one maintenance run (collection or repack) at a time.
+    maintenance: Arc<tokio::sync::Mutex<()>>,
     _lock: std::fs::File,
     /// Scratch stores: the directory, deleted after everything above.
     _scratch: Option<tempfile::TempDir>,
@@ -345,6 +378,8 @@ impl LocalStore {
                 feed,
                 locks: Arc::default(),
                 options: options.clone(),
+                hidden: parking_lot::RwLock::new(None),
+                maintenance: Arc::default(),
                 _lock: lock,
                 _scratch: scratch,
             }),
@@ -394,6 +429,27 @@ impl LocalStore {
 
     pub(crate) fn db(&self) -> &Db {
         &self.inner.db
+    }
+
+    /// The condemned ids readers hide now.
+    fn hidden(&self) -> Option<Arc<Hidden>> {
+        self.inner.hidden.read().clone()
+    }
+
+    /// Install (or with `None`, end) a collection's condemned set.
+    pub(crate) fn set_hidden(&self, hidden: Option<Arc<Hidden>>) {
+        *self.inner.hidden.write() = hidden;
+    }
+
+    /// Wait for, and hold, the store's maintenance slot: one collection or
+    /// repack at a time.
+    pub(crate) async fn maintenance(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.inner.maintenance.clone().lock_owned().await
+    }
+
+    /// The maintenance slot if it is free now.
+    pub(crate) fn try_maintenance(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.inner.maintenance.clone().try_lock_owned().ok()
     }
 
     /// Readiness probe: one trivial read.
@@ -471,9 +527,12 @@ impl ObjectStore for LocalStore {
             return Ok(Vec::new());
         }
         let ids = ids.to_vec();
+        let hidden = self.hidden();
         self.db()
             .read(move |c| {
-                let mut st = c.prepare_cached("SELECT data FROM objects WHERE id = ?1").sq()?;
+                let hide = HideView::of(&hidden);
+                let mut st =
+                    c.prepare_cached("SELECT data, written_at FROM objects WHERE id = ?1").sq()?;
                 let mut found: HashMap<ObjectId, Option<EncodedObject>> = HashMap::new();
                 let mut out = Vec::with_capacity(ids.len());
                 for id in &ids {
@@ -481,8 +540,11 @@ impl ObjectStore for LocalStore {
                         out.push(o.clone());
                         continue;
                     }
-                    let data: Option<Vec<u8>> =
-                        st.query_row([id.as_bytes().as_slice()], |r| r.get(0)).optional().sq()?;
+                    let row: Option<(Vec<u8>, i64)> = st
+                        .query_row([id.as_bytes().as_slice()], |r| Ok((r.get(0)?, r.get(1)?)))
+                        .optional()
+                        .sq()?;
+                    let data = row.filter(|(_, at)| !hide.hides(id, *at)).map(|(d, _)| d);
                     let obj = data
                         .map(|d| crate::s3::S3ObjectStore::decode_object(*id, &d))
                         .transpose()?;
@@ -548,11 +610,20 @@ impl ObjectStore for LocalStore {
             return Ok(Vec::new());
         }
         let ids = ids.to_vec();
+        let hidden = self.hidden();
         self.db()
             .read(move |c| {
-                let mut st = c.prepare_cached("SELECT 1 FROM objects WHERE id = ?1").sq()?;
+                let hide = HideView::of(&hidden);
+                let mut st =
+                    c.prepare_cached("SELECT written_at FROM objects WHERE id = ?1").sq()?;
                 ids.iter()
-                    .map(|id| st.exists([id.as_bytes().as_slice()]).sq())
+                    .map(|id| {
+                        let at: Option<i64> = st
+                            .query_row([id.as_bytes().as_slice()], |r| r.get(0))
+                            .optional()
+                            .sq()?;
+                        Ok(at.is_some_and(|at| !hide.hides(id, at)))
+                    })
                     .collect::<Result<Vec<bool>>>()
             })
             .await
@@ -566,23 +637,29 @@ impl PackIndex for LocalStore {
             return Ok(HashMap::new());
         }
         let ids = ids.to_vec();
+        let hidden = self.hidden();
         self.db()
             .read(move |c| {
+                let hide = HideView::of(&hidden);
                 let mut st = c
-                    .prepare_cached("SELECT pack, off, len FROM object_index WHERE id = ?1")
+                    .prepare_cached(
+                        "SELECT pack, off, len, written_at FROM object_index WHERE id = ?1",
+                    )
                     .sq()?;
                 let mut out = HashMap::with_capacity(ids.len());
                 for id in &ids {
                     if out.contains_key(id) {
                         continue;
                     }
-                    let row: Option<(Vec<u8>, i64, i64)> = st
+                    let row: Option<(Vec<u8>, i64, i64, i64)> = st
                         .query_row([id.as_bytes().as_slice()], |r| {
-                            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                         })
                         .optional()
                         .sq()?;
-                    if let Some((pack, off, len)) = row {
+                    if let Some((pack, off, len, _)) =
+                        row.filter(|(_, _, _, at)| !hide.hides(id, *at))
+                    {
                         let pack: [u8; 16] = pack
                             .as_slice()
                             .try_into()
@@ -641,8 +718,8 @@ impl PackIndex for LocalStore {
     }
 
     async fn condemned_among(&self, _ids: &[ObjectId]) -> Result<HashSet<ObjectId>> {
-        // Collection runs offline (`gc`): nothing is ever condemned while
-        // the store is open.
+        // Only asked about objects stored outside packs, which local stores
+        // never hold; condemned packed objects are hidden by `lookup_index`.
         Ok(HashSet::new())
     }
 }
@@ -828,19 +905,20 @@ impl RefStore for LocalStore {
     }
 }
 
-/// A `commits` row: id, tree, parents, generation, committer time.
-type CommitRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, i64);
+/// A `commits` row: id, tree, parents, generation, committer time, write
+/// time.
+type CommitRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, i64, i64);
 
 /// A `commits` row read by [`GET_COMMIT`].
 fn commit_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<CommitRow> {
-    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
 }
 
-const GET_COMMIT: &str =
-    "SELECT id, tree, parents, generation, committer_time FROM commits WHERE id = ?1";
+const GET_COMMIT: &str = "SELECT id, tree, parents, generation, committer_time, written_at \
+                          FROM commits WHERE id = ?1";
 
 fn node_of(row: CommitRow) -> Result<CommitNode> {
-    let (id, tree, parents, generation, committer_time) = row;
+    let (id, tree, parents, generation, committer_time, _) = row;
     Ok(CommitNode {
         id: id_of(&id)?,
         tree: id_of(&tree)?,
@@ -850,9 +928,19 @@ fn node_of(row: CommitRow) -> Result<CommitNode> {
     })
 }
 
-/// Look up one commit node with a cached statement.
-fn get_node(st: &mut rusqlite::CachedStatement<'_>, id: &ObjectId) -> Result<Option<CommitNode>> {
-    st.query_row([id.as_bytes().as_slice()], commit_row).optional().sq()?.map(node_of).transpose()
+/// Look up one commit node with a cached statement (`None` also when a
+/// running collection hides it).
+fn get_node(
+    st: &mut rusqlite::CachedStatement<'_>,
+    id: &ObjectId,
+    hide: &HideView<'_>,
+) -> Result<Option<CommitNode>> {
+    st.query_row([id.as_bytes().as_slice()], commit_row)
+        .optional()
+        .sq()?
+        .filter(|row| !hide.hides(id, row.5))
+        .map(node_of)
+        .transpose()
 }
 
 #[async_trait]
@@ -891,7 +979,12 @@ impl MetaStore for LocalStore {
                 let mut next: i64 = c
                     .query_row("SELECT coalesce(max(seq), 0) + 1 FROM commits", [], |r| r.get(0))
                     .sq()?;
-                let mut seq_of = c.prepare_cached("SELECT seq FROM commits WHERE id = ?1").sq()?;
+                let mut seq_of =
+                    c.prepare_cached("SELECT seq, written_at FROM commits WHERE id = ?1").sq()?;
+                // Recording a commit again refreshes an old write time, like
+                // storing an object again (see `gc`).
+                let mut refresh =
+                    c.prepare_cached("UPDATE commits SET written_at = ?2 WHERE id = ?1").sq()?;
                 let mut insert = c
                     .prepare_cached(
                         "INSERT INTO commits \
@@ -908,10 +1001,15 @@ impl MetaStore for LocalStore {
                 let mut seqs: HashMap<ObjectId, u64> = HashMap::with_capacity(rows.len());
                 for (n, cs) in &rows {
                     let id = n.id.as_bytes().as_slice();
-                    let existing: Option<i64> =
-                        seq_of.query_row([id], |r| r.get(0)).optional().sq()?;
+                    let existing: Option<(i64, i64)> =
+                        seq_of.query_row([id], |r| Ok((r.get(0)?, r.get(1)?))).optional().sq()?;
                     let seq = match existing {
-                        Some(s) => s,
+                        Some((s, at)) => {
+                            if at < now - FRESHEN_SECS {
+                                refresh.execute(rusqlite::params![id, now]).sq()?;
+                            }
+                            s
+                        }
                         None => {
                             let parents: Vec<u8> = n
                                 .parents
@@ -954,10 +1052,12 @@ impl MetaStore for LocalStore {
             return Ok(Vec::new());
         }
         let ids = ids.to_vec();
+        let hidden = self.hidden();
         self.db()
             .read(move |c| {
+                let hide = HideView::of(&hidden);
                 let mut st = c.prepare_cached(GET_COMMIT).sq()?;
-                ids.iter().map(|id| get_node(&mut st, id)).collect()
+                ids.iter().map(|id| get_node(&mut st, id, &hide)).collect()
             })
             .await
     }
@@ -971,20 +1071,23 @@ impl MetaStore for LocalStore {
             return Ok(Vec::new());
         }
         let ids = ids.to_vec();
+        let hidden = self.hidden();
         self.db()
             .read(move |c| {
+                let hide = HideView::of(&hidden);
                 let mut st = c
                     .prepare_cached(
-                        "SELECT cs.data FROM commits c JOIN changesets cs ON cs.commit_id = c.id \
-                         WHERE c.id = ?1",
+                        "SELECT cs.data, c.written_at FROM commits c \
+                         JOIN changesets cs ON cs.commit_id = c.id WHERE c.id = ?1",
                     )
                     .sq()?;
                 ids.iter()
                     .map(|id| {
-                        let data: Option<Vec<u8>> = st
-                            .query_row([id.as_bytes().as_slice()], |r| r.get(0))
+                        let row: Option<(Vec<u8>, i64)> = st
+                            .query_row([id.as_bytes().as_slice()], |r| Ok((r.get(0)?, r.get(1)?)))
                             .optional()
                             .sq()?;
+                        let data = row.filter(|(_, at)| !hide.hides(id, *at)).map(|(d, _)| d);
                         data.map(|d| changeset_codec::decode(&d)).transpose()
                     })
                     .collect()
@@ -998,8 +1101,10 @@ impl MetaStore for LocalStore {
         stop: Option<ObjectId>,
         limit: usize,
     ) -> Result<Vec<CommitNode>> {
+        let hidden = self.hidden();
         self.db()
             .read(move |c| {
+                let hide = HideView::of(&hidden);
                 let mut st = c.prepare_cached(GET_COMMIT).sq()?;
                 let mut out = Vec::new();
                 let mut next = Some(tip);
@@ -1007,7 +1112,7 @@ impl MetaStore for LocalStore {
                     if out.len() >= limit {
                         break;
                     }
-                    let Some(node) = get_node(&mut st, &id)? else { break };
+                    let Some(node) = get_node(&mut st, &id, &hide)? else { break };
                     next = node.parents.first().copied();
                     out.push(node);
                 }
@@ -1026,8 +1131,10 @@ impl MetaStore for LocalStore {
             return Ok(Vec::new());
         }
         let tips = tips.to_vec();
+        let hidden = self.hidden();
         self.db()
             .read(move |c| {
+                let hide = HideView::of(&hidden);
                 let mut st = c.prepare_cached(GET_COMMIT).sq()?;
                 let mut seen = HashSet::new();
                 let mut queue: VecDeque<ObjectId> =
@@ -1037,7 +1144,7 @@ impl MetaStore for LocalStore {
                     if out.len() >= limit {
                         break;
                     }
-                    let Some(n) = get_node(&mut st, &id)? else { continue };
+                    let Some(n) = get_node(&mut st, &id, &hide)? else { continue };
                     if n.generation <= min_generation {
                         continue;
                     }

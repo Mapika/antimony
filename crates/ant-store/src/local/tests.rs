@@ -242,3 +242,98 @@ async fn path_history_matches_prefixes_exactly() {
     assert_eq!(got, vec![vec![2, 1], vec![2], vec![3], vec![5, 4, 3, 2, 1]]);
     assert_eq!(s.query_history("main", &p(""), 3, 2).await.unwrap().len(), 2);
 }
+
+/// An index whose first lookup is answered with the locations of the
+/// moment, after which the pack they point into is compacted away (rows
+/// moved, file deleted): the read that follows finds the file gone.
+#[derive(Clone)]
+struct MovingIndex {
+    store: LocalStore,
+    moved: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl PackIndex for MovingIndex {
+    async fn lookup_index(&self, ids: &[ObjectId]) -> Result<HashMap<ObjectId, IndexEntry>> {
+        let found = self.store.lookup_index(ids).await?;
+        if !self.moved.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let packs = self.store.packs().clone();
+            tokio::task::spawn_blocking(move || packs.seal()).await.unwrap()?;
+            let records = self.store.db().read(gc::pack_records).await?;
+            for (pack, recs) in records {
+                gc::compact_pack(&self.store, pack, recs).await?;
+            }
+        }
+        Ok(found)
+    }
+
+    async fn index_objects(&self, entries: &[IndexEntry]) -> Result<()> {
+        self.store.index_objects(entries).await
+    }
+
+    async fn condemned_among(&self, ids: &[ObjectId]) -> Result<HashSet<ObjectId>> {
+        self.store.condemned_among(ids).await
+    }
+}
+
+/// A read whose looked-up pack is deleted before it reads it (a collection
+/// or repack moved its rows) looks up again and finds the object at its
+/// new location; nothing else ever reads as missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reads_retry_when_their_pack_was_deleted_under_them() {
+    use crate::packed::PackedStore;
+    let s = fresh();
+    let objects: Vec<EncodedObject> = (0..20u8)
+        .map(|i| EncodedObject::new(ant_core::ObjectKind::Blob, &vec![i; 10_000 + usize::from(i)]))
+        .collect();
+    let ids: Vec<ObjectId> = objects.iter().map(EncodedObject::id).collect();
+    s.backend().objects.put_many(&objects).await.unwrap();
+    let before = s.packs().list().unwrap();
+    let index = MovingIndex { store: s.clone(), moved: Arc::default() };
+    let reader = PackedStore::new(index.clone(), s.packs().clone());
+    let got = reader.get_many(&ids).await.unwrap();
+    assert!(index.moved.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(got.iter().zip(&objects).all(|(g, o)| g.as_ref() == Some(o)));
+    // The pack read first is gone; the objects live elsewhere now.
+    let after = s.packs().list().unwrap();
+    assert!(before.keys().all(|p| !after.contains_key(p)), "{before:?} {after:?}");
+    let got = s.backend().objects.get_many(&ids).await.unwrap();
+    assert!(got.iter().zip(&objects).all(|(g, o)| g.as_ref() == Some(o)));
+}
+
+/// New databases free pages incrementally (`gc` returns them while
+/// serving).
+#[tokio::test]
+async fn new_databases_use_incremental_auto_vacuum() {
+    let s = fresh();
+    let mode: i64 =
+        s.db().read(|c| c.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).sq()).await.unwrap();
+    assert_eq!(mode, 2);
+}
+
+/// Pages freed by deletions go back to the file system while serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn freed_pages_are_returned_while_serving() {
+    let s = fresh();
+    let objects: Vec<EncodedObject> = (0..20_000u32)
+        .map(|i| EncodedObject::new(ant_core::ObjectKind::Blob, format!("{i:>2000}").as_bytes()))
+        .collect();
+    s.put_many(&objects).await.unwrap();
+    s.db().write(true, |c, _| c.execute_batch("DELETE FROM objects").sq()).await.unwrap();
+    let counts = |s: LocalStore| async move {
+        s.db()
+            .read(|c| {
+                let free: i64 = c.query_row("PRAGMA freelist_count", [], |r| r.get(0)).sq()?;
+                let pages: i64 = c.query_row("PRAGMA page_count", [], |r| r.get(0)).sq()?;
+                Ok((free, pages))
+            })
+            .await
+            .unwrap()
+    };
+    let (free, pages) = counts(s.clone()).await;
+    assert!(free > 100, "{free}");
+    assert!(gc::reclaim(&s, false).await.unwrap());
+    let (free_after, pages_after) = counts(s.clone()).await;
+    assert_eq!(free_after, 0);
+    assert!(pages_after < pages - free + 10, "{pages} {free} {pages_after}");
+}

@@ -8,6 +8,38 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+### Added
+
+- Local mode can be maintained while it serves (docs/operations.md, Local
+  mode):
+  - `ant admin gc --local` runs in the server using the directory (it
+    listens on `<dir>/admin.sock`, mode 0600) when one does, and offline
+    otherwise. Online runs follow the Postgres collector's protocol
+    (condemned data reads as missing, `--quiesce` wait, re-mark, sweep in
+    small durable transactions); packs without live objects are deleted
+    and mostly-dead ones compacted while readers keep reading; freed
+    database pages are returned while serving (`incremental_vacuum`).
+  - `ant serve --local --gc-interval <dur>` collects on a schedule
+    (`--gc-grace`, default `7d`; `--gc-quiesce`, default `30m`).
+  - `ant admin repack --local`: the delta-frame repack of Postgres + S3
+    stores for local data directories, online or offline, resumable;
+    old packs are deleted when nothing points into them any more (stdout
+    adds `packs-deleted <count> <bytes>`).
+    git/git imported in local mode: 941 MiB → 223 MiB after an offline
+    repack (40-60 s), against 298 MiB for `git gc` and 94 MiB for
+    `git gc --aggressive`.
+
+### Changed
+
+- Local data directories: SQLite schema version 2 (migration
+  `repacked_packs`, applied on open; 0.3.x binaries then refuse the
+  directory). New databases use incremental auto-vacuum. Pack files may
+  hold `ADF1` delta frames (written by `ant admin repack --local`). See
+  docs/compatibility.md.
+- `ant admin gc --local` reports `condemned` (ids condemned) and `kept`
+  (condemned ids written or referenced again before the sweep) like
+  Postgres runs, and no longer fails while a server uses the directory.
+
 ## [0.3.2] - 2026-10-17
 
 Patch release: no Postgres schema or protocol changes; 0.3.x servers and

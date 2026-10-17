@@ -123,20 +123,40 @@ fn utc_text(secs: i64) -> String {
     )
 }
 
-/// `ant admin gc --local`: an offline run (the directory's lock keeps a
-/// server out while it runs).
-async fn local_gc(a: &GcArgs, store: ant_store::local::LocalStore) -> Result<Outcome> {
+/// The local store of the store flags, opened for an offline run (the
+/// directory's lock keeps a server out while it runs).
+async fn open_local(store: &ant_server::config::StoreArgs) -> Result<ant_store::local::LocalStore> {
+    let (backend, probes) = store.backend_with_probes().await?;
+    drop(backend);
+    probes.local.ok_or_else(|| anyhow!("--local did not open a local store"))
+}
+
+/// `ant admin gc --local`: in the server using the directory (through its
+/// maintenance socket) when one runs, else offline.
+async fn local_gc(a: &GcArgs, dir: &std::path::Path) -> Result<Outcome> {
     use ant_store::local::gc::{GcOptions as LocalGcOptions, collect};
     if a.abort {
         return Err(anyhow!("--abort: local collection runs have nothing to abort"));
     }
-    let opts = LocalGcOptions { grace: a.grace, dry_run: a.dry_run, ..LocalGcOptions::default() };
-    let r = collect(&store, &opts, &|line| eprintln!("gc: {line}")).await?;
+    let mut opts = LocalGcOptions {
+        grace: a.grace,
+        quiesce: a.quiesce,
+        dry_run: a.dry_run,
+        ..LocalGcOptions::default()
+    };
+    let progress = |line: &str| eprintln!("gc: {line}");
+    let r = match ant_store::local::admin::remote_gc(dir, &opts, &progress).await? {
+        Some(r) => r,
+        None => {
+            opts.exclusive = true;
+            collect(&open_local(&a.store).await?, &opts, &progress).await?
+        }
+    };
     let mut out = String::new();
     writeln!(out, "{}", if r.dry_run { "dry-run" } else { "done" })?;
     writeln!(out, "cutoff {}", utc_text(r.cutoff))?;
     writeln!(out, "live {}", r.live)?;
-    writeln!(out, "condemned {}", r.objects + r.large_objects + r.commits)?;
+    writeln!(out, "condemned {}", r.condemned)?;
     writeln!(out, "objects {} {}", r.objects, r.object_bytes)?;
     writeln!(out, "large-objects {} {}", r.large_objects, r.large_object_bytes)?;
     writeln!(out, "commits {}", r.commits)?;
@@ -144,7 +164,7 @@ async fn local_gc(a: &GcArgs, store: ant_store::local::LocalStore) -> Result<Out
     if !r.dry_run {
         writeln!(out, "legacy-changes 0")?;
         writeln!(out, "derived {}", r.derived)?;
-        writeln!(out, "kept 0")?;
+        writeln!(out, "kept {}", r.kept)?;
     }
     writeln!(out, "packs {} {}", r.packs, r.pack_bytes)?;
     let ratio = if r.packs_kept_bytes == 0 {
@@ -204,11 +224,10 @@ pub async fn copy_local(a: CopyLocalArgs) -> Result<Outcome> {
 /// [--abort] <store flags>`. Progress goes to stderr (`gc: ...`); stdout is
 /// the report (see the output contract in `main.rs`).
 pub async fn gc(a: GcArgs) -> Result<Outcome> {
-    let (backend, probes) = a.store.backend_with_probes().await?;
-    if let Some(local) = probes.local {
-        drop(backend);
-        return local_gc(&a, local).await;
+    if let Some(dir) = a.store.local_dir()? {
+        return local_gc(&a, &dir).await;
     }
+    let (backend, probes) = a.store.backend_with_probes().await?;
     let pg = probes
         .pg
         .ok_or_else(|| anyhow!("admin gc needs a Postgres store (--pg-url) or --local"))?;
@@ -272,12 +291,10 @@ pub async fn gc(a: GcArgs) -> Result<Outcome> {
 /// (`repack: ...`); stdout is the report (see the output contract in
 /// `main.rs`).
 pub async fn repack(a: RepackArgs) -> Result<Outcome> {
-    let (backend, probes) = a.store.backend_with_probes().await?;
-    if probes.local.is_some() {
-        return Err(anyhow!(
-            "admin repack needs Postgres + S3; local stores are compacted by `ant admin gc --local`"
-        ));
+    if let Some(dir) = a.store.local_dir()? {
+        return local_repack(&a, &dir).await;
     }
+    let (backend, probes) = a.store.backend_with_probes().await?;
     let pg = probes.pg.ok_or_else(|| anyhow!("admin repack needs a Postgres store (--pg-url)"))?;
     let cfg = a
         .store
@@ -301,6 +318,44 @@ pub async fn repack(a: RepackArgs) -> Result<Outcome> {
     }
     opts.stop_after_packs = a.max_packs;
     let r = pg.repack(backend.objects.as_ref(), &opts, &|line| eprintln!("repack: {line}")).await?;
+    repack_report(&r, false)
+}
+
+/// `ant admin repack --local`: in the server using the directory (through
+/// its maintenance socket) when one runs, else offline.
+async fn local_repack(a: &RepackArgs, dir: &std::path::Path) -> Result<Outcome> {
+    use ant_store::local::repack::{RepackOptions as LocalRepackOptions, repack};
+    let mut opts = LocalRepackOptions {
+        dry_run: a.dry_run,
+        min_age: a.min_age,
+        keep_recent: a.keep_recent,
+        all: a.all,
+        small: !a.no_small,
+        cluster: ClusterOptions {
+            window: a.window,
+            depth: a.depth,
+            cluster_raw: a.record_bytes,
+            level: a.level,
+        },
+        stop_after_packs: a.max_packs,
+        ..LocalRepackOptions::default()
+    };
+    if let Some(j) = a.jobs {
+        opts.jobs = j.max(1);
+    }
+    let progress = |line: &str| eprintln!("repack: {line}");
+    let r = match ant_store::local::admin::remote_repack(dir, &opts, &progress).await? {
+        Some(r) => r,
+        None => {
+            opts.exclusive = true;
+            repack(&open_local(&a.store).await?, &opts, &progress).await?
+        }
+    };
+    repack_report(&r, true)
+}
+
+/// The stdout of `ant admin repack` (see the output contract in `main.rs`).
+fn repack_report(r: &ant_store::repack::RepackReport, local: bool) -> Result<Outcome> {
     let state = match (r.dry_run, r.finished) {
         (true, _) => "dry-run",
         (false, true) => "done",
@@ -323,6 +378,9 @@ pub async fn repack(a: RepackArgs) -> Result<Outcome> {
     writeln!(out, "deltas {} {}", r.deltas, r.max_depth)?;
     writeln!(out, "moved {} {}", r.moved, r.moved_small)?;
     writeln!(out, "skipped {}", r.skipped)?;
+    if local && !r.dry_run {
+        writeln!(out, "packs-deleted {} {}", r.packs_deleted, r.packs_deleted_bytes)?;
+    }
     Ok(Outcome::ok(out))
 }
 

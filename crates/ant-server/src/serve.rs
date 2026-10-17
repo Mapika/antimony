@@ -136,6 +136,22 @@ pub struct ServeArgs {
     #[arg(long, env = "ANT_PREWARM_GIT", value_delimiter = ',', value_enum)]
     pub prewarm_git: Vec<GitFilter>,
 
+    /// Local mode: collect garbage every this long while serving (the
+    /// first run one interval after start), like `ant admin gc --local`.
+    #[arg(long, env = "ANT_GC_INTERVAL", value_parser = crate::config::parse_duration)]
+    pub gc_interval: Option<std::time::Duration>,
+
+    /// Grace period of the scheduled collections (`--gc-interval`): data
+    /// written within it is kept. At least 1d.
+    #[arg(long, env = "ANT_GC_GRACE", default_value = "7d", value_parser = crate::config::parse_duration)]
+    pub gc_grace: std::time::Duration,
+
+    /// Wait of the scheduled collections between condemning data and
+    /// deleting it: longer than the caches' lifetime (10m) plus the longest
+    /// request.
+    #[arg(long, env = "ANT_GC_QUIESCE", default_value = "30m", value_parser = crate::config::parse_duration)]
+    pub gc_quiesce: std::time::Duration,
+
     #[command(flatten)]
     pub limits: LimitArgs,
 
@@ -274,13 +290,42 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         crate::bundle::set_cache_bytes(mib.saturating_mul(1 << 20));
     }
     let started = std::time::Instant::now();
+    if args.gc_interval.is_some() && !args.store.is_local() {
+        anyhow::bail!(
+            "--gc-interval is for local mode (--local); collect Postgres stores with `ant admin gc`"
+        );
+    }
     let (backend, probes) = args.store.backend_with_probes().await?;
+    // Local maintenance: the socket `ant admin gc|repack --local` talk to,
+    // and scheduled collections. Both end with the server.
+    let mut _maintenance = None;
+    let mut _scheduled = None;
     if let Some(local) = &probes.local {
         tracing::info!(
             dir = %local.dir().display(),
             opened_ms = started.elapsed().as_millis() as u64,
             "local mode: SQLite metadata and pack files in one directory"
         );
+        match ant_store::local::admin::serve(local.clone()) {
+            Ok(s) => _maintenance = Some(s),
+            Err(error) => tracing::warn!(
+                %error,
+                "no maintenance socket: `ant admin gc|repack --local` cannot reach this server"
+            ),
+        }
+        if let Some(every) = args.gc_interval {
+            let opts = ant_store::local::gc::GcOptions {
+                grace: args.gc_grace,
+                quiesce: args.gc_quiesce,
+                ..ant_store::local::gc::GcOptions::default()
+            };
+            if opts.grace < ant_store::local::gc::MIN_GRACE {
+                anyhow::bail!("--gc-grace must be at least 1d");
+            }
+            tracing::info!(every_secs = every.as_secs(), "scheduled garbage collection");
+            _scheduled =
+                Some(AbortOnDrop(ant_store::local::admin::schedule_gc(local.clone(), every, opts)));
+        }
     }
     let metrics = Metrics::new();
     metrics.set_probes(probes);
@@ -365,6 +410,15 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             tracing::info!("SIGTERM or SIGINT: shutting down");
             Ok(())
         }
+    }
+}
+
+/// Aborts a background task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
