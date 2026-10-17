@@ -50,7 +50,7 @@ proptest = "1"
 prost = "0.14"
 protox = "0.10"
 rand = "0.9"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled", "hooks"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.11"

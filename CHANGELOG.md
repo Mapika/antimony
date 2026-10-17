@@ -40,6 +40,39 @@ release of the 0.x series may change.
   (condemned ids written or referenced again before the sweep) like
   Postgres runs, and no longer fails while a server uses the directory.
 
+### Performance
+
+- Local mode landing, 2-6x faster and no longer slowing down as the WAL
+  fills. Durability is unchanged: a landed, acknowledged commit survives
+  power loss with `--local-sync full`.
+  - Fixed: checkpoints were scheduled by the WAL file's size, which stays
+    at its 64 MiB limit once reached. From then on every commit group ran
+    a checkpoint and a WAL restart, which took about two thirds of the
+    writer's time. That is why a local server slowed down as it ran.
+    Checkpoints are now scheduled by the WAL's length after each commit
+    (SQLite's WAL hook).
+  - WAL restarts no longer stop the writer for 15-75 ms. The checkpoint
+    thread syncs the database after each copy, because SQLite skips that
+    sync whenever a writer commits during the checkpoint. The restart
+    then copies only the frames committed since and waits for the reads
+    in flight instead of polling for a gap in the read stream.
+  - A land publish is one writer job, answered at commit and again once
+    an fsync covers it, instead of a publish plus an empty durable write.
+  - On a ref that keeps moving, history index catch-ups run at most every
+    100 ms (all backends), so each one indexes many lands in one write.
+  - Fleet benchmark (WSL2, interleaved with the previous build,
+    `fdatasync` p50 1.5 ms):
+    - 16 agents: 1,320-2,150 lands/s, p99 20-45 ms (was 320-490/s, p99
+      60-420 ms).
+    - 50 agents: 2,370-2,940 lands/s, p99 32-52 ms (was 710-1,130/s, p99
+      54-370 ms).
+    - With the disk degraded by back-to-back runs (`fdatasync` p50 6-9 ms
+      instead of 1.5 ms) both builds slow down: 16 agents 880/s against
+      200-270/s; 50 agents 380-1,760/s (p99 76-280 ms) against
+      25-980/s.
+  - Idle RSS is unchanged at 16 MiB. A git/git import into a local
+    directory runs at 6.9-10.8k commits/s (was 5.3-5.8k/s).
+
 ### Fixed
 
 - Garbage collection (Postgres and local) reports as `missing` only ids

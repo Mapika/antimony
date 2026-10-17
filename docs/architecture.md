@@ -137,6 +137,12 @@ single machine running tens of agents without Postgres, S3 or Docker:
   next one, which always precedes anything that references them. Pack bytes are fsynced
   (shared `fdatasync`s across concurrent writers) before their index rows
   are written. `--local-sync normal` trades power-loss durability for speed.
+- **Checkpoints** run beside the writer: after every 16 MiB of WAL growth
+  (measured by its length in frames, not its file size, which is reused) a
+  checkpoint thread copies the WAL into the database and syncs it; at
+  64 MiB the writer restarts the WAL, which leaves it only the frames
+  committed since that copy (a few milliseconds of stall, while reads in
+  flight finish and new ones wait).
 - **Ref events** go on the in-process feed after the transaction commits;
   there are no other processes to notify.
 - **One process per directory** (a lock on `<dir>/LOCK`): the server, or an
