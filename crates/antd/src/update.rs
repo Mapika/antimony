@@ -14,7 +14,8 @@
 //!   [`Target::Write`]; overlapping edits are written with conflict markers
 //!   (`<<<<<<< upstream`, `||||||| base`, `=======`, `>>>>>>> local`) and
 //!   reported as a conflict;
-//! - anything else changed on both sides (modify/delete, add/add, binary,
+//! - anything else changed on both sides (modify/delete, add/add, binary
+//!   (`ant_core::merge::is_binary`; content that is not UTF-8 is text),
 //!   symlinks, mode changed on both sides) keeps the local version and is
 //!   reported as a conflict;
 //! - a file and a path below it can not both exist: when the merged results
@@ -302,7 +303,8 @@ mod tests {
                 ("up", &b"u"[..]),
                 ("same", &b"s"[..]),
                 ("moddel", &b"m"[..]),
-                ("bin", &b"\xff1"[..]),
+                ("bin", &b"\0\xff1"[..]),
+                ("latin", &b"J\xf6rg\n2\n3\n"[..]),
                 ("d/x", &b"x"[..]),
             ],
         )
@@ -316,7 +318,8 @@ mod tests {
                 ("local", &b"l"[..]),
                 ("up", &b"u2"[..]),
                 ("same", &b"s2"[..]),
-                ("bin", &b"\xff2"[..]),
+                ("bin", &b"\0\xff2"[..]),
+                ("latin", &b"J\xc3\xb6rg\n2\n3\n"[..]),
                 ("d", &b"now a file"[..]),
                 ("added", &b"a"[..]),
             ],
@@ -324,7 +327,8 @@ mod tests {
         .await
         .unwrap();
         let local = vec![
-            change(&objs, "bin", Modified, Some(b"\xff3")).await,
+            change(&objs, "bin", Modified, Some(b"\0\xff3")).await,
+            change(&objs, "latin", Modified, Some(b"J\xf6rg\n2\nl\xe9\n")).await,
             change(&objs, "both", Modified, Some(b"1\n2\n3\n4\nfive\n")).await,
             change(&objs, "clash", Modified, Some(b"1\nlocal\n3\n")).await,
             change(&objs, "d/new", Added, Some(b"n")).await,
@@ -349,6 +353,8 @@ mod tests {
                 ("d", &Target::Local, true),
                 ("d/new", &Target::Local, false),
                 ("d/x", &Target::Upstream, false),
+                // Not UTF-8 (Latin-1) but text: merged on its bytes.
+                ("latin", &write(b"J\xc3\xb6rg\n2\nl\xe9\n"), false),
                 ("local", &Target::Local, false),
                 ("moddel", &Target::Local, true),
                 ("same", &Target::Upstream, false),

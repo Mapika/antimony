@@ -20,7 +20,7 @@
 //!   query also schedules a catch-up of that ref, so only the first
 //!   queries scan.
 //! - Exposed as the `Blame` RPC and `ant blame <rev>:<path>` (output per
-//!   line: `<commit-id> <line-no>\t<line>`).
+//!   line: `<commit-id> <line-no>\t<line>`, the line's bytes as stored).
 //!
 //! `catch_up(b, ref_name)`:
 //! - Let `tip` = ref target, `wm` = watermark. If `wm` is None → index the
@@ -75,7 +75,13 @@
 //! is used only when its version's blob is the one being walked and its
 //! line count matches. Older servers' `"blame/v1"` rows (keyed by rev
 //! commit) are no longer read; GC deletes both kinds with their commits.
-//! Binary (non-UTF-8) files → `InvalidArgument`. Missing path → `NotFound`.
+//!
+//! Content is bytes, as in git: any file blames (Latin-1 lines, invalid
+//! UTF-8, NUL bytes). Lines split like `str::lines` does, on the bytes
+//! ([`byte_lines`]: after each `\n`, one `\r` before it dropped), so a
+//! UTF-8 file's attribution is what it was when only UTF-8 was accepted,
+//! and stored values (owners only, no text) stay valid. A directory →
+//! `InvalidArgument`. Missing path → `NotFound`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -123,7 +129,18 @@ const MAX_REFS_PROBED: usize = 16;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlameLine {
     pub commit: ObjectId,
-    pub line: String,
+    /// The line's bytes, without its terminator (not necessarily UTF-8).
+    pub line: Vec<u8>,
+}
+
+/// The lines of `b` exactly as `str::lines` splits text: after each `\n`,
+/// with one `\r` directly before it dropped; a last line without newline
+/// is kept as it is (a bare `\r` included). Works on any bytes.
+pub(crate) fn byte_lines(b: &[u8]) -> impl Iterator<Item = &[u8]> {
+    b.split_inclusive(|&c| c == b'\n').map(|l| match l.strip_suffix(b"\n") {
+        Some(l) => l.strip_suffix(b"\r").unwrap_or(l),
+        None => l,
+    })
 }
 
 /// Walk the first-parent chain from `tip` down to (excluding) `stop`, or to
@@ -722,7 +739,7 @@ impl Derivation for Blame {
 /// Reference implementation of [`line_map_ids`] (quadratic LCS table over the
 /// strings themselves); the oracle the optimised version is tested against.
 #[cfg(test)]
-fn line_map(old: &[&str], new: &[&str]) -> Vec<Option<usize>> {
+fn line_map<T: PartialEq>(old: &[T], new: &[T]) -> Vec<Option<usize>> {
     let mut map = vec![None; new.len()];
     let pre = old.iter().zip(new).take_while(|(a, b)| a == b).count();
     let suf =
@@ -918,21 +935,19 @@ static LINE_HASH_SEED: LazyLock<u64> = LazyLock::new(|| {
     std::collections::hash_map::RandomState::new().hash_one(0x5eed_u64)
 });
 
-/// Number of lines `str::lines` yields for `b` (valid UTF-8 or not: only
-/// newlines matter).
+/// Number of lines [`byte_lines`] (and `str::lines`) yields for `b`.
 fn line_count(b: &[u8]) -> usize {
     b.iter().filter(|&&c| c == b'\n').count() + usize::from(b.last().is_some_and(|&c| c != b'\n'))
 }
 
 /// Interns the lines of two texts into one id space.
-fn intern_pair(old: &str, new: &str) -> (Vec<u32>, Vec<u32>) {
-    let mut ids: HashMap<&str, u32, SeededFx> = HashMap::with_capacity_and_hasher(
-        line_count(old.as_bytes()) + line_count(new.as_bytes()) / 4 + 8,
+fn intern_pair<'a>(old: &'a [u8], new: &'a [u8]) -> (Vec<u32>, Vec<u32>) {
+    let mut ids: HashMap<&[u8], u32, SeededFx> = HashMap::with_capacity_and_hasher(
+        line_count(old) + line_count(new) / 4 + 8,
         SeededFx(*LINE_HASH_SEED),
     );
-    let mut intern = |text| -> Vec<u32> {
-        let text: &str = text;
-        text.lines()
+    let mut intern = |text: &'a [u8]| -> Vec<u32> {
+        byte_lines(text)
             .map(|l| {
                 let next = ids.len() as u32;
                 *ids.entry(l).or_insert(next)
@@ -943,12 +958,12 @@ fn intern_pair(old: &str, new: &str) -> (Vec<u32>, Vec<u32>) {
     (o, intern(new))
 }
 
-/// [`line_map_ids`] over two texts split like `str::lines`. Only the part
-/// between the common prefix and suffix (found bytewise, snapped to line
-/// boundaries) is split and interned, so a small edit costs a memcmp over
-/// the file plus the diff of the edited region.
-fn diff_texts(old: &str, new: &str) -> Vec<Option<usize>> {
-    let (ob, nb) = (old.as_bytes(), new.as_bytes());
+/// [`line_map_ids`] over two texts (any bytes) split by [`byte_lines`].
+/// Only the part between the common prefix and suffix (found bytewise,
+/// snapped to line boundaries) is split and interned, so a small edit costs
+/// a memcmp over the file plus the diff of the edited region.
+fn diff_texts(old: &[u8], new: &[u8]) -> Vec<Option<usize>> {
+    let (ob, nb) = (old, new);
     // Common prefix, snapped back to just after its last newline.
     let p = ob.iter().zip(nb).take_while(|(a, b)| a == b).count();
     let p = ob[..p].iter().rposition(|&c| c == b'\n').map_or(0, |i| i + 1);
@@ -957,8 +972,11 @@ fn diff_texts(old: &str, new: &str) -> Vec<Option<usize>> {
     // compare equal; a repeated line may continue it past the first byte
     // difference), as the reference does before looking at the suffix.
     let (mut po, mut pn) = (p, p);
-    for (a, b) in old[p..].split_inclusive('\n').zip(new[p..].split_inclusive('\n')) {
-        if a.lines().next() != b.lines().next() {
+    fn split(t: &[u8]) -> impl Iterator<Item = &[u8]> {
+        t.split_inclusive(|&c| c == b'\n')
+    }
+    for (a, b) in split(&old[p..]).zip(split(&new[p..])) {
+        if byte_lines(a).next() != byte_lines(b).next() {
             break;
         }
         (po, pn, pre) = (po + a.len(), pn + b.len(), pre + 1);
@@ -977,7 +995,6 @@ fn diff_texts(old: &str, new: &str) -> Vec<Option<usize>> {
         ob[ob.len() - s..].iter().position(|&c| c == b'\n').map_or(0, |i| s - i - 1)
     };
     let suf = line_count(&ob[ob.len() - s..]);
-    // All cut points follow a newline (or are text ends): char boundaries.
     let (o_mid, n_mid) = (&old[po..old.len() - s], &new[pn..new.len() - s]);
 
     let (oi, ni) = intern_pair(o_mid, n_mid);
@@ -989,12 +1006,6 @@ fn diff_texts(old: &str, new: &str) -> Vec<Option<usize>> {
     map.extend((old_lines - suf..old_lines).map(Some));
     debug_assert_eq!(map.len(), new_lines);
     map
-}
-
-fn utf8(bytes: &[u8], path: &RepoPath) -> OpResult<String> {
-    std::str::from_utf8(bytes)
-        .map(str::to_owned)
-        .map_err(|_| OpError::InvalidArgument(format!("{path} is not valid UTF-8")))
 }
 
 /// Stored blame values, by the commit whose version of the file they cover.
@@ -1108,11 +1119,11 @@ impl Drop for Prefetch {
     }
 }
 
-fn attribute(owners: Vec<ObjectId>, lines: Vec<&str>) -> Vec<BlameLine> {
+fn attribute(owners: Vec<ObjectId>, lines: Vec<&[u8]>) -> Vec<BlameLine> {
     owners
         .into_iter()
         .zip(lines)
-        .map(|(commit, l)| BlameLine { commit, line: l.to_string() })
+        .map(|(commit, l)| BlameLine { commit, line: l.to_vec() })
         .collect()
 }
 
@@ -1140,13 +1151,10 @@ fn body_bytes(o: &ant_core::EncodedObject) -> Bytes {
 }
 
 /// [`diff_texts`] for each `(older, newer)` pair, spread over blocking
-/// threads; `None` where either side is not UTF-8.
-async fn diff_pairs(pairs: Vec<(Bytes, Bytes)>) -> OpResult<Vec<Option<Vec<Option<usize>>>>> {
+/// threads.
+async fn diff_pairs(pairs: Vec<(Bytes, Bytes)>) -> OpResult<Vec<Vec<Option<usize>>>> {
     const MIN_PER_TASK: usize = 4;
-    let diff = |(old, new): &(Bytes, Bytes)| {
-        let (old, new) = (std::str::from_utf8(old).ok()?, std::str::from_utf8(new).ok()?);
-        Some(diff_texts(old, new))
-    };
+    let diff = |(old, new): &(Bytes, Bytes)| diff_texts(old, new);
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
     let per_task = pairs.len().div_ceil(workers).max(MIN_PER_TASK);
     if pairs.len() <= per_task {
@@ -1180,7 +1188,7 @@ async fn blame_walk(
     head: Bytes,
     head_blob: ObjectId,
 ) -> OpResult<Vec<ObjectId>> {
-    let lines = std::str::from_utf8(&head).map_or(0, |t| t.lines().count());
+    let lines = line_count(&head);
     let mut chunks = Prefetch::start(b.clone(), path.clone(), history, first, first_stored);
 
     // `cur[k]` = line index, in the version being walked, of final line k.
@@ -1220,8 +1228,6 @@ async fn blame_walk(
         }
         let maps = diff_pairs(pairs).await?;
         for ((commit, created), map) in steps.into_iter().zip(maps) {
-            let map =
-                map.ok_or_else(|| OpError::InvalidArgument(format!("{path} is not valid UTF-8")))?;
             oldest = commit;
             for (slot, owner) in cur.iter_mut().zip(owners.iter_mut()) {
                 let Some(j) = *slot else { continue };
@@ -1261,8 +1267,7 @@ pub async fn blame(b: &Backend, rev: &str, path: &RepoPath) -> OpResult<Vec<Blam
     let Some(content) = info.content else {
         return Err(OpError::InvalidArgument(format!("{path} is not a file")));
     };
-    let text = utf8(&content, path)?;
-    let lines: Vec<&str> = text.lines().collect();
+    let lines: Vec<&[u8]> = byte_lines(&content).collect();
 
     let mut history = FileHistory::open(b, rev, id, path).await?;
     let first = history.next(b, path, BLAME_FIRST_CHUNK).await?;
@@ -1280,7 +1285,8 @@ pub async fn blame(b: &Backend, rev: &str, path: &RepoPath) -> OpResult<Vec<Blam
     {
         return Ok(attribute(v.clone(), lines));
     }
-    let owners = blame_walk(b, id, path, history, (first, stored), content, info.id).await?;
+    let owners =
+        blame_walk(b, id, path, history, (first, stored), content.clone(), info.id).await?;
     if let Some(l) = last {
         derive::put::<Blame>(b.meta.as_ref(), &(l, path.clone()), &owners).await?;
     }
@@ -1292,7 +1298,7 @@ mod tests {
     use super::*;
     use crate::ops::land::{LandOutcome, land};
     use crate::ops::query;
-    use crate::ops::test_support::{commit, delete, read, write};
+    use crate::ops::test_support::{commit, delete, read_bytes, write};
     use ant_store::HistoryRow;
 
     async fn landed(
@@ -1367,7 +1373,8 @@ mod tests {
         let c3 = landed(&b, c2, vec![write("f", "z\na\nB\nc\nd\n")]).await;
         catch_up(&b, "main").await.unwrap();
         let bl = blame(&b, "main", &RepoPath::new("f").unwrap()).await.unwrap();
-        let got: Vec<_> = bl.iter().map(|l| (l.commit, l.line.as_str())).collect();
+        let got: Vec<_> =
+            bl.iter().map(|l| (l.commit, std::str::from_utf8(&l.line).unwrap())).collect();
         assert_eq!(got, vec![(c3, "z"), (c0, "a"), (c1, "B"), (c0, "c"), (c1, "d")]);
         // Cached second call agrees.
         assert_eq!(blame(&b, "main", &RepoPath::new("f").unwrap()).await.unwrap(), bl);
@@ -1575,7 +1582,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blame_scan_equals_indexed_and_rejects_binary() {
+    async fn blame_scan_equals_indexed_and_blames_binary() {
         let b = Backend::in_memory();
         let c0 =
             commit(&b, None, vec![write("f", "1\n2\n3\n4\n"), write("bin", "x")]).await.unwrap();
@@ -1586,13 +1593,14 @@ mod tests {
         let c4 = landed(&b, c3, vec![write("f", "again\n")]).await;
         let f = RepoPath::new("f").unwrap();
         let scan = blame(&b, &c2.to_hex(), &f).await.unwrap();
-        let got: Vec<_> = scan.iter().map(|l| (l.commit, l.line.as_str())).collect();
+        let got: Vec<_> =
+            scan.iter().map(|l| (l.commit, std::str::from_utf8(&l.line).unwrap())).collect();
         assert_eq!(got, vec![(c0, "1"), (c1, "new"), (c0, "3")]);
         catch_up(&b, "main").await.unwrap();
         // Different rev strings take different cache keys but must agree.
         assert_eq!(blame(&b, "main~2", &f).await.unwrap(), scan);
         let last = blame(&b, "main", &f).await.unwrap();
-        assert_eq!((last[0].commit, last[0].line.as_str()), (c4, "again"));
+        assert_eq!((last[0].commit, &last[0].line[..]), (c4, &b"again"[..]));
         assert_eq!(last.len(), 1);
         let bin = commit(
             &b,
@@ -1608,9 +1616,12 @@ mod tests {
         .await
         .unwrap();
         land(&b, "main", bin).await.unwrap();
+        // Not UTF-8, with a NUL: blamed on the bytes, like git.
+        let got = blame(&b, "main", &RepoPath::new("blob").unwrap()).await.unwrap();
+        assert_eq!(got, vec![BlameLine { commit: bin, line: vec![0xff, 0xfe, 0] }]);
         assert!(matches!(
-            blame(&b, "main", &RepoPath::new("blob").unwrap()).await,
-            Err(OpError::InvalidArgument(_))
+            blame(&b, "main", &RepoPath::new("bin").unwrap()).await.unwrap()[..],
+            [BlameLine { commit, .. }] if commit == c0
         ));
         assert!(matches!(
             blame(&b, "main", &RepoPath::new("src").unwrap()).await,
@@ -1708,7 +1719,55 @@ mod tests {
 
     fn assert_texts_agree(o: &str, n: &str) {
         let (ol, nl): (Vec<&str>, Vec<&str>) = (o.lines().collect(), n.lines().collect());
+        assert_eq!(diff_texts(o.as_bytes(), n.as_bytes()), line_map(&ol, &nl), "{o:?} {n:?}");
+    }
+
+    /// Any bytes: [`diff_texts`] equals the reference over [`byte_lines`].
+    fn assert_bytes_agree(o: &[u8], n: &[u8]) {
+        let (ol, nl): (Vec<&[u8]>, Vec<&[u8]>) = (byte_lines(o).collect(), byte_lines(n).collect());
         assert_eq!(diff_texts(o, n), line_map(&ol, &nl), "old={o:?} new={n:?}");
+        assert_eq!(ol.len(), line_count(o));
+    }
+
+    /// Text from small-alphabet symbols, bytes that are not UTF-8 included
+    /// (Latin-1 letters, a stray continuation byte, 0xff, NUL) mixed with
+    /// UTF-8 and every terminator shape.
+    fn render_bytes(v: &[u8]) -> Vec<u8> {
+        const SYMS: [&[u8]; 12] = [
+            b"a",
+            b"b",
+            b"\xe9",
+            b"J\xf6rg",
+            b"\xc3\xa9",
+            b"\x80",
+            b"\xff",
+            b"\0",
+            b"\n",
+            b"\r",
+            b"\r\n",
+            b"x\xe4",
+        ];
+        v.iter().flat_map(|&s| SYMS[usize::from(s) % SYMS.len()]).copied().collect()
+    }
+
+    #[test]
+    fn byte_lines_split_like_str_lines() {
+        for t in ["", "a", "a\n", "a\r\n", "a\r", "\r", "\n\n", "a\r\rb\r\n", "ü\r\nx", "\r\n\r\n"]
+        {
+            let want: Vec<&[u8]> = t.lines().map(str::as_bytes).collect();
+            assert_eq!(byte_lines(t.as_bytes()).collect::<Vec<_>>(), want, "{t:?}");
+        }
+        let lines: Vec<&[u8]> = byte_lines(b"caf\xe9\r\n\xff\n\xc3").collect();
+        assert_eq!(lines, [&b"caf\xe9"[..], b"\xff", b"\xc3"]);
+    }
+
+    #[test]
+    fn diff_texts_on_bytes_that_are_not_utf8() {
+        assert_bytes_agree(b"a\n\xe9\nb\n", b"a\n\xe9\nX\nb\n");
+        assert_bytes_agree(b"J\xf6rg\n", b"J\xc3\xb6rg\n");
+        // A difference inside a multi-byte sequence: cut points are bytes.
+        assert_bytes_agree(b"\xc3\xa9\n\xc3\xa8\n", b"\xc3\xa9\n\xc3\xa9\n");
+        assert_eq!(diff_texts(b"\xff\n\0\n", b"\0\n\xff\n\0\n"), vec![None, Some(0), Some(1)]);
     }
 
     #[test]
@@ -1757,6 +1816,20 @@ mod tests {
             }
             assert_texts_agree(&render_text(&base), &render_text(&new));
         }
+
+        #[test]
+        fn diff_texts_matches_reference_on_any_bytes(
+            o in proptest::collection::vec(0u8..12, 0..80),
+            n in proptest::collection::vec(0u8..12, 0..80),
+        ) {
+            assert_bytes_agree(&render_bytes(&o), &render_bytes(&n));
+        }
+
+        #[test]
+        fn byte_lines_equal_str_lines_on_utf8(t in "(a|ü|\r|\n|\r\n|x){0,40}") {
+            let want: Vec<&[u8]> = t.lines().map(str::as_bytes).collect();
+            proptest::prop_assert_eq!(byte_lines(t.as_bytes()).collect::<Vec<_>>(), want);
+        }
     }
 
     /// The pre-optimisation blame (batched blob reads, `line_map` over
@@ -1764,8 +1837,8 @@ mod tests {
     async fn blame_oracle(b: &Backend, rev: &str, path: &RepoPath) -> OpResult<Vec<BlameLine>> {
         let id = query::resolve_rev(b, rev).await?;
         let info = query::read_path(b, rev, path, true).await?.unwrap();
-        let text = utf8(&info.content.unwrap(), path)?;
-        let lines: Vec<&str> = text.lines().collect();
+        let text = info.content.unwrap().to_vec();
+        let lines: Vec<&[u8]> = byte_lines(&text).collect();
         let mut history = match indexed_ref_for(b, rev, id).await? {
             Some(r) => {
                 let g = b.meta.get_commits(&[id]).await?.pop().flatten().unwrap().generation;
@@ -1801,12 +1874,12 @@ mod tests {
                 }
                 oldest = commit;
                 let old_text = match change.old {
-                    Some((_, bid)) => utf8(old_blobs[&bid].as_ref().unwrap().body(), path)?,
-                    None => String::new(),
+                    Some((_, bid)) => old_blobs[&bid].as_ref().unwrap().body().to_vec(),
+                    None => Vec::new(),
                 };
                 let map = line_map(
-                    &old_text.lines().collect::<Vec<_>>(),
-                    &cur_text.lines().collect::<Vec<_>>(),
+                    &byte_lines(&old_text).collect::<Vec<_>>(),
+                    &byte_lines(&cur_text).collect::<Vec<_>>(),
                 );
                 for (slot, owner) in cur.iter_mut().zip(owners.iter_mut()) {
                     let Some(j) = *slot else { continue };
@@ -1871,6 +1944,24 @@ mod tests {
             }
             t
         };
+        // Every other pair of seeds stores `o` and `e` as the Latin-1 bytes
+        // 0xf6 and 0xe9: the file is not UTF-8 (and blames the same).
+        let latin1 = (seed / 2) % 2 == 1;
+        let f_op = |l: &[String]| {
+            let bytes = render(l)
+                .bytes()
+                .map(|c| match c {
+                    b'o' if latin1 => 0xf6,
+                    b'e' if latin1 => 0xe9,
+                    c => c,
+                })
+                .collect::<Vec<u8>>();
+            crate::ops::changeset::FileOp::Write {
+                path: RepoPath::new("f").unwrap(),
+                mode: ant_core::EntryMode::File,
+                content: crate::ops::changeset::WriteContent::Inline(bytes.into()),
+            }
+        };
         let edit = |lines: &mut Vec<String>, step: usize, next: &mut dyn FnMut(usize) -> usize| {
             for _ in 0..1 + next(4) {
                 let at = next(lines.len() + 1);
@@ -1887,8 +1978,7 @@ mod tests {
                 lines.reverse();
             }
         };
-        let c0 =
-            commit(&b, None, vec![write("f", &render(&lines)), write("o", "x")]).await.unwrap();
+        let c0 = commit(&b, None, vec![f_op(&lines), write("o", "x")]).await.unwrap();
         land(&b, "main", c0).await.unwrap();
         let mut tip = c0;
         let mut exists = true;
@@ -1902,16 +1992,26 @@ mod tests {
                 // A side branch forked from an earlier version, merged with
                 // the file as the side has it.
                 let fork = revs[next(revs.len())];
-                let mut side_lines: Vec<String> = match read(&b, fork, "f").await {
-                    Some(t) => t.lines().map(str::to_owned).collect(),
+                let mut side_lines: Vec<String> = match read_bytes(&b, fork, "f").await {
+                    Some(t) => {
+                        let t: Vec<u8> = t
+                            .into_iter()
+                            .map(|c| match c {
+                                0xf6 => b'o',
+                                0xe9 => b'e',
+                                c => c,
+                            })
+                            .collect();
+                        String::from_utf8(t).unwrap().lines().map(str::to_owned).collect()
+                    }
                     None => Vec::new(),
                 };
                 edit(&mut side_lines, step + 1000, &mut next);
-                let side = commit(&b, Some(fork), vec![write("f", &render(&side_lines))]).await;
+                let side = commit(&b, Some(fork), vec![f_op(&side_lines)]).await;
                 let side = side.unwrap();
                 let side_tip = if next(2) == 0 {
                     edit(&mut side_lines, step + 2000, &mut next);
-                    commit(&b, Some(side), vec![write("f", &render(&side_lines))]).await.unwrap()
+                    commit(&b, Some(side), vec![f_op(&side_lines)]).await.unwrap()
                 } else {
                     side
                 };
@@ -1919,7 +2019,7 @@ mod tests {
                 if next(2) == 0 {
                     edit(&mut merged, step + 3000, &mut next);
                 }
-                let tree = commit(&b, Some(tip), vec![write("f", &render(&merged))]).await.unwrap();
+                let tree = commit(&b, Some(tip), vec![f_op(&merged)]).await.unwrap();
                 let tree = b.meta.get_commits(&[tree]).await.unwrap()[0].clone().unwrap().tree;
                 let merge = ant_core::Commit {
                     tree,
@@ -1941,14 +2041,14 @@ mod tests {
             if !exists {
                 exists = true;
                 lines = (0..next(30)).map(|i| format!("again {step} {i}")).collect();
-                ops.push(write("f", &render(&lines)));
+                ops.push(f_op(&lines));
             } else if next(15) == 0 {
                 exists = false;
                 ops.push(delete("f"));
             } else if next(3) != 0 {
                 // Otherwise only `o` changes: this tip shares the last change.
                 edit(&mut lines, step, &mut next);
-                ops.push(write("f", &render(&lines)));
+                ops.push(f_op(&lines));
             }
             tip = landed(&b, tip, ops).await;
             revs.push(tip);
@@ -2159,7 +2259,7 @@ mod tests {
         let path = RepoPath::new("f").unwrap();
         let chain = commits.iter().enumerate().map(|(i, c)| {
             let old = if i == 0 { "" } else { versions[i - 1] };
-            ((*c, path.clone()), diff_texts(old, versions[i]))
+            ((*c, path.clone()), diff_texts(old.as_bytes(), versions[i].as_bytes()))
         });
         let folded = derive::fold::<Blame>(None, chain);
         for ((c, _), owners) in folded {

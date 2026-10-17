@@ -778,7 +778,7 @@ async fn ops_level_ranges_and_patches() {
     assert!(d.changes.is_empty() && d.patches.unwrap().is_empty());
     let d = query::diff_with(b, Some(&writer), None, "main", &opts).await.unwrap();
     assert_eq!(d.changes.len(), 2);
-    assert!(d.patches.unwrap().iter().flatten().any(|p| p.hunks[0].lines[0] == "+TOPSECRET"));
+    assert!(d.patches.unwrap().iter().flatten().any(|p| p.hunks[0].lines[0] == b"+TOPSECRET"));
 }
 
 // ---------------------------------------------------------------------------

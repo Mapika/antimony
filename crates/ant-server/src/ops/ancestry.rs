@@ -452,7 +452,7 @@ mod tests {
             .unwrap();
         let p = r.patches.unwrap();
         assert_eq!(p.len(), 1);
-        assert_eq!(p[0].as_ref().unwrap().hunks[0].lines, ["+v5"]);
+        assert_eq!(p[0].as_ref().unwrap().hunks[0].lines, [b"+v5"]);
         // A merge-base diff needs a from rev; unrelated histories have none.
         assert!(matches!(
             query::diff_with(&b, None, None, "main", &opts(&[], true, false)).await,

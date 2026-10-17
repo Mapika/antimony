@@ -267,7 +267,9 @@ gets one coalesced event instead of unbounded buffering.
   changed the path, so every revision since `L` shares one value. A new
   change is derived from the previous version's stored value plus one line
   diff; with nothing stored the walk diffs older versions until all lines
-  are owned or a stored value covers the rest.
+  are owned or a stored value covers the rest. Content is bytes, as in git:
+  lines split on `\n`, whether or not the file is UTF-8; the value holds
+  only owners, never text.
 - **Diff:** tree diffs walk both trees breadth first with one batched read
   per depth, through the tree cache, so a `Diff` spanning hundreds of lands
   costs a few round trips, not one per changed directory.

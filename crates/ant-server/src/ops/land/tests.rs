@@ -4,7 +4,7 @@ use ant_store::ObjectStoreExt;
 use ant_store::graph::is_ancestor;
 
 use super::*;
-use crate::ops::test_support::{commit, delete, read, tip, write};
+use crate::ops::test_support::{commit, delete, read, read_bytes, tip, write, write_bytes};
 
 #[tokio::test]
 async fn create_and_fast_forward() {
@@ -59,6 +59,35 @@ async fn three_way_text_merge_same_file() {
     land(&b, "main", x).await.unwrap();
     let LandOutcome::Landed { new_tip, .. } = land(&b, "main", y).await.unwrap() else { panic!() };
     assert_eq!(read(&b, new_tip, "f").await.as_deref(), Some("L1\nl2\nl3\nl4\nl5\nL6\n"));
+}
+
+/// Files that are not UTF-8 (Latin-1) merge on their bytes, as in git;
+/// overlapping edits to them still conflict.
+#[tokio::test]
+async fn three_way_text_merge_of_content_that_is_not_utf8() {
+    let b = Backend::in_memory();
+    let base = commit(&b, None, vec![write_bytes("f", b"J\xf6rg\nl2\nl3\nl4\nl5\nM\xfcller\n")])
+        .await
+        .unwrap();
+    land(&b, "main", base).await.unwrap();
+    let x =
+        commit(&b, Some(base), vec![write_bytes("f", b"J\xc3\xb6rg\nl2\nl3\nl4\nl5\nM\xfcller\n")]);
+    let x = x.await.unwrap();
+    let y = commit(
+        &b,
+        Some(base),
+        vec![write_bytes("f", b"J\xf6rg\nl2\nl3\nl4\nl5\nM\xfcller \xff\n")],
+    );
+    let y = y.await.unwrap();
+    land(&b, "main", x).await.unwrap();
+    let LandOutcome::Landed { new_tip, rebased: true } = land(&b, "main", y).await.unwrap() else {
+        panic!()
+    };
+    let merged = read_bytes(&b, new_tip, "f").await.unwrap();
+    assert_eq!(merged, b"J\xc3\xb6rg\nl2\nl3\nl4\nl5\nM\xfcller \xff\n");
+    let z = commit(&b, Some(base), vec![write_bytes("f", b"J\xe9rg\nl2\nl3\nl4\nl5\nM\xfcller\n")]);
+    let z = z.await.unwrap();
+    assert!(matches!(land(&b, "main", z).await.unwrap(), LandOutcome::Conflict { .. }));
 }
 
 #[tokio::test]
