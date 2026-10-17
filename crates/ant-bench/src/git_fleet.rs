@@ -1,5 +1,5 @@
 //! `git-fleet` subcommand: the plain-git counterpart of `fleet`, for the
-//! head-to-head in `scripts/vs-git.sh`.
+//! head-to-head benchmarks against git.
 //!
 //! N agents, each with its own clone of one remote repository (a `git://`
 //! daemon or `file://` bare repo), loop: write its own file, `git add`, `git

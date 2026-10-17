@@ -104,6 +104,8 @@ guard() {
     local free
     free=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
     [ "$free" -ge 20 ] || { log "only ${free} GB free on /"; exit 3; }
+    # ANT_EXTRA_DISK: another filesystem that must keep 20 GB free, e.g. the
+    # Windows drive holding a WSL disk image (which never shrinks).
     if [ -d "${ANT_EXTRA_DISK:-/nonexistent}" ]; then
         free=$(df -BG --output=avail "${ANT_EXTRA_DISK:-/nonexistent}" | tail -1 | tr -dc 0-9)
         [ "$free" -ge 20 ] || { log "only ${free} GB free on $ANT_EXTRA_DISK"; exit 3; }
