@@ -153,6 +153,11 @@ pub const RETRY_REASONS: [&str; 5] = ["throttled", "server_error", "network", "b
 static RETRIES: [AtomicU64; 5] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static GAVE_UP: AtomicU64 = AtomicU64::new(0);
+/// Request kinds counted by [`S3Stats::requests`] (ranged reads count as `get`).
+pub const REQUEST_OPS: [&str; 4] = ["get", "put", "head", "other"];
+static REQUESTS: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static READ_BYTES: AtomicU64 = AtomicU64::new(0);
 static IN_FLIGHT: AtomicI64 = AtomicI64::new(0);
 static QUEUED: AtomicI64 = AtomicI64::new(0);
 
@@ -168,6 +173,11 @@ pub struct S3Stats {
     pub in_flight: i64,
     /// Requests waiting for a slot now (`max_concurrency`).
     pub queued: i64,
+    /// Requests sent (attempts, retries included), per [`REQUEST_OPS`]
+    /// (cumulative).
+    pub requests: [u64; 4],
+    /// Body bytes received by GETs (cumulative).
+    pub read_bytes: u64,
 }
 
 /// The current [`S3Stats`].
@@ -177,6 +187,8 @@ pub fn stats() -> S3Stats {
         gave_up: GAVE_UP.load(Ordering::Relaxed),
         in_flight: IN_FLIGHT.load(Ordering::Relaxed),
         queued: QUEUED.load(Ordering::Relaxed),
+        requests: std::array::from_fn(|i| REQUESTS[i].load(Ordering::Relaxed)),
+        read_bytes: READ_BYTES.load(Ordering::Relaxed),
     }
 }
 
@@ -399,6 +411,13 @@ impl S3ObjectStore {
                     let _slot = self.slots.acquire().await.map_err(StoreError::backend)?;
                     drop(waiting);
                     let _running = GaugeGuard::new(&IN_FLIGHT);
+                    let kind = match op {
+                        "get" | "get_range" => 0,
+                        "put" => 1,
+                        "head" => 2,
+                        _ => 3,
+                    };
+                    REQUESTS[kind].fetch_add(1, Ordering::Relaxed);
                     match tokio::time::timeout(attempt_timeout, attempt()).await {
                         Ok(r) => r,
                         Err(_) => Err(Attempt::Retry {
@@ -632,6 +651,19 @@ impl S3ObjectStore {
     /// whole (request, headers and body): a server that throttles or stalls
     /// mid-body costs one attempt, not the caller.
     pub(crate) async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Bytes> {
+        self.get_range_inner(key, offset, len, false).await
+    }
+
+    /// Like [`Self::get_range`], but a range reaching past the end of the
+    /// object returns the bytes up to its end (`offset` must lie inside it).
+    /// The length is checked against the object size the server reports
+    /// (`Content-Range`), so a cut-off body is still retried, never taken
+    /// for the end of the object.
+    pub(crate) async fn get_range_upto(&self, key: &str, offset: u64, len: u64) -> Result<Bytes> {
+        self.get_range_inner(key, offset, len, true).await
+    }
+
+    async fn get_range_inner(&self, key: &str, offset: u64, len: u64, upto: bool) -> Result<Bytes> {
         let (client, bucket) = (&self.client, &self.bucket);
         let range = format!("bytes={}-{}", offset, offset + len.max(1) - 1);
         let range = &range;
@@ -645,15 +677,25 @@ impl S3ObjectStore {
                 .send()
                 .await
                 .map_err(|e| classify("get_range", key, e))?;
+            // The object's size, from `Content-Range: bytes a-b/size`.
+            let size = resp
+                .content_range()
+                .and_then(|r| r.rsplit_once('/'))
+                .and_then(|(_, size)| size.trim().parse::<u64>().ok());
+            let expected = match (upto, size) {
+                (true, Some(size)) => len.min(size.saturating_sub(offset)),
+                _ => len,
+            };
             let body = resp
                 .body
                 .collect()
                 .await
                 .map_err(|e| Attempt::body(format!("reading body: {e}")))?
                 .into_bytes();
-            if body.len() as u64 != len {
+            READ_BYTES.fetch_add(body.len() as u64, Ordering::Relaxed);
+            if body.len() as u64 != expected {
                 return Err(Attempt::body(format!(
-                    "short range read ({} of {len} bytes)",
+                    "short range read ({} of {expected} bytes)",
                     body.len()
                 )));
             }
@@ -688,8 +730,10 @@ impl S3ObjectStore {
                     .body
                     .collect()
                     .await
-                    .map_err(|e| Attempt::body(format!("reading body: {e}")))?;
-                Ok(Some(body.into_bytes()))
+                    .map_err(|e| Attempt::body(format!("reading body: {e}")))?
+                    .into_bytes();
+                READ_BYTES.fetch_add(body.len() as u64, Ordering::Relaxed);
+                Ok(Some(body))
             })
             .await?;
         let Some(compressed) = compressed else {
@@ -890,6 +934,31 @@ mod tests {
         let (s, fake) = store_for(vec![Act::Truncate], 3).await;
         assert!(matches!(s.get_range("k", 5, LEN).await, Err(StoreError::Backend(_))));
         assert_eq!(fake.hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn ranges_past_the_end_stop_there_only_when_asked() {
+        let want = |from: u64, to: u64| (from..to).map(byte_at).collect::<Vec<u8>>();
+        // Up to the end: the bytes the object has.
+        let (s, fake) = store_for(vec![Act::Sized(1000)], 3).await;
+        assert_eq!(&s.get_range_upto("k", 900, 500).await.unwrap()[..], &want(900, 1000)[..]);
+        assert_eq!(&s.get_range_upto("k", 0, 1000).await.unwrap()[..], &want(0, 1000)[..]);
+        assert_eq!(&s.get_range_upto("k", 10, 20).await.unwrap()[..], &want(10, 30)[..]);
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 3);
+        // A body cut off before the end the server named is retried, never
+        // taken for the end of the object.
+        let (s, fake) = store_for(vec![Act::SizedTruncate(1000), Act::Sized(1000)], 3).await;
+        assert_eq!(&s.get_range_upto("k", 800, 500).await.unwrap()[..], &want(800, 1000)[..]);
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 2);
+        let (s, _) = store_for(vec![Act::SizedTruncate(1000)], 2).await;
+        assert!(matches!(s.get_range_upto("k", 800, 500).await, Err(StoreError::Backend(_))));
+        // A plain ranged read still wants every byte it asked for.
+        let (s, fake) = store_for(vec![Act::Sized(1000)], 2).await;
+        assert!(matches!(s.get_range("k", 900, 500).await, Err(StoreError::Backend(_))));
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 2);
+        // Without a size from the server, a short body is an error.
+        let (s, _) = store_for(vec![Act::Truncate], 2).await;
+        assert!(matches!(s.get_range_upto("k", 0, 100).await, Err(StoreError::Backend(_))));
     }
 
     #[tokio::test]

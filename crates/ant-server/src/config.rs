@@ -172,6 +172,14 @@ pub struct StoreArgs {
     /// 0.2.0 read; for the window of a rolling upgrade).
     #[arg(long, env = "ANT_PACK_FRAMES", default_value_t = true, action = clap::ArgAction::Set)]
     pack_frames: bool,
+
+    /// Compressed S3 pack bytes kept in memory, MiB (0: off). Records are
+    /// read as aligned 64 KiB segments, nearby ones with one ranged GET, and
+    /// kept: a checkout or clone against a freshly started server reads
+    /// each segment of the packs it needs about once, instead of one GET per
+    /// object, while those packs fit.
+    #[arg(long, env = "ANT_S3_PACK_CACHE_MIB", default_value_t = ant_store::packed::DEFAULT_SEGMENT_CACHE_BYTES >> 20)]
+    s3_pack_cache_mib: usize,
 }
 
 impl StoreArgs {
@@ -317,7 +325,10 @@ impl StoreArgs {
                         s3.ensure_bucket().await.context("ensuring S3 bucket")?;
                         // Large objects are bundled into S3 packs indexed in Postgres.
                         s3_probe = Some(s3.clone());
-                        let mut packed = PackedS3Store::new(pg.as_ref().clone(), s3);
+                        let mut packed = PackedS3Store::new(pg.as_ref().clone(), s3)
+                            .with_segment_cache_bytes(
+                                self.s3_pack_cache_mib.saturating_mul(1 << 20),
+                            );
                         if !self.pack_frames {
                             packed = packed.with_frame_bytes(0);
                         }

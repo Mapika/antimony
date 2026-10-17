@@ -816,6 +816,8 @@ Families (all names verified in `crates/ant-server/src/metrics.rs`):
 | `ant_pg_pool_size`, `_idle`, `_in_use`, `_max` | | query pool (the lock pool is not included) |
 | `ant_s3_retries_total`, `ant_s3_gave_up_total` | `reason` = `throttled`/`server_error`/`network`/`body`/`timeout` | S3 attempts retried; operations that failed after the retry budget |
 | `ant_s3_requests_in_flight`, `ant_s3_requests_queued`, `ant_s3_max_concurrency` | | S3 request slots (`--s3-max-concurrency`) in use, waited for, configured |
+| `ant_s3_requests_total`, `ant_s3_read_bytes_total` | `op` = `get`/`put`/`head`/`other` | S3 requests sent (retries included); body bytes received |
+| `ant_s3_pack_segments_total`, `ant_s3_pack_cache_bytes` | `result` = `hit`/`read` | pack segments found cached (or being read) and read from S3; bytes held (`--s3-pack-cache-mib`) |
 | `ant_build_info` | `version`, `git` | always 1 |
 
 `ant cache-serve` has its own `ant_cacheserve_*` families (see Cache tier).

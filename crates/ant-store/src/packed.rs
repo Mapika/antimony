@@ -43,13 +43,14 @@
 
 pub(crate) mod cluster;
 pub(crate) mod frame;
+pub(crate) mod segments;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ant_core::{EncodedObject, ObjectId, ObjectKind};
 use async_trait::async_trait;
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 
@@ -61,6 +62,7 @@ use crate::{BLOCKING_THRESHOLD, ObjectStore, Result, StoreError};
 
 pub use cluster::ClusterOptions;
 pub use frame::FRAME_RAW;
+pub use segments::{DEFAULT_SEGMENT_CACHE_BYTES, SEGMENT};
 
 /// Target size of one pack, after compression.
 const PACK_BYTES: usize = 24 * 1024 * 1024;
@@ -81,6 +83,8 @@ const DECODE_UNIT: usize = 64 * 1024;
 const DECODE_PERMITS: usize = DECODE_BUDGET / DECODE_UNIT;
 /// Uncompressed bytes of records compressed per blocking task.
 const ENCODE_TASK_BYTES: usize = 1024 * 1024;
+/// Compressed plus uncompressed bytes of records decoded per task, roughly.
+const DECODE_TASK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Bytes of ranged reads in flight per store, across all callers. Bounds
 /// memory, and S3 servers throttle beyond some in-flight volume (SeaweedFS
@@ -126,6 +130,17 @@ pub trait PackFiles: Clone + Send + Sync + 'static {
     async fn write_packs(&self, bodies: Vec<Vec<u8>>) -> Result<Vec<([u8; 16], u64)>>;
     /// `len` bytes at `offset` of pack `pack`.
     async fn read_range(&self, pack: &[u8; 16], offset: u64, len: u64) -> Result<Bytes>;
+    /// Whether a pack's bytes never change once written (S3 packs: written
+    /// once under a random id); only then are they cached by segment.
+    fn immutable_packs(&self) -> bool {
+        false
+    }
+    /// Up to `len` bytes at `offset` of pack `pack`: fewer only where the
+    /// pack ends (`offset` lies inside it). Only called when
+    /// [`Self::immutable_packs`].
+    async fn read_range_upto(&self, pack: &[u8; 16], offset: u64, len: u64) -> Result<Bytes> {
+        self.read_range(pack, offset, len).await
+    }
     /// Whether objects may also be stored one per key, outside packs (S3
     /// stores written before packs existed).
     fn may_hold_unpacked(&self) -> bool {
@@ -167,6 +182,12 @@ impl PackFiles for S3ObjectStore {
     }
     async fn read_range(&self, pack: &[u8; 16], offset: u64, len: u64) -> Result<Bytes> {
         self.get_range(&self.pack_key(pack), offset, len).await
+    }
+    fn immutable_packs(&self) -> bool {
+        true
+    }
+    async fn read_range_upto(&self, pack: &[u8; 16], offset: u64, len: u64) -> Result<Bytes> {
+        self.get_range_upto(&self.pack_key(pack), offset, len).await
     }
     fn may_hold_unpacked(&self) -> bool {
         true
@@ -309,21 +330,117 @@ pub struct PackedStore<I, F> {
     /// Uncompressed frame bytes being decoded, in `DECODE_UNIT`s.
     decoding: Arc<Semaphore>,
     frames: Arc<Mutex<FrameCache>>,
+    /// Recently read compressed pack bytes (`None`: off); used only when the
+    /// packs are immutable ([`PackFiles::immutable_packs`]).
+    segments: Option<Arc<Segments>>,
     /// Uncompressed bytes per frame written ([`FRAME_RAW`]; 0: every object
     /// alone, the format older versions read).
     frame_raw: usize,
 }
 
+/// A segment read in flight, shared by every caller that needs one of its
+/// segments: the body read (from the read's first segment on).
+type SharedRead = futures::future::Shared<
+    futures::future::BoxFuture<'static, std::result::Result<Bytes, Arc<StoreError>>>,
+>;
+
+/// The segment cache of a store (see [`segments`]).
+struct Segments {
+    state: Mutex<SegmentState>,
+    serial: std::sync::atomic::AtomicU64,
+}
+
+struct SegmentState {
+    cache: segments::SegmentCache,
+    /// Segments being read, with the serial number of the read.
+    pending: HashMap<segments::Key, (u64, SharedRead, segments::Fetch)>,
+}
+
+impl Segments {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: Mutex::new(SegmentState {
+                cache: segments::SegmentCache::new(limit),
+                pending: HashMap::new(),
+            }),
+            serial: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+/// Process-wide segment cache counters (all stores), for metrics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentStats {
+    /// Segments found in the cache, or in a read another caller started.
+    pub hits: u64,
+    /// Segments read from the pack files (gaps between wanted ones included).
+    pub read: u64,
+    /// Segments held now, and their bytes.
+    pub held: u64,
+    pub bytes: u64,
+}
+
+static SEGMENT_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SEGMENT_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SEGMENT_HELD: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static SEGMENT_BYTES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// The current [`SegmentStats`].
+pub fn segment_stats() -> SegmentStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    SegmentStats {
+        hits: SEGMENT_HITS.load(Relaxed),
+        read: SEGMENT_READS.load(Relaxed),
+        held: SEGMENT_HELD.load(Relaxed).max(0) as u64,
+        bytes: SEGMENT_BYTES.load(Relaxed).max(0) as u64,
+    }
+}
+
+impl SegmentState {
+    /// Run `f` on the cache and fold its change in size into the gauges.
+    fn with_cache<T>(&mut self, f: impl FnOnce(&mut segments::SegmentCache) -> T) -> T {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (n0, b0) = self.cache.usage();
+        let out = f(&mut self.cache);
+        let (n1, b1) = self.cache.usage();
+        SEGMENT_HELD.fetch_add(n1 as i64 - n0 as i64, Relaxed);
+        SEGMENT_BYTES.fetch_add(b1 as i64 - b0 as i64, Relaxed);
+        out
+    }
+}
+
+impl Drop for Segments {
+    fn drop(&mut self) {
+        let state = self.state.get_mut();
+        state.with_cache(|c| *c = segments::SegmentCache::new(0));
+    }
+}
+
+/// Records larger than this are read with ranged reads of their own, never
+/// through the segment cache: nothing else is in their segments.
+const SEGMENT_MAX_RECORD: u64 = 1024 * 1024;
+
+/// Read-budget units of a ranged read of `len` bytes.
+fn read_units(len: u64) -> u32 {
+    len.max(READ_MIN_COST).div_ceil(READ_UNIT).clamp(1, READ_PERMITS as u64) as u32
+}
+
 impl<I: PackIndex, F: PackFiles> PackedStore<I, F> {
     /// `index` holds the object index; `files` receives the packs and (S3) is
-    /// also consulted for objects stored one per key.
+    /// also consulted for objects stored one per key. Immutable packs (S3)
+    /// are read through a segment cache of
+    /// [`segments::DEFAULT_SEGMENT_CACHE_BYTES`].
     pub fn new(index: I, files: F) -> Self {
+        let segments = files
+            .immutable_packs()
+            .then(|| Arc::new(Segments::new(segments::DEFAULT_SEGMENT_CACHE_BYTES)));
         Self {
             index,
             files,
             reading: Arc::new(Semaphore::new(READ_PERMITS)),
             decoding: Arc::new(Semaphore::new(DECODE_PERMITS)),
             frames: Arc::new(Mutex::new(FrameCache::new(FRAME_CACHE_BYTES))),
+            segments,
             frame_raw: FRAME_RAW,
         }
     }
@@ -331,6 +448,16 @@ impl<I: PackIndex, F: PackFiles> PackedStore<I, F> {
     /// Keep at most `bytes` of decoded frames (default [`FRAME_CACHE_BYTES`]).
     pub fn with_frame_cache_bytes(mut self, bytes: usize) -> Self {
         self.frames = Arc::new(Mutex::new(FrameCache::new(bytes)));
+        self
+    }
+
+    /// Keep at most `bytes` of compressed pack bytes read (see [`segments`];
+    /// default [`segments::DEFAULT_SEGMENT_CACHE_BYTES`]); 0 turns the cache
+    /// off, and every read is a ranged read of its own. Only immutable packs
+    /// ([`PackFiles::immutable_packs`]) are ever cached.
+    pub fn with_segment_cache_bytes(mut self, bytes: usize) -> Self {
+        self.segments =
+            (bytes > 0 && self.files.immutable_packs()).then(|| Arc::new(Segments::new(bytes)));
         self
     }
 
@@ -344,20 +471,33 @@ impl<I: PackIndex, F: PackFiles> PackedStore<I, F> {
     /// Read one run with a single ranged GET and decode its records.
     async fn get_run(&self, run: Run) -> Result<Vec<(ObjectId, EncodedObject)>> {
         let len = run.end - run.start;
-        let units = len.max(READ_MIN_COST).div_ceil(READ_UNIT).clamp(1, READ_PERMITS as u64) as u32;
-        let permit = self.reading.acquire_many(units).await.map_err(StoreError::backend)?;
+        let permit =
+            self.reading.acquire_many(read_units(len)).await.map_err(StoreError::backend)?;
         let body = self.files.read_range(&run.pack, run.start, len).await?;
         drop(permit);
-        // Every frame's uncompressed size: decoding memory, and CPU work.
-        let raw = run
+        let records = run
             .entries
             .chunk_by(|a, b| a.off == b.off)
             .map(|group| {
                 let at = (group[0].off - run.start) as usize;
-                frame::frame_raw_len(&body[at..at + group[0].len as usize]).unwrap_or(0)
+                (group.to_vec(), body.slice(at..at + group[0].len as usize))
             })
+            .collect();
+        self.decode_records(records).await
+    }
+
+    /// Decode records (each: its members' index entries, which share one
+    /// offset, and the record bytes) and remember decoded frames.
+    async fn decode_records(
+        &self,
+        records: Vec<(Vec<IndexEntry>, Bytes)>,
+    ) -> Result<Vec<(ObjectId, EncodedObject)>> {
+        // Every frame's uncompressed size: decoding memory, and CPU work.
+        let raw = records
+            .iter()
+            .map(|(_, record)| frame::frame_raw_len(record).unwrap_or(0))
             .sum::<usize>();
-        let work = len as usize + raw;
+        let work = records.iter().map(|(_, r)| r.len()).sum::<usize>() + raw;
         let decoding = if raw == 0 {
             None
         } else {
@@ -373,17 +513,15 @@ impl<I: PackIndex, F: PackFiles> PackedStore<I, F> {
         let cache = self.frames.clone();
         let decode = move || -> Result<Vec<(ObjectId, EncodedObject)>> {
             let _decoding = decoding;
-            let mut out = Vec::with_capacity(run.entries.len());
-            for group in run.entries.chunk_by(|a, b| a.off == b.off) {
+            let mut out = Vec::with_capacity(records.iter().map(|(g, _)| g.len()).sum());
+            for (group, record) in &records {
                 let first = &group[0];
-                let at = (first.off - run.start) as usize;
-                let record = &body[at..at + first.len as usize];
                 if let Some(f) = Decoded::decode(record) {
                     let f = Arc::new(f?);
                     for e in group {
                         out.push((e.id, member(&f, e)?));
                     }
-                    cache.lock().insert((run.pack, first.off), f);
+                    cache.lock().insert((first.pack, first.off), f);
                 } else {
                     for e in group {
                         out.push((e.id, frame::decode_single(e.id, record)?));
@@ -397,6 +535,168 @@ impl<I: PackIndex, F: PackFiles> PackedStore<I, F> {
         } else {
             decode()
         }
+    }
+
+    /// Read `entries` through the segment cache: segments held or being
+    /// read by another caller are reused, the missing ones read in few
+    /// ranged reads (see [`segments`]).
+    async fn get_segmented(
+        &self,
+        seg: &Arc<Segments>,
+        mut entries: Vec<IndexEntry>,
+    ) -> Result<Vec<(ObjectId, EncodedObject)>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        entries.sort_by_key(|e| (e.pack, e.off));
+        let records: Vec<Vec<IndexEntry>> = entries
+            .chunk_by(|a, b| (a.pack, a.off) == (b.pack, b.off))
+            .map(<[_]>::to_vec)
+            .collect();
+        let mut wanted: Vec<segments::Key> = records
+            .iter()
+            .flat_map(|g| {
+                let e = &g[0];
+                segments::segments_of(e.off, e.len.into()).map(move |s| (e.pack, s))
+            })
+            .collect();
+        wanted.dedup();
+
+        // Held, being read, or to read (registered as being read before the
+        // lock is released, so concurrent callers share the read).
+        let mut held: HashMap<segments::Key, Bytes> = HashMap::with_capacity(wanted.len());
+        let mut waits: Vec<(segments::Fetch, SharedRead)> = Vec::new();
+        {
+            let mut state = seg.state.lock();
+            let mut missing = Vec::new();
+            let mut joined: HashSet<u64> = HashSet::new();
+            for key in &wanted {
+                if let Some(bytes) = state.cache.get(key) {
+                    held.insert(*key, bytes);
+                } else if let Some((serial, read, fetch)) = state.pending.get(key) {
+                    if joined.insert(*serial) {
+                        waits.push((*fetch, read.clone()));
+                    }
+                } else {
+                    missing.push(*key);
+                }
+            }
+            SEGMENT_HITS.fetch_add((wanted.len() - missing.len()) as u64, Relaxed);
+            for fetch in segments::plan(missing) {
+                let serial = seg.serial.fetch_add(1, Relaxed);
+                let read = self.read_segments(seg, fetch, serial);
+                for s in fetch.first..=fetch.last {
+                    // A gap segment another read already covers keeps it.
+                    state
+                        .pending
+                        .entry((fetch.pack, s))
+                        .or_insert_with(|| (serial, read.clone(), fetch));
+                }
+                waits.push((fetch, read));
+            }
+        }
+        let bodies = futures::future::join_all(
+            waits.into_iter().map(|(fetch, read)| async move { (fetch, read.await) }),
+        )
+        .await;
+        for (fetch, body) in bodies {
+            let body = body.map_err(|e| StoreError::Backend(e.to_string().into()))?;
+            for (i, chunk) in body.chunks(segments::SEGMENT as usize).enumerate() {
+                let at = i * segments::SEGMENT as usize;
+                held.entry((fetch.pack, fetch.first + i as u64))
+                    .or_insert_with(|| body.slice(at..at + chunk.len()));
+            }
+        }
+
+        let mut jobs = Vec::with_capacity(records.len());
+        for group in records {
+            let e = group[0];
+            let Some(record) = segments::assemble(&held, e.pack, e.off, e.len.into()) else {
+                return Err(frame::corrupt(format!(
+                    "record at {} of pack {} ({} bytes) lies past the end of the pack",
+                    e.off,
+                    hex::encode(e.pack),
+                    e.len
+                )));
+            };
+            jobs.push((group, record));
+        }
+        let touched: Vec<segments::Key> = held.into_keys().collect();
+        // Decode in parallel, about DECODE_TASK_BYTES of work per task.
+        let mut tasks: Vec<Vec<(Vec<IndexEntry>, Bytes)>> = Vec::new();
+        let mut cur = Vec::new();
+        let mut work = 0;
+        for job in jobs {
+            work += job.1.len() + frame::frame_raw_len(&job.1).unwrap_or(0);
+            cur.push(job);
+            if work >= DECODE_TASK_BYTES {
+                tasks.push(std::mem::take(&mut cur));
+                work = 0;
+            }
+        }
+        if !cur.is_empty() {
+            tasks.push(cur);
+        }
+        let out = stream::iter(tasks)
+            .map(|t| self.decode_records(t))
+            .buffer_unordered(FANOUT)
+            .try_collect::<Vec<_>>()
+            .await
+            .map(|parts| parts.into_iter().flatten().collect());
+        if out.is_err() {
+            // Do not keep serving bytes that did not decode.
+            let mut state = seg.state.lock();
+            state.with_cache(|c| touched.iter().for_each(|k| c.remove(k)));
+        }
+        out
+    }
+
+    /// Start reading `fetch` on its own task (it completes even when every
+    /// caller waiting for it gives up, so no read budget is held by a read
+    /// nobody polls) and keep what it read.
+    fn read_segments(
+        &self,
+        seg: &Arc<Segments>,
+        fetch: segments::Fetch,
+        serial: u64,
+    ) -> SharedRead {
+        let (files, reading, seg) = (self.files.clone(), self.reading.clone(), seg.clone());
+        let task = tokio::spawn(async move {
+            let body = async {
+                let _permit = reading
+                    .acquire_many_owned(read_units(fetch.len()))
+                    .await
+                    .map_err(StoreError::backend)?;
+                files.read_range_upto(&fetch.pack, fetch.offset(), fetch.len()).await
+            }
+            .await;
+            let split = match &body {
+                Ok(b) => {
+                    SEGMENT_READS.fetch_add(
+                        fetch.last - fetch.first + 1,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    segments::split(&fetch, b)
+                }
+                Err(_) => Vec::new(),
+            };
+            let mut state = seg.state.lock();
+            for s in fetch.first..=fetch.last {
+                let key = (fetch.pack, s);
+                if state.pending.get(&key).is_some_and(|(n, _, _)| *n == serial) {
+                    state.pending.remove(&key);
+                }
+            }
+            state.with_cache(|c| split.into_iter().for_each(|(k, b)| c.insert(k, b)));
+            drop(state);
+            body.map_err(Arc::new)
+        });
+        async move {
+            match task.await {
+                Ok(r) => r,
+                Err(e) => Err(Arc::new(StoreError::backend(e))),
+            }
+        }
+        .boxed()
+        .shared()
     }
 }
 
@@ -471,12 +771,28 @@ impl<I: PackIndex, F: PackFiles> ObjectStore for PackedStore<I, F> {
             };
             got.extend(objects);
         }
-        let fetched: Vec<Vec<(ObjectId, EncodedObject)>> = stream::iter(coalesce(fetch))
-            .map(|run| self.get_run(run))
-            .buffer_unordered(FANOUT)
-            .try_collect()
-            .await?;
+        // Records through the segment cache; large ones (and all of them
+        // without the cache) with ranged reads of their own.
+        let segments = self.segments.as_ref().filter(|_| self.files.immutable_packs());
+        let (segmented, direct): (Vec<IndexEntry>, Vec<IndexEntry>) = fetch
+            .into_iter()
+            .partition(|e| segments.is_some() && u64::from(e.len) <= SEGMENT_MAX_RECORD);
+        let direct_reads = async {
+            stream::iter(coalesce(direct))
+                .map(|run| self.get_run(run))
+                .buffer_unordered(FANOUT)
+                .try_collect::<Vec<Vec<(ObjectId, EncodedObject)>>>()
+                .await
+        };
+        let segment_reads = async {
+            match segments {
+                Some(s) if !segmented.is_empty() => self.get_segmented(s, segmented).await,
+                _ => Ok(Vec::new()),
+            }
+        };
+        let (fetched, segmented) = futures::try_join!(direct_reads, segment_reads)?;
         got.extend(fetched.into_iter().flatten());
+        got.extend(segmented);
         // Objects stored one per key (before packs existed).
         let mut legacy_ids: Vec<ObjectId> = if self.files.may_hold_unpacked() {
             wanted.iter().filter(|id| !got.contains_key(id)).copied().collect()
@@ -805,6 +1121,9 @@ mod tests {
     async fn frames_conform_and_so_does_the_old_record_format() {
         conformance::object_store(Arc::new(fresh().await.0.with_frame_bytes(0))).await;
         conformance::object_store(Arc::new(fresh().await.0.with_frame_bytes(4096))).await;
+        // Without the segment cache, and with one too small for any segment.
+        conformance::object_store(Arc::new(fresh().await.0.with_segment_cache_bytes(0))).await;
+        conformance::object_store(Arc::new(fresh().await.0.with_segment_cache_bytes(1))).await;
     }
 
     #[tokio::test]
@@ -964,5 +1283,174 @@ mod tests {
         let cold = PackedS3Store::new(store.index.clone(), s3.clone());
         let got = cold.get_many(&ids).await.unwrap();
         assert!(got.iter().zip(&objects).all(|(g, o)| g.as_ref() == Some(o)));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres and s3: docker compose up -d"]
+    async fn segments_that_did_not_decode_are_read_again() {
+        let (store, s3) = fresh().await;
+        let objects = history(8);
+        let ids: Vec<ObjectId> = objects.iter().map(EncodedObject::id).collect();
+        store.put_many(&objects).await.unwrap();
+        let index = store.index.lookup_index(&ids).await.unwrap();
+        let key = s3.pack_key(&index[&ids[0]].pack);
+        let size = index.values().map(|e| e.off + u64::from(e.len)).max().unwrap();
+        let good = s3.get_range(&key, 0, size).await.unwrap().to_vec();
+        s3.put_raw(key.clone(), good.iter().map(|b| b ^ 0x5A).collect()).await.unwrap();
+        let reader = PackedS3Store::new(store.index.clone(), s3.clone());
+        assert!(matches!(reader.get_many(&ids).await, Err(StoreError::Backend(_))));
+        // Repaired: the same reader does not keep serving the bad bytes.
+        s3.put_raw(key, good).await.unwrap();
+        let got = reader.get_many(&ids).await.unwrap();
+        assert!(got.iter().zip(&objects).all(|(g, o)| g.as_ref() == Some(o)));
+    }
+
+    /// Pack files that count the ranged reads made through them.
+    #[derive(Clone)]
+    struct Counting {
+        inner: S3ObjectStore,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl PackFiles for Counting {
+        async fn write_packs(&self, bodies: Vec<Vec<u8>>) -> Result<Vec<([u8; 16], u64)>> {
+            self.inner.write_packs(bodies).await
+        }
+        async fn read_range(&self, pack: &[u8; 16], offset: u64, len: u64) -> Result<Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read_range(pack, offset, len).await
+        }
+        fn immutable_packs(&self) -> bool {
+            true
+        }
+        async fn read_range_upto(&self, pack: &[u8; 16], offset: u64, len: u64) -> Result<Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read_range_upto(pack, offset, len).await
+        }
+    }
+
+    /// Many objects stored one per record, so that one pack holds several
+    /// segments of them: `(objects, store, counting reads)`.
+    async fn segmented_pack() -> (Vec<EncodedObject>, PackedS3Store, S3ObjectStore) {
+        let (store, s3) = fresh().await;
+        // Incompressible bodies of 6 KiB: about 10 per segment.
+        let objects: Vec<EncodedObject> = (0..200u32)
+            .map(|i| {
+                let mut x = 0x9E37_79B9u32.wrapping_mul(i + 1);
+                let body: Vec<u8> = (0..6 * 1024)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 17;
+                        x ^= x << 5;
+                        x as u8
+                    })
+                    .collect();
+                EncodedObject::new(ObjectKind::Blob, &body)
+            })
+            .collect();
+        store.clone().with_frame_bytes(0).put_many(&objects).await.unwrap();
+        (objects, store, s3)
+    }
+
+    fn counting(
+        store: &PackedS3Store,
+        s3: &S3ObjectStore,
+    ) -> (PackedStore<PgStore, Counting>, Arc<std::sync::atomic::AtomicUsize>) {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let files = Counting { inner: s3.clone(), reads: reads.clone() };
+        (PackedStore::new(store.index.clone(), files), reads)
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres and s3: docker compose up -d"]
+    async fn nearby_objects_read_one_at_a_time_share_segment_reads() {
+        use std::sync::atomic::Ordering;
+        let (objects, store, s3) = segmented_pack().await;
+        let ids: Vec<ObjectId> = objects.iter().map(EncodedObject::id).collect();
+        let index = store.index.lookup_index(&ids).await.unwrap();
+        assert_eq!(index.values().map(|e| e.pack).collect::<HashSet<_>>().len(), 1, "one pack");
+        let span = index.values().map(|e| e.off + u64::from(e.len)).max().unwrap();
+        assert!(span > 10 * SEGMENT, "{span}");
+
+        // One at a time, in an order unrelated to the layout: each segment
+        // is read about once (a gap between wanted segments is read too).
+        let (reader, reads) = counting(&store, &s3);
+        let mut order: Vec<usize> = (0..ids.len()).collect();
+        order.sort_by_key(|&i| (i * 7919) % ids.len());
+        for &i in &order {
+            assert_eq!(reader.get(&ids[i]).await.unwrap().as_ref(), Some(&objects[i]));
+        }
+        let segments = span.div_ceil(SEGMENT) as usize;
+        let n = reads.load(Ordering::SeqCst);
+        assert!(n <= segments, "{n} reads for {segments} segments of {} objects", ids.len());
+        // All held now: no further reads.
+        assert!(reader.get_many(&ids).await.unwrap().iter().all(Option::is_some));
+        assert_eq!(reads.load(Ordering::SeqCst), n);
+
+        // Concurrent callers wanting the same segments share the reads.
+        let (reader, reads) = counting(&store, &s3);
+        let got = futures::future::join_all(ids.chunks(3).map(|chunk| {
+            let reader = reader.clone();
+            async move { reader.get_many(chunk).await }
+        }))
+        .await;
+        for (chunk, got) in ids.chunks(3).zip(got) {
+            let got = got.unwrap();
+            assert!(
+                chunk
+                    .iter()
+                    .zip(&got)
+                    .all(|(id, g)| g.as_ref().map(EncodedObject::id) == Some(*id))
+            );
+        }
+        let n = reads.load(Ordering::SeqCst);
+        assert!(n <= segments, "{n} reads for {segments} segments");
+
+        // Without the cache every call reads for itself.
+        let (reader, reads) = counting(&store, &s3);
+        let reader = reader.with_segment_cache_bytes(0);
+        for &i in order.iter().take(20) {
+            assert_eq!(reader.get(&ids[i]).await.unwrap().as_ref(), Some(&objects[i]));
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 20);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres and s3: docker compose up -d"]
+    async fn the_segment_cache_serves_neighbours_and_stays_within_its_budget() {
+        let (objects, store, s3) = segmented_pack().await;
+        let ids: Vec<ObjectId> = objects.iter().map(EncodedObject::id).collect();
+        let index = store.index.lookup_index(&ids).await.unwrap();
+        // Read the first object: its segment (and nothing far away) is kept.
+        let reader = PackedS3Store::new(store.index.clone(), s3.clone());
+        assert!(reader.get(&ids[0]).await.unwrap().is_some());
+        let pack = index[&ids[0]].pack;
+        s3.delete_packs(&[pack]).await.unwrap();
+        let first = index[&ids[0]].off / SEGMENT;
+        let mut near = 0;
+        for (i, id) in ids.iter().enumerate() {
+            let e = index[id];
+            let segs = segments::segments_of(e.off, e.len.into());
+            if *segs.start() == first && *segs.end() == first {
+                assert_eq!(reader.get(id).await.unwrap().as_ref(), Some(&objects[i]));
+                near += 1;
+            } else if *segs.start() > first + segments::GAP_SEGMENTS + 1 {
+                assert!(reader.get(id).await.is_err(), "far objects need the (deleted) pack");
+            }
+        }
+        assert!(near > 1);
+
+        // A budget of two segments holds two segments at most.
+        let (objects, store, s3) = segmented_pack().await;
+        let ids: Vec<ObjectId> = objects.iter().map(EncodedObject::id).collect();
+        let reader = PackedS3Store::new(store.index.clone(), s3.clone())
+            .with_segment_cache_bytes(2 * SEGMENT as usize);
+        let got = reader.get_many(&ids).await.unwrap();
+        assert!(got.iter().zip(&objects).all(|(g, o)| g.as_ref() == Some(o)));
+        let seg = reader.segments.as_ref().unwrap();
+        let (held, bytes) = seg.state.lock().cache.usage();
+        assert!(held <= 2 && bytes <= 2 * SEGMENT as usize, "{held} segments, {bytes} bytes");
+        assert!(seg.state.lock().pending.is_empty());
     }
 }

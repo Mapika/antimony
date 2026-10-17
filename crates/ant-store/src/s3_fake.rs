@@ -36,6 +36,11 @@ pub(crate) enum Act {
     Status(u16),
     /// A full, correct response after a pause of this many milliseconds.
     Slow(u64),
+    /// A correct response from an object of this many bytes: the range is
+    /// cut at its end, and `Content-Range` names its size.
+    Sized(u64),
+    /// As `Sized`, but only half the body is sent before a clean close.
+    SizedTruncate(u64),
 }
 
 pub(crate) struct Fake {
@@ -129,7 +134,14 @@ async fn handle(mut stream: TcpStream, act: Act, load: Load) {
         let (a, b) = r.split_once('-')?;
         Some((a.trim().parse::<u64>().ok()?, b.trim().parse::<u64>().ok()?))
     });
-    let (start, len) = range.map_or((0, 0), |(a, b)| (a, b - a + 1));
+    let (start, mut len) = range.map_or((0, 0), |(a, b)| (a, b - a + 1));
+    let size = match act {
+        Act::Sized(n) | Act::SizedTruncate(n) => Some(n),
+        _ => None,
+    };
+    if let Some(n) = size {
+        len = len.min(n.saturating_sub(start));
+    }
     // Worked on until the response starts: the client holds its slot from
     // before connecting until the response is read, so this never counts more
     // requests than the client has in flight.
@@ -143,7 +155,17 @@ async fn handle(mut stream: TcpStream, act: Act, load: Load) {
     let header = |status: &str, extra: &str, len: usize| {
         format!("HTTP/1.1 {status}\r\nContent-Length: {len}\r\nConnection: close\r\n{extra}\r\n")
     };
+    let content_range = size.map_or(String::new(), |n| {
+        format!("Content-Range: bytes {start}-{}/{n}\r\n", start + len.max(1) - 1)
+    });
     match act {
+        Act::Sized(_) | Act::SizedTruncate(_) => {
+            let h = header("206 Partial Content", &content_range, body.len());
+            let _ = stream.write_all(h.as_bytes()).await;
+            let sent =
+                if matches!(act, Act::SizedTruncate(_)) { body.len() / 2 } else { body.len() };
+            let _ = stream.write_all(&body[..sent]).await;
+        }
         Act::Ok | Act::Slow(_) if is_get => {
             let h = header("206 Partial Content", "", body.len());
             let _ = stream.write_all(h.as_bytes()).await;
