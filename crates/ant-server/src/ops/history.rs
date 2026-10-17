@@ -4,7 +4,8 @@
 //! - `schedule_catch_up(b, ref, metrics)` runs `catch_up` in the background,
 //!   coalesced per ref, after every successful `Land` and every `UpdateRef`
 //!   to a new target (best effort: errors are logged; queries fall back, see
-//!   `log`).
+//!   `log`). On a ref that keeps moving, runs that indexed something are
+//!   at least `CATCH_UP_PACE` apart, so each indexes many lands in one write.
 //! - `ops::query::log_as` with a path: a rev naming a ref goes to
 //!   `lagging_path_log`, which reads that ref's watermark once — rev at or
 //!   behind it → index only; rev ahead of it (a busy ref between catch-ups)
@@ -93,6 +94,11 @@ use crate::metrics::Metrics;
 const INDEX_BATCH: usize = 1000;
 /// Nodes fetched per `first_parent_chain` call.
 const CHAIN_CHUNK: usize = 8192;
+/// Pause between background catch-ups of a ref that keeps moving: one
+/// catch-up per pause indexes everything landed meanwhile in one write
+/// (index rows of a path share pages), instead of one small write per land
+/// batch. Queries cover the lag (`lagging_path_log`).
+const CATCH_UP_PACE: std::time::Duration = std::time::Duration::from_millis(100);
 /// Attempts before `catch_up` gives up on a ref that keeps moving.
 const MAX_ROUNDS: usize = 4;
 /// Derived-data kind of [`Blame`] values (keyed by the last commit changing
@@ -313,16 +319,27 @@ pub fn schedule_catch_up(b: &Backend, ref_name: &str, metrics: Option<&Arc<Metri
     let metrics = metrics.cloned();
     tokio::spawn(async move {
         loop {
-            if let Err(error) = catch_up_observed(&b, &ref_name, metrics.as_deref()).await {
-                tracing::warn!(%error, ref_name, "history catch-up failed");
-            }
-            let mut running = crate::lock(&CATCH_UPS);
-            match running.get_mut(&key) {
-                Some(dirty) if *dirty => *dirty = false,
-                _ => {
-                    running.remove(&key);
-                    return;
+            let indexed = match catch_up_observed(&b, &ref_name, metrics.as_deref()).await {
+                Ok(n) => n,
+                Err(error) => {
+                    tracing::warn!(%error, ref_name, "history catch-up failed");
+                    0
                 }
+            };
+            {
+                let mut running = crate::lock(&CATCH_UPS);
+                match running.get_mut(&key) {
+                    Some(dirty) if *dirty => *dirty = false,
+                    _ => {
+                        running.remove(&key);
+                        return;
+                    }
+                }
+            }
+            if indexed > 0 {
+                // The ref keeps moving: let lands accumulate (see
+                // `CATCH_UP_PACE`); moves meanwhile mark it dirty again.
+                tokio::time::sleep(CATCH_UP_PACE).await;
             }
         }
     });

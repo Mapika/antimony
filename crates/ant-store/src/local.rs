@@ -365,6 +365,7 @@ impl LocalStore {
                 readers: options.readers,
                 cache_kib: options.cache_kib,
                 no_fsync: options.sync == LocalSync::Normal,
+                ..DbOptions::default()
             },
             feed.clone(),
             |conn| migrate::migrate(conn, migrate, &label).map(|_| ()),
@@ -765,12 +766,12 @@ impl RefLockRelease for LocalRefLock {
         kind: &str,
         derived: Vec<(Vec<u8>, Bytes)>,
     ) -> Result<CasOutcome> {
-        publish_in(&self.store, &self.name, expected, new, kind, derived, true).await
+        let job = publish_job(&self.name, expected, new, kind, derived);
+        self.store.db().write(true, job).await
     }
 
     /// The same transaction, answered at commit; the [`crate::Durability`]
-    /// is an empty durable write queued after it, which the syncer answers
-    /// only after an fsync that covers the publish.
+    /// resolves once an fsync covers it (the syncer's next).
     async fn publish_pipelined(
         &mut self,
         expected: Option<ObjectId>,
@@ -778,48 +779,44 @@ impl RefLockRelease for LocalRefLock {
         kind: &str,
         derived: Vec<(Vec<u8>, Bytes)>,
     ) -> Result<(CasOutcome, crate::Durability)> {
-        let out = publish_in(&self.store, &self.name, expected, new, kind, derived, false).await?;
-        let store = self.store.clone();
-        // Queued now, behind the publish: its group commits later.
-        let synced = tokio::spawn(async move { store.db().write(true, |_, _| Ok(())).await });
-        let durable: crate::Durability =
-            Box::pin(async move { synced.await.map_err(StoreError::backend)? });
+        let job = publish_job(&self.name, expected, new, kind, derived);
+        let (out, synced) = self.store.db().write_pipelined(job).await?;
+        let durable: crate::Durability = Box::pin(async move {
+            synced
+                .await
+                .map_err(|_| StoreError::InvalidArgument("local store syncer stopped".into()))?
+        });
         Ok((out, durable))
     }
 }
 
 /// The publish transaction of [`LocalRefLock`]: CAS plus derived rows; the
 /// ref move is announced once it is durable.
-async fn publish_in(
-    store: &LocalStore,
+fn publish_job(
     name: &str,
     expected: Option<ObjectId>,
     new: ObjectId,
     kind: &str,
     derived: Vec<(Vec<u8>, Bytes)>,
-    durable: bool,
-) -> Result<CasOutcome> {
+) -> impl FnOnce(&Connection, &mut Effects) -> Result<CasOutcome> + Send + 'static {
     let (name, kind) = (name.to_owned(), kind.to_owned());
-    store
-        .db()
-        .write(durable, move |c, fx| {
-            let actual = cas_in(c, &name, expected, Some(new))?;
-            if actual != expected {
-                return Ok(CasOutcome::Mismatch { actual });
-            }
-            insert_derived(c, &kind, &derived)?;
-            if expected != Some(new) {
-                fx.moves.push(RefMove {
-                    name,
-                    old: expected,
-                    new: Some(new),
-                    cause: MoveCause::Land,
-                    nonce: crate::feed::nonce(),
-                });
-            }
-            Ok(CasOutcome::Updated)
-        })
-        .await
+    move |c, fx| {
+        let actual = cas_in(c, &name, expected, Some(new))?;
+        if actual != expected {
+            return Ok(CasOutcome::Mismatch { actual });
+        }
+        insert_derived(c, &kind, &derived)?;
+        if expected != Some(new) {
+            fx.moves.push(RefMove {
+                name,
+                old: expected,
+                new: Some(new),
+                cause: MoveCause::Land,
+                nonce: crate::feed::nonce(),
+            });
+        }
+        Ok(CasOutcome::Updated)
+    }
 }
 
 #[async_trait]
