@@ -21,9 +21,11 @@
 //! # A run
 //!
 //! 1. **Mark.** The closure of the roots (commit → tree and parents, tree →
-//!    entries, gitlinks skipped), in memory; commit records give tree and
-//!    parents without reading the commit object. Rows written since the
-//!    mark began are marked again right before step 2. Ids the published
+//!    entries, gitlinks skipped), in memory (`crate::gcmark`, shared with
+//!    the Postgres collector): commit records, loaded with one scan, give
+//!    tree and parents without reading the commit object, and trees are
+//!    read level by level in history order. Rows written since the mark
+//!    began are marked again right before step 2. Ids the published
 //!    roots (refs, history, root kinds) reach but the store lacks are
 //!    reported as missing ([`GcReport::missing`]).
 //! 2. **Condemn.** Every id with a row written before the cutoff (`start -
@@ -101,10 +103,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ant_core::{EntryMode, ObjectId, ObjectKind};
+use ant_core::ObjectId;
+use async_trait::async_trait;
 
 use super::{Hidden, LocalStore, Sq, id_of, now_secs};
-use crate::{ObjectStore, Result, StoreError};
+use crate::gcmark::{self, CommitRecords, IdSet, Kind, MarkOptions, Record, RecordSource};
+use crate::{Result, StoreError};
 
 pub use crate::postgres::gc::{
     DEFAULT_COMMIT_KEYED_KINDS, DEFAULT_GRACE, DEFAULT_QUIESCE, DEFAULT_ROOT_KINDS, MIN_GRACE,
@@ -119,6 +123,9 @@ const MARGIN_SECS: i64 = 60;
 const REMARK_EVERY: Duration = Duration::from_secs(5);
 /// Pages freed per incremental-vacuum step (one short writer job each).
 const VACUUM_STEP_PAGES: u32 = 4096;
+/// Ids per object read while marking, at most, and reads in flight.
+const MARK_BATCH: usize = 500;
+const MARK_READS: usize = 32;
 
 /// Settings of one local collection run.
 #[derive(Debug, Clone)]
@@ -264,63 +271,13 @@ impl GcReport {
     }
 }
 
-const KIND_UNKNOWN: u8 = 0;
-const KIND_COMMIT: u8 = 1;
-const KIND_TREE: u8 = 2;
-const KIND_BLOB: u8 = 3;
-
-/// Child ids of a tree body (gitlinks skipped; unparsable modes count as
-/// blobs, so their targets stay).
-fn tree_children(body: &[u8], out: &mut Vec<(ObjectId, u8)>) -> Result<()> {
-    let malformed = || StoreError::InvalidArgument("gc: malformed tree object".into());
-    let mut rest = body;
-    while !rest.is_empty() {
-        let sp = rest.iter().position(|&b| b == b' ').ok_or_else(malformed)?;
-        let mode = &rest[..sp];
-        rest = &rest[sp + 1..];
-        let nul = rest.iter().position(|&b| b == 0).ok_or_else(malformed)?;
-        rest = &rest[nul + 1..];
-        if rest.len() < ObjectId::LEN {
-            return Err(malformed());
-        }
-        let id = ObjectId::from_bytes(&rest[..ObjectId::LEN])?;
-        rest = &rest[ObjectId::LEN..];
-        match EntryMode::from_octal(mode).map(EntryMode::class) {
-            Ok(EntryMode::Tree) => out.push((id, KIND_TREE)),
-            Ok(EntryMode::Gitlink) => {}
-            _ => out.push((id, KIND_BLOB)),
-        }
-    }
-    Ok(())
-}
-
-/// Tree and parent ids of a commit body.
-fn commit_children(body: &[u8], out: &mut Vec<(ObjectId, u8)>) -> Result<()> {
-    let malformed = || StoreError::InvalidArgument("gc: malformed commit object".into());
-    for line in body.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            break;
-        }
-        let (kind, hex) = if let Some(hex) = line.strip_prefix(b"tree ") {
-            (KIND_TREE, hex)
-        } else if let Some(hex) = line.strip_prefix(b"parent ") {
-            (KIND_COMMIT, hex)
-        } else {
-            continue;
-        };
-        let hex = std::str::from_utf8(hex).map_err(|_| malformed())?;
-        out.push((hex.parse::<ObjectId>().map_err(|_| malformed())?, kind));
-    }
-    Ok(())
-}
-
 /// Ids of the rows of `sql` (first column; `param` bound as `?1`).
 fn ids_of(
     c: &rusqlite::Connection,
     sql: &str,
     param: Option<i64>,
-    kind: u8,
-    out: &mut Vec<(ObjectId, u8)>,
+    kind: Kind,
+    out: &mut Vec<(ObjectId, Kind)>,
 ) -> Result<()> {
     let mut st = c.prepare(sql).sq()?;
     let mut rows = match param {
@@ -340,11 +297,11 @@ fn ids_of(
 /// watermarks and index, and the derived root kinds. Everything they reach
 /// was stored before they were written; the other roots are the rows
 /// written within the grace period ([`written_since`]).
-fn published_roots(c: &rusqlite::Connection, opts: &GcOptions) -> Result<Vec<(ObjectId, u8)>> {
+fn published_roots(c: &rusqlite::Connection, opts: &GcOptions) -> Result<Vec<(ObjectId, Kind)>> {
     let mut out = Vec::new();
-    ids_of(c, "SELECT target FROM refs", None, KIND_UNKNOWN, &mut out)?;
-    ids_of(c, "SELECT commit_id FROM history_watermark", None, KIND_COMMIT, &mut out)?;
-    ids_of(c, "SELECT DISTINCT commit_id FROM history", None, KIND_COMMIT, &mut out)?;
+    ids_of(c, "SELECT target FROM refs", None, Kind::Unknown, &mut out)?;
+    ids_of(c, "SELECT commit_id FROM history_watermark", None, Kind::Commit, &mut out)?;
+    ids_of(c, "SELECT DISTINCT commit_id FROM history", None, Kind::Commit, &mut out)?;
     let mut st = c.prepare("SELECT key, value FROM derived WHERE kind = ?1").sq()?;
     for kind in &opts.root_kinds {
         let mut rows = st.query([kind]).sq()?;
@@ -352,7 +309,7 @@ fn published_roots(c: &rusqlite::Connection, opts: &GcOptions) -> Result<Vec<(Ob
             for col in 0..2 {
                 let b: Vec<u8> = r.get(col).sq()?;
                 if b.len() == ObjectId::LEN {
-                    out.push((id_of(&b)?, KIND_UNKNOWN));
+                    out.push((id_of(&b)?, Kind::Unknown));
                 }
             }
         }
@@ -361,32 +318,72 @@ fn published_roots(c: &rusqlite::Connection, opts: &GcOptions) -> Result<Vec<(Ob
 }
 
 /// Ids of every row written at or after `since`.
-fn written_since(c: &rusqlite::Connection, since: i64) -> Result<Vec<(ObjectId, u8)>> {
+fn written_since(c: &rusqlite::Connection, since: i64) -> Result<Vec<(ObjectId, Kind)>> {
     let mut out = Vec::new();
     let p = Some(since);
-    ids_of(c, "SELECT id FROM commits WHERE written_at >= ?1", p, KIND_COMMIT, &mut out)?;
-    ids_of(c, "SELECT id FROM objects WHERE written_at >= ?1", p, KIND_UNKNOWN, &mut out)?;
-    ids_of(c, "SELECT id FROM object_index WHERE written_at >= ?1", p, KIND_UNKNOWN, &mut out)?;
+    ids_of(c, "SELECT id FROM commits WHERE written_at >= ?1", p, Kind::Commit, &mut out)?;
+    ids_of(c, "SELECT id FROM objects WHERE written_at >= ?1", p, Kind::Unknown, &mut out)?;
+    ids_of(c, "SELECT id FROM object_index WHERE written_at >= ?1", p, Kind::Unknown, &mut out)?;
     Ok(out)
 }
 
-/// Commit records of `ids` (tree, parents).
-fn recorded(
-    c: &rusqlite::Connection,
-    ids: &[ObjectId],
-) -> Result<HashMap<ObjectId, (ObjectId, Vec<ObjectId>)>> {
-    let mut st = c.prepare_cached("SELECT tree, parents FROM commits WHERE id = ?1").sq()?;
-    let mut out = HashMap::new();
-    for id in ids {
-        let row: Option<(Vec<u8>, Vec<u8>)> = rusqlite::OptionalExtension::optional(
-            st.query_row([id.as_bytes().as_slice()], |r| Ok((r.get(0)?, r.get(1)?))),
+/// A `commits` row (`tree, parents, generation, committer_time`) as a mark
+/// record.
+fn record_of(r: &rusqlite::Row<'_>) -> Result<Record> {
+    Ok(Record {
+        tree: id_of(&r.get::<_, Vec<u8>>(0).sq()?)?,
+        parents: super::decode_ids(&r.get::<_, Vec<u8>>(1).sq()?)?,
+        generation: r.get::<_, i64>(2).sq()? as u64,
+        committer_time: r.get(3).sq()?,
+    })
+}
+
+/// Commit records of those of `ids` that have one.
+fn recorded(c: &rusqlite::Connection, ids: &[ObjectId]) -> Result<Vec<(ObjectId, Record)>> {
+    let mut st = c
+        .prepare_cached(
+            "SELECT tree, parents, generation, committer_time FROM commits WHERE id = ?1",
         )
         .sq()?;
-        if let Some((tree, parents)) = row {
-            out.insert(*id, (id_of(&tree)?, super::decode_ids(&parents)?));
+    let mut out = Vec::new();
+    for id in ids {
+        let mut rows = st.query([id.as_bytes().as_slice()]).sq()?;
+        if let Some(r) = rows.next().sq()? {
+            out.push((*id, record_of(r)?));
         }
     }
     Ok(out)
+}
+
+/// Every commit record.
+fn all_records(c: &rusqlite::Connection) -> Result<CommitRecords> {
+    let mut st =
+        c.prepare("SELECT id, tree, parents, generation, committer_time FROM commits").sq()?;
+    let mut rows = st.query([]).sq()?;
+    let mut out = CommitRecords::default();
+    while let Some(r) = rows.next().sq()? {
+        let id = id_of(&r.get::<_, Vec<u8>>(0).sq()?)?;
+        let rec = Record {
+            tree: id_of(&r.get::<_, Vec<u8>>(1).sq()?)?,
+            parents: super::decode_ids(&r.get::<_, Vec<u8>>(2).sq()?)?,
+            generation: r.get::<_, i64>(3).sq()? as u64,
+            committer_time: r.get(4).sq()?,
+        };
+        out.insert(id, &rec);
+    }
+    Ok(out)
+}
+
+/// Commit records looked up in the store (commits recorded after the
+/// mark's scan).
+struct LocalRecords<'a>(&'a LocalStore);
+
+#[async_trait]
+impl RecordSource for LocalRecords<'_> {
+    async fn records(&self, ids: &[ObjectId]) -> Result<Vec<(ObjectId, Record)>> {
+        let ids = ids.to_vec();
+        self.0.db().read(move |c| recorded(c, &ids)).await
+    }
 }
 
 /// Rows of `sql` (`id, bytes`; `?1` the cutoff) whose id is not live.
@@ -394,7 +391,7 @@ fn dead(
     c: &rusqlite::Connection,
     sql: &str,
     cutoff: i64,
-    live: &HashSet<ObjectId>,
+    live: &IdSet,
 ) -> Result<Vec<(ObjectId, u64)>> {
     let mut st = c.prepare(sql).sq()?;
     let mut rows = st.query([cutoff]).sq()?;
@@ -444,87 +441,41 @@ impl Drop for HiddenGuard<'_> {
 /// The mark: live ids, and (from step 2 on) the condemned set they leave.
 struct Marker<'a> {
     store: &'a LocalStore,
-    objects: Arc<dyn ObjectStore>,
-    live: HashSet<ObjectId>,
+    mark: gcmark::Marker<'a>,
     hidden: Option<Arc<Hidden>>,
     batch: usize,
-    /// Count ids found missing (marking from published roots).
-    count_missing: bool,
-    missing: u64,
 }
 
 impl Marker<'_> {
-    /// Mark `ids` and everything they reach.
-    async fn mark(&mut self, ids: Vec<(ObjectId, u8)>) -> Result<()> {
-        let mut todo = self.admit(ids);
-        while !todo.is_empty() {
-            let take = todo.len().min(self.batch);
-            let level: Vec<(ObjectId, u8)> = todo.split_off(todo.len() - take);
-            let mut children: Vec<(ObjectId, u8)> = Vec::new();
-            let maybe_commits: Vec<ObjectId> = level
-                .iter()
-                .filter(|(_, k)| matches!(*k, KIND_COMMIT | KIND_UNKNOWN))
-                .map(|(id, _)| *id)
-                .collect();
-            let records = self.store.db().read(move |c| recorded(c, &maybe_commits)).await?;
-            for (tree, parents) in records.values() {
-                children.push((*tree, KIND_TREE));
-                children.extend(parents.iter().map(|p| (*p, KIND_COMMIT)));
-            }
-            let read: Vec<ObjectId> = level
-                .iter()
-                .filter(|(id, k)| *k != KIND_BLOB && !records.contains_key(id))
-                .map(|(id, _)| *id)
-                .collect();
-            if !read.is_empty() {
-                for (id, object) in read.iter().zip(self.objects.get_many(&read).await?) {
-                    let Some(object) = object else {
-                        // Reached from a published root: the store lost it.
-                        // Reached first from a recent row: that row's
-                        // writer may still be storing it (commit records
-                        // and their objects are written concurrently, and a
-                        // land batch builds on its predecessor's writes in
-                        // flight), or stopped before it did; nothing
-                        // published needs it.
-                        if self.count_missing {
-                            self.missing += 1;
-                            tracing::debug!(%id, "gc: reachable object missing");
-                        }
-                        continue;
-                    };
-                    match object.kind() {
-                        ObjectKind::Tree => tree_children(object.body(), &mut children)?,
-                        ObjectKind::Commit => commit_children(object.body(), &mut children)?,
-                        ObjectKind::Blob => {}
-                    }
+    /// Mark `ids` and everything they reach; newly marked ids leave the
+    /// condemned set before anything reads them.
+    async fn mark(&mut self, ids: Vec<(ObjectId, Kind)>, count_missing: bool) -> Result<()> {
+        let hidden = self.hidden.clone();
+        let mut admitted = |new: &[ObjectId]| {
+            if let Some(h) = &hidden
+                && !new.is_empty()
+            {
+                let mut condemned = h.ids.write();
+                for id in new {
+                    condemned.remove(id);
                 }
             }
-            todo.extend(self.admit(children));
-        }
-        Ok(())
+        };
+        self.mark.mark(ids, count_missing, &mut admitted).await
     }
 
-    /// The ids not marked yet, now marked; condemned ones leave the
-    /// condemned set before anything reads them.
-    fn admit(&mut self, ids: Vec<(ObjectId, u8)>) -> Vec<(ObjectId, u8)> {
-        let new: Vec<(ObjectId, u8)> =
-            ids.into_iter().filter(|(id, _)| self.live.insert(*id)).collect();
-        if let Some(h) = &self.hidden
-            && !new.is_empty()
-        {
-            let mut condemned = h.ids.write();
-            for (id, _) in &new {
-                condemned.remove(id);
-            }
-        }
-        new
+    fn live(&self) -> &IdSet {
+        &self.mark.live
     }
 
-    /// Mark the rows written since `since`.
+    /// Mark the rows written since `since`. Ids they reach that the store
+    /// lacks are not counted: a writer may still be storing them (commit
+    /// records and their objects are written concurrently, and a land
+    /// batch builds on its predecessor's writes in flight), or stopped
+    /// before it did; nothing published needs them.
     async fn mark_since(&mut self, since: i64) -> Result<()> {
         let recent = self.store.db().read(move |c| written_since(c, since)).await?;
-        self.count_missing = false;
-        self.mark(recent).await
+        self.mark(recent, false).await
     }
 
     /// Mark the roots: the published ones first (counting what they reach
@@ -538,10 +489,8 @@ impl Marker<'_> {
             .read(move |c| Ok((published_roots(c, &o)?, written_since(c, cutoff)?)))
             .await?;
         let n = published.len() + recent.len();
-        self.count_missing = true;
-        self.mark(published).await?;
-        self.count_missing = false;
-        self.mark(recent).await?;
+        self.mark(published, true).await?;
+        self.mark(recent, false).await?;
         Ok(n)
     }
 
@@ -584,25 +533,25 @@ async fn collect_run(
     let start = now_secs();
     let cutoff = start.saturating_sub(i64::try_from(opts.grace.as_secs()).unwrap_or(i64::MAX));
     let mut report = GcReport { dry_run: opts.dry_run, cutoff, ..GcReport::default() };
-    let mut m = Marker {
-        store,
-        objects: store.backend().objects,
-        live: HashSet::new(),
-        hidden: None,
-        batch: opts.batch.max(1),
-        count_missing: true,
-        missing: 0,
-    };
-
     // -- 1. mark
     progress("marking from the roots");
+    let objects = store.backend().objects;
+    let records = store.db().read(all_records).await?;
+    let lookup = LocalRecords(store);
+    let mark_opts = MarkOptions { batch: opts.batch.clamp(1, MARK_BATCH), reads: MARK_READS };
+    let mut m = Marker {
+        store,
+        mark: gcmark::Marker::new(objects.as_ref(), records, &lookup, mark_opts),
+        hidden: None,
+        batch: opts.batch.max(1),
+    };
     let roots = m.mark_roots(opts, cutoff).await?;
     progress(&format!("marked from {roots} roots"));
     m.mark_since(start - MARGIN_SECS).await?;
-    progress(&format!("marked {} live ids", m.live.len()));
+    progress(&format!("marked {} live ids", m.live().len()));
 
     // -- 2. condemn
-    let live = Arc::new(std::mem::take(&mut m.live));
+    let live = Arc::new(std::mem::take(&mut m.mark.live));
     let l = live.clone();
     let (small, large, commits) = store
         .db()
@@ -625,13 +574,13 @@ async fn collect_run(
             Ok((small, large, commits))
         })
         .await?;
-    m.live = Arc::try_unwrap(live).unwrap_or_else(|a| (*a).clone());
+    m.mark.live = Arc::try_unwrap(live).unwrap_or_else(|a| (*a).clone());
     let condemned: HashSet<ObjectId> =
         small.iter().chain(&large).chain(&commits).map(|(id, _)| *id).collect();
     report.condemned = condemned.len() as u64;
     if opts.dry_run {
-        report.live = m.live.len() as u64;
-        report.missing = m.missing;
+        report.live = m.live().len() as u64;
+        report.missing = m.mark.stats.missing;
         report.objects = small.len() as u64;
         report.object_bytes = small.iter().map(|(_, b)| b).sum();
         report.large_objects = large.len() as u64;
@@ -676,8 +625,8 @@ async fn collect_run(
         ));
     }
     drop(guard);
-    report.live = m.live.len() as u64;
-    report.missing = m.missing;
+    report.live = m.live().len() as u64;
+    report.missing = m.mark.stats.missing;
     drop(m);
 
     // -- 6. packs
@@ -790,8 +739,8 @@ fn sweep_batch(
     let ids: Vec<ObjectId> = {
         let condemned = hidden.ids.read();
         let mut targets = Vec::new();
-        ids_of(c, "SELECT target FROM refs", None, KIND_UNKNOWN, &mut targets)?;
-        ids_of(c, "SELECT commit_id FROM history_watermark", None, KIND_COMMIT, &mut targets)?;
+        ids_of(c, "SELECT target FROM refs", None, Kind::Unknown, &mut targets)?;
+        ids_of(c, "SELECT commit_id FROM history_watermark", None, Kind::Commit, &mut targets)?;
         if targets.iter().any(|(id, _)| condemned.contains(id)) {
             out.remark = true;
             return Ok(out);
@@ -1147,7 +1096,7 @@ pub(crate) async fn reclaim(store: &LocalStore, exclusive: bool) -> Result<bool>
 
 #[cfg(test)]
 mod tests {
-    use ant_core::{Commit, Signature};
+    use ant_core::{Commit, ObjectKind, Signature};
 
     use super::*;
     use crate::Backend;

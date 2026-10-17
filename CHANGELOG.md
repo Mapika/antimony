@@ -33,6 +33,23 @@ release of the 0.x series may change.
   - A `.gitignore` (or `.ant/ignore`) that is not UTF-8 no longer disables
     all of its rules: invalid bytes match nothing, the other lines apply.
 
+### Performance
+
+- `ant admin gc` (Postgres + S3 and local mode) marks reachable data in
+  memory: commit records are loaded with one scan, trees are read level by
+  level in history order with parallel reads, and every object is expanded
+  once; the mark set is written to Postgres with one `COPY`. The mark used
+  to insert every entry of every tree into a working table, one batch at a
+  time. Dry run on a kernel-shaped synthetic history (250,000 commits,
+  2.3M objects): mark 227 s → 7-9 s before `ant admin repack`, 354 s →
+  14-29 s after it; git/git: 102 s → 1.7 s. A kernel-size store (11.7M
+  objects), which did not finish marking in 30 minutes, should mark in
+  about 1-2 minutes. The marker needs about 90 bytes per reachable object
+  while it runs (about 1 GB for the Linux kernel's history).
+- The condemn step of a Postgres collection reads only each chunk's id
+  range of the mark set instead of all of it per chunk (synthetic history:
+  14 s → 4 s, 57 s → 3-6 s after repack).
+
 ## [0.4.0] - 2026-10-17
 
 Minor release for local mode: a local server can now be garbage-collected
