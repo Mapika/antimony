@@ -8,27 +8,15 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
-### Changed
+## [0.3.0] - 2026-10-17
 
-- **Network checkout**: a 96k-file, 1.4 GiB checkout over Hetzner's private
-  network now takes 2.9 s cold and 1.8 s warm, down from 14.4 s and 3.5 s.
-  The client uses 13 CPU-s instead of 43. Adding 30 ms of RTT costs about
-  0.1 s (`docs/scorecard/2026-10-16-hetzner-ccx43-ccx33-checkout.md`).
-  - `Workspace::materialize` overlaps the tree walk, the fetches and the
-    file writes. Subtrees are requested as soon as their parent is decoded,
-    with no wait between levels. Files come straight from the downloaded
-    tree bundles, without reading the cache back.
-  - HTTP requests are bounded per client (64), across all of its
-    concurrent calls.
-- **Client disk cache**: batches of 64 or more objects (tree bundles,
-  batched fetches) are stored as one pack plus an index under
-  `<cache>/packs/`, instead of one compressed file per object.
-  - Pack records are uncompressed: they use more disk and less CPU.
-  - Eviction removes whole packs, least recently used first. `ant cache
-    stats/gc` count the objects inside them.
-  - The change is additive and the cache format stays 1. Older binaries
-    ignore `packs/` and fetch what they miss
-    (`docs/compatibility.md`).
+Minor release: no Postgres schema or protocol changes; 0.2.x servers and
+clients interoperate. New: local mode (`ant serve --local`, SQLite + local
+packs, no Postgres/S3). New on-disk formats are additive (local data
+directory, client cache `packs/`). Final scorecard:
+[docs/scorecard/2026-10-17-v0.3.0.md](docs/scorecard/2026-10-17-v0.3.0.md)
+(27/27); upgrade test from v0.2.2: 83 passed, 0 failed; cloud numbers in
+`docs/scorecard/2026-10-16-hetzner-*`.
 
 ### Added
 
@@ -74,6 +62,58 @@ release of the 0.x series may change.
   path and the import for several builds, Postgres options and server
   arguments, with WAL, commit, CPU and Postgres wait-event statistics per
   run. `scripts/dev-services.sh pg-restart` and `ANT_PG_OPTS`.
+
+### Changed
+
+- **Network checkout**: a 96k-file, 1.4 GiB checkout over Hetzner's private
+  network now takes 2.9 s cold and 1.8 s warm, down from 14.4 s and 3.5 s.
+  The client uses 13 CPU-s instead of 43. Adding 30 ms of RTT costs about
+  0.1 s (`docs/scorecard/2026-10-16-hetzner-ccx43-ccx33-checkout.md`).
+  - `Workspace::materialize` overlaps the tree walk, the fetches and the
+    file writes. Subtrees are requested as soon as their parent is decoded,
+    with no wait between levels. Files come straight from the downloaded
+    tree bundles, without reading the cache back.
+  - HTTP requests are bounded per client (64), across all of its
+    concurrent calls.
+- **Client disk cache**: batches of 64 or more objects (tree bundles,
+  batched fetches) are stored as one pack plus an index under
+  `<cache>/packs/`, instead of one compressed file per object.
+  - Pack records are uncompressed: they use more disk and less CPU.
+  - Eviction removes whole packs, least recently used first. `ant cache
+    stats/gc` count the objects inside them.
+  - The change is additive and the cache format stays 1. Older binaries
+    ignore `packs/` and fetch what they miss
+    (`docs/compatibility.md`).
+
+- **Faster `git clone` from the git export.** A complete clone (no
+  `have`s, not shallow) keeps its pack entries as the cached *base pack* of
+  its filter (`blob:none` or none) in an unlinked temporary file; later
+  clones send the base verbatim followed by exactly the objects their wants
+  add beyond it (the pack holds the same objects as without the cache).
+  Clones arriving while a base is built wait for it. A new base is built
+  once clones reach more than 1/8 of its commits (plus 1,024) beyond it, or
+  when a tip of the base is no longer reachable. Bases live in the server
+  process only (no store or format change; at most one per filter). The
+  export still admits only principals that can read everything, so a base
+  never carries objects its requester could not get uncached (new ACL test).
+  git/git (Postgres + S3, local, `--single-branch`): blobless clone 6.0-7.8 s
+  -> 2.1 s (native `git daemon` 1.6 s), full clone 19-22 s -> 7.1 s (native
+  6.3 s); a clone 2,000 first-parent commits past the base: 3.0 s / 10 s.
+  Hetzner ccx43 + ccx33 (docs/scorecard/2026-10-16-hetzner-gitserve-clone.md):
+  blobless 29.5 -> 4.2 s (native 2.9 s), full 77.5 -> 11.4 s (native 8.9 s).
+- Smaller and cheaper export packs: trees try 40 delta bases instead of 10
+  (git/git blobless `.git` 92.4 -> 81.4 MB, native 61.1 MB; full 160 -> 149
+  MB, native 112 MB; most of the rest is SHA-256 ids); entries are zlib-
+  compressed through a small scratch buffer with the zlib-rs backend
+  (flate2's `compress_vec` zero-filled the multi-MB segment buffer on every
+  object: half the export's compression CPU); blobs are read 16 requests of
+  64 at a time (was 8 of 16). First (uncached) clone: blobless 6.8 s, full
+  12-17 s.
+- `scripts/vs-git.sh`: clones use `--single-branch` on both sides (the export
+  lists every ref of the store, `synth` and `storm*` included, which made
+  antimony's clones 3-7x larger than the daemon's single-branch repository);
+  `--phases "clone ..."` runs only the named timed phases and prepares only
+  what they need.
 
 ### Performance
 
@@ -142,38 +182,6 @@ Landing and import on cloud boxes (Hetzner ccx43 + ccx33, same-box A/B,
 - `history_bench_postgres` (benchmark test) no longer races the
   background catch-up its unindexed query starts: it waits for it and
   clears the index before timing a catch-up of the whole history.
-
-### Changed
-
-- **Faster `git clone` from the git export.** A complete clone (no
-  `have`s, not shallow) keeps its pack entries as the cached *base pack* of
-  its filter (`blob:none` or none) in an unlinked temporary file; later
-  clones send the base verbatim followed by exactly the objects their wants
-  add beyond it (the pack holds the same objects as without the cache).
-  Clones arriving while a base is built wait for it. A new base is built
-  once clones reach more than 1/8 of its commits (plus 1,024) beyond it, or
-  when a tip of the base is no longer reachable. Bases live in the server
-  process only (no store or format change; at most one per filter). The
-  export still admits only principals that can read everything, so a base
-  never carries objects its requester could not get uncached (new ACL test).
-  git/git (Postgres + S3, local, `--single-branch`): blobless clone 6.0-7.8 s
-  -> 2.1 s (native `git daemon` 1.6 s), full clone 19-22 s -> 7.1 s (native
-  6.3 s); a clone 2,000 first-parent commits past the base: 3.0 s / 10 s.
-  Hetzner ccx43 + ccx33 (docs/scorecard/2026-10-16-hetzner-gitserve-clone.md):
-  blobless 29.5 -> 4.2 s (native 2.9 s), full 77.5 -> 11.4 s (native 8.9 s).
-- Smaller and cheaper export packs: trees try 40 delta bases instead of 10
-  (git/git blobless `.git` 92.4 -> 81.4 MB, native 61.1 MB; full 160 -> 149
-  MB, native 112 MB; most of the rest is SHA-256 ids); entries are zlib-
-  compressed through a small scratch buffer with the zlib-rs backend
-  (flate2's `compress_vec` zero-filled the multi-MB segment buffer on every
-  object: half the export's compression CPU); blobs are read 16 requests of
-  64 at a time (was 8 of 16). First (uncached) clone: blobless 6.8 s, full
-  12-17 s.
-- `scripts/vs-git.sh`: clones use `--single-branch` on both sides (the export
-  lists every ref of the store, `synth` and `storm*` included, which made
-  antimony's clones 3-7x larger than the daemon's single-branch repository);
-  `--phases "clone ..."` runs only the named timed phases and prepares only
-  what they need.
 
 ## [0.2.2] - 2026-10-16
 
@@ -666,7 +674,8 @@ Also in this release:
   around restricted paths, and principals sharing a cache directory share
   what it holds.
 
-[Unreleased]: https://github.com/Mapika/antimony/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/Mapika/antimony/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Mapika/antimony/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/Mapika/antimony/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Mapika/antimony/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Mapika/antimony/compare/v0.1.0...v0.2.0

@@ -269,6 +269,13 @@ every flag; `ant completions <shell>` prints a completion script.
 
 ## Status
 
+- **v0.3.0** (2026-10-17): local mode (`ant serve --local`: one process,
+  SQLite and local pack files, no Postgres/S3, 16 MiB idle), faster landing
+  (64 agents 4,221 lands/s, p99 30 ms), import, network checkout (96k files:
+  2.4 s cold) and git-export clones (cached base packs), a production deploy
+  kit (`deploy/`) and TLS (`https://`) for clients. See
+  [CHANGELOG](CHANGELOG.md).
+- **v0.2.2** (2026-10-16): fixes (repack deadlock, cache dedup races).
 - **v0.2.0** (2026-10-16): storage format change (look-alike objects
   compressed together in S3 packs, whole-history repacking with
   `ant admin repack`; schema version 7, see the upgrade notes in
