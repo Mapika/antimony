@@ -13,7 +13,7 @@ Source control for agent fleets.
 
 [![ci](https://img.shields.io/github/actions/workflow/status/Mapika/antimony/ci.yml?branch=main&label=ci)](https://github.com/Mapika/antimony/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![release](https://img.shields.io/github/v/release/Mapika/antimony?include_prereleases&label=release)](https://github.com/Mapika/antimony/releases)
+[![release](https://img.shields.io/github/v/release/Mapika/antimony?sort=semver&display_name=tag&label=release)](https://github.com/Mapika/antimony/releases)
 
 When dozens of AI agents commit to one branch of a large monorepo, git's
 operating model gets in the way: every agent clones the whole repository,
