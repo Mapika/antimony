@@ -254,3 +254,37 @@ async fn rebased_changesets_match_tree_diff_including_directory_replacement() {
     let again = rebase(&b, original, rebased).await.unwrap().unwrap();
     assert!(b.meta.get_changeset(&again).await.unwrap().unwrap().is_empty());
 }
+
+/// A recorded commit whose object is gone (condemned by a collection while
+/// it was being landed) fails alone; the rest of its batch lands.
+#[tokio::test]
+async fn a_commit_whose_object_is_gone_fails_alone_in_its_batch() {
+    let mut b = Backend::in_memory();
+    let root = commit(&b, None, vec![write("f", "base\n")]).await.unwrap();
+    land(&b, "main", root).await.unwrap();
+    let a = commit(&b, Some(root), vec![write("a", "a")]).await.unwrap();
+    let c = commit(&b, Some(root), vec![write("c", "c")]).await.unwrap();
+    let tree = b.objects.read_commit(&root).await.unwrap().tree;
+    let gone = ObjectId([9; 32]);
+    let node = ant_store::CommitNode {
+        id: gone,
+        tree,
+        parents: vec![root],
+        generation: 2,
+        committer_time: 1,
+    };
+    b.meta.put_commit(node, vec![]).await.unwrap();
+    let _refs = GatedRefs::install(&mut b);
+    let outcomes = batch(&b, &[a, gone, c]).await;
+    assert_eq!(outcomes[0].as_ref().unwrap(), &LandOutcome::Landed { new_tip: a, rebased: false });
+    assert!(
+        matches!(outcomes[1], Err(OpError::Store(ant_store::StoreError::NotFound(id))) if id == gone),
+        "{:?}",
+        outcomes[1]
+    );
+    let LandOutcome::Landed { new_tip, rebased: true } = outcomes[2].as_ref().unwrap() else {
+        panic!("{:?}", outcomes[2])
+    };
+    assert_eq!(read(&b, *new_tip, "c").await.as_deref(), Some("c"));
+    assert_eq!(read(&b, *new_tip, "a").await.as_deref(), Some("a"));
+}

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind};
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use futures::stream::{self, FuturesUnordered, StreamExt};
 
 use crate::packed::cluster::{Builder, ClusterOptions, Record};
@@ -636,7 +637,9 @@ impl<T: Target> Run<'_, T> {
         let jobs = opts.jobs.max(1);
         let mut pending = segments.into_iter();
         let mut running = FuturesUnordered::new();
-        let mut uploads: FuturesUnordered<tokio::task::JoinHandle<Result<Switched>>> =
+        // Uploads are futures of this run, not tasks: a run that is dropped
+        // (cancelled) drops them with it, so nothing of it outlives it.
+        let mut uploads: FuturesUnordered<BoxFuture<'static, Result<Switched>>> =
             FuturesUnordered::new();
         // Delta frames and hot objects' plain frames go to separate packs.
         let mut bufs = [PackBuf::default(), PackBuf { hot: true, ..PackBuf::default() }];
@@ -692,7 +695,7 @@ impl<T: Target> Run<'_, T> {
                     }
                 }
                 Some(up) = uploads.next(), if !uploads.is_empty() => {
-                    match up.map_err(StoreError::backend).and_then(|r| r) {
+                    match up {
                         Ok(s) => self.tally(s),
                         Err(e) => {
                             failed = failed.or(Some(e));
@@ -711,7 +714,7 @@ impl<T: Target> Run<'_, T> {
             }
         }
         while let Some(up) = uploads.next().await {
-            match up.map_err(StoreError::backend).and_then(|r| r) {
+            match up {
                 Ok(s) => self.tally(s),
                 Err(e) => failed = failed.or(Some(e)),
             }
@@ -734,14 +737,14 @@ impl<T: Target> Run<'_, T> {
         &mut self,
         buf: &mut PackBuf,
         sources: Arc<HashMap<ObjectId, Source>>,
-    ) -> tokio::task::JoinHandle<Result<Switched>> {
+    ) -> BoxFuture<'static, Result<Switched>> {
         let hot = buf.hot;
         let body = std::mem::take(&mut buf.body);
         let entries = std::mem::take(&mut buf.entries);
         self.report.packs += 1;
         self.report.new_bytes += body.len() as u64;
         let (target, dry_run, batch) = (self.target.clone(), self.opts.dry_run, self.opts.batch);
-        tokio::spawn(async move {
+        Box::pin(async move {
             if dry_run {
                 return Ok(Switched { moved: entries.len() as u64, ..Switched::default() });
             }

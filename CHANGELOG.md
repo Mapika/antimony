@@ -49,6 +49,17 @@ release of the 0.x series may change.
   concurrently, and a land batch builds on its predecessor's writes in
   flight) as missing, and so did unreachable leftovers of a writer stopped
   midway. Nothing was deleted wrongly; only the report was off.
+- Local mode maintenance (unreleased): a collection or repack could delete
+  the pack file a writer had just started, while its first objects' index
+  rows were still being written, leaving those objects and every later
+  write to that pack unreadable (`pack <id>: No such file or directory`).
+  A pack is now deleted only after a check on the database writer thread
+  finds it unused (not being written to, no index rows), whatever the
+  run's earlier listing said. A cancelled repack (Postgres + S3 or local)
+  no longer leaves its pack writes running in the background, where they
+  kept the local store open and switched rows beside the next run.
+- Landing a changeset that a collection condemns meanwhile fails that land
+  alone with `NOT_FOUND`; it no longer aborts the other lands of its batch.
 
 ## [0.3.2] - 2026-10-17
 

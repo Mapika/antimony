@@ -337,3 +337,172 @@ async fn freed_pages_are_returned_while_serving() {
     assert_eq!(free_after, 0);
     assert!(pages_after < pages - free + 10, "{pages} {free} {pages_after}");
 }
+
+use crate::packed::PackFiles;
+
+fn big_blob(n: u8) -> EncodedObject {
+    EncodedObject::new(ant_core::ObjectKind::Blob, &vec![n; 100_000])
+}
+
+/// The interleaving behind packs deleted while still in use: maintenance
+/// seals the active pack and takes its snapshot of the pack files; right
+/// then a writer's next append starts a new pack, whose index rows are not
+/// written yet. That pack must survive the run (it is the active pack, and
+/// rows are about to point into it), and so must every write after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pack_a_writer_starts_during_the_maintenance_snapshot_is_kept() {
+    use packs::HookPoint;
+    let s = fresh();
+    let b = s.backend();
+    let first = big_blob(1);
+    b.objects.put_many(std::slice::from_ref(&first)).await.unwrap();
+    type Placed = ([u8; 16], u64);
+    let appended: Arc<Mutex<Option<Placed>>> = Arc::default();
+    {
+        let (packs, appended) = (s.packs().clone(), appended.clone());
+        s.packs().set_hook(Some(Arc::new(move |point| {
+            let mut at = appended.lock();
+            if point == HookPoint::Snapshot && at.is_none() {
+                *at = Some(packs.write_blocking(&[b"in flight".to_vec()]).unwrap()[0]);
+            }
+        })));
+    }
+    let (deleted, _) = gc::delete_unreferenced(&s).await.unwrap();
+    s.packs().set_hook(None);
+    let (pack, off) = appended.lock().expect("the hook ran");
+    assert!(s.packs().list().unwrap().contains_key(&pack), "the new active pack was deleted");
+    assert_eq!(deleted, 0);
+    // The writer's rows land (settled), later writes go to the same pack:
+    // everything reads back.
+    s.packs().settle(&[(pack, off)]);
+    let second = big_blob(2);
+    b.objects.put_many(std::slice::from_ref(&second)).await.unwrap();
+    let got = b.objects.get_many(&[first.id(), second.id()]).await.unwrap();
+    assert_eq!(got, vec![Some(first), Some(second)]);
+    assert_eq!(&s.packs().read_range(&pack, off, 9).await.unwrap()[..], b"in flight");
+}
+
+/// Whatever candidates a run chose from its (possibly stale) snapshots,
+/// `delete_packs` unlinks only packs that, checked on the writer thread,
+/// are not busy and have no index rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pack_deletion_rechecks_busy_packs_and_index_rows_on_the_writer_thread() {
+    let s = fresh();
+    let b = s.backend();
+    // A pack with rows (sealed: not active, not busy).
+    let kept = big_blob(3);
+    b.objects.put_many(std::slice::from_ref(&kept)).await.unwrap();
+    let indexed = s.lookup_index(&[kept.id()]).await.unwrap()[&kept.id()].pack;
+    s.packs().seal().unwrap();
+    // A pack holding an append whose rows are not written yet.
+    let pending = s.packs().write_blocking(&[b"pending".to_vec()]).unwrap()[0];
+    s.packs().seal().unwrap();
+    // The active pack.
+    let active = s.packs().write_blocking(&[b"active".to_vec()]).unwrap()[0];
+    s.packs().settle(&[active]);
+    // A pack maintenance is writing (pinned).
+    let mut w = s.packs().writer().unwrap();
+    w.append(b"maintenance").unwrap();
+    let (pinned, pin) = w.finish().unwrap();
+    let candidates = vec![indexed, pending.0, active.0, pinned];
+    assert_eq!(gc::delete_packs(&s, candidates.clone()).await.unwrap(), Vec::<[u8; 16]>::new());
+    let on_disk = s.packs().list().unwrap();
+    assert!(candidates.iter().all(|p| on_disk.contains_key(p)), "{on_disk:?}");
+    assert_eq!(b.objects.get_many(&[kept.id()]).await.unwrap(), vec![Some(kept)]);
+    // Settled, unpinned and sealed, the packs without rows go.
+    s.packs().settle(&[pending]);
+    drop(pin);
+    s.packs().seal().unwrap();
+    let mut deleted = gc::delete_packs(&s, candidates).await.unwrap();
+    deleted.sort_unstable();
+    let mut want = vec![pending.0, active.0, pinned];
+    want.sort_unstable();
+    assert_eq!(deleted, want);
+    let on_disk = s.packs().list().unwrap();
+    assert!(on_disk.contains_key(&indexed) && want.iter().all(|p| !on_disk.contains_key(p)));
+}
+
+/// Nothing of a repack outlives it: dropped while one of its packs is being
+/// written (on a blocking thread, held there by the hook), it leaves no task
+/// holding the store, which reopens at once; the pack it was writing ends
+/// up unreferenced and the next run deletes it. (Pack writes and switches
+/// used to run as detached tasks: the store stayed open, in use, and they
+/// switched rows beside the next maintenance run.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_repack_leaves_nothing_running() {
+    use crate::graph::{build_tree, write_commit};
+    use packs::HookPoint;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data");
+    let opts = LocalOptions::default();
+    let mut ids = Vec::new();
+    {
+        let s = LocalStore::open(&path, &opts).unwrap();
+        let b = s.backend();
+        let mut parents = Vec::new();
+        for i in 0..4u8 {
+            let big = vec![i; 50_000];
+            let tree = build_tree(b.objects.as_ref(), &[("big", &big[..]), ("small", &[i][..])])
+                .await
+                .unwrap();
+            let sig = ant_core::Signature {
+                name: b"t".to_vec(),
+                email: b"t@x".to_vec(),
+                time: 1,
+                tz_offset_minutes: 0,
+            };
+            let c = ant_core::Commit {
+                tree,
+                parents: std::mem::take(&mut parents),
+                author: sig.clone(),
+                committer: sig,
+                extra_headers: vec![],
+                message: format!("{i}\n").into_bytes(),
+            };
+            let id = write_commit(&b, &c).await.unwrap();
+            ids.extend([id, tree, ant_core::hash_object(ant_core::ObjectKind::Blob, &big)]);
+            parents.push(id);
+        }
+        b.refs.cas_ref("main", None, Some(parents[0])).await.unwrap();
+    }
+    let s = LocalStore::open(&path, &opts).unwrap();
+    let before = s.backend().objects.get_many(&ids).await.unwrap();
+    let (reached, wait_reached) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    {
+        let (gate, fired) = (gate.clone(), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let reached = Mutex::new(reached);
+        s.packs().set_hook(Some(Arc::new(move |point| {
+            if point == HookPoint::MaintenancePack
+                && !fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let _ = reached.lock().send(());
+                gate.wait();
+            }
+        })));
+    }
+    let o = repack::RepackOptions {
+        min_age: std::time::Duration::ZERO,
+        all: true,
+        ..repack::RepackOptions::default()
+    };
+    let wait = tokio::task::spawn_blocking(move || wait_reached.recv());
+    tokio::select! {
+        r = repack::repack(&s, &o, &|_| {}) => panic!("finished without writing a pack: {r:?}"),
+        r = wait => r.unwrap().unwrap(),
+    }
+    // The run is dropped; its pack write is still held by the hook.
+    s.packs().set_hook(None);
+    drop(s);
+    let reopened = LocalStore::open(&path, &opts);
+    gate.wait();
+    let s = reopened.expect("nothing of the dropped run holds the store");
+    assert_eq!(s.backend().objects.get_many(&ids).await.unwrap(), before);
+    let r = repack::repack(&s, &o, &|_| {}).await.unwrap();
+    assert!(r.finished, "{r:?}");
+    assert_eq!(s.backend().objects.get_many(&ids).await.unwrap(), before);
+    let indexed: HashSet<[u8; 16]> =
+        s.db().read(gc::pack_records).await.unwrap().into_keys().collect();
+    let on_disk: HashSet<[u8; 16]> = s.packs().list().unwrap().into_keys().collect();
+    assert_eq!(on_disk, indexed, "no unreferenced pack is left");
+}

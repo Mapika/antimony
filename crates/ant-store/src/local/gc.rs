@@ -81,7 +81,10 @@
 //! - *Packs.* A pack gains index rows only from writers that appended to it
 //!   (busy until their rows are written) or from maintenance, which runs
 //!   one at a time (collection or repack, `LocalStore::maintenance`). So a
-//!   pack that is not busy and has no rows stays that way. Compaction
+//!   pack that is not busy and has no rows stays that way; a pack is
+//!   unlinked only after both were checked in one job on the writer thread
+//!   ([`delete_packs`]; the full argument is `super::packs`, *Deletion*),
+//!   whatever the listing and rows a run read earlier said. Compaction
 //!   copies whole records (each self-contained: a frame or delta frame
 //!   decodes from its own bytes) to a new pack, fsyncs it, moves the index
 //!   rows still pointing at the old location in one durable transaction,
@@ -856,10 +859,14 @@ fn sweep_batch(
     Ok(out)
 }
 
-/// Pack files on disk with their sizes, and the busy ones. Index rows read
-/// after this returns show every row a pack that is not busy will ever have
-/// (module docs): writes queued before (a switch whose caller went away
-/// included) have committed, and busy packs are taken before the rows.
+/// Pack files on disk with their sizes, and the busy ones: the candidates
+/// of a run. Index rows read after this returns show every row a listed
+/// pack that is not busy will ever have (`super::packs`, *Busy packs*):
+/// writes queued before (a switch whose caller went away included) have
+/// committed, the files are listed before the busy set is taken (a pack is
+/// busy from before its file exists, so a listed pack created meanwhile is
+/// in the set), and the busy set before the rows are read. Deletions are
+/// checked again on the writer thread ([`delete_packs`]) all the same.
 /// `seal`: close the active pack first (the next write starts a new one),
 /// so that its dead bytes can go too; it stays busy while appends to it
 /// wait for their index rows.
@@ -873,9 +880,9 @@ async fn pack_files(
         if seal {
             f.seal()?;
         }
-        // Busy first: a pack not busy now gains no rows later (module docs).
-        let busy = f.busy();
-        Ok::<_, StoreError>((f.list()?, busy))
+        let listed = f.list()?;
+        f.hook(super::packs::HookPoint::Snapshot);
+        Ok::<_, StoreError>((listed, f.busy()))
     })
     .await
     .map_err(StoreError::backend)?
@@ -890,7 +897,7 @@ async fn packs(
 ) -> Result<()> {
     let (on_disk, busy) = pack_files(store, !opts.dry_run).await?;
     let records = store.db().read(pack_records).await?;
-    let mut doomed: Vec<[u8; 16]> = Vec::new();
+    let mut doomed: Vec<([u8; 16], u64)> = Vec::new();
     let mut compact: Vec<([u8; 16], PackRecords)> = Vec::new();
     for (pack, size) in &on_disk {
         let recs = records.get(pack);
@@ -905,9 +912,7 @@ async fn packs(
             continue;
         }
         let Some(recs) = recs else {
-            doomed.push(*pack);
-            report.packs += 1;
-            report.pack_bytes += size;
+            doomed.push((*pack, *size));
             continue;
         };
         if *size > 0 && dead as f64 / *size as f64 >= opts.compact_ratio {
@@ -923,9 +928,22 @@ async fn packs(
     }
     drop(records);
     if opts.dry_run {
+        report.packs += doomed.len() as u64;
+        report.pack_bytes += doomed.iter().map(|(_, size)| size).sum::<u64>();
         return Ok(());
     }
-    delete_packs(store, doomed).await?;
+    let deleted: HashSet<[u8; 16]> =
+        delete_packs(store, doomed.iter().map(|(p, _)| *p).collect()).await?.into_iter().collect();
+    for (pack, size) in doomed {
+        if deleted.contains(&pack) {
+            report.packs += 1;
+            report.pack_bytes += size;
+        } else {
+            // Gained rows or became busy since the snapshot: kept.
+            report.packs_kept += 1;
+            report.packs_kept_bytes += size;
+        }
+    }
     for (pack, recs) in compact {
         compact_pack(store, pack, recs).await?;
     }
@@ -936,25 +954,49 @@ async fn packs(
     Ok(())
 }
 
-/// Delete packs that have no index rows and are not busy, with their
-/// repack records.
-pub(crate) async fn delete_packs(store: &LocalStore, doomed: Vec<[u8; 16]>) -> Result<()> {
-    if doomed.is_empty() {
-        return Ok(());
+/// Delete those of `candidates` that, checked on the writer thread, are not
+/// busy and have no index rows, with their repack records; returns them.
+/// Candidates come from snapshots that may be stale; this check is the one
+/// the safety argument rests on (`super::packs`, *Deletion*): no row can
+/// point into a pack it passes, so the file is unlinked once it committed.
+pub(crate) async fn delete_packs(
+    store: &LocalStore,
+    candidates: Vec<[u8; 16]>,
+) -> Result<Vec<[u8; 16]>> {
+    if candidates.is_empty() {
+        return Ok(candidates);
     }
-    let d = doomed.clone();
-    store
+    let f = store.packs().clone();
+    let doomed = store
         .db()
         .write(true, move |c, _| {
-            let mut st = c.prepare_cached("DELETE FROM packs WHERE pack = ?1").sq()?;
-            for p in &d {
-                st.execute([p.as_slice()]).sq()?;
+            // Busy before the rows: a pack not busy now has had every row a
+            // writer will give it committed before this job (same thread).
+            let busy = f.busy();
+            let mut rows = c
+                .prepare_cached("SELECT EXISTS (SELECT 1 FROM object_index WHERE pack = ?1)")
+                .sq()?;
+            let mut del = c.prepare_cached("DELETE FROM packs WHERE pack = ?1").sq()?;
+            let mut doomed = Vec::with_capacity(candidates.len());
+            for p in candidates {
+                if busy.contains(&p)
+                    || rows.query_row([p.as_slice()], |r| r.get::<_, bool>(0)).sq()?
+                {
+                    continue;
+                }
+                del.execute([p.as_slice()]).sq()?;
+                doomed.push(p);
             }
-            Ok(())
+            Ok(doomed)
         })
         .await?;
+    if doomed.is_empty() {
+        return Ok(doomed);
+    }
     let f = store.packs().clone();
-    tokio::task::spawn_blocking(move || f.delete(&doomed)).await.map_err(StoreError::backend)?
+    tokio::task::spawn_blocking(move || f.delete(&doomed).map(|()| doomed))
+        .await
+        .map_err(StoreError::backend)?
 }
 
 /// Delete the packs no index row points into that are not busy (after a
@@ -973,11 +1015,14 @@ pub(crate) async fn delete_unreferenced(store: &LocalStore) -> Result<(u64, u64)
             Ok(out)
         })
         .await?;
-    let doomed: Vec<([u8; 16], u64)> =
-        on_disk.into_iter().filter(|(p, _)| !busy.contains(p) && !referenced.contains(p)).collect();
-    let (n, bytes) = (doomed.len() as u64, doomed.iter().map(|(_, s)| s).sum());
-    delete_packs(store, doomed.into_iter().map(|(p, _)| p).collect()).await?;
-    Ok((n, bytes))
+    let candidates: Vec<[u8; 16]> = on_disk
+        .keys()
+        .filter(|p| !busy.contains(*p) && !referenced.contains(*p))
+        .copied()
+        .collect();
+    let deleted = delete_packs(store, candidates).await?;
+    let bytes = deleted.iter().filter_map(|p| on_disk.get(p)).sum();
+    Ok((deleted.len() as u64, bytes))
 }
 
 /// Copy the live records of `pack` to a new pack, move their index rows,
@@ -1042,7 +1087,8 @@ pub(crate) async fn compact_pack(
     if n == 0 {
         doomed.push(new_pack);
     }
-    delete_packs(store, doomed).await
+    delete_packs(store, doomed).await?;
+    Ok(())
 }
 
 /// Return freed database pages to the file system (see the module docs).

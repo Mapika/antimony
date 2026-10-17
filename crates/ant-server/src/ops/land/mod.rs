@@ -130,11 +130,25 @@ pub async fn land_observed(
             .await
             .map_err(|_| OpError::Aborted("land worker stopped before replying".into()))?
     }
-    .await;
+    .await
+    .map_err(object_not_found);
     if let Some(m) = metrics {
         m.record_land(&result);
     }
     result
+}
+
+/// A land that finds an object of what it replays missing fails with
+/// `NotFound`, like a land of a commit never recorded. That happens without
+/// any damage when a collection condemns an unreachable changeset while it
+/// is being landed (its record read or cached just before, its objects
+/// hidden right after: `ant_store::local::gc`, `ant_store::postgres::gc`).
+/// The gRPC status was `NOT_FOUND` either way.
+fn object_not_found(e: OpError) -> OpError {
+    match e {
+        OpError::Store(ant_store::StoreError::NotFound(id)) => OpError::not_found_object(id),
+        e => e,
+    }
 }
 
 #[cfg(test)]

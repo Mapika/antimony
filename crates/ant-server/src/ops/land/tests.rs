@@ -160,3 +160,26 @@ async fn concurrent_lands_all_succeed() {
     let node = b.meta.get_commits(&[t]).await.unwrap().pop().unwrap().unwrap();
     assert_eq!(node.generation as usize, N + 1);
 }
+
+/// A recorded commit whose object is gone (a collection condemned the
+/// unreachable changeset while it was being landed) lands as `NotFound`.
+#[tokio::test]
+async fn landing_a_commit_whose_object_is_gone_is_not_found() {
+    let b = Backend::in_memory();
+    let base = commit(&b, None, vec![write("a", "a")]).await.unwrap();
+    land(&b, "main", base).await.unwrap();
+    let x = commit(&b, Some(base), vec![write("a", "A")]).await.unwrap();
+    land(&b, "main", x).await.unwrap();
+    let tree = b.objects.read_commit(&base).await.unwrap().tree;
+    let gone = ObjectId([9; 32]);
+    let node = ant_store::CommitNode {
+        id: gone,
+        tree,
+        parents: vec![base],
+        generation: 2,
+        committer_time: 1,
+    };
+    b.meta.put_commit(node, vec![]).await.unwrap();
+    let err = land(&b, "main", gone).await.unwrap_err();
+    assert!(matches!(err, OpError::NotFound(_)), "{err:?}");
+}

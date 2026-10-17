@@ -18,19 +18,46 @@
 //!   started. A new pack's directory entry is fsynced when it is created.
 //! - **Reads** are `pread`s on the blocking pool through a small cache of
 //!   open file handles.
-//! - **Busy packs.** The active pack, and every pack holding an append whose
-//!   index rows have not been written yet ([`PackFiles::settle`] reports
-//!   them written), may still gain index rows: maintenance (`local::gc`,
-//!   `local::repack`) never deletes or compacts them ([`LocalPacks::busy`]).
-//!   Any other pack gains rows only from maintenance itself (new appends go
-//!   to the active pack only, and a pack never becomes active again).
-//! - **Deletion.** Maintenance deletes a pack only after moving or deleting
-//!   every index row pointing into it, in a committed transaction. A reader
-//!   that looked up an old location just before may still open the file:
-//!   [`LocalPacks::delete`] bumps a generation counter before unlinking, and
-//!   `PackedStore` repeats a failed read with a fresh index lookup when the
-//!   generation changed meanwhile ([`PackFiles::generation`]). Handles
-//!   already open keep reading the unlinked file.
+//! - **Busy packs.** A pack is *busy* while it may still gain index rows
+//!   from anyone but the maintenance run deciding about it: while it is the
+//!   active pack, while it holds an append whose index rows have not been
+//!   written yet ([`PackFiles::settle`] reports them written), and while a
+//!   pack maintenance writes is pinned ([`PackWriter`], until its rows are
+//!   switched). Maintenance (`local::gc`, `local::repack`) never deletes or
+//!   compacts a busy pack ([`LocalPacks::busy`]). A pack is busy from
+//!   before its file exists: the active pack is created, appended to and
+//!   registered under the `pending` lock that [`LocalPacks::busy`] takes,
+//!   and a maintenance pack is pinned in the critical section that creates
+//!   it. A pack that is not busy never becomes busy again (pack ids are
+//!   random and new, and a pack never becomes active again), so no writer
+//!   appends to it any more.
+//! - **Deletion** (`local::gc::delete_packs`, the only caller of
+//!   [`LocalPacks::delete`]). Invariant: *a pack file is unlinked only if,
+//!   at one instant on the store's writer thread after the file was
+//!   created, the pack was not busy and no index row pointed into it.*
+//!   Both are checked in one job on the writer thread, which also deletes
+//!   the pack's `packs` row; the file is unlinked once that job committed.
+//!   No row can point into the pack afterwards: an ordinary writer writes
+//!   rows only into packs it appended to, and settles an append only after
+//!   its rows committed, so a pack that is not busy already has every row
+//!   a writer will ever give it, committed before the job ran on the same
+//!   thread, where the job sees it. Maintenance runs one at a time and
+//!   writes rows only into its own pinned packs; nothing of a run outlives
+//!   it but writer jobs it already queued (a cancelled run's row switch),
+//!   and those run before any job queued later, the check included.
+//!   Earlier snapshots (the directory listing, the busy set, the rows a run
+//!   read) can therefore be stale without harm: they only nominate
+//!   candidates. (They once decided
+//!   alone: a pack created by a writer between the busy snapshot and the
+//!   listing was listed, not busy and, its rows not written yet,
+//!   unreferenced, so it was deleted while it was the active pack: its
+//!   rows, and every append after them, pointed into a deleted file.)
+//! - **Readers.** A reader that looked up an old location just before its
+//!   rows moved may still open the file: [`LocalPacks::delete`] bumps a
+//!   generation counter before unlinking, and `PackedStore` repeats a
+//!   failed read with a fresh index lookup when the generation changed
+//!   meanwhile ([`PackFiles::generation`]). Handles already open keep
+//!   reading the unlinked file.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -93,6 +120,24 @@ struct Inner {
     pending: Mutex<HashMap<[u8; 16], HashSet<u64>>>,
     /// Bumped before every pack deletion (see the module docs).
     generation: AtomicU64,
+    /// Test hook, called at each [`HookPoint`].
+    #[cfg(test)]
+    hook: Mutex<Option<Hook>>,
+}
+
+/// A test hook (see [`LocalPacks::set_hook`]).
+#[cfg(test)]
+pub(crate) type Hook = Arc<dyn Fn(HookPoint) + Send + Sync>;
+
+/// Points of maintenance's pack handling where tests interleave other work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HookPoint {
+    /// Between listing the pack files and taking the busy set
+    /// (`local::gc::pack_files`).
+    Snapshot,
+    /// A pack of maintenance's own was created and pinned
+    /// ([`LocalPacks::writer`], on a blocking thread).
+    MaintenancePack,
 }
 
 /// Pack files under one directory (see the module docs). Clones share state.
@@ -128,6 +173,8 @@ impl LocalPacks {
                 open: Mutex::new(open),
                 pending: Mutex::new(HashMap::new()),
                 generation: AtomicU64::new(0),
+                #[cfg(test)]
+                hook: Mutex::new(None),
             }),
         })
     }
@@ -307,20 +354,40 @@ impl LocalPacks {
     /// returns is dropped, so that a later maintenance run cannot delete it
     /// before its rows are written.
     pub(crate) fn writer(&self) -> Result<PackWriter> {
+        // Created and pinned in one critical section of `pending`: busy
+        // from before its file exists (see the module docs).
+        let mut pending = self.inner.pending.lock();
         let a = self.create()?;
-        let pin = self.pin(a.id);
+        pending.entry(a.id).or_default().insert(PIN);
+        drop(pending);
+        let pin = PackPin { packs: self.clone(), pack: a.id };
+        self.hook(HookPoint::MaintenancePack);
         Ok(PackWriter { id: a.id, file: a.file, len: a.len, pin })
     }
 
-    /// Count `pack` as busy until the pin is dropped.
-    fn pin(&self, pack: [u8; 16]) -> PackPin {
-        self.inner.pending.lock().entry(pack).or_default().insert(PIN);
-        PackPin { packs: self.clone(), pack }
+    /// Install (or remove) the test hook.
+    #[cfg(test)]
+    pub(crate) fn set_hook(&self, hook: Option<Hook>) {
+        *self.inner.hook.lock() = hook;
     }
 
-    /// Delete packs no index row points into any more (blocking): the
-    /// generation moves first, so readers that looked up a location in one
-    /// of them retry (see the module docs).
+    /// Run the test hook at `point` (nothing outside tests).
+    #[cfg(test)]
+    pub(crate) fn hook(&self, point: HookPoint) {
+        let hook = self.inner.hook.lock().clone();
+        if let Some(h) = hook {
+            h(point);
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn hook(&self, _point: HookPoint) {}
+
+    /// Unlink packs (blocking) that `local::gc::delete_packs` found not busy
+    /// and without index rows on the writer thread (the invariant of the
+    /// module docs). The generation moves first, so readers that looked up
+    /// a location in one of them retry.
     pub(crate) fn delete(&self, ids: &[[u8; 16]]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
