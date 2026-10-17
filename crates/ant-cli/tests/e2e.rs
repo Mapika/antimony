@@ -739,8 +739,9 @@ fn cli_gc() {
     }
 }
 
-/// `ant admin gc` / `ant admin schema` on a local data directory, which one
-/// process uses at a time.
+/// `ant admin gc|repack` / `ant admin schema` on a local data directory,
+/// which one process uses at a time: offline, then through the server using
+/// it (its maintenance socket).
 #[test]
 fn cli_gc_and_schema_local() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -760,10 +761,15 @@ fn cli_gc_and_schema_local() {
         &r,
         "new directory",
         r.stdout(),
-        "version 0\nsupported 1\npending 1 baseline\n".into(),
+        "version 0\nsupported 2\npending 1 baseline\npending 2 repacked_packs\n".into(),
     );
     let r = run(&["admin", "schema", "--migrate"]).ok();
-    check_eq(&r, "migrated", r.stdout(), "migrated 1 baseline\nversion 1\nsupported 1\n".into());
+    check_eq(
+        &r,
+        "migrated",
+        r.stdout(),
+        "migrated 1 baseline\nmigrated 2 repacked_packs\nversion 2\nsupported 2\n".into(),
+    );
     let counts = "live 0\ncondemned 0\nobjects 0 0\nlarge-objects 0 0\ncommits 0\nchangesets 0 0\n";
     let r = run(&["admin", "gc", "--dry-run"]).ok();
     let out = r.stdout();
@@ -782,7 +788,13 @@ fn cli_gc_and_schema_local() {
     if !r.stderr().contains("grace period must be at least 24 hours") {
         r.fail("short grace refused");
     }
-    // While a server uses the directory, offline tools are refused.
+    let repacked = "done\ncommits 0\nreachable 0\nhot 0\nselected 0 0 0 0\nold-bytes 0 0\n\
+                    new-bytes 0\nsaved 0\npacks 0 0\ndeltas 0 0\nmoved 0 0\nskipped 0\n\
+                    packs-deleted 0 0\n";
+    let r = run(&["admin", "repack"]).ok();
+    check_eq(&r, "offline repack", r.stdout(), repacked.into());
+    // While a server uses the directory, gc and repack run in it; offline
+    // tools are refused.
     let (grpc, http) = free_ports();
     let _server = KillOnDrop(
         Command::new(env!("CARGO_BIN_EXE_ant"))
@@ -790,6 +802,8 @@ fn cli_gc_and_schema_local() {
             .arg(format!("127.0.0.1:{grpc}"))
             .arg("--http-listen")
             .arg(format!("127.0.0.1:{http}"))
+            // Scheduled collections as well (none due during the test).
+            .args(["--gc-interval", "1h", "--gc-grace", "2d"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -797,7 +811,18 @@ fn cli_gc_and_schema_local() {
             .expect("spawning ant serve"),
     );
     common::wait_until(|| std::net::TcpStream::connect(("127.0.0.1", grpc)).is_ok());
-    let r = run(&["admin", "gc"]).expect_code(1);
+    let r = run(&["admin", "gc", "--quiesce", "1s"]).ok();
+    let out = r.stdout();
+    if !out.starts_with("done\ncutoff ") || !out.contains(&tail) {
+        r.fail("gc through the server");
+    }
+    let r = run(&["admin", "gc", "--grace", "1h"]).expect_code(1);
+    if !r.stderr().contains("grace period must be at least 24 hours") {
+        r.fail("short grace refused by the server");
+    }
+    let r = run(&["admin", "repack", "--min-age", "0"]).ok();
+    check_eq(&r, "repack through the server", r.stdout(), repacked.into());
+    let r = run(&["admin", "schema", "--migrate"]).expect_code(1);
     if !r.stderr().contains("is in use by another process") {
         r.fail("directory in use");
     }
@@ -840,10 +865,15 @@ fn cli_local_start_status_stop() {
     check_eq(&r, "status", r.stdout(), format!("running {pid} {urls}"));
     let r = ctx.run(None, &start).ok();
     check_eq(&r, "second start", r.stdout(), format!("running {pid} {urls}"));
-    // The server answers, and the directory is busy for offline tools.
+    // The server answers and collects garbage on request; the directory is
+    // busy for offline tools.
     let r = ctx.run(None, &["ref", "list"]).ok();
     check_eq(&r, "no refs yet", r.stdout(), String::new());
-    let r = ctx.run(None, &["admin", "gc", "--local", &data_s]).expect_code(1);
+    let r = ctx.run(None, &["admin", "gc", "--local", &data_s]).ok();
+    if !r.stdout().starts_with("done\n") {
+        r.fail("gc in the server");
+    }
+    let r = ctx.run(None, &["admin", "schema", "--migrate", "--local", &data_s]).expect_code(1);
     if !r.stderr().contains("in use") {
         r.fail("busy directory");
     }

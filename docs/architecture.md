@@ -140,12 +140,19 @@ single machine running tens of agents without Postgres, S3 or Docker:
 - **Ref events** go on the in-process feed after the transaction commits;
   there are no other processes to notify.
 - **One process per directory** (a lock on `<dir>/LOCK`): the server, or an
-  offline tool (`ant import`, `ant admin gc`). Garbage collection is
-  therefore offline: mark from the same roots as the Postgres collector,
-  sweep at once (no condemn or quiesce phase), delete packs without live
-  records and compact mostly-dead ones (live records appended to a new pack,
-  index rows moved durably, then the old file deleted). There is no
-  `ant admin repack` in local mode.
+  offline tool (`ant import`, `ant admin gc`). Maintenance of a directory a
+  server uses runs inside that server: `ant admin gc|repack --local` ask
+  it over a Unix socket in the directory (`admin.sock`), and
+  `--gc-interval` schedules collections. Garbage collection follows the
+  Postgres collector's protocol (mark, condemn, quiesce, re-mark, sweep)
+  with the condemned set in memory: readers hide condemned rows older than
+  the cutoff, and every sweep batch runs on the writer thread, re-checking
+  write times and ref targets in its own transaction. Packs without live
+  records are deleted and mostly-dead ones compacted (live records copied
+  to a new pack, index rows moved durably, then the old file deleted; a
+  reader that looked up an old location retries). `ant admin repack
+  --local` runs the Postgres + S3 repack engine (delta frames across
+  history) on SQLite rows and local pack files.
 - **Small footprint.** A local server runs min(4, CPUs) async workers, at
   most 64 blocking threads, a 48 MiB server cache budget, 8 MiB SQLite page
   cache per connection and a 16 MiB decoded-frame cache; nothing polls while

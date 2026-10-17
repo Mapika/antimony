@@ -24,6 +24,8 @@ pub fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
         (n, 60_000)
     } else if let Some(n) = t.strip_suffix('h') {
         (n, 3_600_000)
+    } else if let Some(n) = t.strip_suffix('d') {
+        (n, 86_400_000)
     } else {
         (t, 1000)
     };

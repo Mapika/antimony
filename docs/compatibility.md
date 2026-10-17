@@ -137,18 +137,38 @@ binary's supported version is printed by `ant admin schema` as `supported <n>`.
 | part | marker | now |
 |---|---|---|
 | directory layout | `<dir>/FORMAT` (`1\n`) | 1 |
-| SQLite schema (`meta.db`) | `schema_version` table (`ant admin schema --local`) | 1 |
+| SQLite schema (`meta.db`) | `schema_version` table (`ant admin schema --local`) | 2 |
 | pack files (`packs/<32 hex>.pack`) | 8-byte header `ANTPACK1` | 1 |
+| maintenance socket (`admin.sock`) | text protocol, unknown settings refused | 1 |
 
 - The same rules as the Postgres schema apply: migrations are forward-only,
   recorded in `schema_version` and applied on open (or refused with
   `--no-migrate`); a binary refuses a newer `FORMAT` or schema version
   without touching the directory (`hint: upgrade ant`).
-- Pack records are the S3 pack records above (single-object records and
-  `AFR1` frames; local mode does not write `ADF1`), each self-contained;
-  a pack file has no index of its own (the SQLite `object_index` holds
-  `id -> (pack, offset, length)`). A new record format needs a new magic, a
-  new pack header version and a schema bump.
+- Migration 2 (`repacked_packs`, 0.4.0) creates the `packs` table: the
+  packs `ant admin repack --local` wrote (`repacked_at`, `hot`), so later
+  runs skip their objects and interrupted runs resume. Opening a directory
+  applies it; 0.3.x binaries then refuse the directory (`hint: upgrade
+  ant`), so downgrading needs a copy made before (or `ant admin
+  copy-local` by the newer binary into a store the older one reads).
+  Databases created by 0.4.0 use `auto_vacuum = INCREMENTAL` (freed pages
+  go back to the file system while serving); older ones switch at their
+  next offline `ant admin gc --local` or `repack --local` that vacuums.
+  Neither changes what older binaries can read.
+- Pack records are the S3 pack records above (single-object records,
+  `AFR1` frames and, since 0.4.0 written by `ant admin repack --local`,
+  `ADF1` delta frames), each self-contained; a pack file has no index of
+  its own (the SQLite `object_index` holds `id -> (pack, offset,
+  length)`). A new record format needs a new magic, a new pack header
+  version and a schema bump. Pack files are never modified once written:
+  compaction and repacking write new ones and delete the old ones when no
+  row points into them.
+- `admin.sock` exists while a server uses the directory (removed when it
+  stops; a stale one is replaced at start). Requests are one line, `gc` or
+  `repack` with `key=value` settings; answers are `progress <text>` lines,
+  then `report <key=value>...` or `error <message>`. A server refuses
+  settings it does not know, so an older server never silently ignores
+  one; new report keys may appear (clients ignore unknown keys).
 - Table names are an implementation detail, as for Postgres. Moving a local
   repository to Postgres + S3 goes through `ant admin copy-local` (see
   `docs/operations.md`, Local mode), not through the files.

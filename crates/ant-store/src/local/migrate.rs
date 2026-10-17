@@ -15,7 +15,7 @@ use rusqlite::Connection;
 use crate::{Result, StoreError};
 
 /// The schema version this binary reads and writes.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// One schema migration.
 pub struct Migration {
@@ -32,13 +32,32 @@ impl std::fmt::Debug for Migration {
 }
 
 /// All migrations, in order; `MIGRATIONS[i].version == i + 1`.
-pub static MIGRATIONS: [Migration; SCHEMA_VERSION as usize] = [Migration {
-    version: 1,
-    name: "baseline",
-    description: "small objects, packed-object index, refs, commit graph with log sequence, \
-                  changesets, derived data, history index (with write times for gc)",
-    sql: BASELINE,
-}];
+pub static MIGRATIONS: [Migration; SCHEMA_VERSION as usize] = [
+    Migration {
+        version: 1,
+        name: "baseline",
+        description: "small objects, packed-object index, refs, commit graph with log sequence, \
+                      changesets, derived data, history index (with write times for gc)",
+        sql: BASELINE,
+    },
+    Migration {
+        version: 2,
+        name: "repacked_packs",
+        description: "packs written by `ant admin repack` (when, and whether they hold hot \
+                      objects), so later runs skip their objects and resume",
+        sql: REPACKED_PACKS,
+    },
+];
+
+/// Pack files a repack wrote (`local::repack`): `repacked_at` Unix seconds;
+/// `hot` 1 for the plain frames of recent objects, 0 for delta packs.
+const REPACKED_PACKS: &str = "
+CREATE TABLE packs (
+    pack BLOB PRIMARY KEY,
+    repacked_at INTEGER NOT NULL,
+    hot INTEGER NOT NULL
+) WITHOUT ROWID;
+";
 
 /// Ids are 32-byte blobs; times are Unix seconds; `generation` and `seq`
 /// are positive integers below 2^63.
@@ -154,6 +173,21 @@ pub(crate) fn migrate(conn: &Connection, migrate: bool, dir: &str) -> Result<Vec
             found: current,
             required: SCHEMA_VERSION,
         });
+    }
+    if current == 0 {
+        // A new database: pages freed by garbage collection and repacking
+        // can be returned to the file system while serving (`PRAGMA
+        // incremental_vacuum`), which only works when set before the first
+        // table is created. Older databases switch at their next offline
+        // `VACUUM` (`local::gc`).
+        let empty: bool = conn
+            .query_row("SELECT NOT EXISTS (SELECT 1 FROM sqlite_master)", [], |r| r.get(0))
+            .map_err(sql)?;
+        if empty {
+            // `VACUUM` of the empty file applies it (setting WAL mode has
+            // already written the header).
+            conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM").map_err(sql)?;
+        }
     }
     conn.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
     let applied = (|| {

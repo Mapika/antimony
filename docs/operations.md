@@ -202,8 +202,10 @@ ant serve --local /data/ant            # the same in the foreground, any directo
   (`ant local start -- --policy policy.toml`).
 - **One process per directory.** The server holds `<dir>/LOCK`; offline
   tools fail at once while it runs (`is in use by another process`). Import
-  and collect with the server stopped:
-  `ant local stop && ant import <git-dir> --local && ant admin gc --local && ant local start`.
+  with the server stopped:
+  `ant local stop && ant import <git-dir> --local && ant local start`.
+  Maintenance (`ant admin gc --local`, `ant admin repack --local`) runs
+  in the server when one uses the directory (see below), else offline.
 - **Durability.** By default every acknowledged write and land is fsynced
   (group commit shares the fsyncs). `--local-sync normal` skips the fsync at
   commit: a crash of the server loses nothing, an OS crash or power loss can
@@ -213,14 +215,37 @@ ant serve --local /data/ant            # the same in the foreground, any directo
   (`--local-readers`) with 8 MiB page cache each, decoded-frame cache 16 MiB
   (`--local-frame-cache-mib`), concurrency limits of a 16-connection pool.
   Idle, the server does no work at all.
-- **Garbage collection** (`ant admin gc --local`) is offline and immediate
-  (no quiesce wait): same roots and grace period as on Postgres, then packs
-  without live objects are deleted, packs at least half dead are compacted,
-  and the database is vacuumed when a quarter of it is free. `ant admin
-  repack` is not available in local mode.
+- **Garbage collection** (`ant admin gc --local`), safe while the server
+  serves: with a server using the directory, the command asks it through
+  its maintenance socket (`<dir>/admin.sock`, mode 0600) and prints its
+  progress and report; with none, it opens the directory and runs offline.
+  Same roots, grace period (`--grace`, default `7d`) and protocol as on
+  Postgres: mark, condemn (the server reports condemned data as missing),
+  wait `--quiesce` (default `30m`; offline runs skip it), mark again,
+  delete in small durable transactions. Then packs without live objects
+  are deleted and packs at least half dead are compacted (live records
+  copied to a new pack, index rows moved, old file deleted; readers never
+  miss an object), and freed database pages go back to the file system
+  (`PRAGMA incremental_vacuum` while serving; offline a `VACUUM` when a
+  quarter of the file is free). One collection or repack runs at a time;
+  a second waits. Ctrl-C cancels a run (nothing stays condemned); so does
+  stopping the server, and the next run starts over. Or let the server
+  collect on a schedule: `ant serve --local --gc-interval 1d` (with
+  `--gc-grace`, default `7d`, and `--gc-quiesce`, default `30m`; the first
+  run one interval after start; results in the server log).
+- **Repacking** (`ant admin repack --local [--min-age 1d] [--all] ...`):
+  the Postgres + S3 repack (see the operator guide, Repacking) on the local
+  store, through the server or offline like `gc`: cold objects, small ones
+  from SQLite included, become delta frames across history; packs whose
+  rows all moved are deleted at the end of the run (stdout adds
+  `packs-deleted <count> <bytes>`). Interrupted runs resume. git/git in
+  local mode: 941 MiB after the import, 223 MiB after a repack (operator
+  guide, Repacking, Local mode).
 - **Backups.** Stop the server (or use SQLite's `.backup` on `meta.db`) and
-  copy the directory; pack files are append-only and never rewritten except
-  by `ant admin gc --local`.
+  copy the directory; pack files are append-only and only rewritten (into
+  new files) by `ant admin gc --local` and `ant admin repack --local`,
+  which delete packs once no row points into them: with `.backup` of a
+  running server, copy the pack files while neither runs.
 - **Moving to Postgres + S3** (or to another directory): stop the server
   and copy the directory into the new stores, then serve those:
 

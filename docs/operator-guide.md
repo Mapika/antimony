@@ -339,6 +339,34 @@ Reads (fresh server, cold client): checkout of the tip 0.34 → 0.28 s, of a
 Memory: about 100 bytes per object for the walk, plus per job a read batch
 (16 MiB), a delta window (at most 24 MiB) and a record.
 
+### Local mode
+
+`ant admin gc --local` and `ant admin repack --local` take the same flags.
+While `ant serve --local` uses the directory they run inside the server
+(the command connects to `<dir>/admin.sock` and relays progress); with no
+server they open the directory themselves (offline: a collection then
+skips the quiesce wait, and both end with a `VACUUM` when worth it). In
+the server, maintenance runs on threads of its own and reads through
+SQLite connections of its own, one collection or repack at a time. The
+collector's condemned set lives in memory: cancelling a run (Ctrl-C) or
+restarting the server drops it, and the next run starts over. Packs a
+collection finds mostly dead are compacted, and those a repack moved every
+row out of are deleted when it ends; freed SQLite pages are returned while
+serving (databases created by 0.4.0; older ones after their first offline
+run that vacuums). `ant serve --local --gc-interval 1d` collects on a
+schedule.
+
+Measured on git/git (82k commits, 20 cores) imported in local mode (9 s):
+941 MiB (SQLite 221 MiB, WAL 64 MiB, packs 656 MiB). An offline
+`ant admin repack --local --min-age 0` takes 40-60 s, 110-120 CPU-seconds
+and 1.15 GB peak RSS and leaves 223 MiB (SQLite 138 MiB, packs 84 MiB),
+against 298 MiB for `git gc` and 94 MiB for `git gc --aggressive`; a second
+run finds nothing to do in 5 s. Online, on the same import with a fleet of
+16 agents landing: the repack took 80-100 s and the collection's mark of
+700-870k objects 10-13 s. Lands during the repack: 339/s, p99 133 ms
+(adjacent run without maintenance: 505/s, p99 38 ms); during collections
+the fleet's rate stayed within the run-to-run noise of that machine.
+
 
 ### Client cache
 

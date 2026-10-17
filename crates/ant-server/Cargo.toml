@@ -43,3 +43,4 @@ tempfile.workspace = true
 sqlx.workspace = true
 aws-sdk-s3.workspace = true
 zstd.workspace = true
+rusqlite.workspace = true

@@ -154,6 +154,15 @@ pub trait PackFiles: Clone + Send + Sync + 'static {
     async fn has_unpacked(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {
         Ok(vec![false; ids.len()])
     }
+    /// The index rows of these bodies (as [`Self::write_packs`] placed
+    /// them) are written: local packs stop counting them as pending.
+    fn settle(&self, _placed: &[([u8; 16], u64)]) {}
+    /// Changes whenever a pack is deleted (local packs, `crate::local`): a
+    /// read that fails after it changed may have looked up a location the
+    /// deletion moved, and is repeated with a fresh index lookup.
+    fn generation(&self) -> u64 {
+        0
+    }
 }
 
 #[async_trait]
@@ -732,12 +741,13 @@ fn encode_task(
     })
 }
 
-#[async_trait]
-impl<I: PackIndex, F: PackFiles> ObjectStore for PackedStore<I, F> {
-    async fn get_many(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
+/// Reads of a [`PackedStore`] repeated after packs were deleted under them
+/// ([`PackFiles::generation`]), at most.
+const MOVED_RETRIES: usize = 8;
+
+impl<I: PackIndex, F: PackFiles> PackedStore<I, F> {
+    /// One attempt of `get_many`: an index lookup, then the reads.
+    async fn get_many_once(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
         let index = self.index.lookup_index(ids).await?;
         let mut wanted: HashSet<ObjectId> = HashSet::new();
         let found: Vec<IndexEntry> = ids
@@ -811,6 +821,26 @@ impl<I: PackIndex, F: PackFiles> ObjectStore for PackedStore<I, F> {
             }
         }
         Ok(ids.iter().map(|id| got.get(id).cloned()).collect())
+    }
+}
+
+#[async_trait]
+impl<I: PackIndex, F: PackFiles> ObjectStore for PackedStore<I, F> {
+    async fn get_many(&self, ids: &[ObjectId]) -> Result<Vec<Option<EncodedObject>>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut attempt = 0;
+        loop {
+            let generation = self.files.generation();
+            match self.get_many_once(ids).await {
+                Err(e) if attempt < MOVED_RETRIES && self.files.generation() != generation => {
+                    tracing::debug!(error = %e, "pack deleted during a read: looking up again");
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
     }
 
     async fn put_many(&self, objects: &[EncodedObject]) -> Result<()> {
@@ -888,7 +918,7 @@ impl<I: PackIndex, F: PackFiles> ObjectStore for PackedStore<I, F> {
             packs.into_iter().map(|p| (p.body, p.entries)).unzip();
         let placed = self.files.write_packs(bodies).await?;
         let mut entries: Vec<IndexEntry> = Vec::new();
-        for ((pack, base), layout) in placed.into_iter().zip(layouts) {
+        for ((pack, base), layout) in placed.iter().copied().zip(layouts) {
             entries.extend(layout.into_iter().map(|(id, off, len, share)| IndexEntry {
                 id,
                 pack,
@@ -897,7 +927,9 @@ impl<I: PackIndex, F: PackFiles> ObjectStore for PackedStore<I, F> {
                 share,
             }));
         }
-        self.index.index_objects(&entries).await
+        self.index.index_objects(&entries).await?;
+        self.files.settle(&placed);
+        Ok(())
     }
 
     async fn has_many(&self, ids: &[ObjectId]) -> Result<Vec<bool>> {

@@ -203,13 +203,14 @@
 //!       `packs-kept <count> <bytes> <dead-bytes> <dead-percent>%`. Dry runs
 //!       report what a run would delete. `--abort`: `aborted` or
 //!       `nothing to abort`. A grace period under 1d: exit 1.
-//!       With `--local [<dir>]` (offline: the directory must not be in use,
-//!       else exit 1): first line `dry-run` or `done`, the same lines as
-//!       above (`condemned` = ids deleted; `legacy-changes` and `kept` are
-//!       0) plus `packs <count> <bytes>`, `packs-kept ...` as with S3,
-//!       `packs-compacted <count> <bytes-before> <bytes-after>` and, except
-//!       for dry runs, `vacuumed yes|no`. `--quiesce` and `--max-batches`
-//!       are ignored; `--abort`: exit 1.
+//!       With `--local [<dir>]`: run by the server using the directory
+//!       (through its maintenance socket; progress relayed) or, with none,
+//!       offline (no quiesce wait); another offline tool holding the
+//!       directory: exit 1. First line `dry-run` or `done`, the same lines
+//!       as above (`legacy-changes` is 0) plus `packs <count> <bytes>`,
+//!       `packs-kept ...` as with S3, `packs-compacted <count>
+//!       <bytes-before> <bytes-after>` and, except for dry runs, `vacuumed
+//!       yes|no`. `--max-batches` is ignored; `--abort`: exit 1.
 //!   ant admin copy-local [--from <dir>] <store flags>
 //!       Copies a local data directory (offline: not in use by a server,
 //!       else exit 1; `<dir>` defaults like `--local`) into the stores of
@@ -222,16 +223,21 @@
 //!   ant admin repack [--dry-run] [--min-age 1d] [--keep-recent 100] [--all] [--no-small]
 //!       [--window 10] [--depth 16] [--record-bytes 2097152] [--level 19] [--jobs N]
 //!       [--max-packs N] <store flags>
-//!       Rewrite cold objects as delta frames (Postgres + S3 stores; see
-//!       `ant_store::postgres::repack`). Progress on stderr (`repack: ...`).
+//!       Rewrite cold objects as delta frames (Postgres + S3 stores, see
+//!       `ant_store::postgres::repack`; or `--local [<dir>]`, through the
+//!       server using the directory like `admin gc`, see
+//!       `ant_store::local::repack`). Progress on stderr (`repack: ...`).
 //!       stdout: first line `dry-run`, `done` or `stopped` (resumable: run
 //!       again); then `commits <n>`, `reachable <n>`, `hot <n>`,
 //!       `selected <cold> <hot> <other> <from-postgres>`,
 //!       `old-bytes <s3> <postgres>`, `new-bytes <n>`, `saved <bytes>` (may
 //!       be negative), `packs <packs> <records>`, `deltas <n> <max-depth>`,
-//!       `moved <n> <from-postgres>`, `skipped <n>`. Dry runs report what a
-//!       run would write. Another repack of the schema running, or no S3
-//!       store: exit 1.
+//!       `moved <n> <from-postgres>`, `skipped <n>`; local stores (not dry
+//!       runs) add `packs-deleted <count> <bytes>` (old packs no row points
+//!       into any more), and their `<postgres>` columns count SQLite rows.
+//!       Dry runs report what a run would write. Another repack of the
+//!       schema running, or no S3 store: exit 1 (a local repack waits for
+//!       the running one).
 //!
 //!   ant local start [--dir <dir>] [--grpc-listen 127.0.0.1:7420]
 //!       [--http-listen 127.0.0.1:7421] [-- <ant serve flags>...]

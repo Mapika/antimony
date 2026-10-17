@@ -18,8 +18,21 @@
 //!   started. A new pack's directory entry is fsynced when it is created.
 //! - **Reads** are `pread`s on the blocking pool through a small cache of
 //!   open file handles.
+//! - **Busy packs.** The active pack, and every pack holding an append whose
+//!   index rows have not been written yet ([`PackFiles::settle`] reports
+//!   them written), may still gain index rows: maintenance (`local::gc`,
+//!   `local::repack`) never deletes or compacts them ([`LocalPacks::busy`]).
+//!   Any other pack gains rows only from maintenance itself (new appends go
+//!   to the active pack only, and a pack never becomes active again).
+//! - **Deletion.** Maintenance deletes a pack only after moving or deleting
+//!   every index row pointing into it, in a committed transaction. A reader
+//!   that looked up an old location just before may still open the file:
+//!   [`LocalPacks::delete`] bumps a generation counter before unlinking, and
+//!   `PackedStore` repeats a failed read with a fresh index lookup when the
+//!   generation changed meanwhile ([`PackFiles::generation`]). Handles
+//!   already open keep reading the unlinked file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -75,6 +88,11 @@ struct Inner {
     /// Appends `<=` this are durable.
     synced: AtomicU64,
     open: Mutex<lru::LruCache<[u8; 16], Arc<File>>>,
+    /// Appends (pack, offset of the body) whose index rows are not known to
+    /// be written yet.
+    pending: Mutex<HashMap<[u8; 16], HashSet<u64>>>,
+    /// Bumped before every pack deletion (see the module docs).
+    generation: AtomicU64,
 }
 
 /// Pack files under one directory (see the module docs). Clones share state.
@@ -108,6 +126,8 @@ impl LocalPacks {
                 syncing: Mutex::new(()),
                 synced: AtomicU64::new(0),
                 open: Mutex::new(open),
+                pending: Mutex::new(HashMap::new()),
+                generation: AtomicU64::new(0),
             }),
         })
     }
@@ -253,11 +273,109 @@ impl LocalPacks {
         Ok(buf)
     }
 
-    /// Append and sync (blocking).
+    /// Append and sync (blocking). The appends count as pending until
+    /// [`PackFiles::settle`] reports their index rows written.
     pub(crate) fn write_blocking(&self, bodies: &[Vec<u8>]) -> Result<Vec<([u8; 16], u64)>> {
-        let (placed, seq) = self.append(bodies)?;
+        let (placed, seq) = {
+            // Registered before the bytes exist anywhere a scan could see
+            // them: a pack is busy from its first append on.
+            let mut pending = self.inner.pending.lock();
+            let (placed, seq) = self.append(bodies)?;
+            for (pack, off) in &placed {
+                pending.entry(*pack).or_default().insert(*off);
+            }
+            (placed, seq)
+        };
         self.sync_upto(seq)?;
         Ok(placed)
+    }
+
+    /// Packs that may still gain index rows from writers: the active pack
+    /// and those holding pending appends (see the module docs).
+    pub(crate) fn busy(&self) -> HashSet<[u8; 16]> {
+        let pending = self.inner.pending.lock();
+        let mut out: HashSet<[u8; 16]> =
+            pending.iter().filter(|(_, offs)| !offs.is_empty()).map(|(p, _)| *p).collect();
+        if let Some(a) = &self.inner.active.lock().0 {
+            out.insert(a.id);
+        }
+        out
+    }
+
+    /// Start a new pack of maintenance's own (blocking): never the active
+    /// pack; busy (pinned) until the [`PackPin`] that [`PackWriter::finish`]
+    /// returns is dropped, so that a later maintenance run cannot delete it
+    /// before its rows are written.
+    pub(crate) fn writer(&self) -> Result<PackWriter> {
+        let a = self.create()?;
+        let pin = self.pin(a.id);
+        Ok(PackWriter { id: a.id, file: a.file, len: a.len, pin })
+    }
+
+    /// Count `pack` as busy until the pin is dropped.
+    fn pin(&self, pack: [u8; 16]) -> PackPin {
+        self.inner.pending.lock().entry(pack).or_default().insert(PIN);
+        PackPin { packs: self.clone(), pack }
+    }
+
+    /// Delete packs no index row points into any more (blocking): the
+    /// generation moves first, so readers that looked up a location in one
+    /// of them retry (see the module docs).
+    pub(crate) fn delete(&self, ids: &[[u8; 16]]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.inner.generation.fetch_add(1, Ordering::SeqCst);
+        self.forget(ids);
+        for pack in ids {
+            match std::fs::remove_file(self.path_of(pack)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io(e)),
+            }
+        }
+        sync_dir(&self.inner.dir).map_err(io)
+    }
+}
+
+/// The pending "offset" a pin registers (never a real append's offset).
+const PIN: u64 = u64::MAX;
+
+/// Keeps a pack busy (see [`LocalPacks::writer`]).
+pub(crate) struct PackPin {
+    packs: LocalPacks,
+    pack: [u8; 16],
+}
+
+impl Drop for PackPin {
+    fn drop(&mut self) {
+        self.packs.settle(&[(self.pack, PIN)]);
+    }
+}
+
+/// A pack written by maintenance (compaction, repacking): appended to, then
+/// made durable by [`PackWriter::finish`] before any index row points into it.
+pub(crate) struct PackWriter {
+    id: [u8; 16],
+    file: Arc<File>,
+    len: u64,
+    pin: PackPin,
+}
+
+impl PackWriter {
+    /// Append `body` (blocking); returns its offset.
+    pub(crate) fn append(&mut self, body: &[u8]) -> Result<u64> {
+        let at = self.len;
+        self.file.write_all_at(body, at).map_err(io)?;
+        self.len += body.len() as u64;
+        Ok(at)
+    }
+
+    /// Make the pack durable (blocking); it stays busy while the returned
+    /// pin lives.
+    pub(crate) fn finish(self) -> Result<([u8; 16], PackPin)> {
+        self.file.sync_data().map_err(io)?;
+        Ok((self.id, self.pin))
     }
 }
 
@@ -280,6 +398,22 @@ impl PackFiles for LocalPacks {
             .await
             .map_err(StoreError::backend)??;
         Ok(Bytes::from(body))
+    }
+
+    fn settle(&self, placed: &[([u8; 16], u64)]) {
+        let mut pending = self.inner.pending.lock();
+        for (pack, off) in placed {
+            if let Some(offs) = pending.get_mut(pack) {
+                offs.remove(off);
+                if offs.is_empty() {
+                    pending.remove(pack);
+                }
+            }
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.inner.generation.load(Ordering::SeqCst)
     }
 }
 

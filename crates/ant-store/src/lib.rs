@@ -17,6 +17,7 @@ pub mod local;
 pub mod memory;
 pub mod packed;
 pub mod postgres;
+pub mod repack;
 pub mod s3;
 #[cfg(test)]
 mod s3_fake;

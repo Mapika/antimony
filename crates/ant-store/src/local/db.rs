@@ -23,6 +23,9 @@
 //! - **Readers.** Up to `readers` connections, opened on first use and
 //!   reused; each read runs on the blocking pool (`spawn_blocking`), never
 //!   on an async worker. WAL readers never block the writer or each other.
+//!   Reads of maintenance runs (inside [`maintenance_reads`]) take up to
+//!   [`MAINTENANCE_READERS`] connections of their own, so a collection or
+//!   repack never queues the server's reads behind its own.
 //! - **Ref moves** a job makes are announced on the feed once they are
 //!   durable, in commit order; a job that rolled back announces nothing.
 
@@ -39,6 +42,18 @@ use crate::{Result, StoreError};
 
 /// Jobs committed together at most.
 pub(crate) const MAX_GROUP: usize = 256;
+/// Reader connections of maintenance runs at most (beyond `readers`).
+pub(crate) const MAINTENANCE_READERS: usize = 2;
+
+tokio::task_local! {
+    static MAINTENANCE: ();
+}
+
+/// Run `fut` with its reads counted as maintenance reads (see the module
+/// docs).
+pub(crate) async fn maintenance_reads<F: std::future::Future>(fut: F) -> F::Output {
+    MAINTENANCE.scope((), fut).await
+}
 
 pub(crate) fn be(e: impl std::error::Error + Send + Sync + 'static) -> StoreError {
     StoreError::backend(e)
@@ -108,6 +123,7 @@ pub(crate) struct Db {
     writer: Mutex<Writer>,
     readers: Mutex<Vec<Connection>>,
     permits: Semaphore,
+    maintenance_permits: Semaphore,
     options: DbOptions,
 }
 
@@ -199,6 +215,7 @@ impl Db {
             writer: Mutex::new(Writer { tx: Some(tx), thread: Some(thread) }),
             readers: Mutex::new(Vec::new()),
             permits: Semaphore::new(options.readers.max(1)),
+            maintenance_permits: Semaphore::new(MAINTENANCE_READERS),
             options,
         })
     }
@@ -260,7 +277,11 @@ impl Db {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R> + Send + 'static,
     {
-        let _permit = self.permits.acquire().await.map_err(be)?;
+        let permits = match MAINTENANCE.try_with(|_| ()) {
+            Ok(()) => &self.maintenance_permits,
+            Err(_) => &self.permits,
+        };
+        let _permit = permits.acquire().await.map_err(be)?;
         let pooled = self.readers.lock().pop();
         let path = self.path.clone();
         let cache = self.options.cache_kib;
