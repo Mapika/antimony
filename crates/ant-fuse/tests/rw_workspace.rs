@@ -4,7 +4,7 @@
 //! never shares a process with the daemon (see `KERNEL_GATE` in `lib.rs`).
 //!
 //! - `rw_write_bench`: the write-performance contract
-//!   (`docs/contracts/rw-write-performance.md`). Without `ANT_RW_BENCH=1` it
+//!   (`docs/dev/contracts/rw-write-performance.md`). Without `ANT_RW_BENCH=1` it
 //!   runs a reduced smoke version and asserts nothing about speed.
 //! - `crash_*`: kill the daemon at random points of a scripted workload,
 //!   remount, and check that the workspace is a prefix of the completed

@@ -7,7 +7,7 @@ upgrade procedure) and [architecture.md](architecture.md) (how it works).
 **About the numbers.** Every performance figure here was measured on a single
 WSL2 development machine (20 cores, Postgres and SeaweedFS S3 running locally
 on the same box and disk, see the 2026-10-14 scorecard in
-[scorecard/](scorecard/2026-10-14.md) and the soak/import notes in
+[scorecard/](dev/scorecard/2026-10-14.md) and the soak/import notes in
 [ROADMAP.md](../ROADMAP.md)). They are useful for ratios and orders of
 magnitude. Network latency, managed Postgres, real S3 and separate hosts will
 all move them; measure your own deployment with `ant-bench` before trusting a
@@ -98,7 +98,7 @@ deployment.
 
 On Hetzner Cloud (ccx43 server box with Postgres, S3 and `ant serve`; a ccx33
 client box driving the fleet over the private network, RTT about 0.35 ms;
-[A/B record](scorecard/2026-10-16-hetzner-landing-ab.md)), 0.3.0 measured:
+[A/B record](dev/scorecard/2026-10-16-hetzner-landing-ab.md)), 0.3.0 measured:
 
 | agents | lands/s | land p99 |
 |---|---|---|
