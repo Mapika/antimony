@@ -1,5 +1,6 @@
 mod support;
 use ant_core::{EncodedObject, EntryMode, ObjectId, ObjectKind, TreeEntry};
+use ant_store::server_cache::{DiskCache, ServerCache};
 use ant_store::{
     Backend, ObjectStoreExt,
     graph::{build_tree, write_commit, write_tree},
@@ -363,4 +364,124 @@ async fn clones_reuse_the_cached_base_pack() {
         git(&back, &["fsck", "--full", "--strict"]).await;
         assert_eq!(objects(&back).await, fresh(format!("fresh-{n}-c")).await);
     }
+}
+
+/// Serve an export with a persistent server cache in `dir` (disk tier).
+async fn serve_persisted(
+    b: Backend,
+    dir: &Path,
+) -> (String, tokio::task::JoinHandle<()>, ant_gitserve::Export, std::sync::Arc<ServerCache>) {
+    let disk = DiskCache::open(dir, "test", 1 << 30).unwrap();
+    let cache = std::sync::Arc::new(ServerCache::new(Some(disk), None).unwrap());
+    let export = ant_gitserve::Export::new(b, Some(cache.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
+    let router = export.router();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (url, task, export, cache)
+}
+
+/// Wait (bounded) until the base of a filter is persisted in `cache`.
+async fn persisted(cache: &ServerCache, name: &str) -> String {
+    for _ in 0..3000 {
+        if let Some(key) = cache.pointer(name).await {
+            return key;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("base {name} was not persisted");
+}
+
+/// A copy of a cache directory, as a restarted server finds it.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// A base pack written to the server cache is loaded by the next server
+/// (a restart: the same directory) before its first clone, which then
+/// sends the same pack without building it; a damaged entry is dropped and
+/// the clone built from scratch. `prewarm` loads (or builds) the base at
+/// start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persisted_base_pack_survives_a_restart() {
+    let f = Fixture::new().await;
+    let tip = support::revisions(&f.b, Some(f.ids[2]), 0..20).await;
+    f.b.refs.cas_ref("main", Some(f.ids[2]), Some(tip)).await.unwrap();
+    let dirs = tempfile::tempdir().unwrap();
+    let clone = |url: String, name: &str| {
+        let dest = f.temp.path().join(name);
+        let temp = f.temp.path().to_path_buf();
+        async move {
+            let args = ["clone", "--bare", "--filter=blob:none", &url, dest.to_str().unwrap()];
+            git(&temp, &args).await;
+            git(&dest, &["fsck", "--full", "--strict"]).await;
+            single_pack(&dest)
+        }
+    };
+
+    let first_dir = dirs.path().join("first");
+    let (url, task, _, cache) = serve_persisted(f.b.clone(), &first_dir).await;
+    let first = clone(url, "first").await;
+    let key = persisted(&cache, "git-blobless").await;
+    assert!(key.starts_with("blobless-f1-"), "{key}");
+    task.abort();
+
+    // Restarted: the base is read from disk, not built.
+    let restarted = dirs.path().join("restarted");
+    copy_dir(&first_dir, &restarted);
+    let (url, task, _, cache) = serve_persisted(f.b.clone(), &restarted).await;
+    let again = clone(url, "again").await;
+    assert!(again == first, "the persisted base is sent as is");
+    assert_eq!(cache.stats().disk_hits, 1);
+    task.abort();
+
+    // Damaged on disk: dropped, and the clone is built (and exact) anyway.
+    let damaged = dirs.path().join("damaged");
+    copy_dir(&first_dir, &damaged);
+    let entry = damaged.join("v1/test/git").join(&key[..2]).join(&key);
+    let mut bytes = std::fs::read(&entry).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x55;
+    std::fs::write(&entry, bytes).unwrap();
+    let (url, task, _, cache) = serve_persisted(f.b.clone(), &damaged).await;
+    let rebuilt = clone(url, "rebuilt").await;
+    assert_eq!(cache.stats().disk_hits, 0);
+    assert_eq!(cache.stats().corrupt, 1);
+    assert_eq!(
+        objects(&f.temp.path().join("rebuilt")).await,
+        objects(&f.temp.path().join("first")).await
+    );
+    assert_eq!(rebuilt.len(), first.len());
+    task.abort();
+
+    // Prewarm: loads the persisted base, or builds one when there is none.
+    let warm = dirs.path().join("warm");
+    copy_dir(&first_dir, &warm);
+    let (_, task, export, cache) = serve_persisted(f.b.clone(), &warm).await;
+    assert!(export.prewarm(true).await.unwrap());
+    assert_eq!(cache.stats().disk_hits, 1);
+    task.abort();
+    let (url, task, export, cache) = serve_persisted(f.b.clone(), &dirs.path().join("cold")).await;
+    assert!(export.prewarm(true).await.unwrap());
+    assert_eq!(persisted(&cache, "git-blobless").await, key);
+    // (Its pack lists the wants in another order than a clone does: same
+    // objects, other layout.)
+    clone(url, "prewarmed").await;
+    assert_eq!(
+        objects(&f.temp.path().join("prewarmed")).await,
+        objects(&f.temp.path().join("first")).await
+    );
+    assert_eq!(cache.stats().disk_hits, 0, "the prewarmed base was used, not loaded");
+    task.abort();
 }

@@ -11,6 +11,11 @@
 //!                          json otherwise; level via `RUST_LOG`
 //!   --policy <file>        (ANT_POLICY) access-control policy (`ant_auth`);
 //!                          without it the server runs in OPEN mode
+//!   persistent caches of tree bundles and git base packs
+//!   (`ant_store::server_cache`): `--cache-dir <dir>` (default in local mode:
+//!   `<data dir>/cache`), `--no-cache-dir`, `--cache-dir-mib`,
+//!   `--shared-cache`, `--shared-cache-mib`; warming at start: `--prewarm
+//!   <ref>`, `--prewarm-git blobless|full` (env `ANT_CACHE_DIR`, ...)
 //!   rate limits / load shedding (`crate::limits`): `--no-limits`,
 //!   `--rate-{read,write,admin} <rps[:burst]|off>`,
 //!   `--max-inflight-{read,write,land,admin} <n>`, `--shed-wait <dur>`
@@ -93,12 +98,66 @@ pub struct ServeArgs {
     #[arg(long, env = "ANT_BUNDLE_CACHE_MIB")]
     pub bundle_cache_mib: Option<usize>,
 
+    /// Directory of the persistent server cache: tree bundles and git base
+    /// packs survive restarts (one server process per directory; entries
+    /// of different repositories are kept apart). Default: none, or
+    /// `<data dir>/cache` in local mode.
+    #[arg(long, env = "ANT_CACHE_DIR", value_name = "DIR")]
+    pub cache_dir: Option<PathBuf>,
+
+    /// No persistent disk cache, also in local mode.
+    #[arg(long, env = "ANT_NO_CACHE_DIR", conflicts_with = "cache_dir")]
+    pub no_cache_dir: bool,
+
+    /// Budget of the persistent disk cache, MiB (least recently used
+    /// entries are evicted; an entry over half of it is not kept). Default
+    /// 4096; 1024 in local mode.
+    #[arg(long, env = "ANT_CACHE_DIR_MIB")]
+    pub cache_dir_mib: Option<u64>,
+
+    /// Share the persistent cache between replicas: also keep entries in
+    /// the store's S3 bucket, under `<s3 prefix>/cache/` (needs `--s3-*`).
+    #[arg(long, env = "ANT_SHARED_CACHE")]
+    pub shared_cache: bool,
+
+    /// Budget of the shared cache in S3, MiB (oldest entries are deleted
+    /// beyond it, checked every 10 minutes).
+    #[arg(long, env = "ANT_SHARED_CACHE_MIB", default_value_t = 16384)]
+    pub shared_cache_mib: u64,
+
+    /// After start, bring the tree bundles of a checkout of these refs into
+    /// the caches, in the background (repeat or comma-separate).
+    #[arg(long, env = "ANT_PREWARM", value_delimiter = ',', value_name = "REF")]
+    pub prewarm: Vec<String>,
+
+    /// After start, load (or build) the git export's base pack for clones
+    /// of all branches with this filter: `blobless` (`--filter=blob:none`)
+    /// or `full` (repeat or comma-separate).
+    #[arg(long, env = "ANT_PREWARM_GIT", value_delimiter = ',', value_enum)]
+    pub prewarm_git: Vec<GitFilter>,
+
     #[command(flatten)]
     pub limits: LimitArgs,
 
     #[command(flatten)]
     pub store: StoreArgs,
 }
+
+/// A clone filter of the git export (`--prewarm-git`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum GitFilter {
+    /// `--filter=blob:none` clones.
+    Blobless,
+    /// Clones with every blob.
+    Full,
+}
+
+/// Persistent disk cache budget, MiB (`--cache-dir-mib`).
+pub const DEFAULT_CACHE_DIR_MIB: u64 = 4096;
+/// Persistent disk cache budget in local mode, MiB.
+pub const LOCAL_CACHE_DIR_MIB: u64 = 1024;
+/// How often the shared cache is pruned to its budget.
+const SHARED_PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Async worker threads of a local-mode server at most (`--worker-threads`).
 pub const LOCAL_WORKER_THREADS: usize = 4;
@@ -227,6 +286,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     metrics.set_probes(probes);
     let backend = metrics.instrument(&backend);
     spawn_malloc_trim();
+    let persist = open_server_cache(&args).await?;
+    let caches = http::Caches::new(&backend, persist.clone());
     let acl = match &args.policy {
         Some(path) => {
             let acl = Acl::load(path)?;
@@ -280,8 +341,12 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     );
     let expose = metrics_listener.is_none();
     let http_metrics = metrics.clone();
+    if !args.prewarm.is_empty() || !args.prewarm_git.is_empty() {
+        let (b, a, c) = (backend.clone(), acl.clone(), caches.clone());
+        tokio::spawn(prewarm(b, a, c, args.prewarm.clone(), args.prewarm_git.clone()));
+    }
     let http_fut = async move {
-        http::serve_with_limiter(backend, acl, http_listener, http_metrics, expose, limiter)
+        http::serve_with_caches(backend, acl, http_listener, http_metrics, expose, limiter, caches)
             .await
             .context("HTTP server failed")
     };
@@ -299,6 +364,121 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         () = shutdown_signal() => {
             tracing::info!("SIGTERM or SIGINT: shutting down");
             Ok(())
+        }
+    }
+}
+
+/// The persistent server cache the flags ask for (see [`ServeArgs::cache_dir`]),
+/// if any. A disk cache that cannot be opened (in use, not writable) is
+/// left out with a warning: the server runs without it.
+async fn open_server_cache(
+    args: &ServeArgs,
+) -> anyhow::Result<Option<Arc<ant_store::server_cache::ServerCache>>> {
+    use ant_store::server_cache::{DiskCache, ServerCache, SharedCache, namespace};
+    let local = args.store.local_dir()?;
+    let dir = match (&args.cache_dir, &local) {
+        _ if args.no_cache_dir => None,
+        (Some(dir), _) => Some(dir.clone()),
+        (None, Some(local)) => Some(local.join("cache")),
+        (None, None) => None,
+    };
+    let default_mib = if local.is_some() { LOCAL_CACHE_DIR_MIB } else { DEFAULT_CACHE_DIR_MIB };
+    let budget = args.cache_dir_mib.unwrap_or(default_mib).saturating_mul(1 << 20);
+    let ns = namespace(&args.store.identity()?);
+    let disk = match dir {
+        Some(dir) if budget > 0 => {
+            let at = dir.clone();
+            let ns = ns.clone();
+            match tokio::task::spawn_blocking(move || DiskCache::open(&at, &ns, budget)).await? {
+                Ok(disk) => {
+                    let (entries, bytes) = disk.usage();
+                    tracing::info!(
+                        dir = %disk.dir().display(),
+                        entries,
+                        bytes,
+                        budget_bytes = budget,
+                        "persistent server cache"
+                    );
+                    Some(disk)
+                }
+                Err(e) => {
+                    tracing::warn!(dir = %dir.display(), error = %e, "persistent server cache unavailable");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let shared = if args.shared_cache {
+        let Some(cfg) = args.store.s3_config()? else {
+            anyhow::bail!("--shared-cache needs the S3 store (--s3-*)");
+        };
+        let s3 = ant_store::s3::S3ObjectStore::connect(&cfg).await?;
+        tracing::info!(bucket = %cfg.bucket, prefix = %cfg.prefix, "shared server cache in S3");
+        Some(SharedCache::new(s3, args.shared_cache_mib.saturating_mul(1 << 20)))
+    } else {
+        None
+    };
+    let cache = ServerCache::new(disk, shared).map(Arc::new);
+    if let Some(cache) = &cache {
+        cache.spawn_pruner(SHARED_PRUNE_EVERY);
+    }
+    Ok(cache)
+}
+
+/// Warm the caches after start (`--prewarm`, `--prewarm-git`), one step at
+/// a time: the bundles of each ref's tree, then each git base pack.
+async fn prewarm(
+    backend: Backend,
+    acl: Acl,
+    caches: http::Caches,
+    refs: Vec<String>,
+    git: Vec<GitFilter>,
+) {
+    let budget = match crate::bundle::BundleCache::default().budget() {
+        0 => 256 << 20,
+        n => n,
+    };
+    for name in refs {
+        let started = std::time::Instant::now();
+        let tree = async {
+            let Some(commit) = backend.refs.get_ref(&name).await? else {
+                return Ok::<_, ant_store::StoreError>(None);
+            };
+            Ok(backend.meta.get_commits(&[commit]).await?.pop().flatten().map(|n| n.tree))
+        };
+        let result = match tree.await {
+            Ok(Some(tree)) => caches.prewarm_bundles(&backend, &acl, tree, budget).await,
+            Ok(None) => {
+                tracing::warn!(r#ref = name, "prewarm: no such ref (or commit)");
+                continue;
+            }
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok((bundles, bytes)) => tracing::info!(
+                r#ref = name,
+                bundles,
+                bytes,
+                ms = started.elapsed().as_millis() as u64,
+                "prewarm: tree bundles ready"
+            ),
+            Err(e) => tracing::warn!(r#ref = name, error = %e, "prewarm: bundles failed"),
+        }
+    }
+    for filter in git {
+        let started = std::time::Instant::now();
+        let no_blobs = filter == GitFilter::Blobless;
+        match caches.git().prewarm(no_blobs).await {
+            Ok(fits) => tracing::info!(
+                ?filter,
+                base = fits,
+                ms = started.elapsed().as_millis() as u64,
+                "prewarm: git base pack ready"
+            ),
+            Err(e) => {
+                tracing::warn!(?filter, error = format!("{e:#}"), "prewarm: git base pack failed")
+            }
         }
     }
 }
@@ -385,11 +565,36 @@ async fn spawn_local_inner(
     spawn_local_with_limiter(backend, acl, metrics, limiter).await
 }
 
+/// [`spawn_local`] with a persistent server cache (`ant serve
+/// --cache-dir`): also returns the server's caches (to prewarm or inspect).
+pub async fn spawn_local_with_cache(
+    backend: Backend,
+    acl: Acl,
+    persist: Option<Arc<ant_store::server_cache::ServerCache>>,
+) -> std::io::Result<(LocalServer, http::Caches)> {
+    let metrics = Metrics::new();
+    let limiter = Limiter::new(LimitConfig::default(), acl.clone(), metrics.clone());
+    let caches = http::Caches::new(&backend, persist);
+    let server = spawn_local_with_caches(backend, acl, metrics, limiter, caches.clone()).await?;
+    Ok((server, caches))
+}
+
 async fn spawn_local_with_limiter(
     backend: Backend,
     acl: Acl,
     metrics: Arc<Metrics>,
     limiter: Arc<Limiter>,
+) -> std::io::Result<LocalServer> {
+    let caches = http::Caches::new(&backend, None);
+    spawn_local_with_caches(backend, acl, metrics, limiter, caches).await
+}
+
+async fn spawn_local_with_caches(
+    backend: Backend,
+    acl: Acl,
+    metrics: Arc<Metrics>,
+    limiter: Arc<Limiter>,
+    caches: http::Caches,
 ) -> std::io::Result<LocalServer> {
     let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -401,7 +606,15 @@ async fn spawn_local_with_limiter(
         metrics.clone(),
         limiter.clone(),
     ));
-    tokio::spawn(http::serve_with_limiter(backend, acl, http_listener, metrics, true, limiter));
+    tokio::spawn(http::serve_with_caches(
+        backend,
+        acl,
+        http_listener,
+        metrics,
+        true,
+        limiter,
+        caches,
+    ));
     Ok(addrs)
 }
 
@@ -478,6 +691,37 @@ mod tests {
         assert_eq!(cli.serve.log_format, None);
         assert_eq!(cli.serve.metrics_listen, None);
         assert!(Cli::try_parse_from(["ant-server", "--memory", "--log-format", "xml"]).is_err());
+    }
+
+    #[test]
+    fn cache_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "ant-server",
+            "--memory",
+            "--cache-dir",
+            "/tmp/x",
+            "--cache-dir-mib",
+            "10",
+            "--prewarm",
+            "main,dev",
+            "--prewarm",
+            "x",
+            "--prewarm-git",
+            "blobless,full",
+        ])
+        .unwrap();
+        assert_eq!(cli.serve.cache_dir.as_deref(), Some(std::path::Path::new("/tmp/x")));
+        assert_eq!(cli.serve.cache_dir_mib, Some(10));
+        assert_eq!(cli.serve.prewarm, ["main", "dev", "x"]);
+        assert_eq!(cli.serve.prewarm_git, [GitFilter::Blobless, GitFilter::Full]);
+        assert!(!cli.serve.shared_cache);
+        let cli = Cli::try_parse_from(["ant-server", "--memory"]).unwrap();
+        assert!(cli.serve.cache_dir.is_none() && cli.serve.prewarm.is_empty());
+        assert!(
+            Cli::try_parse_from(["ant-server", "--memory", "--cache-dir", "x", "--no-cache-dir"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["ant-server", "--memory", "--prewarm-git", "none"]).is_err());
     }
 
     #[test]

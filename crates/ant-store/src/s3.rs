@@ -622,6 +622,122 @@ impl S3ObjectStore {
         Ok(())
     }
 
+    /// Key of `rel` in the persistent server cache (`crate::server_cache`):
+    /// `{prefix}/cache/{rel}`, beside (never inside) the object and pack
+    /// keys.
+    fn cache_key(&self, rel: &str) -> String {
+        if self.prefix.is_empty() {
+            format!("cache/{rel}")
+        } else {
+            format!("{}/cache/{rel}", self.prefix.trim_end_matches('/'))
+        }
+    }
+
+    /// The body of cache key `rel`, `None` when absent (`crate::server_cache`).
+    pub async fn cache_get(&self, rel: &str) -> Result<Option<Bytes>> {
+        let (client, bucket) = (&self.client, &self.bucket);
+        let key = self.cache_key(rel);
+        let key = &key;
+        self.retrying("get", key, self.timeouts.attempt_for(UNKNOWN_SIZE), || async move {
+            let resp = match client.get_object().bucket(bucket).key(key).send().await {
+                Ok(r) => r,
+                Err(e) if e.as_service_error().is_some_and(|s| s.is_no_such_key()) => {
+                    return Ok(None);
+                }
+                Err(e) => return Err(classify("get", key, e)),
+            };
+            let expected = resp.content_length().and_then(|n| u64::try_from(n).ok());
+            let body = resp
+                .body
+                .collect()
+                .await
+                .map_err(|e| Attempt::body(format!("reading body: {e}")))?
+                .into_bytes();
+            READ_BYTES.fetch_add(body.len() as u64, Ordering::Relaxed);
+            if expected.is_some_and(|n| n != body.len() as u64) {
+                return Err(Attempt::body(format!("short read ({} bytes)", body.len())));
+            }
+            Ok(Some(body))
+        })
+        .await
+    }
+
+    /// Store `body` at cache key `rel` (`crate::server_cache`).
+    pub async fn cache_put(&self, rel: &str, body: Bytes) -> Result<()> {
+        self.put_bytes(&self.cache_key(rel), body).await
+    }
+
+    /// Every cache key under `rel_prefix`: (key relative to the cache
+    /// prefix, size, last modified as Unix seconds).
+    pub async fn cache_list(&self, rel_prefix: &str) -> Result<Vec<(String, u64, f64)>> {
+        let prefix = self.cache_key(rel_prefix);
+        let base = self.cache_key("");
+        let (client, bucket, p) = (&self.client, &self.bucket, &prefix);
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let resp = self
+                .retrying("list", p, self.timeouts.attempt, || {
+                    let token = token.clone();
+                    async move {
+                        client
+                            .list_objects_v2()
+                            .bucket(bucket)
+                            .prefix(p)
+                            .set_continuation_token(token)
+                            .send()
+                            .await
+                            .map_err(|e| classify("list", p, e))
+                    }
+                })
+                .await?;
+            for o in resp.contents() {
+                let Some(rel) = o.key().and_then(|k| k.strip_prefix(base.as_str())) else {
+                    continue;
+                };
+                let modified = o.last_modified().map_or(0.0, |t| t.as_secs_f64());
+                out.push((rel.to_owned(), o.size().unwrap_or(0).max(0) as u64, modified));
+            }
+            token = match resp.is_truncated() {
+                Some(true) => resp.next_continuation_token().map(str::to_owned),
+                _ => None,
+            };
+            if token.is_none() {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// Delete cache keys (relative to the cache prefix), one request per
+    /// 1000; absent keys are fine.
+    pub async fn cache_delete(&self, rels: &[String]) -> Result<()> {
+        use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+        for chunk in rels.chunks(1000) {
+            let objects = chunk
+                .iter()
+                .map(|r| ObjectIdentifier::builder().key(self.cache_key(r)).build())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(StoreError::backend)?;
+            let delete = Delete::builder()
+                .set_objects(Some(objects))
+                .quiet(true)
+                .build()
+                .map_err(StoreError::backend)?;
+            let (client, bucket, delete) = (&self.client, &self.bucket, &delete);
+            self.retrying("delete_objects", bucket, self.timeouts.attempt, || async move {
+                client
+                    .delete_objects()
+                    .bucket(bucket)
+                    .delete(delete.clone())
+                    .send()
+                    .await
+                    .map_err(|e| classify("delete_objects", bucket, e))
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn put_raw(&self, key: String, body: Vec<u8>) -> Result<()> {
         self.put_bytes(&key, Bytes::from(body)).await
     }

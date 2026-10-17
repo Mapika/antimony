@@ -57,6 +57,17 @@
 //! `WWW-Authenticate: Basic` so git asks its credential helpers) and needs
 //! `can_read_everything`, else 403. `/healthz`, `/readyz` and `/metrics` stay open.
 //!
+//! Persistent caches (`Caches`, `ant serve --cache-dir` / `--shared-cache`):
+//! a bundle that hid nothing is also written to the server cache
+//! (`ant_store::server_cache`, key: tree id and [`Limits`]), together with
+//! the ids its visibility depends on. A request that misses the in-memory
+//! cache looks there next; a hit is served only if the tree is still in the
+//! object store (garbage collection keeps the closure of every object it
+//! keeps, and stores report condemned objects missing, so every object of
+//! the bundle is live) and, under a policy, only under exactly the rule of
+//! an in-memory hit (`bundle_visibility` of its ids: nothing hidden,
+//! `public`); otherwise the bundle is built as without the cache.
+//!
 //! Every response carries `x-request-id` (the request's own or a fresh ULID);
 //! requests are counted and timed per route (`crate::observe`).
 
@@ -64,7 +75,8 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use ant_core::ObjectId;
+use ant_core::{ObjectId, ObjectKind, Tree};
+use ant_store::server_cache::{Kind, ServerCache, Source};
 use ant_store::{Backend, StoreError};
 use axum::Router;
 use axum::extract::{Path, State};
@@ -115,8 +127,24 @@ pub async fn serve_with_limiter(
     expose_metrics: bool,
     limiter: Arc<Limiter>,
 ) -> std::io::Result<()> {
+    let caches = Caches::new(&backend, None);
+    serve_with_caches(backend, acl, listener, metrics, expose_metrics, limiter, caches).await
+}
+
+/// [`serve_with_limiter`] with the server's derived-data caches (`Caches`:
+/// tree bundles and git base packs, persisted when they have a server
+/// cache), shared with whoever prewarms them.
+pub async fn serve_with_caches(
+    backend: Backend,
+    acl: Acl,
+    listener: tokio::net::TcpListener,
+    metrics: Arc<Metrics>,
+    expose_metrics: bool,
+    limiter: Arc<Limiter>,
+    caches: Caches,
+) -> std::io::Result<()> {
     use axum::serve::ListenerExt;
-    let app = app_with_metrics(backend, acl, metrics, expose_metrics, limiter);
+    let app = app_with_metrics(backend, acl, metrics, expose_metrics, limiter, caches);
     let listener = listener.tap_io(|tcp| {
         // Avoid Nagle/delayed-ACK stalls on small responses.
         let _ = tcp.set_nodelay(true);
@@ -143,10 +171,12 @@ fn app_with_metrics(
     metrics: Arc<Metrics>,
     expose_metrics: bool,
     limiter: Arc<Limiter>,
+    caches: Caches,
 ) -> Router {
     let observer = Arc::new(Observer::new(metrics.clone(), acl.clone()));
-    let git = ant_gitserve::router(backend.clone());
-    let mut app = router_with_state(backend, acl.clone(), metrics, expose_metrics).merge(git);
+    let git = caches.git.router();
+    let mut app =
+        router_with_state(backend, acl.clone(), metrics, expose_metrics, caches).merge(git);
     if !acl.is_open() {
         // A layer on the git router itself would also wrap its fallback and
         // answer 401 for every unknown path (e.g. a `/metrics` moved to
@@ -171,6 +201,7 @@ fn router_with_state(
     acl: Acl,
     metrics: Arc<Metrics>,
     expose_metrics: bool,
+    caches: Caches,
 ) -> Router {
     let mut router = Router::new()
         .route("/o/check", post(check_objects))
@@ -179,13 +210,7 @@ fn router_with_state(
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
         .route("/debug/stats", get(debug_stats))
-        .with_state(HttpState {
-            bundle_reads: Arc::new(bundle::Coalescer::new(backend.objects.clone())),
-            backend,
-            acl,
-            probes: metrics.probes(),
-            bundles: Arc::new(bundle::BundleCache::default()),
-        });
+        .with_state(HttpState { backend, acl, probes: metrics.probes(), caches });
     if expose_metrics {
         router = router.merge(Router::new().route("/metrics", get(scrape)).with_state(metrics));
     }
@@ -219,13 +244,14 @@ async fn debug_stats(State(state): State<HttpState>, headers: HeaderMap) -> Resp
         }
         Ok(_) => {}
     }
-    ([(header::CONTENT_TYPE, "application/json")], stats_json(&state.bundles)).into_response()
+    ([(header::CONTENT_TYPE, "application/json")], stats_json(&state.caches)).into_response()
 }
 
 /// Cache entries and weights, store registrations, land queues and running
 /// catch-ups, and the tree-bundle cache. Built by hand: the shape is fixed
 /// and no JSON crate is needed.
-fn stats_json(bundles: &bundle::BundleCache) -> String {
+fn stats_json(server: &Caches) -> String {
+    let bundles = &server.bundles;
     let (caches, objects, metas) = crate::ops::cache::cache_stats();
     let caches: Vec<String> = caches
         .iter()
@@ -239,8 +265,29 @@ fn stats_json(bundles: &bundle::BundleCache) -> String {
     let (queues, requests) = crate::ops::land::queue_stats();
     let (entries, bytes) = bundles.usage();
     let (hits, misses) = bundle::cache_lookups();
+    let persistent = match &server.persist {
+        None => "null".to_owned(),
+        Some(p) => {
+            let s = p.stats();
+            format!(
+                r#"{{"disk_entries":{},"disk_bytes":{},"disk_budget_bytes":{},"shared":{},"disk_hits":{},"shared_hits":{},"misses":{},"writes":{},"write_errors":{},"skipped":{},"corrupt":{},"evicted":{}}}"#,
+                s.disk_entries,
+                s.disk_bytes,
+                s.disk_budget,
+                s.shared,
+                s.disk_hits,
+                s.shared_hits,
+                s.misses,
+                s.writes,
+                s.write_errors,
+                s.skipped,
+                s.corrupt,
+                s.evicted
+            )
+        }
+    };
     format!(
-        r#"{{"caches":[{}],"cache_stores":{{"objects":{objects},"meta":{metas}}},"land_queues":{{"queues":{queues},"requests":{requests}}},"catch_ups":{},"bundle_cache":{{"entries":{entries},"bytes":{bytes},"budget_bytes":{},"hits":{hits},"misses":{misses}}}}}"#,
+        r#"{{"caches":[{}],"cache_stores":{{"objects":{objects},"meta":{metas}}},"land_queues":{{"queues":{queues},"requests":{requests}}},"catch_ups":{},"bundle_cache":{{"entries":{entries},"bytes":{bytes},"budget_bytes":{},"hits":{hits},"misses":{misses}}},"persistent_cache":{persistent}}}"#,
         caches.join(","),
         crate::ops::history::running_catch_ups(),
         bundles.budget(),
@@ -252,10 +299,203 @@ struct HttpState {
     backend: Backend,
     acl: Acl,
     probes: crate::health::Probes,
+    caches: Caches,
+}
+
+/// The derived-data caches of one server: tree bundles (in memory, and in
+/// the server cache if there is one) and the git export with its base
+/// packs. Shared by the HTTP routes and [`Caches::prewarm_bundles`] /
+/// [`Caches::git`]'s `prewarm`.
+#[derive(Clone)]
+pub struct Caches {
     /// Recently served tree bundles (`crate::bundle::BundleCache`).
     bundles: Arc<bundle::BundleCache>,
     /// The store as bundle builds read it (`crate::bundle::Coalescer`).
     bundle_reads: Arc<bundle::Coalescer>,
+    /// Bundles (and base packs) across restarts and replicas.
+    persist: Option<Arc<ServerCache>>,
+    git: ant_gitserve::Export,
+}
+
+/// Bundles built at once while prewarming.
+const PREWARM_CONCURRENCY: usize = 4;
+
+impl Caches {
+    /// Caches for `backend`, persisted in `persist` if given (the in-memory
+    /// bundle budget is the one set by `bundle::set_cache_bytes`).
+    pub fn new(backend: &Backend, persist: Option<Arc<ServerCache>>) -> Self {
+        Self {
+            bundles: Arc::new(bundle::BundleCache::default()),
+            bundle_reads: Arc::new(bundle::Coalescer::new(backend.objects.clone())),
+            git: ant_gitserve::Export::new(backend.clone(), persist.clone()),
+            persist,
+        }
+    }
+
+    /// The git export (`prewarm` builds or loads its base packs).
+    pub fn git(&self) -> &ant_gitserve::Export {
+        &self.git
+    }
+
+    /// The server cache, if any.
+    pub fn persist(&self) -> Option<&Arc<ServerCache>> {
+        self.persist.as_ref()
+    }
+
+    /// Bring the bundles a checkout of `root` requests into the caches:
+    /// the bundle of `root`, then of every subtree no fetched bundle holds,
+    /// level by level ([`PREWARM_CONCURRENCY`] at a time), until about
+    /// `max_bytes` of bundles were handled. Bundles come from memory, the
+    /// server cache or are built, as for a request by a principal that may
+    /// read everything; only bundles without objects outside the root zone
+    /// are kept (as requests keep them). Returns (bundles, bytes).
+    pub async fn prewarm_bundles(
+        &self,
+        backend: &Backend,
+        acl: &Acl,
+        root: ObjectId,
+        max_bytes: usize,
+    ) -> Result<(usize, usize), StoreError> {
+        use futures::StreamExt;
+        let mut seen: HashSet<ObjectId> = HashSet::from([root]);
+        let mut level = vec![root];
+        let (mut count, mut bytes) = (0usize, 0usize);
+        while !level.is_empty() && bytes < max_bytes {
+            let bodies: Vec<Result<Option<Bytes>, StoreError>> = futures::stream::iter(level)
+                .map(|tree| self.warm_bundle(backend, acl, tree))
+                .buffer_unordered(PREWARM_CONCURRENCY)
+                .collect()
+                .await;
+            let mut next = Vec::new();
+            for body in bodies {
+                let Some(body) = body? else { continue };
+                count += 1;
+                bytes += body.len();
+                let below = tokio::task::spawn_blocking(move || subtrees_not_bundled(&body))
+                    .await
+                    .map_err(StoreError::backend)?;
+                next.extend(below.into_iter().filter(|id| seen.insert(*id)));
+            }
+            level = next;
+        }
+        Ok((count, bytes))
+    }
+
+    /// The bundle of `tree` for prewarming (see [`Self::prewarm_bundles`]).
+    async fn warm_bundle(
+        &self,
+        backend: &Backend,
+        acl: &Acl,
+        tree: ObjectId,
+    ) -> Result<Option<Bytes>, StoreError> {
+        if let Some(hit) = self.bundles.get(&tree) {
+            return Ok(Some(hit.body.clone()));
+        }
+        let public = |ids: Vec<ObjectId>| async move {
+            match acl.policy() {
+                None => Ok::<_, StoreError>(true),
+                Some(policy) => {
+                    Ok(!acl::private_many(backend, policy, &ids).await?.into_iter().any(|p| p))
+                }
+            }
+        };
+        if let Some((body, ids)) = self.persisted_bundle(backend, tree).await
+            && public(ids.clone()).await?
+        {
+            self.bundles.insert(tree, body.clone(), ids);
+            return Ok(Some(body));
+        }
+        let Some(units) =
+            bundle::collect(self.bundle_reads.as_ref(), tree, Limits::default()).await?
+        else {
+            return Ok(None);
+        };
+        let ids = bundle::visibility_ids(&units);
+        let whole = public(ids.clone()).await?;
+        let objects = bundle::select(&units, &HashSet::new());
+        drop(units);
+        let body = encode_bundle(objects).await?;
+        if whole {
+            self.remember_bundle(tree, body.clone(), ids);
+        }
+        Ok(Some(body))
+    }
+
+    /// A bundle that hid nothing: into the in-memory cache and (in the
+    /// background) the server cache.
+    fn remember_bundle(&self, tree: ObjectId, body: Bytes, ids: Vec<ObjectId>) {
+        if let Some(persist) = &self.persist {
+            let meta: Vec<u8> = ids.iter().flat_map(|id| id.0).collect();
+            persist.put_background(
+                Kind::Bundle,
+                bundle::persist_key(&tree, Limits::default()),
+                meta,
+                Source::Bytes(body.clone()),
+            );
+        }
+        self.bundles.insert(tree, body, ids);
+    }
+
+    /// The persisted bundle of `tree` (body, visibility ids), if there is
+    /// one and `tree` is still in the object store (see the module docs).
+    async fn persisted_bundle(
+        &self,
+        backend: &Backend,
+        tree: ObjectId,
+    ) -> Option<(Bytes, Vec<ObjectId>)> {
+        let persist = self.persist.as_ref()?;
+        let key = bundle::persist_key(&tree, Limits::default());
+        let entry = persist.get(Kind::Bundle, &key).await?;
+        match backend.objects.has_many(&[tree]).await {
+            Ok(found) if found.first().copied().unwrap_or(false) => {}
+            Ok(_) => {
+                // Collected (or another repository's tree): never served.
+                persist.remove(Kind::Bundle, &key).await;
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, %tree, "bundle cache: existence check failed");
+                return None;
+            }
+        }
+        let ids = bundle::parse_ids(&entry.meta)?;
+        let body = entry.read_payload().ok()?;
+        Some((body, ids))
+    }
+}
+
+/// Encode a bundle's objects (off the async threads).
+async fn encode_bundle(
+    objects: Vec<(ObjectId, ant_core::EncodedObject)>,
+) -> Result<Bytes, StoreError> {
+    let body = tokio::task::spawn_blocking(move || {
+        ant_proto::bundle::encode(objects.iter().map(|(id, o)| (id, o.as_bytes().as_ref())))
+    })
+    .await
+    .map_err(StoreError::backend)?;
+    body.map(Bytes::from).map_err(StoreError::backend)
+}
+
+/// Subtrees listed by the trees of an encoded bundle that the bundle does
+/// not hold (a checkout requests their bundles next).
+fn subtrees_not_bundled(body: &[u8]) -> Vec<ObjectId> {
+    let Ok(objects) = ant_proto::bundle::decode(body, 1 << 30) else { return Vec::new() };
+    let held: HashSet<ObjectId> = objects.iter().map(|(id, _)| *id).collect();
+    let mut out = Vec::new();
+    for (_, bytes) in &objects {
+        let Ok(obj) = ant_core::EncodedObject::from_bytes(bytes.clone()) else { continue };
+        if obj.kind() != ObjectKind::Tree {
+            continue;
+        }
+        let Ok(tree) = Tree::decode(obj.body()) else { continue };
+        out.extend(
+            tree.entries()
+                .iter()
+                .filter(|e| e.mode.is_tree() && !held.contains(&e.id))
+                .map(|e| e.id),
+        );
+    }
+    out
 }
 
 fn authorization(headers: &HeaderMap) -> Option<&str> {
@@ -445,11 +685,11 @@ fn check_error(e: impl std::fmt::Display) -> Response {
 
 /// `GET /t/{hex}`: the tree bundle of `hex` (see the module docs).
 async fn get_tree_bundle(
-    State(HttpState { backend, acl, bundles, bundle_reads, .. }): State<HttpState>,
+    State(HttpState { backend, acl, caches, .. }): State<HttpState>,
     Path(hex): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let mut res = tree_bundle(backend, acl, &bundles, &bundle_reads, &hex, &headers).await;
+    let mut res = tree_bundle(backend, acl, &caches, &hex, &headers).await;
     res.headers_mut().insert(ant_proto::bundle::HEADER, HeaderValue::from_static("1"));
     res
 }
@@ -468,11 +708,11 @@ fn bundle_response(body: Bytes, cache: &'static str) -> Response {
 async fn tree_bundle(
     backend: Backend,
     acl: Acl,
-    cached: &bundle::BundleCache,
-    reads: &bundle::Coalescer,
+    caches: &Caches,
     hex: &str,
     headers: &HeaderMap,
 ) -> Response {
+    let cached = caches.bundles.as_ref();
     let access = match acl.authenticate_header(authorization(headers)) {
         Ok(a) => a,
         Err(e) => return unauthorized(BEARER_CHALLENGE, e),
@@ -500,8 +740,21 @@ async fn tree_bundle(
         if whole {
             return bundle_response(hit.body.clone(), CACHE_IMMUTABLE);
         }
+    } else if let Some((body, ids)) = caches.persisted_bundle(&backend, id).await {
+        // Persisted: served under the rule of an in-memory hit.
+        let whole = match &access {
+            None => true,
+            Some(access) => match bundle_visibility(&backend, access, id, &ids).await {
+                Ok((hidden, cache)) => hidden.is_empty() && cache == CACHE_IMMUTABLE,
+                Err(e) => return backend_error(e, &id),
+            },
+        };
+        if whole {
+            cached.insert(id, body.clone(), ids);
+            return bundle_response(body, CACHE_IMMUTABLE);
+        }
     }
-    let units = match bundle::collect(reads, id, Limits::default()).await {
+    let units = match bundle::collect(caches.bundle_reads.as_ref(), id, Limits::default()).await {
         Ok(Some(units)) => units,
         Ok(None) => return not_found(),
         Err(e) => return backend_error(e, &id),
@@ -516,19 +769,13 @@ async fn tree_bundle(
     };
     let objects = bundle::select(&units, &hidden);
     drop(units);
-    let body = tokio::task::spawn_blocking(move || {
-        ant_proto::bundle::encode(objects.iter().map(|(id, o)| (id, o.as_bytes().as_ref())))
-    })
-    .await;
-    match body {
-        Ok(Ok(body)) => {
-            let body = Bytes::from(body);
+    match encode_bundle(objects).await {
+        Ok(body) => {
             if hidden.is_empty() && cache == CACHE_IMMUTABLE {
-                cached.insert(id, body.clone(), ids);
+                caches.remember_bundle(id, body.clone(), ids);
             }
             bundle_response(body, cache)
         }
-        Ok(Err(e)) => backend_error(e, &id),
         Err(e) => backend_error(e, &id),
     }
 }
@@ -589,14 +836,15 @@ mod tests {
 
     #[test]
     fn stats_json_has_expected_shape() {
-        let json = stats_json(&crate::bundle::BundleCache::new(1024));
+        crate::bundle::set_cache_bytes(1024);
+        let json = stats_json(&super::Caches::new(&ant_store::Backend::in_memory(), None));
         assert!(json.starts_with(r#"{"caches":[{"name":"trees""#), "{json}");
         assert!(json.contains(r#""land_queues":{"queues":"#), "{json}");
         assert!(
             json.contains(r#""bundle_cache":{"entries":0,"bytes":0,"budget_bytes":1024,"#),
             "{json}"
         );
-        assert!(json.ends_with('}'), "{json}");
+        assert!(json.ends_with(r#""persistent_cache":null}"#), "{json}");
         assert!(!json.contains('\n'));
     }
 }

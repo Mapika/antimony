@@ -544,6 +544,26 @@ not flap), and `/healthz` for the process supervisor or Kubernetes
 use `/readyz` for liveness). `/readyz` requests are counted under
 `route="readyz"`.
 
+Give every replica a persistent server cache, so that a restart or a
+deploy does not make the next checkouts and clones rebuild tree bundles and
+git base packs (docs/operations.md, "Persistent server caches"):
+
+```sh
+  --cache-dir /var/cache/antimony --cache-dir-mib 8192 \
+  --prewarm main --prewarm-git blobless
+```
+
+A local volume per replica is enough for restarts (keep it across deploys:
+a host path or a persistent volume, not the container's writable layer).
+New replicas start from a shared copy with `--shared-cache` (entries in the
+store's S3 bucket under `<s3 prefix>/cache/`, `--shared-cache-mib`). With
+`--prewarm` the replica fills its caches in the background right after it
+starts listening; route traffic to it once `/readyz` passes as usual (the
+prewarm does not delay readiness, and requests arriving meanwhile build or
+load what they need themselves). Entries are checked against the replica's
+own policy and the store on every use, so a cache written under an older
+policy, or before a garbage collection, never serves what it should not.
+
 `--memory` starts an empty throwaway server. It cannot be seeded by
 `ant import`; create its first commit with `ant ref init main` and fill it
 from a workspace (`ant ws new`, `ant submit`, `ant land`), or use a scratch

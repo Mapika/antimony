@@ -273,6 +273,34 @@ impl StoreArgs {
         }))
     }
 
+    /// A stable description of the repository these flags select, without
+    /// credentials: the namespace of its persistent server cache
+    /// (`ant_store::server_cache::namespace`).
+    pub fn identity(&self) -> anyhow::Result<String> {
+        if let Some(dir) = self.local_dir()? {
+            let dir = dir.canonicalize().unwrap_or(dir);
+            return Ok(format!("local:{}", dir.display()));
+        }
+        if self.memory {
+            return Ok("memory".to_owned());
+        }
+        // postgres://user:password@host/db -> postgres://host/db
+        let pg = self.pg_url.as_deref().map_or(String::new(), |url| match url.split_once("://") {
+            Some((scheme, rest)) => {
+                let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+                format!("{scheme}://{host}")
+            }
+            None => url.to_owned(),
+        });
+        Ok(format!(
+            "pg:{pg}|schema:{}|s3:{}|{}|{}",
+            self.pg_schema,
+            self.s3_endpoint.as_deref().unwrap_or(""),
+            self.s3_bucket.as_deref().unwrap_or(""),
+            self.s3_prefix
+        ))
+    }
+
     pub async fn backend(&self) -> anyhow::Result<Backend> {
         Ok(self.backend_with_probes().await?.0)
     }

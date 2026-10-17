@@ -153,6 +153,41 @@ binary's supported version is printed by `ant admin schema` as `supported <n>`.
   repository to Postgres + S3 goes through `ant admin copy-local` (see
   `docs/operations.md`, Local mode), not through the files.
 
+### Persistent server cache (`ant serve --cache-dir`, `--shared-cache`)
+
+| part | marker | now |
+|---|---|---|
+| entry format and layout | `v1/` directory (disk) and key prefix (`<s3 prefix>/cache/v1/`), entry header `ANTCACHE` + u32 version | 1 |
+| tree bundle entries | key `<tree hex>-b<n>-<limits>` | `b1` |
+| git base pack entries | key `<blobless\|full>-f<n>-<tips hash>`, pointer `git-<filter>` | `f1` |
+
+- The cache holds only data derived from the stores (encoded tree bundles
+  and git export base packs), so it is always safe to delete, as a whole or
+  entry by entry, with the server stopped (disk) or running (S3). Nothing
+  else depends on it.
+- An entry is `ANTCACHE`, u32 LE format version, u32 LE kind (1 bundle,
+  2 base pack, 3 pointer), u64 LE meta and payload lengths, the meta, the
+  payload, and a SHA-256 of all of it. Readers check the hash on every read
+  and drop (and delete) entries that fail it, are truncated, or carry
+  another version or kind. Disk entries are written under `tmp/` and
+  renamed into place; `tmp/` is emptied at start.
+- Disk layout: `<dir>/v1/<namespace>/{bundles,git,pointers}/<key[..2]>/<key>`
+  plus `LOCK` (flock, one process per namespace directory). The namespace
+  is a hash of the store the server serves (Postgres host, database and
+  schema, S3 endpoint, bucket and prefix; the local data directory),
+  without credentials, so servers of different repositories can share a
+  `--cache-dir`.
+- Bundle meta: the 32-byte ids whose visibility decides who may be served
+  the bundle (sorted); payload: the `GET /t/` response body. Base pack meta:
+  filter (u8), commit count (u64 LE), tips and object ids (u32 LE count,
+  32-byte ids each; object ids sorted); payload: the pack entries without
+  header and trailer.
+- A change to an entry's layout or meaning takes a new version (`v2/`, or a
+  new `b`/`f` number in the keys); servers ignore entries of other
+  versions, so old and new servers can share a cache during a rolling
+  upgrade, each rebuilding what it cannot read. Old version directories can
+  be deleted by hand.
+
 ## 3. On-disk client formats
 
 | format | marker | now |

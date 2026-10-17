@@ -511,6 +511,33 @@ impl BundleCache {
     }
 }
 
+/// Version of persisted bundle entries (the meta layout below and the
+/// bundle encoding); part of every key.
+pub const PERSIST_FORMAT: u32 = 1;
+
+/// Key of the bundle of `tree` built with `limits` in the server cache
+/// (`ant_store::server_cache`). The content is a function of exactly these.
+pub fn persist_key(tree: &ObjectId, limits: Limits) -> String {
+    format!(
+        "{}-b{PERSIST_FORMAT}-{}-{}-{}",
+        tree.to_hex(),
+        limits.max_blob,
+        limits.max_bytes,
+        limits.max_objects
+    )
+}
+
+/// The visibility ids of a persisted bundle (its meta: concatenated 32-byte
+/// ids, sorted, no repeats); `None` if malformed.
+pub fn parse_ids(meta: &[u8]) -> Option<Vec<ObjectId>> {
+    if !meta.len().is_multiple_of(32) {
+        return None;
+    }
+    let ids: Vec<ObjectId> =
+        meta.chunks_exact(32).filter_map(|c| <[u8; 32]>::try_from(c).ok()).map(ObjectId).collect();
+    ids.windows(2).all(|w| w[0] < w[1]).then_some(ids)
+}
+
 /// The objects whose visibility decides the response for `units` (see
 /// [`CachedBundle::ids`]), sorted and deduplicated.
 pub fn visibility_ids(units: &[Unit]) -> Vec<ObjectId> {

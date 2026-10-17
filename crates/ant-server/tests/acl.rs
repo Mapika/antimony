@@ -23,8 +23,9 @@ use ant_server::acl::{self, Access, Acl};
 use ant_server::ops::changeset::{self, ChangesetRequest, FileOp, WriteContent};
 use ant_server::ops::land::{self, LandOutcome};
 use ant_server::ops::{OpError, query};
-use ant_server::serve::spawn_local;
+use ant_server::serve::{spawn_local, spawn_local_with_cache};
 use ant_store::graph::{build_tree, write_commit};
+use ant_store::server_cache::{DiskCache, ServerCache};
 use ant_store::{Backend, ObjectStoreExt};
 use bytes::Bytes;
 use common::wire::{blob_file, delete_file, write_file};
@@ -139,6 +140,16 @@ impl Server {
 
     async fn start_on(backend: Backend, acl: Acl) -> Self {
         let server = spawn_local(backend.clone(), acl).await.unwrap();
+        let channel = Channel::from_shared(server.grpc_url()).unwrap().connect().await.unwrap();
+        Self { backend, channel, http_base: server.http_url(), http: reqwest::Client::new() }
+    }
+
+    async fn start_with_cache(
+        backend: Backend,
+        acl: Acl,
+        cache: std::sync::Arc<ServerCache>,
+    ) -> Self {
+        let (server, _) = spawn_local_with_cache(backend.clone(), acl, Some(cache)).await.unwrap();
         let channel = Channel::from_shared(server.grpc_url()).unwrap().connect().await.unwrap();
         Self { backend, channel, http_base: server.http_url(), http: reqwest::Client::new() }
     }
@@ -2008,4 +2019,196 @@ mod check_props {
                 .block_on(run_case(root_read, rules, files, unknown))?;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// persisted tree bundles (`ant serve --cache-dir`)
+// ---------------------------------------------------------------------------
+
+/// A persistent server cache (disk tier) in a temporary directory.
+fn server_cache(dir: &Path) -> std::sync::Arc<ServerCache> {
+    let disk = DiskCache::open(dir, "test", 1 << 30).unwrap();
+    std::sync::Arc::new(ServerCache::new(Some(disk), None).unwrap())
+}
+
+/// Wait (bounded) until `n` entries were written to `cache` (bundles are
+/// persisted in the background).
+async fn writes_reach(cache: &ServerCache, n: u64) {
+    for _ in 0..3000 {
+        if cache.stats().writes >= n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("only {} of {n} bundles persisted", cache.stats().writes);
+}
+
+/// Bundles persisted by one server are served by another sharing its cache
+/// (a restarted server, or a replica) only under that server's own policy,
+/// exactly as in-memory hits: here the first server runs in open mode, so
+/// it persists every bundle whole; the second, under a policy whose root
+/// zone is restricted, never serves one of them to a caller who could not
+/// read every object it holds, nor a bundle holding objects outside the
+/// root zone.
+#[tokio::test]
+async fn persisted_tree_bundles_follow_the_serving_policy() {
+    let policy = closed_policy();
+    let b = Backend::in_memory();
+    let tree = |entries: Vec<(&str, EntryMode, ObjectId)>| {
+        let es = entries.into_iter().map(|(n, mode, id)| TreeEntry { mode, name: n.into(), id });
+        Object::Tree(Tree::new(es.collect()).unwrap()).encode()
+    };
+    let blob = |s: &str| EncodedObject::new(ObjectKind::Blob, s.as_bytes());
+    let guide = blob("guide\n");
+    let docs = tree(vec![("guide", EntryMode::File, guide.id())]);
+    let main_rs = blob("fn main() {}\n");
+    let src = tree(vec![("main", EntryMode::File, main_rs.id())]);
+    let hidden = blob("staff only\n");
+    let shared = tree(vec![("f", EntryMode::File, hidden.id())]);
+    let root = tree(vec![
+        ("docs", EntryMode::Tree, docs.id()),
+        ("shared", EntryMode::Tree, shared.id()),
+        ("src", EntryMode::Tree, src.id()),
+    ]);
+    acl::tag_written(&b, &policy, &[(p("docs"), docs.id()), (p("docs/guide"), guide.id())])
+        .await
+        .unwrap();
+    b.objects
+        .put_many(&[
+            guide,
+            docs.clone(),
+            main_rs,
+            src.clone(),
+            hidden,
+            shared.clone(),
+            root.clone(),
+        ])
+        .await
+        .unwrap();
+    acl::tag_written(&b, &policy, &[(p("docs/shared"), shared.id())]).await.unwrap();
+    let trees = [root.id(), docs.id(), src.id(), shared.id()];
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = server_cache(dir.path());
+    let open = Server::start_with_cache(b.clone(), Acl::open(), cache.clone()).await;
+    for t in &trees {
+        let r = get_bundle(&open, t, None).await;
+        assert_eq!((r.status, r.cache.as_str()), (200, "public, max-age=31536000, immutable"));
+    }
+    writes_reach(&cache, trees.len() as u64).await;
+
+    let s = Server::start_with_cache(b.clone(), Acl::new(policy.clone()), cache.clone()).await;
+    // src/ holds only root-zone objects the insider may read: served from
+    // the persisted cache, byte for byte the open server's bundle.
+    let hits = cache.stats().disk_hits;
+    let r = get_bundle(&s, &src.id(), Some("t-insider")).await;
+    assert_eq!(r.cache, "public, max-age=31536000, immutable");
+    assert_eq!(r.body, get_bundle(&open, &src.id(), None).await.body);
+    assert_eq!(cache.stats().disk_hits, hits + 1);
+    // The persisted root bundle holds docs/ (outside the root zone here):
+    // not served; the insider gets the bundle without it.
+    let r = get_bundle(&s, &root.id(), Some("t-insider")).await;
+    assert_eq!(r.cache, "public, max-age=31536000, immutable");
+    assert!(!r.ids.contains(&docs.id()));
+    assert_eq!(get_bundle(&s, &root.id(), Some("t-outsider")).await.status, 404);
+    // shared/: the outsider cannot read its blob, so the persisted bundle
+    // (which holds it) is not served to the outsider.
+    let r = get_bundle(&s, &shared.id(), Some("t-outsider")).await;
+    assert_eq!(r.cache, "private, no-store");
+    assert_eq!(r.ids, [shared.id()]);
+    check_bundle_invariants(&s, &policy, &trees, &["t-outsider", "t-insider"]).await;
+}
+
+/// A persisted bundle of a tree the object store no longer has (collected
+/// by garbage collection; here: a server on a store without it) is never
+/// served, and is deleted.
+#[tokio::test]
+async fn persisted_tree_bundles_of_collected_trees_are_not_served() {
+    let b = Backend::in_memory();
+    let file = EncodedObject::new(ObjectKind::Blob, b"x\n");
+    let t = Object::Tree(
+        Tree::new(vec![TreeEntry { mode: EntryMode::File, name: "f".into(), id: file.id() }])
+            .unwrap(),
+    )
+    .encode();
+    b.objects.put_many(&[file, t.clone()]).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cache = server_cache(dir.path());
+    let first = Server::start_with_cache(b, Acl::open(), cache.clone()).await;
+    assert_eq!(get_bundle(&first, &t.id(), None).await.status, 200);
+    writes_reach(&cache, 1).await;
+    assert_eq!(cache.stats().disk_entries, 1);
+
+    let collected =
+        Server::start_with_cache(Backend::in_memory(), Acl::open(), cache.clone()).await;
+    let r = get_bundle(&collected, &t.id(), None).await;
+    assert_eq!(r.status, 404);
+    assert_eq!(cache.stats().disk_entries, 0, "the entry of a collected tree is deleted");
+    // The first server, whose store has the tree, still serves it.
+    assert_eq!(get_bundle(&first, &t.id(), None).await.status, 200);
+}
+
+/// `prewarm_bundles` brings every bundle a checkout requests into the
+/// caches: walking the tree as a client does (the bundle of the root, then
+/// of every subtree no fetched bundle holds), every request is a hit.
+#[tokio::test]
+async fn prewarmed_bundles_cover_a_checkout() {
+    let b = Backend::in_memory();
+    // 90 directories of 100 files: more objects than one bundle holds.
+    let mut dirs = Vec::new();
+    let mut objects = Vec::new();
+    for d in 0..90 {
+        let mut entries = Vec::new();
+        for f in 0..100 {
+            let blob = EncodedObject::new(ObjectKind::Blob, format!("{d}/{f}\n").as_bytes());
+            entries.push(TreeEntry { mode: EntryMode::File, name: format!("f{f}"), id: blob.id() });
+            objects.push(blob);
+        }
+        let dir = Object::Tree(Tree::new(entries).unwrap()).encode();
+        dirs.push(TreeEntry { mode: EntryMode::Tree, name: format!("d{d:02}"), id: dir.id() });
+        objects.push(dir);
+    }
+    let root = Object::Tree(Tree::new(dirs).unwrap()).encode();
+    objects.push(root.clone());
+    b.objects.put_many(&objects).await.unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = server_cache(dir.path());
+    let (server, caches) =
+        spawn_local_with_cache(b.clone(), Acl::open(), Some(cache.clone())).await.unwrap();
+    let (count, bytes) =
+        caches.prewarm_bundles(&b, &Acl::open(), root.id(), usize::MAX).await.unwrap();
+    assert!(count > 1 && bytes > 0, "{count} bundles");
+    writes_reach(&cache, count as u64).await;
+
+    let s = Server {
+        backend: b.clone(),
+        channel: Channel::from_shared(server.grpc_url()).unwrap().connect().await.unwrap(),
+        http_base: server.http_url(),
+        http: reqwest::Client::new(),
+    };
+    let (_, misses) = ant_server::bundle::cache_lookups();
+    let mut have: std::collections::HashSet<ObjectId> = Default::default();
+    let mut want = vec![root.id()];
+    let mut requests = 0;
+    while let Some(t) = want.pop() {
+        if have.contains(&t) {
+            continue;
+        }
+        let r = get_bundle(&s, &t, None).await;
+        assert_eq!(r.status, 200);
+        requests += 1;
+        let frames = ant_proto::bundle::decode(&r.body, 64 << 20).unwrap();
+        have.extend(frames.iter().map(|(id, _)| *id));
+        for (_, data) in frames {
+            let obj = EncodedObject::from_bytes(data).unwrap();
+            if obj.kind() == ObjectKind::Tree {
+                let tree = Tree::decode(obj.body()).unwrap();
+                want.extend(tree.entries().iter().filter(|e| e.mode.is_tree()).map(|e| e.id));
+            }
+        }
+    }
+    assert_eq!(requests, count);
+    assert_eq!(have.len(), objects.len(), "the checkout got everything");
+    assert_eq!(ant_server::bundle::cache_lookups().1, misses, "every request was a hit");
 }
