@@ -12,6 +12,7 @@ mod changeset_codec;
 pub mod conformance;
 pub mod derive;
 pub mod feed;
+mod gcmark;
 pub mod graph;
 pub mod local;
 pub mod memory;

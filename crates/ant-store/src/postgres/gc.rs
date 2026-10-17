@@ -28,14 +28,17 @@
 //!
 //! # A run
 //!
-//! 1. **Mark.** The closure of the roots is collected in `gc_live` (an
-//!    unlogged working table, so client memory stays bounded however large
-//!    the store): batches of unexpanded ids are read (commit records from
-//!    `commits`, everything else through the object store) and their
-//!    children inserted. Ids written since the mark began are marked again
-//!    right before step 2. Ids the published roots (refs, history, root
-//!    kinds) reach but the store lacks are reported as missing
-//!    ([`GcReport::missing`]).
+//! 1. **Mark.** The closure of the roots is computed in memory
+//!    (`crate::gcmark`: commit records loaded with one scan of `commits`,
+//!    trees read level by level in history order with parallel reads,
+//!    every id expanded once; about 50 bytes per reachable object plus
+//!    ~150 per commit) and written to `gc_live` (an unlogged working table)
+//!    with one `COPY`. Ids written since the mark began are marked again
+//!    right before step 2, and by the later re-marks, through `gc_live`:
+//!    batches of unexpanded ids are read (commit records from `commits`,
+//!    everything else through the object store) and their children
+//!    inserted. Ids the published roots (refs, history, root kinds) reach
+//!    but the store lacks are reported as missing ([`GcReport::missing`]).
 //! 2. **Condemn.** Every id not marked whose rows were all written before
 //!    the cutoff is inserted into `gc_condemned`, one id-range chunk per
 //!    statement; its object and index rows are locked and re-checked while
@@ -165,11 +168,14 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use ant_core::{EntryMode, ObjectId, ObjectKind};
+use ant_core::{ObjectId, ObjectKind};
+use async_trait::async_trait;
+use futures::TryStreamExt;
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 
-use super::{PgStore, be, ids_to_vecs, object_id_col};
+use super::{PgStore, be, commit_node, ids_to_vecs, object_id_col};
+use crate::gcmark::{self, CommitRecords, Kind, MarkOptions, Marker, Record, RecordSource};
 use crate::s3::S3ObjectStore;
 use crate::{ObjectStore, Result, StoreError};
 
@@ -209,6 +215,49 @@ const KIND_UNKNOWN: i16 = 0;
 const KIND_COMMIT: i16 = 1;
 const KIND_TREE: i16 = 2;
 const KIND_BLOB: i16 = 3;
+
+/// Ids per object read while marking, at most, and reads in flight: about
+/// 16,000 trees in flight (a few hundred MB for directories of a few
+/// hundred entries).
+const MARK_BATCH: usize = 500;
+const MARK_READS: usize = 32;
+
+/// The `gc_live.kind` code of a mark kind.
+fn kind_code(k: Kind) -> i16 {
+    match k {
+        Kind::Unknown => KIND_UNKNOWN,
+        Kind::Commit => KIND_COMMIT,
+        Kind::Tree => KIND_TREE,
+        Kind::Blob => KIND_BLOB,
+    }
+}
+
+fn record(n: crate::CommitNode) -> Record {
+    Record {
+        tree: n.tree,
+        parents: n.parents,
+        generation: n.generation,
+        committer_time: n.committer_time,
+    }
+}
+
+/// Commit records looked up in `commits` (commits recorded after the
+/// mark's scan of it).
+struct PgRecords<'a>(&'a PgStore);
+
+#[async_trait]
+impl RecordSource for PgRecords<'_> {
+    async fn records(&self, ids: &[ObjectId]) -> Result<Vec<(ObjectId, Record)>> {
+        let rows = sqlx::query(
+            "SELECT id, tree, parents, generation, committer_time FROM commits WHERE id = ANY($1)",
+        )
+        .bind(ids_to_vecs(ids))
+        .fetch_all(&self.0.pool)
+        .await
+        .map_err(be)?;
+        rows.iter().map(|r| commit_node(r).map(|n| (n.id, record(n)))).collect()
+    }
+}
 
 tokio::task_local! {
     static UNHIDDEN: ();
@@ -402,54 +451,6 @@ fn secs(d: Duration) -> f64 {
 /// The raw `id` column of `rows`.
 fn id_set(rows: &[PgRow]) -> Result<HashSet<Vec<u8>>> {
     rows.iter().map(|r| r.try_get::<Vec<u8>, _>("id").map_err(be)).collect()
-}
-
-/// Child ids of an encoded tree body, with their mark kinds. Parsed without
-/// the canonical-order checks of `Tree::decode`: the collector must see the
-/// children of whatever is stored. Gitlinks (other repositories) are skipped.
-fn tree_children(body: &[u8], out: &mut Vec<(ObjectId, i16)>) -> Result<()> {
-    let malformed = || StoreError::InvalidArgument("gc: malformed tree object".into());
-    let mut rest = body;
-    while !rest.is_empty() {
-        let sp = rest.iter().position(|&b| b == b' ').ok_or_else(malformed)?;
-        let mode = &rest[..sp];
-        rest = &rest[sp + 1..];
-        let nul = rest.iter().position(|&b| b == 0).ok_or_else(malformed)?;
-        rest = &rest[nul + 1..];
-        if rest.len() < ObjectId::LEN {
-            return Err(malformed());
-        }
-        let id = ObjectId::from_bytes(&rest[..ObjectId::LEN])?;
-        rest = &rest[ObjectId::LEN..];
-        // Legacy spellings ("040000", "40755", ...) behave like their class;
-        // an unparsable mode is treated as a blob so its target stays alive.
-        match EntryMode::from_octal(mode).map(EntryMode::class) {
-            Ok(EntryMode::Tree) => out.push((id, KIND_TREE)),
-            Ok(EntryMode::Gitlink) => {}
-            _ => out.push((id, KIND_BLOB)),
-        }
-    }
-    Ok(())
-}
-
-/// Tree and parent ids of an encoded commit body (header lines only).
-fn commit_children(body: &[u8], out: &mut Vec<(ObjectId, i16)>) -> Result<()> {
-    let malformed = || StoreError::InvalidArgument("gc: malformed commit object".into());
-    for line in body.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            break;
-        }
-        let (kind, hex) = if let Some(hex) = line.strip_prefix(b"tree ") {
-            (KIND_TREE, hex)
-        } else if let Some(hex) = line.strip_prefix(b"parent ") {
-            (KIND_COMMIT, hex)
-        } else {
-            continue;
-        };
-        let hex = std::str::from_utf8(hex).map_err(|_| malformed())?;
-        out.push((hex.parse::<ObjectId>().map_err(|_| malformed())?, kind));
-    }
-    Ok(())
 }
 
 impl PgStore {
@@ -774,6 +775,7 @@ impl Run<'_> {
                 .map(|(id, _)| *id)
                 .collect();
             if !read.is_empty() {
+                let mut parsed = Vec::new();
                 let found = unhidden(self.objects.get_many(&read)).await?;
                 for (id, object) in read.iter().zip(found) {
                     let Some(object) = object else {
@@ -791,13 +793,14 @@ impl Run<'_> {
                         continue;
                     };
                     match object.kind() {
-                        ObjectKind::Tree => tree_children(object.body(), &mut children),
-                        ObjectKind::Commit => commit_children(object.body(), &mut children),
+                        ObjectKind::Tree => gcmark::tree_children(object.body(), &mut parsed),
+                        ObjectKind::Commit => gcmark::commit_children(object.body(), &mut parsed),
                         ObjectKind::Blob => Ok(()),
                     }
                     .map_err(|e| {
                         StoreError::InvalidArgument(format!("{e} ({id}); nothing was deleted"))
                     })?;
+                    children.extend(parsed.drain(..).map(|(id, k)| (id, kind_code(k))));
                 }
             }
             self.insert_marks(&children).await?;
@@ -838,11 +841,11 @@ impl Run<'_> {
     /// index (the first mark of a run). `since`: rows written at or after it
     /// are roots.
     async fn mark(&mut self, all_history: bool, since: f64) -> Result<()> {
+        if all_history {
+            return self.mark_all(since).await;
+        }
         let mut added = self.add_roots(ROOTS_REFS, since).await?;
         added += self.add_roots(ROOTS_WATERMARKS, since).await?;
-        if all_history {
-            added += self.add_roots(ROOTS_HISTORY, since).await?;
-        }
         added += self.add_roots(ROOTS_DERIVED, since).await?;
         // The published roots first: what they reach and the store lacks
         // is missing.
@@ -856,6 +859,137 @@ impl Run<'_> {
         added += self.add_roots(ROOTS_FRESH_OBJECTS, since).await?;
         self.expand().await?;
         tracing::debug!(added, "gc: marked roots");
+        Ok(())
+    }
+
+    /// The first mark of a run: the closure of every root, in memory
+    /// ([`gcmark`]), then written to an empty `gc_live` as expanded rows.
+    /// In a real run nothing is condemned during the mark phase: what an
+    /// interrupted condemn step left is dropped first (it is redone after
+    /// the mark).
+    async fn mark_all(&mut self, since: f64) -> Result<()> {
+        let started = Instant::now();
+        let reset = if self.opts.dry_run {
+            "TRUNCATE gc_live"
+        } else {
+            "DELETE FROM gc_condemned; TRUNCATE gc_live"
+        };
+        sqlx::raw_sql(reset).execute(&mut *self.conn).await.map_err(be)?;
+        let records = self.commit_records().await?;
+        self.say(&format!(
+            "loaded {} commit records in {:.1}s",
+            records.len(),
+            started.elapsed().as_secs_f64()
+        ));
+        let lookup = PgRecords(self.store);
+        let opts = MarkOptions { batch: self.opts.batch.clamp(1, MARK_BATCH), reads: MARK_READS };
+        let mut m = Marker::new(self.objects, records, &lookup, opts);
+        // The published roots first: what they reach and the store lacks
+        // is missing.
+        let published = self
+            .root_ids(&[ROOTS_REFS, ROOTS_WATERMARKS, ROOTS_HISTORY, ROOTS_DERIVED], since)
+            .await?;
+        unhidden(m.mark(published, true, &mut |_| {})).await?;
+        let fresh = self.root_ids(&[ROOTS_FRESH_COMMITS], since).await?;
+        unhidden(m.mark(fresh, false, &mut |_| {})).await?;
+        // Objects written recently that no commit reaches yet (uploads, a
+        // batch in flight): their kind is unknown until read.
+        let fresh = self.root_ids(&[ROOTS_FRESH_OBJECTS], since).await?;
+        unhidden(m.mark(fresh, false, &mut |_| {})).await?;
+        let stats = m.stats;
+        let live = std::mem::take(&mut m.live);
+        drop(m);
+        self.report.missing += stats.missing;
+        let walked = started.elapsed().as_secs_f64();
+        self.say(&format!(
+            "marked {} ids in {walked:.1}s ({} commits from records, {} read; {} trees; \
+             {} objects in {} reads; {} record lookups)",
+            live.len(),
+            stats.commits_recorded,
+            stats.commits_read,
+            stats.trees,
+            stats.objects_read,
+            stats.reads,
+            stats.lookups
+        ));
+        let mut ids: Vec<ObjectId> = live.into_iter().collect();
+        // Sorted: the primary key is built by appending.
+        ids.sort_unstable();
+        self.copy_live(&ids).await?;
+        self.say(&format!(
+            "wrote the mark set in {:.1}s",
+            started.elapsed().as_secs_f64() - walked
+        ));
+        Ok(())
+    }
+
+    /// Every commit record (one scan of `commits`).
+    async fn commit_records(&mut self) -> Result<CommitRecords> {
+        let mut out = CommitRecords::default();
+        let mut rows =
+            sqlx::query("SELECT id, tree, parents, generation, committer_time FROM commits")
+                .fetch(&mut *self.conn);
+        while let Some(row) = rows.try_next().await.map_err(be)? {
+            let n = commit_node(&row)?;
+            out.insert(n.id, &record(n));
+        }
+        Ok(out)
+    }
+
+    /// The `(id, kind)` rows of root sources (see [`Run::add_roots`]).
+    async fn root_ids(&mut self, sources: &[&str], since: f64) -> Result<Vec<(ObjectId, Kind)>> {
+        let mut out = Vec::new();
+        for source in sources {
+            let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT id, kind FROM ({source}) AS src(id, kind) WHERE id IS NOT NULL"
+            )))
+            .bind(&self.opts.root_kinds)
+            .bind(since)
+            .fetch_all(&mut *self.conn)
+            .await
+            .map_err(be)?;
+            for r in &rows {
+                let id: Vec<u8> = r.try_get("id").map_err(be)?;
+                // Anything else names no object (and no `gc_live` row).
+                let Ok(id) = ObjectId::from_bytes(&id) else { continue };
+                let kind: i16 = r.try_get("kind").map_err(be)?;
+                out.push((id, if kind == KIND_COMMIT { Kind::Commit } else { Kind::Unknown }));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Write `ids` (sorted) to the empty `gc_live` as expanded rows, with one
+    /// binary `COPY`. Their kind is not kept (only unexpanded rows need it).
+    async fn copy_live(&mut self, ids: &[ObjectId]) -> Result<()> {
+        const CHUNK: usize = 1 << 20;
+        let mut copy = self
+            .conn
+            .copy_in_raw("COPY gc_live (id, kind, expanded) FROM STDIN (FORMAT binary)")
+            .await
+            .map_err(be)?;
+        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK + 64);
+        buf.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+        buf.extend_from_slice(&0u32.to_be_bytes()); // flags
+        buf.extend_from_slice(&0u32.to_be_bytes()); // header extension
+        for id in ids {
+            buf.extend_from_slice(&3i16.to_be_bytes());
+            buf.extend_from_slice(&(ObjectId::LEN as i32).to_be_bytes());
+            buf.extend_from_slice(id.as_bytes());
+            buf.extend_from_slice(&2i32.to_be_bytes());
+            buf.extend_from_slice(&KIND_UNKNOWN.to_be_bytes());
+            buf.extend_from_slice(&1i32.to_be_bytes());
+            buf.push(1);
+            if buf.len() >= CHUNK {
+                let full = std::mem::replace(&mut buf, Vec::with_capacity(CHUNK + 64));
+                copy.send(full).await.map_err(be)?;
+            }
+        }
+        buf.extend_from_slice(&(-1i16).to_be_bytes());
+        copy.send(buf).await.map_err(be)?;
+        copy.finish().await.map_err(be)?;
+        // The condemn step anti-joins against it: plan with real numbers.
+        sqlx::query("ANALYZE gc_live").execute(&mut *self.conn).await.map_err(be)?;
         Ok(())
     }
 
@@ -926,7 +1060,9 @@ impl Run<'_> {
     }
 }
 
-/// One chunk of the condemn step. `$1`..`$2` (null: open end): id range;
+/// One chunk of the condemn step. `$1`..`$2` (null: open end): id range
+/// (repeated on the `gc_live` side of each anti-join, which then reads only
+/// the chunk's range of the mark set instead of all of it per chunk);
 /// `$3`: cutoff (Unix seconds); `$4`: insert into `gc_condemned`. Returns
 /// the number of ids condemned, then counts and bytes per table of their
 /// rows.
@@ -948,13 +1084,15 @@ macro_rules! condemn_chunk {
             "WITH co AS (SELECT id, octet_length(data)::bigint AS bytes FROM objects o \
                   WHERE id >= $1 AND ($2::bytea IS NULL OR id < $2) \
                     AND written_at < to_timestamp($3) \
-                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = o.id) ",
+                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = o.id \
+                                    AND l.id >= $1 AND ($2::bytea IS NULL OR l.id < $2)) ",
             $lock_o,
             "), \
              cx AS (SELECT id, coalesce(share, len)::bigint AS bytes FROM object_index x \
                   WHERE id >= $1 AND ($2::bytea IS NULL OR id < $2) \
                     AND written_at < to_timestamp($3) \
-                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = x.id) ",
+                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = x.id \
+                                    AND l.id >= $1 AND ($2::bytea IS NULL OR l.id < $2)) ",
             $lock_x,
             "), \
              cand AS ( \
@@ -965,12 +1103,14 @@ macro_rules! condemn_chunk {
                  SELECT id, 'c', 0::bigint FROM commits c \
                   WHERE id >= $1 AND ($2::bytea IS NULL OR id < $2) \
                     AND written_at < to_timestamp($3) \
-                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = c.id) \
+                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = c.id \
+                                    AND l.id >= $1 AND ($2::bytea IS NULL OR l.id < $2)) \
                  UNION ALL \
                  SELECT commit_id, 's', octet_length(data)::bigint FROM changesets s \
                   WHERE commit_id >= $1 AND ($2::bytea IS NULL OR commit_id < $2) \
                     AND written_at < to_timestamp($3) \
-                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = s.commit_id)), \
+                    AND NOT EXISTS (SELECT 1 FROM gc_live l WHERE l.id = s.commit_id \
+                                    AND l.id >= $1 AND ($2::bytea IS NULL OR l.id < $2))), \
              ids AS (SELECT DISTINCT id FROM cand d \
                   WHERE NOT EXISTS (SELECT 1 FROM objects o WHERE o.id = d.id \
                                     AND NOT EXISTS (SELECT 1 FROM co WHERE co.id = o.id)) \
@@ -1922,78 +2062,6 @@ pub(super) mod tests {
         conn.close_on_drop();
         drop(conn);
         run(&s, &opts()).await;
-    }
-
-    /// Legacy mode spellings must not hide subtrees from the collector.
-    #[test]
-    fn tree_children_classify_legacy_modes() {
-        let m = |s: &str| EntryMode::from_octal(s.as_bytes()).unwrap();
-        let t = Tree::new(vec![
-            TreeEntry { mode: m("100664"), name: "a".into(), id: ObjectId([1; 32]) },
-            TreeEntry { mode: m("040000"), name: "d".into(), id: ObjectId([2; 32]) },
-            TreeEntry { mode: m("40755"), name: "e".into(), id: ObjectId([3; 32]) },
-            TreeEntry { mode: m("160755"), name: "g".into(), id: ObjectId([4; 32]) },
-        ])
-        .unwrap();
-        let o = Object::Tree(t).encode();
-        let mut out = Vec::new();
-        tree_children(o.body(), &mut out).unwrap();
-        out.sort();
-        assert_eq!(
-            out,
-            [
-                (ObjectId([1; 32]), KIND_BLOB),
-                (ObjectId([2; 32]), KIND_TREE),
-                (ObjectId([3; 32]), KIND_TREE)
-            ]
-        );
-    }
-
-    #[test]
-    fn tree_children_follow_subtrees_and_blobs_but_not_gitlinks() {
-        let t = Tree::new(vec![
-            TreeEntry { mode: EntryMode::File, name: "a".into(), id: ObjectId([1; 32]) },
-            TreeEntry { mode: EntryMode::Tree, name: "d".into(), id: ObjectId([2; 32]) },
-            TreeEntry { mode: EntryMode::Gitlink, name: "m".into(), id: ObjectId([3; 32]) },
-            TreeEntry { mode: EntryMode::Symlink, name: "s".into(), id: ObjectId([4; 32]) },
-        ])
-        .unwrap();
-        let o = Object::Tree(t).encode();
-        let mut out = Vec::new();
-        tree_children(o.body(), &mut out).unwrap();
-        out.sort();
-        assert_eq!(
-            out,
-            [
-                (ObjectId([1; 32]), KIND_BLOB),
-                (ObjectId([2; 32]), KIND_TREE),
-                (ObjectId([4; 32]), KIND_BLOB)
-            ]
-        );
-        assert!(tree_children(b"100644 a\0short", &mut out).is_err());
-        assert!(tree_children(b"100644 a", &mut out).is_err());
-    }
-
-    #[test]
-    fn commit_children_are_tree_and_parents() {
-        let body = format!(
-            "tree {}\nparent {}\nparent {}\nauthor a <a> 1 +0000\n\ntree {}\n",
-            ObjectId([1; 32]).to_hex(),
-            ObjectId([2; 32]).to_hex(),
-            ObjectId([3; 32]).to_hex(),
-            ObjectId([9; 32]).to_hex(),
-        );
-        let mut out = Vec::new();
-        commit_children(body.as_bytes(), &mut out).unwrap();
-        assert_eq!(
-            out,
-            [
-                (ObjectId([1; 32]), KIND_TREE),
-                (ObjectId([2; 32]), KIND_COMMIT),
-                (ObjectId([3; 32]), KIND_COMMIT)
-            ]
-        );
-        assert!(commit_children(b"tree xyz\n\n", &mut out).is_err());
     }
 
     #[test]
