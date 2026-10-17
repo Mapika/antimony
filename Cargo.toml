@@ -84,3 +84,14 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# The hot paths of our own crates (git deltas, pack frames and repack, pack
+# generation) are optimised in test builds too: unoptimised they made the
+# large clone and repack race tests 3-10x slower on CI runners. Debug
+# assertions stay on.
+[profile.dev.package.ant-core]
+opt-level = 2
+[profile.dev.package.ant-store]
+opt-level = 2
+[profile.dev.package.ant-gitserve]
+opt-level = 2
