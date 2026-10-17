@@ -829,7 +829,14 @@ mod tests {
         }
         assert_eq!(up.ids(), objs.len(), "each object fetched once");
         assert!(waited > 0, "some handle waited for a peer");
-        assert!(!dir.path().join("claims").read_dir().unwrap().any(|e| e.is_ok()), "claims gone");
+        // No claim file is left. Handles that met through batch announcements
+        // may never have created the claims directory at all.
+        let claims_left = match dir.path().join("claims").read_dir() {
+            Ok(entries) => entries.filter(|e| e.is_ok()).count(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => panic!("reading claims: {e}"),
+        };
+        assert_eq!(claims_left, 0, "claims gone");
     }
 
     /// A process alone on its cache takes no claims (no per-object claim
