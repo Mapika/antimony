@@ -117,10 +117,10 @@ local mode scorecard, the v0.2.0 scorecard (rows marked v0.2.0) and the
 | Stored size of git/git vs its git pack | | v0.2.0: 901 MiB after import (3.0x); 361 MiB after `ant admin repack` and GC (298 MiB for `git gc`, 94 MiB for `git gc --aggressive`) |
 
 Local mode (`ant serve --local`, SQLite and pack files, no Postgres or S3),
-same WSL2 machine, which was busy with other builds during the run (so
-latencies are pessimistic): 16 MiB idle RSS, 57 ms from process start to
-listening, about 1,000 lands/s with 50 agents (p99 64 ms), 172 MiB server peak RSS at 50
-agents, git/git imported in 941 MiB on disk.
+same WSL2 machine: 16 MiB idle RSS, 57 ms from process start to listening,
+2,370 to 2,940 lands/s with 50 agents (p99 32 to 52 ms; v0.3.0: about
+1,000/s), git/git imported at 6.9k to 10.8k commits/s into 941 MiB on disk,
+223 MiB after `ant admin repack --local` (v0.4.0).
 
 ## How it compares to git
 
@@ -296,6 +296,9 @@ every flag; `ant completions <shell>` prints a completion script.
 
 ## Status
 
+- **v0.4.0** (2026-10-17): local mode maintenance while serving
+  (`ant admin gc --local`, `--gc-interval`, `ant admin repack --local`)
+  and 2-6x faster local landing; local schema version 2.
 - **v0.3.2** (2026-10-17): persistent server cache (bundles and git base
   packs survive restarts; `--cache-dir`, `--shared-cache`, `--prewarm`).
 - **v0.3.1** (2026-10-17): faster warm checkout and cold-server reads (S3

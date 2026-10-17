@@ -8,6 +8,14 @@ release of the 0.x series may change.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-17
+
+Minor release for local mode: a local server can now be garbage-collected
+and repacked while it serves, and lands 2-6x faster (50 agents: about 1,000
+to 2,400-2,900 lands/s). Local data directories move to SQLite schema
+version 2, which 0.3.x binaries refuse. Postgres + S3 deployments have no
+schema or protocol change; 0.3.x and 0.4.0 servers and clients interoperate.
+
 ### Added
 
 - Local mode can be maintained while it serves (docs/operations.md, Local
@@ -82,15 +90,9 @@ release of the 0.x series may change.
   concurrently, and a land batch builds on its predecessor's writes in
   flight) as missing, and so did unreachable leftovers of a writer stopped
   midway. Nothing was deleted wrongly; only the report was off.
-- Local mode maintenance (unreleased): a collection or repack could delete
-  the pack file a writer had just started, while its first objects' index
-  rows were still being written, leaving those objects and every later
-  write to that pack unreadable (`pack <id>: No such file or directory`).
-  A pack is now deleted only after a check on the database writer thread
-  finds it unused (not being written to, no index rows), whatever the
-  run's earlier listing said. A cancelled repack (Postgres + S3 or local)
-  no longer leaves its pack writes running in the background, where they
-  kept the local store open and switched rows beside the next run.
+- A cancelled or failed `ant admin repack` no longer leaves its pack writes
+  running in the background; cancelling now behaves like a crash mid-run
+  (resumable, nothing referenced is lost).
 - Landing a changeset that a collection condemns meanwhile fails that land
   alone with `NOT_FOUND`; it no longer aborts the other lands of its batch.
 
@@ -872,7 +874,8 @@ Also in this release:
   around restricted paths, and principals sharing a cache directory share
   what it holds.
 
-[Unreleased]: https://github.com/Mapika/antimony/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/Mapika/antimony/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Mapika/antimony/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/Mapika/antimony/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Mapika/antimony/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Mapika/antimony/compare/v0.2.2...v0.3.0
