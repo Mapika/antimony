@@ -865,6 +865,7 @@ Families (all names verified in `crates/ant-server/src/metrics.rs`):
 | `ant_s3_requests_in_flight`, `ant_s3_requests_queued`, `ant_s3_max_concurrency` | | S3 request slots (`--s3-max-concurrency`) in use, waited for, configured |
 | `ant_s3_requests_total`, `ant_s3_read_bytes_total` | `op` = `get`/`put`/`head`/`other` | S3 requests sent (retries included); body bytes received |
 | `ant_s3_pack_segments_total`, `ant_s3_pack_cache_bytes` | `result` = `hit`/`read` | pack segments found cached (or being read) and read from S3; bytes held (`--s3-pack-cache-mib`) |
+| `ant_pack_frame_decodes_total`, `ant_pack_frame_decoded_bytes_total` | | multi-object pack records (frames) decompressed, and their uncompressed bytes; reads served by the decoded-frame cache (or by a decode another reader started) do not count |
 | `ant_build_info` | `version`, `git` | always 1 |
 
 `ant cache-serve` has its own `ant_cacheserve_*` families (see Cache tier).

@@ -288,6 +288,7 @@ async fn fetch_response(export: Export, fetch: Fetch) -> Result<Response> {
     prefix.extend(packet(b"packfile\n"));
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     tx.send(Ok(prefix.into())).await?;
+    let frames0 = ant_store::packed::frame_stats();
     tokio::spawn(async move {
         match pack::send_with(b, selection, fetch.ofs_delta, record, tx.clone()).await {
             Ok(stats) => {
@@ -298,6 +299,8 @@ async fn fetch_response(export: Export, fetch: Fetch) -> Result<Response> {
                     bytes = stats.bytes,
                     planning_ms = planned.as_millis() as u64,
                     total_ms = started.elapsed().as_millis() as u64,
+                    frame_decodes = ant_store::packed::frame_stats().0 - frames0.0,
+                    frame_decoded_mib = (ant_store::packed::frame_stats().1 - frames0.1) >> 20,
                     "git pack sent"
                 );
             }
